@@ -1,0 +1,7 @@
+robot_cfg:
+  kinematics:
+    urdf_path: "/workspaces/isaac_ros-dev/openarm.urdf"
+    asset_root_path: "/workspaces/isaac_ros-dev/src"
+    base_link: "world"
+    ee_link: "openarm_left_hand_tcp"
+    link_names: ["openarm_right_hand_tcp"]
