@@ -1,0 +1,24 @@
+# ROS2 Workspace
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# Docker / System / Crash dumps
+core.*
+.DS_Store
+*.swp
+*~
+
+# IDEs
+.vscode/
+.idea/
