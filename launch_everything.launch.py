@@ -56,11 +56,38 @@ def generate_launch_description():
         }],
         output='screen'
     )
+    # 3. Add the RealSense Camera Node
+    try:
+        realsense_launch_file = os.path.join(
+            get_package_share_directory('realsense2_camera'),
+            'launch',
+            'rs_launch.py'
+        )
+        realsense_node = IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(realsense_launch_file),
+            launch_arguments={
+                'depth_module.profile': '848x480x30',
+                'pointcloud.enable': 'true',
+                'align_depth.enable': 'true',
+            }.items()
+        )
+        launch_nodes = [
+            declare_fake_hardware,
+            declare_right_can,
+            declare_left_can,
+            demo_launch,
+            cumotion_node,
+            realsense_node
+        ]
+    except Exception as e:
+        # If realsense2_camera is not installed, fallback to just the robot without crashing
+        print(f"\n[WARNING]: realsense2_camera package not found! Please run 'sudo apt-get install ros-humble-realsense2-camera ros-humble-realsense2-description -y' inside the container.\n")
+        launch_nodes = [
+            declare_fake_hardware,
+            declare_right_can,
+            declare_left_can,
+            demo_launch,
+            cumotion_node
+        ]
     
-    return LaunchDescription([
-        declare_fake_hardware,
-        declare_right_can,
-        declare_left_can,
-        demo_launch,
-        cumotion_node
-    ])
+    return LaunchDescription(launch_nodes)

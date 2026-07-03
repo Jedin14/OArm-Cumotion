@@ -83,5 +83,10 @@
   left_arm_base_rpy="$(arg left_arm_base_rpy)"
   can_fd="$(arg can_fd)"
   />
+  <xacro:include filename="$(find realsense2_description)/urdf/_d455.urdf.xacro" />
+  <xacro:sensor_d455 parent="world" name="camera">
+    <origin xyz="0.100 0.000 0.735" rpy="0 1.0472 0"/>
+  </xacro:sensor_d455>
+
 
 </robot>
