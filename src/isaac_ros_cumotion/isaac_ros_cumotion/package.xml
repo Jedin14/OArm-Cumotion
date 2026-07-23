@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>isaac_ros_cumotion</name>
+  <version>4.4.0</version>
+  <description>Package adds a cuMotion planner node</description>
+  <maintainer email="isaac-ros-maintainers@nvidia.com">Isaac ROS Maintainers</maintainer>
+  <license>NVIDIA Isaac ROS Software License</license>
+  <url type="website">https://developer.nvidia.com/isaac-ros-gems/</url>
+  <author>Yash Oza</author>
+
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+
+  <depend>ament_index_cpp</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+  <depend>rclcpp_components</depend>
+  <depend>tf2_ros</depend>
+  <depend>moveit_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>shape_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>nvblox_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>eigen</depend>
+  <depend>yaml-cpp</depend>
+  <depend>assimp</depend>
+  <depend>isaac_ros_nitros</depend>
+  <depend>tf2</depend>
+  <depend>control_msgs</depend>
+  <depend>isaac_ros_cumotion_interfaces</depend>
+  <depend>isaac_ros_common</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <!-- Load URDF/XRDF via ament_index_cpp at runtime from the robot description package. -->
+  <test_depend>isaac_ros_cumotion_robot_description</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

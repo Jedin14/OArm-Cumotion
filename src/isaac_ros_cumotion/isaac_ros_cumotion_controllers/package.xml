@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>isaac_ros_cumotion_controllers</name>
+  <version>4.4.0</version>
+  <description>ROS 2 control controllers using cuMotion (e.g. IK via RMPflow)</description>
+  <maintainer email="isaac-ros-maintainers@nvidia.com">Isaac ROS Maintainers</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+
+  <!-- Core ROS2 Control -->
+  <depend>controller_interface</depend>
+  <depend>hardware_interface</depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+
+  <!-- ROS2 Messages -->
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+
+  <!-- Third-party -->
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>pinocchio</depend>
+  <depend>realtime_tools</depend>
+  <depend>isaac_ros_nitros</depend>
+
+  <!-- Python marker node deps -->
+  <exec_depend>interactive_markers</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+    <controller_interface plugin="${prefix}/isaac_ros_cumotion_controllers.xml"/>
+  </export>
+</package>

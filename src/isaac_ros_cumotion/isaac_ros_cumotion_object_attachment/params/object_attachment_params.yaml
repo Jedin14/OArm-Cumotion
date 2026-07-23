@@ -1,0 +1,18 @@
+/**:
+  ros__parameters:
+
+    # Object attachment behavior
+    # max_overshoot: How far spheres extend beyond mesh surface (m). Larger = fewer spheres, faster.
+    max_overshoot: 0.01
+
+    # nvblox ESDF clearing configuration
+    clear_esdf_on_attach: True  # Enable/disable clearing of attached objects from ESDF when attaching
+    object_esdf_clearing_padding: [0.05, 0.05, 0.05]  # Per-side padding around objects when clearing from ESDF [x, y, z] in meters
+    
+    esdf_reference_frame: 'base_link'  # Reference frame for ESDF (must match nvblox's global_frame parameter)
+    esdf_visualize_when_clearing: True  # Trigger nvblox to republish ESDF visualization after clearing
+
+    # Robot description service names (must match cumotion_planner service names)
+    get_robot_description_service: '/cumotion/get_robot_description'
+    set_robot_description_service: '/cumotion/set_robot_description'
+

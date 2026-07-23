@@ -1,0 +1,22 @@
+/**:
+  ros__parameters:
+    urdf_path: ""
+    xrdf_path: ""
+    input_qos: 'DEFAULT'
+    output_qos: 'DEFAULT'
+    depth_image_topics: [/depth_image]
+    depth_camera_infos: [/rgb/camera_info]
+    robot_mask_publish_topics: [/cumotion/camera_1/robot_mask]
+    world_depth_publish_topics: [/cumotion/camera_1/world_depth]
+    joint_states_topic: /joint_states
+    distance_threshold: 0.05
+    enable_cuda_mps: False
+    cuda_mps_pipe_directory: '/tmp/mps_pipe_dir'
+    cuda_mps_client_priority: 1
+    cuda_mps_active_thread_percentage: 100
+    num_cameras: 1
+    container_name: manipulator_container
+    reload_robot_description_topic: /cumotion/reload_robot_description
+    robot_description_service_name: /cumotion/get_robot_description
+    robot_base_frame: base_link
+    enable_performance_logging: False

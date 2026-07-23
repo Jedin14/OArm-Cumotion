@@ -1,0 +1,7 @@
+# New robot description strings.
+string urdf
+string xrdf
+---
+bool success
+string message
+
