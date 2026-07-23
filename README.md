@@ -34,3 +34,12 @@ code ~/workspaces/isaac_ros-dev
   - **Always switch the Planning Pipeline to `ompl` in RViz** when planning motions for `left_gripper` or `right_gripper`!
 - **Gripper PID Tuning**: The DM4310 gripper motor gains have been carefully tuned (`Kp = 20.0`, `Kd = 0.5`) to eliminate high-frequency noise and vibrations while providing enough torque for accurate movement.
 - **Core Dump Cleanup**: The `./scripts/run_dev.sh` startup script has been modified to automatically delete large `core.*` crash dump files from the workspace before the container starts, ensuring your hard drive does not run out of space.
+
+
+sudo ip link set can0 down
+sudo ip link set can0 type can bitrate 1000000 dbitrate 5000000 fd on
+sudo ip link set can0 up
+
+sudo ip link set can1 down
+sudo ip link set can1 type can bitrate 1000000 dbitrate 5000000 fd on
+sudo ip link set can1 up

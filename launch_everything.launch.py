@@ -110,7 +110,7 @@ def generate_launch_description():
         realsense_node_live = IncludeLaunchDescription(
             PythonLaunchDescriptionSource(realsense_launch_file),
             launch_arguments={
-                'depth_module.profile': '848x480x15',
+                'depth_module.depth_profile': '848x480x15',
                 'pointcloud.enable': 'false',
                 'align_depth.enable': 'false',
                 'enable_color': 'false',
@@ -123,7 +123,7 @@ def generate_launch_description():
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(realsense_launch_file),
                 launch_arguments={
-                    'depth_module.profile': '848x480x15',
+                    'depth_module.depth_profile': '848x480x15',
                     'pointcloud.enable': 'false',
                     'align_depth.enable': 'false',
                     'enable_color': 'false',

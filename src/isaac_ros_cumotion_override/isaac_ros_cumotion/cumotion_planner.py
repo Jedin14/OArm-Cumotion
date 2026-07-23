@@ -835,6 +835,24 @@ class CumotionActionServer(Node):
             traj = self.get_joint_trajectory(
                 motion_gen_result.optimized_plan, motion_gen_result.optimized_dt.item()
             )
+            # Never allow invalid GPU output to reach MoveIt or a hardware
+            # controller.  NaN/Inf joint values can make FCL crash while it
+            # updates collision-object transforms.
+            points = traj.joint_trajectory.points
+            arrays = [
+                value
+                for point in points
+                for values in (point.positions, point.velocities,
+                               point.accelerations)
+                for value in values
+            ]
+            if not arrays or not np.isfinite(np.asarray(arrays, dtype=np.float64)).all():
+                self.get_logger().error(
+                    'Rejected cuMotion trajectory: it contains non-finite values.'
+                )
+                result.error_code.val = MoveItErrorCodes.PLANNING_FAILED
+                result.planned_trajectory = RobotTrajectory()
+                return result
             result.planning_time = motion_gen_result.total_time
             result.planned_trajectory = traj
         elif not motion_gen_result.valid_query:
