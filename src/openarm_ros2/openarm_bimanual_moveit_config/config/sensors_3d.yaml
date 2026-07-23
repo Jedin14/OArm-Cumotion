@@ -1,5 +1,5 @@
 octomap_frame: world
-octomap_resolution: 0.02
+octomap_resolution: 0.05
 max_range: 5.0
 sensors:
   - realsense_depth
@@ -10,6 +10,6 @@ realsense_depth:
   near_clipping_plane_distance: 0.3
   far_clipping_plane_distance: 5.0
   shadow_threshold: 0.2
-  padding_scale: 4.0
-  padding_offset: 0.03
-  max_update_rate: 10.0
+  padding_scale: 2.0
+  padding_offset: 0.20
+  max_update_rate: 5.0
