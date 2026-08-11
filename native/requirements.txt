@@ -1,0 +1,32 @@
+# Python stack for the native cuMotion setup, pinned to the versions the
+# Isaac ROS container shipped (see docker/Dockerfile.x86_64 and the container's
+# own pip freeze). cuRobo's prebuilt CUDA extensions are linked against this
+# torch ABI, so the torch/numpy pins are not optional.
+#
+# These land in native/venv only. The host's ~/.local stack (torch 2.12+cu130,
+# numpy 2.2.6) is never touched or read -- setup.bash sets PYTHONNOUSERSITE=1.
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.7.0+cu128
+torchvision==0.22.0+cu128
+
+numpy==1.26.4
+warp-lang==1.15.0
+trimesh==4.12.2
+yourdfpy==0.0.60
+numpy-quaternion==2024.0.13
+scipy==1.15.3
+networkx==3.4.2
+lxml==6.1.1
+PyYAML==6.0.3
+tqdm==4.69.0
+importlib_resources==7.1.0
+setuptools_scm==10.2.1
+ninja
+
+# Build tooling, kept in the venv for two reasons: the host's pip-installed
+# cmake 4.1.3 lives in ~/.local (invisible under PYTHONNOUSERSITE), and cmake 4
+# drops compatibility with pre-3.5 CMakeLists that several ROS Humble packages
+# still declare. 3.22.x is what the container built with.
+cmake==3.22.6

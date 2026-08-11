@@ -73,10 +73,6 @@ class LeLabBridgeNode(Node):
         self._vel: dict[str, float] = {j: 0.0 for j in ALL_JOINTS}
 
         self.latest_action   = {}
-        self.action_timestamps: dict[str, float] = {}
-        self.action_ros_timestamps: dict[str, float] = {}
-        self.latest_observation_timestamp = 0.0
-        self.latest_observation_ros_timestamp = 0.0
         self.latest_buttons  = []
         self.lock            = threading.Lock()
 
@@ -114,41 +110,23 @@ class LeLabBridgeNode(Node):
 
     def obs_callback(self, msg: JointState):
         """Store position & velocity for every recognised openarm joint."""
-        received_at = time.monotonic()
         with self.lock:
             for i, name in enumerate(msg.name):
                 if name in self._pos:
                     self._pos[name] = float(msg.position[i]) if i < len(msg.position) else 0.0
                     self._vel[name] = float(msg.velocity[i]) if i < len(msg.velocity) else 0.0
-            # Use the local monotonic receive time for cross-process alignment.
-            # ROS header clocks may be simulated or use a different epoch.
-            self.latest_observation_timestamp = received_at
-            self.latest_observation_ros_timestamp = (
-                float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
-            )
 
     def _extract_action(self, side: str, msg: JointState):
-        received_at = time.monotonic()
-        ros_timestamp = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
         with self.lock:
             for i in range(min(7, len(msg.position))):
-                name = f"openarm_{side}_joint{i+1}"
-                self.latest_action[name] = float(msg.position[i])
-                self.action_timestamps[name] = received_at
-                self.action_ros_timestamps[name] = ros_timestamp
+                self.latest_action[f"openarm_{side}_joint{i+1}"] = float(msg.position[i])
 
             if len(msg.position) >= 8:
-                name = f"openarm_{side}_finger_joint1"
-                self.latest_action[name] = float(msg.position[7])
-                self.action_timestamps[name] = received_at
-                self.action_ros_timestamps[name] = ros_timestamp
+                self.latest_action[f"openarm_{side}_finger_joint1"] = float(msg.position[7])
             elif f'{side}_gripper_joint' in msg.name:
                 try:
                     idx = msg.name.index(f'{side}_gripper_joint')
-                    name = f"openarm_{side}_finger_joint1"
-                    self.latest_action[name] = float(msg.position[idx])
-                    self.action_timestamps[name] = received_at
-                    self.action_ros_timestamps[name] = ros_timestamp
+                    self.latest_action[f"openarm_{side}_finger_joint1"] = float(msg.position[idx])
                 except ValueError:
                     pass
 
@@ -201,10 +179,6 @@ class LeLabBridgeNode(Node):
             ]
 
             action_snapshot  = self.latest_action.copy()
-            action_timestamps = self.action_timestamps.copy()
-            action_ros_timestamps = self.action_ros_timestamps.copy()
-            observation_timestamp = self.latest_observation_timestamp
-            observation_ros_timestamp = self.latest_observation_ros_timestamp
             buttons_snapshot = self.latest_buttons.copy()
 
         # --- ee_pose [14] (TF lookup outside the main lock to avoid blocking) ---
@@ -222,11 +196,6 @@ class LeLabBridgeNode(Node):
         payload = {
             "observation": observation,
             "action":      action_snapshot,
-            "observation_timestamp": observation_timestamp,
-            "observation_ros_timestamp": observation_ros_timestamp,
-            "action_timestamps": action_timestamps,
-            "action_ros_timestamps": action_ros_timestamps,
-            "bridge_timestamp": time.monotonic(),
             "buttons":     buttons_snapshot,
             "timestamp":   time.time(),
         }

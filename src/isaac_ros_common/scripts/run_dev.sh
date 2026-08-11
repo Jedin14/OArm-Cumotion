@@ -88,6 +88,25 @@ function cleanup {
 }
 trap cleanup EXIT
 
+# Keep Docker storage bounded. The final tagged image remains available, while
+# excess BuildKit cache and dangling intermediate images are discarded after a
+# build. A bounded cache is retained so subsequent builds can remain
+# incremental instead of rebuilding everything from scratch.
+function cleanup_docker_build_storage {
+    if [[ "${CONFIG_CLEANUP_DOCKER_BUILD_STORAGE:-1}" == "0" ]]; then
+        return
+    fi
+
+    print_info "Limiting Docker build cache and removing dangling images"
+    docker buildx prune --max-used-space 25GB --force >/dev/null 2>&1 || true
+    docker image prune --force >/dev/null 2>&1 || true
+
+    # build_image_layers creates this tagged intermediate image while building
+    # the platform layer. The final dev image already contains the layers it
+    # needs, so retaining this tag only keeps an extra image reference alive.
+    docker image rm "${PLATFORM}-image" >/dev/null 2>&1 || true
+}
+
 pushd . >/dev/null
 cd $ROOT
 ON_EXIT+=("popd")
@@ -207,6 +226,7 @@ print_info "Launching Isaac ROS Dev container with image key ${BASE_IMAGE_KEY}: 
 # Build imag to launch
 if [[ $SKIP_IMAGE_BUILD -ne 1 ]]; then
     print_info "Building $BASE_IMAGE_KEY base as image: $BASE_NAME"
+    ON_EXIT+=("cleanup_docker_build_storage")
    $ROOT/build_image_layers.sh --image_key "$BASE_IMAGE_KEY" --image_name "$BASE_NAME"
 
     # Check result
