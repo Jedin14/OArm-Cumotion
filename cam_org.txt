@@ -1,9 +1,13 @@
-X = 104.89 mm
+D455 mount position relative to `world`, as set in
+src/openarm_description/urdf/robot/v10.urdf.xacro (xacro:sensor_d455).
+
+current:    <origin xyz="0.10175 0.000 0.93272" rpy="0 1.0472 0"/>
+
+X = 101.75 mm   (forward)
 Y = 0 mm
-Z = 723.46 mm
+Z = 932.72 mm   (height)
+pitch = 1.0472 rad = 60 deg, tilted forward/down
 
-current:    <origin xyz="0.16089 0.000 0.72846" rpy="0 1.0472 0"/>
-
-160.89mm
-0
-728.46mm
+history:
+  X = 160.89 mm, Z = 728.46 mm    <origin xyz="0.16089 0.000 0.72846" rpy="0 1.0472 0"/>
+  X = 104.89 mm, Z = 723.46 mm

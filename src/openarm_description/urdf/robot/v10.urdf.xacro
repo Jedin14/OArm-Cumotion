@@ -86,7 +86,7 @@
   <xacro:include filename="$(find realsense2_description)/urdf/_d455.urdf.xacro" />
   <xacro:sensor_d455 parent="world" name="camera">
     <!-- Measured camera mount position; retain verified +60 deg ROS pitch. -->
-    <origin xyz="0.16089 0.000 0.72846" rpy="0 1.0472 0"/>
+    <origin xyz="0.10175 0.000 0.99272" rpy="0 1.0472 0"/>
   </xacro:sensor_d455>
 
 
