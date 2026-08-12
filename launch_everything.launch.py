@@ -100,34 +100,47 @@ def generate_launch_description():
 
 
     # 3. Add the RealSense Camera Node
+    #
+    # Colour and depth-to-colour alignment are on because VLM/vlm_detector_node.py
+    # needs them: it cannot open the D455 itself while this driver holds it, so it
+    # subscribes to /camera/camera/color/image_raw and
+    # /camera/camera/aligned_depth_to_color/image_raw instead. The aligned depth
+    # follows the colour resolution, so /camera/camera/color/camera_info is the
+    # one set of intrinsics that describes both.
+    #
+    # Colour is 640x480x15: this D455's RGB sensor offers only 1280x720,
+    # 1280x800x8, 640x480 and 424x240 (ros2 param describe /camera/camera
+    # rgb_camera.color_profile), so asking for depth's 848x480 silently fell
+    # back to 640x480 anyway.
+    #
+    # Note the aligned topic is *not* affected by the octomap gater's remap below,
+    # so the VLM keeps seeing live frames even with octomap:=static.
     try:
         realsense_launch_file = os.path.join(
             get_package_share_directory('realsense2_camera'),
             'launch',
             'rs_launch.py'
         )
-        
+
+        realsense_args = {
+            'depth_module.depth_profile': '848x480x15',
+            'rgb_camera.color_profile': '640x480x15',
+            'pointcloud.enable': 'false',
+            'align_depth.enable': 'true',
+            'enable_color': 'true',
+        }
+
         realsense_node_live = IncludeLaunchDescription(
             PythonLaunchDescriptionSource(realsense_launch_file),
-            launch_arguments={
-                'depth_module.depth_profile': '848x480x15',
-                'pointcloud.enable': 'false',
-                'align_depth.enable': 'false',
-                'enable_color': 'false',
-            }.items(),
+            launch_arguments=realsense_args.items(),
             condition=IfCondition(is_live)
         )
-        
+
         realsense_node_static = GroupAction([
             SetRemap(src='/camera/camera/depth/image_rect_raw', dst='/camera/camera/depth/image_rect_raw_in'),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(realsense_launch_file),
-                launch_arguments={
-                    'depth_module.depth_profile': '848x480x15',
-                    'pointcloud.enable': 'false',
-                    'align_depth.enable': 'false',
-                    'enable_color': 'false',
-                }.items()
+                launch_arguments=realsense_args.items()
             )
         ], condition=IfCondition(is_static))
         
