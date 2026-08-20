@@ -238,44 +238,46 @@ Grasp poses: that the tool approach axis lands on world −Z at every yaw, that
 the fingers close perpendicular to the detected object axis, and that the retry
 ladder actually escalates.
 
-### The reachable envelope is smaller than the arm is long
+### Reach: ask cuMotion, never `/compute_ik`
 
-Sum the link offsets and this arm reaches 0.80 m from the shoulder. The usable
-envelope for *picking* is far smaller, and the reason is `joint6`, limited to
-±45°: pointing the tool straight down while extended forward runs out of wrist
-long before it runs out of arm. The practical consequence is counter-intuitive —
-**reach shrinks as the tool goes lower**. Measured on this rig with
-`/compute_ik`, left arm, top-down:
+**`/compute_ik` lies on this robot.** `config/kinematics.yaml` configures
+`kdl_kinematics_plugin` with a **5 ms** solver timeout, and KDL is a local
+numerical solver seeded from the current state. On a redundant 7-DOF arm it
+returns `-31 NO_IK_SOLUTION` for poses cuMotion plans without trouble — measured
+here, it rejected the entire work area including poses that plan fine. OMPL
+inherits the same problem, because it samples pose goals through that plugin.
 
-```
-   tool z=   0.35   0.40   0.45   0.50        tool z=   0.35   0.40   0.45
-  x=0.30       .      #      #      #        x=0.30       .      .      #
-  x=0.35       .      #      #      #        x=0.35       .      .      .
-  x=0.40       .      #      #      #        x=0.40       .      .      .
-  x=0.45       .      .      .      .        x=0.45       .      .      .
-        y = +0.15                                   y = 0.00
-```
-
-A work surface at z=0.345 — a flight case, in the original setup — is
-**unreachable at every x, y and approach orientation**, azimuth and tilt sweeps
-included. Raising the same point by 5 cm makes top-down work immediately. So the
-objects need to sit around **z ≥ 0.42, x ≤ 0.40, y ≥ +0.10** for the left arm.
-Put them on a riser rather than moving the table forward: height is the binding
-constraint, not distance.
-
-Check any point before planning to it:
+So check reachability against the planner you will actually use:
 
 ```bash
-python3 native/tests/check_reachability.py --point 0.38 0.15 0.43
+python3 native/tests/check_reachability.py --point 0.38 0.15 0.35
 ```
 
-```bash
-python3 native/tests/check_reachability.py --heights --y 0.15
-```
+That sends a `plan_only` goal through cuMotion and sweeps approach azimuth and
+tilt, so a failure tells you whether the *position* is out or only some approach
+angles are.
+
+What the geometry actually is, verified three ways — cuMotion planning, a
+position-only damped-least-squares IK over the URDF, and 300k random FK samples
+(the FK was checked against TF at all-zeros: `0.000, 0.1735, 0.0819` vs TF's
+`0.000, 0.173, 0.082`):
+
+- shoulders at `(0, ±0.051, 0.698)`; link offsets sum to 0.804 m but the usable
+  straight-line reach is **≈0.738 m**, less in awkward directions
+- `(0.380, +0.150, 0.350)` — table height — **plans top-down** ✓
+- `(0.541, -0.023, 0.350)` is **93 mm beyond reach**; `(0.496, -0.249, 0.375)`
+  is 222 mm beyond ✗
+- both reachable solutions sit exactly on `joint2`'s upper limit of +0.175 rad
+  (10°). Relaxing that limit recovers only ~3 cm and then plateaus, so it is
+  the arm's geometry that runs out, not that one limit.
+
+Practically, for the left arm keep pick targets around **x ≤ 0.40, y ≥ +0.10** at
+table height. Reach does improve with height, so a riser buys a few centimetres —
+but moving the object into the near-left area is simpler and enough.
 
 `VLM/pixel_to_world.py` tells you where something *is*; this tells you whether
-the arm can get there. A pick that fails with a bare MoveIt error code halfway
-through is nearly always this.
+the arm can get there. A pick that dies on an opaque MoveIt error code is nearly
+always one of these two.
 
 ### Dry-running on fake hardware
 
