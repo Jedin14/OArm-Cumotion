@@ -90,12 +90,75 @@ else
     fail=1
 fi
 
+# Every nvidia-smi call below is guarded with `|| true`: under `set -o pipefail`
+# a failing driver would otherwise abort this script mid-preflight, which is the
+# opposite of reporting the problem.
+GPU_INFO=""
 if command -v nvidia-smi > /dev/null 2>&1; then
-    printf '   ok      %-14s %s\n' "nvidia" \
-        "$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -1)"
+    GPU_INFO="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader \
+                2>/dev/null | head -1 || true)"
+fi
+
+if [[ -n "${GPU_INFO}" ]]; then
+    printf '   ok      %-14s %s\n' "nvidia" "${GPU_INFO}"
+elif command -v nvidia-smi > /dev/null 2>&1; then
+    printf '   MISSING %-14s %s\n' "nvidia" \
+        "nvidia-smi is installed but failed; check the driver (nvidia-smi -L)"
+    fail=1
 else
     printf '   MISSING %-14s %s\n' "nvidia" "no nvidia-smi; cuMotion needs a CUDA GPU"
     fail=1
+fi
+
+# --- GPU architecture -------------------------------------------------------
+# native/setup.bash derives TORCH_CUDA_ARCH_LIST from this. Printing it here
+# means the arch the build will target is visible before anything is compiled,
+# rather than being discovered when a kernel fails to launch.
+GPU_CAPS="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+            | tr -d ' ' | sort -u | paste -sd',' - || true)"
+if [[ -n "${GPU_CAPS}" ]]; then
+    printf '   ok      %-14s %s\n' "gpu arch" \
+        "compute ${GPU_CAPS} (sm_${GPU_CAPS//[.,]/})"
+else
+    printf '   MISSING %-14s %s\n' "gpu arch" \
+        "nvidia-smi could not report compute_cap"
+    fail=1
+fi
+
+# --- CUDA toolkit -----------------------------------------------------------
+# The torch pin is cu128, so extensions cannot be compiled against these wheels
+# with an older toolkit; 12.8 is also the first nvcc that knows compute_120.
+# Without this check a pre-12.8 host passes preflight and then fails later, at
+# the first cuRobo JIT compile.
+CUDA_FOUND=""
+CUDA_BEST=""
+for _c in /usr/local/cuda-*/ /usr/local/cuda/; do
+    [[ -x "${_c}bin/nvcc" ]] || continue
+    _v="$("${_c}bin/nvcc" --version 2>/dev/null \
+          | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' || true)"
+    [[ -n "${_v}" ]] || continue
+    CUDA_FOUND+="${_v} "
+    if (( ${_v%%.*} > 12 || ( ${_v%%.*} == 12 && ${_v##*.} >= 8 ) )); then
+        CUDA_BEST="${_v}"
+    fi
+done
+
+if [[ -n "${CUDA_BEST}" ]]; then
+    printf '   ok      %-14s %s\n' "cuda toolkit" "${CUDA_BEST} (>= 12.8)"
+elif [[ -n "${CUDA_FOUND}" ]]; then
+    printf '   MISSING %-14s %s\n' "cuda toolkit" \
+        "found ${CUDA_FOUND% }, need >= 12.8 for the cu128 torch pin"
+    fail=1
+else
+    printf '   MISSING %-14s %s\n' "cuda toolkit" \
+        "no nvcc under /usr/local/cuda*; install CUDA >= 12.8"
+    fail=1
+fi
+
+# sm_120 needs 12.8 as a hard floor; anything older cannot emit compute_120 at
+# all, so call that out specifically rather than leaving it to the generic line.
+if [[ "${GPU_CAPS}" == *12.0* && -z "${CUDA_BEST}" ]]; then
+    echo "           this GPU is Blackwell (sm_120); nvcc < 12.8 cannot target it"
 fi
 
 if command -v uv > /dev/null 2>&1; then

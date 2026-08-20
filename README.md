@@ -144,6 +144,45 @@ The only host-level change the workspace needs is the
 runs. (Bringing the CAN interfaces up also needs root, but that configures
 kernel network devices and is per-boot, not part of installation.)
 
+### GPU and CUDA
+
+The GPU architecture is **detected, not hardcoded**. `native/setup.bash` reads
+the compute capability from `nvidia-smi` and sets `TORCH_CUDA_ARCH_LIST` from
+it, so the JIT builds target the card actually present — building for the wrong
+architecture produces cubins the GPU cannot execute, and that fails at *launch*,
+not at build time. `source native/setup.bash` reports what it picked:
+
+```
+  gpu arch  : 12.0+PTX  (-maxrregcount=160)
+  cuda      : /usr/local/cuda-12.8
+```
+
+Set `TORCH_CUDA_ARCH_LIST` yourself before sourcing to override the detection,
+e.g. to build fat binaries for several cards. The `sm_120` register cap is
+applied only when the detected arch actually needs it.
+
+Preflight requires **CUDA ≥ 12.8** and fails with the detected versions listed
+if that is not met. Two independent reasons: the torch pin is `cu128`, so
+extensions cannot be compiled against these wheels with an older toolkit, and
+12.8 is the first `nvcc` that knows `compute_120`. The newest qualifying toolkit
+under `/usr/local/` is used, rather than one hardcoded path.
+
+### Portability
+
+What is machine-independent: the venv isolation, the pinned Python stacks, the
+private ROS overlay, and now the GPU arch and CUDA selection.
+
+What is still specific to this rig, and needs editing elsewhere:
+
+| | |
+| --- | --- |
+| **x86_64 + Ubuntu 22.04 + ROS Humble** | `native/setup.bash` and `extract_debs.sh` hardcode `x86_64-linux-gnu`; `fetch_debs.sh` pins the `jammy` archives. No Jetson/ARM, no 24.04. |
+| **The `/workspaces/isaac_ros-dev` path** | 16 files reference it; the symlink absorbs that, but the absolute paths in these READMEs are this machine's. |
+| **The robot itself** | the 14-DOF bimanual URDF, the D455 mount in `cam_org.txt`, and `can0`/`can1`. |
+
+So this installs unattended on another x86_64 Ubuntu 22.04 + Humble machine with
+a CUDA ≥ 12.8 GPU. Other platforms need work beyond the installer.
+
 ---
 
 ## 🤖 VLM-guided pick and place
@@ -451,10 +490,12 @@ native setup uses `native/build` and `native/install`, so the two never collide.
 - **Gripper PID Tuning**: the DM4310 gripper motor gains (`Kp = 20.0`, `Kd = 0.5`)
   are tuned to remove high-frequency noise and vibration while keeping enough
   torque for accurate movement.
-- **Blackwell register cap**: `native/setup.bash` sets
+- **Blackwell register cap**: on `sm_120` only, `native/setup.bash` sets
   `NVCC_APPEND_FLAGS=-maxrregcount=160`. Without it, every cuMotion *trajectory*
   optimisation fails on this GPU with `too many resources requested for launch`
-  (IK alone still works). If you raise `num_steps` in
+  (IK alone still works). It is applied conditionally because on `sm_75/86/89`
+  the prebuilt cubins are used and the kernel fits in 118 registers anyway, so
+  the cap would only force needless spilling. If you raise `num_steps` in
   `config/cumotion_planning.yaml` above 32, the cap must be recomputed —
   the formula is in [native/README.md](native/README.md).
 - **Octomap gater**: in `octomap:=static`, `octomap_gater.py` sits between the

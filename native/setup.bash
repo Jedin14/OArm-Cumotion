@@ -64,13 +64,35 @@ export PYTHONNOUSERSITE=1
 unset PYTHONHOME
 
 # --- 4. GPU / cuMotion runtime ---------------------------------------------
-# The cuRobo debs ship cubins for sm_75/86/89 only, so on Blackwell (sm_120)
-# kernels are JIT-compiled -- from the shipped PTX, and by torch's extension
-# builder for anything cuRobo compiles itself. Both need this arch list, and the
-# latter needs a CUDA toolkit matching the cu128 wheels.
-export TORCH_CUDA_ARCH_LIST="12.0+PTX"
+# The cuRobo debs ship cubins for sm_75/86/89 only, so on anything newer --
+# Blackwell (sm_120) is the case this was built on -- kernels are JIT-compiled
+# from the shipped PTX, and by torch's extension builder for anything cuRobo
+# compiles itself. Both need an arch list, and the latter needs a CUDA toolkit
+# matching the cu128 wheels.
+#
+# The arch is detected rather than hardcoded: building for the wrong one
+# produces cubins the card cannot execute, and it fails at launch rather than at
+# build time. Set TORCH_CUDA_ARCH_LIST yourself to override the detection (e.g.
+# to build fat binaries for several cards).
+if [[ -z "${TORCH_CUDA_ARCH_LIST:-}" ]]; then
+    # compute_cap is reported as e.g. "12.0", which is already the format
+    # TORCH_CUDA_ARCH_LIST wants. With several GPUs installed, take the
+    # distinct capabilities so the build covers all of them.
+    # `|| true` matters: this file is sourced by bootstrap.sh and build_ws.sh,
+    # which run under `set -o pipefail`, so a failing driver would abort the
+    # build instead of falling through to the warning below.
+    _CAPS="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+             | tr -d ' ' | sort -u | paste -sd';' - || true)"
+    if [[ -n "${_CAPS}" ]]; then
+        export TORCH_CUDA_ARCH_LIST="${_CAPS}+PTX"
+    else
+        echo "  WARNING: could not read compute capability from nvidia-smi;" >&2
+        echo "  leaving TORCH_CUDA_ARCH_LIST unset (torch will guess)." >&2
+    fi
+fi
 
-# Cap registers per thread when cuRobo JIT-compiles its kernels.
+# Cap registers per thread when cuRobo JIT-compiles its kernels. sm_120 only --
+# see below for why it must not be applied blindly.
 #
 # Why this is needed: cuRobo's LBFGS step kernel launches with one thread per
 # optimisation variable, i.e. horizon x dof -- 28 x 14 = 392 threads/block for
@@ -84,12 +106,33 @@ export TORCH_CUDA_ARCH_LIST="12.0+PTX"
 # this cap only binds on the one kernel that is over budget, and costs it a
 # small amount of spilling.
 #
+# On sm_75/86/89 the prebuilt cubins are used and the kernel fits in 118
+# registers anyway, so the cap buys nothing and only forces needless spilling --
+# hence it is applied only where it is actually needed.
+#
 # Raise the thread count and this needs revisiting: the safe cap is
 # floor(65536 / (horizon * dof)) rounded down to a multiple of 8.
-export NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:+${NVCC_APPEND_FLAGS} }-maxrregcount=160"
-if [[ -d /usr/local/cuda-12.8 ]]; then
-    export CUDA_HOME=/usr/local/cuda-12.8
-    export PATH="${CUDA_HOME}/bin:${PATH}"
+if [[ "${TORCH_CUDA_ARCH_LIST:-}" == *12.0* ]]; then
+    export NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:+${NVCC_APPEND_FLAGS} }-maxrregcount=160"
+fi
+
+# CUDA toolkit for the JIT builds. The torch pin is cu128, so a toolkit older
+# than 12.8 cannot compile extensions against these wheels, and 12.8 is also the
+# first release whose nvcc knows compute_120. Pick the newest toolkit available
+# rather than one hardcoded path.
+if [[ -z "${CUDA_HOME:-}" ]]; then
+    for _cuda in /usr/local/cuda-12.9 /usr/local/cuda-12.8 /usr/local/cuda; do
+        if [[ -x "${_cuda}/bin/nvcc" ]]; then
+            _ver="$("${_cuda}/bin/nvcc" --version | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')"
+            # 12.8 <= ver, compared as two integers rather than as a float
+            if [[ -n "${_ver}" ]] \
+               && (( ${_ver%%.*} > 12 || ( ${_ver%%.*} == 12 && ${_ver##*.} >= 8 ) )); then
+                export CUDA_HOME="${_cuda}"
+                export PATH="${CUDA_HOME}/bin:${PATH}"
+                break
+            fi
+        fi
+    done
 fi
 # Keep warp's and torch's JIT caches inside the workspace instead of ~/.cache.
 export WARP_CACHE_PATH="${_NATIVE_DIR}/cache/warp"
@@ -154,5 +197,8 @@ echo "  workspace : ${_WS_DIR}"
 echo "  overlay   : ${_OVERLAY_PREFIX}"
 echo "  python    : $(command -v python3)"
 echo "  build     : ${_NATIVE_DIR}/build -> ${_NATIVE_DIR}/install"
+echo "  gpu arch  : ${TORCH_CUDA_ARCH_LIST:-<unset>}${NVCC_APPEND_FLAGS:+  (${NVCC_APPEND_FLAGS})}"
+echo "  cuda      : ${CUDA_HOME:-<none found>}"
 
-unset _NATIVE_DIR _WS_DIR _OVERLAY_ROOT _OVERLAY_PREFIX _VENV _needed _PROFILE
+unset _NATIVE_DIR _WS_DIR _OVERLAY_ROOT _OVERLAY_PREFIX _VENV _needed _PROFILE \
+      _CAPS _cuda _ver
