@@ -1,16 +1,19 @@
 # VLM detector environment (VLM/.venv), frozen from the working install.
 #
-# torch/torchvision are nightly cu130 builds, so a plain install will not find
-# them -- point uv at the nightly index for those two:
+# Build it with:  VLM/bootstrap.sh          (or ./install.sh from the workspace root)
 #
-#   cd VLM && uv venv
-#   uv pip install --index-url https://download.pytorch.org/whl/nightly/cu130 \
-#       torch torchvision
-#   uv pip install -r requirements.txt
+# torch/torchvision are nightly cu130 builds, which PyPI does not carry, so the
+# nightly index is declared below rather than passed on the command line -- that
+# way the pins in this file are the single source of truth and a plain
+# `uv pip install -r requirements.txt` reproduces the environment exactly.
 #
 # This stack is deliberately separate from native/venv (torch 2.7.0+cu128,
 # numpy 1.26.4), which is pinned to the ABI cuRobo's prebuilt kernels need.
-# run_vlm_detector.sh keeps the two apart at runtime.
+# The two can never share an interpreter; run_in_vlm_env.sh keeps them apart at
+# runtime and check_isolation.sh verifies they stayed apart.
+
+--extra-index-url https://download.pytorch.org/whl/nightly/cu130
+
 accelerate==1.14.0
 annotated-doc==0.0.4
 anyio==4.14.2

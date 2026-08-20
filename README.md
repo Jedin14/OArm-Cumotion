@@ -1,6 +1,6 @@
-# OpenArm IK Environment
+# 7DOF-OArm IK Environment
 
-Runs the OpenArm bimanual exoskeleton with GPU-accelerated cuMotion kinematics,
+Runs the 7DOF-OArm bimanual exoskeleton with GPU-accelerated cuMotion kinematics,
 MoveIt 2, and real hardware interfaces.
 
 There are two ways to run it. **Use the native one** — see
@@ -10,11 +10,15 @@ There are two ways to run it. **Use the native one** — see
 
 ## 🚀 Quick Start (native — recommended)
 
-One-time setup, if `native/` has not been built on this machine yet:
+One-time setup, if this machine has not been set up yet:
 
 ```bash
-native/bootstrap.sh
+./install.sh
 ```
+
+That builds both project environments and verifies they are isolated from the
+system's Python — see [Installation](#-installation) for what it does and does
+not touch. Then, the one step that needs root:
 
 ```bash
 sudo mkdir -p /workspaces && sudo ln -s /home/mr/workspaces/isaac_ros-dev /workspaces/isaac_ros-dev
@@ -83,6 +87,65 @@ code ~/workspaces/isaac_ros-dev
 
 ---
 
+## 📦 Installation
+
+```bash
+./install.sh                 # everything (native cuMotion stack + VLM)
+./install.sh --native-only   # skip the VLM detector environment
+./install.sh --vlm-only      # only the VLM detector environment
+./install.sh --check         # verify an existing install, change nothing
+```
+
+It runs a preflight (Python 3.10, ROS Humble, an NVIDIA GPU, free disk), then
+[`native/bootstrap.sh`](native/bootstrap.sh) and
+[`VLM/bootstrap.sh`](VLM/bootstrap.sh), then the isolation check. Every step is
+idempotent, so re-running after editing a `requirements.txt` is fine and cheap.
+
+### Three Python stacks, none of them the system's
+
+This workspace needs two mutually incompatible Python environments, and the host
+already has a third. Mixing any two produces either a numpy ABI error on import
+or a silently wrong torch:
+
+| Stack | numpy | torch | Why it is pinned there |
+| --- | --- | --- | --- |
+| `native/venv` | 1.26.4 | 2.7.0+cu128 | the ABI cuRobo's prebuilt CUDA kernels are linked against |
+| `VLM/.venv` | 2.2.6 | 2.14 nightly +cu130 | what PaliGemma / `transformers` needs |
+| the host | 1.21.5 (apt), 2.2.6 (`~/.local`) | 2.12+cu130 | not used by this project at all |
+
+The separation is enforced, not just documented:
+
+- **Nothing is installed system-wide.** `install.sh` never runs `apt install` and
+  never writes to `/usr`, `/opt` or `/usr/local`. The ROS packages the host is
+  missing are downloaded as debs and unpacked into `native/root`, a private
+  prefix — the host's `/opt/ros/humble` is used read-only as the underlay.
+- **The host's `~/.local` is invisible.** `PYTHONNOUSERSITE=1` is exported by
+  both runtime wrappers and set for every `pip`/`uv` call, in both directions.
+- **The two venvs never share an interpreter.**
+  [`VLM/run_in_vlm_env.sh`](VLM/run_in_vlm_env.sh) scrubs `PYTHONPATH` and
+  `LD_LIBRARY_PATH` before launching the detector, because a `PYTHONPATH` set by
+  `native/setup.bash` would otherwise beat the venv's own `site-packages` and
+  hand PaliGemma the wrong numpy.
+
+Verify all of that at any time:
+
+```bash
+./check_isolation.sh
+```
+
+It checks that each venv resolves `numpy` and `torch` to its own pinned copies
+from inside the workspace, that neither can see `~/.local`, that the two carry
+different versions, and that nothing of the project leaked into the system's
+`dist-packages`. A failure here is an early warning for a crash that would
+otherwise surface mid-launch.
+
+The only host-level change the workspace needs is the
+`/workspaces/isaac_ros-dev` symlink, which `install.sh` prints rather than
+runs. (Bringing the CAN interfaces up also needs root, but that configures
+kernel network devices and is per-boot, not part of installation.)
+
+---
+
 ## 🤖 VLM-guided pick and place
 
 A PaliGemma detector finds the object, cuMotion plans to it, and the same
@@ -123,6 +186,7 @@ current motion. `ros2 launch pick_place.launch.py --show-args` lists every tunab
 | --- | --- | --- |
 | [VLM/vlm_detector_node.py](VLM/vlm_detector_node.py) | `VLM/.venv` | PaliGemma → 3D points in `world` on `/vlm/detections` |
 | [VLM/run_in_vlm_env.sh](VLM/run_in_vlm_env.sh) | — | environment isolation for the above |
+| [VLM/bootstrap.sh](VLM/bootstrap.sh) | — | builds `VLM/.venv` from `requirements.txt` |
 | [pick_place_orchestrator.py](pick_place_orchestrator.py) | `native/venv` | the state machine, MoveIt + gripper + planning scene |
 | [pick_place.launch.py](pick_place.launch.py) | — | starts both, one set of arguments |
 | [VLM/pixel_to_world.py](VLM/pixel_to_world.py) | `VLM/.venv` | click any point, get its world coordinate |
@@ -310,7 +374,7 @@ work.
   both. Expect ~6–10 Hz on the topics with alignment and RViz running, which is
   ample against a 0.4 s inference period.
 - **The grasp axis is segmented from depth, not from image contrast.**
-  `3d_coordinates.py` ran Otsu on the colour crop. On a narrow crop of a
+  The earlier prototype ran Otsu on the colour crop. On a narrow crop of a
   screwdriver that locks onto the band where the handle meets the shaft and
   reports an axis ~80° off — measured on this rig: a 25×119 px vertical
   detection came back as `image_angle_deg: -10.3`, which would have closed the
@@ -323,8 +387,8 @@ work.
   needs torch 2.14+cu130 / numpy 2.2.6. They cannot coexist in one process, so
   `run_in_vlm_env.sh` scrubs `PYTHONPATH`/`LD_LIBRARY_PATH` before starting the
   detector.
-- **Extrinsics come from tf2.** The old `T_CAM_TO_ROBOT` matrix in
-  `VLM/3d_coordinates.py` disagreed with the calibrated URDF mount; the node now
+- **Extrinsics come from tf2.** The hardcoded `T_CAM_TO_ROBOT` matrix the early
+  prototypes carried disagreed with the calibrated URDF mount; the node now
   looks up `camera_color_optical_frame → world`, so re-measuring the mount needs
   no code change.
 - **The gripper bypasses MoveIt** — cuMotion rejects 1-DOF groups (see below), so
@@ -411,6 +475,14 @@ native setup uses `native/build` and `native/install`, so the two never collide.
   The native flow does not create them in the workspace root.
 
 ## Troubleshooting
+
+If anything fails with a numpy ABI error, an unexpected torch version, or a
+missing module, check the environment split first — it is the most common cause
+and the check is instant:
+
+```bash
+./check_isolation.sh
+```
 
 Check the native environment itself (works headless):
 

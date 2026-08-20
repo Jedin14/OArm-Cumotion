@@ -100,7 +100,7 @@ def test_camera_to_world():
 def test_depth_sampling():
     """A dead centre pixel must not sink the whole detection.
 
-    3d_coordinates.py read depth at the box centre only, so a single dropout
+    The original prototype read depth at the box centre only, so a single dropout
     there -- common on shiny or thin objects -- reported "depth invalid" for an
     otherwise clean detection.
     """
@@ -227,7 +227,7 @@ def test_axis_yaw():
 
     Optical x maps to world +x, so a horizontal image axis is yaw 0. Optical y
     maps to world -y, so a vertical image axis is yaw -90 deg. If this were
-    taken straight from minAreaRect (as 3d_coordinates.py did) the second case
+    taken straight from minAreaRect (as the original prototype did) the second case
     would come out +90.
     """
     info = SimpleNamespace(k=[400.0, 0.0, 424.0, 0.0, 400.0, 240.0,

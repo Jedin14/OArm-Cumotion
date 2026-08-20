@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """PaliGemma object detector as a ROS 2 node, publishing 3D points in `world`.
 
-This is the ROS port of 3d_coordinates.py. Three things changed, all forced by
-how this workspace is wired:
+This is the ROS port of the original standalone prototype. Three things
+changed, all forced by how this workspace is wired:
 
 1. It does NOT open the RealSense itself. launch_everything.launch.py already
    starts realsense2_camera for the MoveIt octomap, and the D455 can only be
@@ -10,7 +10,7 @@ how this workspace is wired:
    subscribes to the driver's colour + aligned-depth topics instead.
 
 2. The camera->robot transform comes from tf2, not a hardcoded matrix.
-   3d_coordinates.py had T_CAM_TO_ROBOT = (0.150, 0.450, 0.600), but the
+   The prototype had T_CAM_TO_ROBOT = (0.150, 0.450, 0.600), but the
    calibrated mount in v10.urdf.xacro is xyz="0.10175 0 0.93272" rpy="0 1.0472 0"
    parented to `world` (see cam_org.txt). tf2 tracks that automatically, so
    re-measuring the mount needs no change here.
@@ -96,7 +96,7 @@ def decode_image(msg):
 
 
 def parse_paligemma_coordinates(output_text, img_width, img_height):
-    """Unchanged from 3d_coordinates.py: <locNNNN> quadruples -> pixel boxes."""
+    """Unchanged from the original prototype: <locNNNN> quadruples -> pixel boxes."""
     detections = []
     for match in LOC_PATTERN.findall(output_text):
         ymin, xmin, ymax, xmax = [int(v) / 1024.0 for v in match]
@@ -143,7 +143,7 @@ def object_axis_angle(image, depth, box, z_ref, depth_scale, depth_tol=0.03):
     """Object long axis in the image. Returns (degrees, corners, source).
 
     Segmentation is by depth, not intensity. Otsu on the colour crop -- what
-    3d_coordinates.py's calculate_orientation did -- keys on whatever contrast
+    the prototype's calculate_orientation did -- keys on whatever contrast
     happens to be inside the box, and on a narrow crop of a screwdriver it
     latches onto the boundary between shaft and handle and reports an axis
     ~80 degrees off the true one. Depth ignores texture entirely: anything
@@ -196,7 +196,7 @@ def put_lines(canvas, lines, x, y, colour, scale=0.42, line_h=15):
 
 
 def colorize_depth(depth, depth_scale, near=0.2, far=2.0):
-    """Depth to a viewable rainbow, the way rs.colorizer did in 3d_coordinates.py."""
+    """Depth to a viewable rainbow, the way rs.colorizer did in the prototype."""
     metres = depth.astype(np.float32) * depth_scale
     norm = np.clip((metres - near) / max(far - near, 1e-6), 0.0, 1.0)
     view = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
@@ -373,7 +373,7 @@ class VlmDetectorNode(Node):
     def _sample_depth(self, depth, box):
         """Median depth over the inner half of the box.
 
-        3d_coordinates.py read the single centre pixel, so one dropout at the
+        The original prototype read the single centre pixel, so one dropout at the
         object centre sent it down the "depth reading is invalid" path even with
         a perfectly good detection all around it.
         """

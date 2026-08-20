@@ -26,7 +26,7 @@ set -u
 # isaac_ros_common -- its CMakeLists does find_package(vpi REQUIRED). VPI is an
 #   NVIDIA library the container pulled from the Jetson OTA repo, and the only
 #   thing in the package that uses it is vpi_utilities.cpp, which nothing in the
-#   OpenArm / qnbot / realsense stack references. The prebuilt deb of the same
+#   7DOF-OArm / qnbot / realsense stack references. The prebuilt deb of the same
 #   package (3.2.5, in the overlay) supplies the package and its CMake extras,
 #   so skipping the source build costs nothing here.
 SKIP=(isaac_ros_common)

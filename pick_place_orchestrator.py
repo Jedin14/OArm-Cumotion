@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VLM-guided pick and place for the OpenArm, with VLM-checked retries.
+"""VLM-guided pick and place for the 7DOF-OArm, with VLM-checked retries.
 
     LOCATE -> PREGRASP -> DESCEND -> CLOSE -> VERIFY_GRASP -> LIFT
        ^                                          | failed        |

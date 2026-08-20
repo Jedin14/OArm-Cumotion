@@ -51,7 +51,7 @@ TARGETS=(
 #
 #   ros-humble-moveit / -servo / -visual-tools / -setup-*, moveit-resources-*,
 #   ur-description, ur-moveit-config, ros2-control, topic-based-ros2-control
-#     Nothing in the OpenArm / qnbot / realsense stack references any of these
+#     Nothing in the 7DOF-OArm / qnbot / realsense stack references any of these
 #     (checked against every package.xml, CMakeLists and launch file in src/).
 #     The host's ros-humble-desktop already provides the MoveIt and ros2_control
 #     packages that are actually used, at a build that matches its own ABI.

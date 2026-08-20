@@ -1,6 +1,6 @@
-# Native (container-free) OpenArm + cuMotion environment
+# Native (container-free) 7DOF-OArm + cuMotion environment
 
-Runs the OpenArm bimanual stack with GPU cuMotion planning directly on the host,
+Runs the 7DOF-OArm bimanual stack with GPU cuMotion planning directly on the host,
 with everything it needs kept inside this `native/` directory. The container
 setup (`src/isaac_ros_common/scripts/run_dev.sh`, and the root `build/` +
 `install/` trees) is untouched and still works, so you can switch back at any
@@ -10,6 +10,14 @@ time.
 
 ```bash
 native/bootstrap.sh
+```
+
+This builds the native environment only. To set up the whole workspace — this
+plus the VLM detector's separate venv, with a preflight and an isolation check —
+use the top-level installer instead:
+
+```bash
+./install.sh
 ```
 
 Then, once per machine (needs root, see [The one system change](#the-one-system-change)):
@@ -106,7 +114,7 @@ the host's `ros-humble-desktop`.
 **`isaac_ros_common` is not built from source** (`build_ws.sh` skips it). Its
 `CMakeLists` requires VPI, an NVIDIA library the container pulled from the Jetson
 OTA repo, and the only file using it is `vpi_utilities.cpp`, which nothing in the
-OpenArm / qnbot / realsense stack references. The prebuilt deb of the same
+7DOF-OArm / qnbot / realsense stack references. The prebuilt deb of the same
 package supplies the package and its CMake extras.
 
 **The container's FastDDS profile is off by default.**
@@ -186,7 +194,7 @@ python3 native/tests/test_move_group_planners.py
 - `verify_overlay.sh`: 117 shared objects, all dependencies resolve; numpy
   1.26.4, torch 2.7.0+cu128, warp 1.15.0, cuRobo, rclpy, `isaac_ros_cumotion`
   all import; CUDA available on the RTX 5070 Ti at sm_120.
-- cuRobo batch IK on the OpenArm URDF: 14 DOF, 10/10 solved in 40 ms, max
+- cuRobo batch IK on the 7DOF-OArm URDF: 14 DOF, 10/10 solved in 40 ms, max
   position error 8 µm.
 - cuMotion trajopt warmup completes (the LBFGS fix above).
 - `cumotion_goal_set_planner_node`: *"cuMotion is ready for planning queries!"*

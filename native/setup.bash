@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 #
-# Activate the native (container-free) OpenArm + cuMotion environment.
+# Activate the native (container-free) 7DOF-OArm + cuMotion environment.
 #
 #   source native/setup.bash
 #
