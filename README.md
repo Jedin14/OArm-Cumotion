@@ -6,6 +6,12 @@ MoveIt 2, and real hardware interfaces.
 There are two ways to run it. **Use the native one** — see
 [Why native](#why-native-and-not-the-container) below.
 
+| Document | |
+| --- | --- |
+| **README.md** (this file) | running the robot, the VLM pick-and-place, tuning, design rationale |
+| [INSTALL.md](INSTALL.md) | setting up a machine: requirements, the Python-stack split, GPU/CUDA, portability |
+| [native/README.md](native/README.md) | how the native environment is assembled and exactly what it touches |
+
 ---
 
 ## 🚀 Quick Start (native — recommended)
@@ -17,8 +23,8 @@ One-time setup, if this machine has not been set up yet:
 ```
 
 That builds both project environments and verifies they are isolated from the
-system's Python — see [Installation](#-installation) for what it does and does
-not touch. Then, the one step that needs root:
+system's Python — see [INSTALL.md](INSTALL.md) for requirements and what it does
+and does not touch. Then, the one step that needs root:
 
 ```bash
 sudo mkdir -p /workspaces && sudo ln -s /home/mr/workspaces/isaac_ros-dev /workspaces/isaac_ros-dev
@@ -90,98 +96,16 @@ code ~/workspaces/isaac_ros-dev
 ## 📦 Installation
 
 ```bash
-./install.sh                 # everything (native cuMotion stack + VLM)
-./install.sh --native-only   # skip the VLM detector environment
-./install.sh --vlm-only      # only the VLM detector environment
-./install.sh --check         # verify an existing install, change nothing
+./install.sh          # everything; --native-only / --vlm-only / --check
+./check_isolation.sh  # verify the venvs never overlap the system's Python
 ```
 
-It runs a preflight (Python 3.10, ROS Humble, an NVIDIA GPU, free disk), then
-[`native/bootstrap.sh`](native/bootstrap.sh) and
-[`VLM/bootstrap.sh`](VLM/bootstrap.sh), then the isolation check. Every step is
-idempotent, so re-running after editing a `requirements.txt` is fine and cheap.
+Requires Ubuntu 22.04, `ros-humble-desktop`, Python 3.10 and CUDA ≥ 12.8 already
+on the host — it verifies the system, it does not provision it.
 
-### Three Python stacks, none of them the system's
-
-This workspace needs two mutually incompatible Python environments, and the host
-already has a third. Mixing any two produces either a numpy ABI error on import
-or a silently wrong torch:
-
-| Stack | numpy | torch | Why it is pinned there |
-| --- | --- | --- | --- |
-| `native/venv` | 1.26.4 | 2.7.0+cu128 | the ABI cuRobo's prebuilt CUDA kernels are linked against |
-| `VLM/.venv` | 2.2.6 | 2.14 nightly +cu130 | what PaliGemma / `transformers` needs |
-| the host | 1.21.5 (apt), 2.2.6 (`~/.local`) | 2.12+cu130 | not used by this project at all |
-
-The separation is enforced, not just documented:
-
-- **Nothing is installed system-wide.** `install.sh` never runs `apt install` and
-  never writes to `/usr`, `/opt` or `/usr/local`. The ROS packages the host is
-  missing are downloaded as debs and unpacked into `native/root`, a private
-  prefix — the host's `/opt/ros/humble` is used read-only as the underlay.
-- **The host's `~/.local` is invisible.** `PYTHONNOUSERSITE=1` is exported by
-  both runtime wrappers and set for every `pip`/`uv` call, in both directions.
-- **The two venvs never share an interpreter.**
-  [`VLM/run_in_vlm_env.sh`](VLM/run_in_vlm_env.sh) scrubs `PYTHONPATH` and
-  `LD_LIBRARY_PATH` before launching the detector, because a `PYTHONPATH` set by
-  `native/setup.bash` would otherwise beat the venv's own `site-packages` and
-  hand PaliGemma the wrong numpy.
-
-Verify all of that at any time:
-
-```bash
-./check_isolation.sh
-```
-
-It checks that each venv resolves `numpy` and `torch` to its own pinned copies
-from inside the workspace, that neither can see `~/.local`, that the two carry
-different versions, and that nothing of the project leaked into the system's
-`dist-packages`. A failure here is an early warning for a crash that would
-otherwise surface mid-launch.
-
-The only host-level change the workspace needs is the
-`/workspaces/isaac_ros-dev` symlink, which `install.sh` prints rather than
-runs. (Bringing the CAN interfaces up also needs root, but that configures
-kernel network devices and is per-boot, not part of installation.)
-
-### GPU and CUDA
-
-The GPU architecture is **detected, not hardcoded**. `native/setup.bash` reads
-the compute capability from `nvidia-smi` and sets `TORCH_CUDA_ARCH_LIST` from
-it, so the JIT builds target the card actually present — building for the wrong
-architecture produces cubins the GPU cannot execute, and that fails at *launch*,
-not at build time. `source native/setup.bash` reports what it picked:
-
-```
-  gpu arch  : 12.0+PTX  (-maxrregcount=160)
-  cuda      : /usr/local/cuda-12.8
-```
-
-Set `TORCH_CUDA_ARCH_LIST` yourself before sourcing to override the detection,
-e.g. to build fat binaries for several cards. The `sm_120` register cap is
-applied only when the detected arch actually needs it.
-
-Preflight requires **CUDA ≥ 12.8** and fails with the detected versions listed
-if that is not met. Two independent reasons: the torch pin is `cu128`, so
-extensions cannot be compiled against these wheels with an older toolkit, and
-12.8 is the first `nvcc` that knows `compute_120`. The newest qualifying toolkit
-under `/usr/local/` is used, rather than one hardcoded path.
-
-### Portability
-
-What is machine-independent: the venv isolation, the pinned Python stacks, the
-private ROS overlay, and now the GPU arch and CUDA selection.
-
-What is still specific to this rig, and needs editing elsewhere:
-
-| | |
-| --- | --- |
-| **x86_64 + Ubuntu 22.04 + ROS Humble** | `native/setup.bash` and `extract_debs.sh` hardcode `x86_64-linux-gnu`; `fetch_debs.sh` pins the `jammy` archives. No Jetson/ARM, no 24.04. |
-| **The `/workspaces/isaac_ros-dev` path** | 16 files reference it; the symlink absorbs that, but the absolute paths in these READMEs are this machine's. |
-| **The robot itself** | the 14-DOF bimanual URDF, the D455 mount in `cam_org.txt`, and `can0`/`can1`. |
-
-So this installs unattended on another x86_64 Ubuntu 22.04 + Humble machine with
-a CUDA ≥ 12.8 GPU. Other platforms need work beyond the installer.
+**Full details in [INSTALL.md](INSTALL.md)**: requirements, the three-Python-stack
+split and how it is enforced, GPU/CUDA detection, what needs root, portability
+limits, and install troubleshooting.
 
 ---
 
@@ -517,9 +441,10 @@ native setup uses `native/build` and `native/install`, so the two never collide.
 
 ## Troubleshooting
 
-If anything fails with a numpy ABI error, an unexpected torch version, or a
-missing module, check the environment split first — it is the most common cause
-and the check is instant:
+Install-time problems — preflight failures, numpy ABI errors, an unexpected torch
+version, the gated PaliGemma download — are tabulated in
+[INSTALL.md](INSTALL.md#troubleshooting-the-install). Start there; the first check
+is instant:
 
 ```bash
 ./check_isolation.sh
