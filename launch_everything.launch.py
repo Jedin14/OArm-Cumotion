@@ -16,6 +16,7 @@ def generate_launch_description():
     left_can = LaunchConfiguration('left_can_interface')
     octomap_mode = LaunchConfiguration('octomap')
     enable_4d = LaunchConfiguration('4d')
+    tool_frame = LaunchConfiguration('tool_frame')
     
     declare_fake_hardware = DeclareLaunchArgument(
         'use_fake_hardware',
@@ -39,6 +40,17 @@ def generate_launch_description():
         '4d',
         default_value='false',
         description='Enable 4D lidar TF bridge'
+    )
+    # cuMotion has a single ee_link and rejects any pose goal aimed at a
+    # different link with INVALID_LINK_NAME, so this is what decides which arm
+    # can be given Cartesian goals -- from RViz or from pick_place_orchestrator.
+    # The other arm still takes joint-space goals. Both arms stay in the
+    # kinematic chain either way; see the note in openarm.yml.
+    declare_tool_frame = DeclareLaunchArgument(
+        'tool_frame',
+        default_value='openarm_right_hand_tcp',
+        description='Link cuMotion plans Cartesian goals for. Use '
+                    'openarm_left_hand_tcp for left-arm pose goals.'
     )
     
     # 1. Include the MoveIt demo launch file
@@ -66,8 +78,14 @@ def generate_launch_description():
             'robot': '/workspaces/isaac_ros-dev/openarm.yml',
             'robot_file': '/workspaces/isaac_ros-dev/openarm.yml',
             'robot_filepath': '/workspaces/isaac_ros-dev/openarm.yml',
+            'tool_frame': tool_frame,
         }],
-        output='screen'
+        output='screen',
+        # cuMotion is a Python node and launch pipes its stdout, so without this
+        # its output block-buffers and is lost when it dies. It has crashed here
+        # with SIGFPE (exit code -8) leaving nothing but launch's own "process
+        # has died" line, which says nothing about why.
+        additional_env={'PYTHONUNBUFFERED': '1'},
     )
     
     is_static = PythonExpression(["'", octomap_mode, "' == 'static'"])
@@ -79,6 +97,7 @@ def generate_launch_description():
         declare_left_can,
         declare_octomap,
         declare_4d,
+        declare_tool_frame,
         demo_launch,
         cumotion_node
     ]

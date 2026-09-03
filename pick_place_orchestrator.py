@@ -1,10 +1,29 @@
 #!/usr/bin/env python3
 """VLM-guided pick and place for the 7DOF-OArm, with VLM-checked retries.
 
-    LOCATE -> PREGRASP -> DESCEND -> CLOSE -> VERIFY_GRASP -> LIFT
-       ^                                          | failed        |
-       +------------------------------------------+               v
-                                        HOME -> OVER_BOX -> RELEASE -> VERIFY_PLACE
+    READY -> LOCATE -> PRE_PICK -> PREGRASP -> OPEN -> DESCEND -> CLOSE
+       ^                                                             |
+       |                                                             v
+       +----------------------- failed ----------------- VERIFY_GRASP -> LIFT
+                                                                        |
+                    READY -> DROP -> RELEASE -> VERIFY_PLACE <----------+
+
+Three named postures, all joint-space goals:
+
+  READY            ready_joint_positions, from the parameter. The observation
+                   pose: the arm starts here and the object is located from
+                   here, so it has to leave the camera a clear view.
+  PRE_PICK         pre_pick_state, from the states file. Staging pose entered
+                   after the object is located, so the approach to the object
+                   starts from a known posture.
+  DROP             drop_state, from the states file. Where the object is
+                   released.
+
+PRE_PICK and DROP are recorded with record_states.py rather than typed in; the
+orchestrator re-reads that file at the start of every cycle, so re-recording a
+pose takes effect without restarting anything. place_mode selects what DROP
+means: "state" (the recorded drop_state), "ready" (the observation pose), or
+"position" (a place_position in world coordinates).
 
 Consumes /vlm/detections from VLM/vlm_detector_node.py (world-frame 3D points)
 and drives the arm through MoveIt's /move_action with pipeline_id "cumotion".
@@ -39,7 +58,7 @@ Run it via pick_place.launch.py, or standalone:
 
     source native/setup.bash
     python3 pick_place_orchestrator.py --ros-args \
-        -p prompt:="detect screwdriver" -p place_position:="[0.35, 0.30, 0.25]"
+        -p prompt:="detect screwdriver" -p arm:=right
 
 Then start a cycle with:
 
@@ -48,6 +67,7 @@ Then start a cycle with:
 
 import math
 import json
+import os
 import threading
 
 import rclpy
@@ -63,7 +83,9 @@ from moveit_msgs.msg import (
     PlanningScene,
     PositionConstraint,
 )
+import yaml
 from moveit_msgs.srv import ApplyPlanningScene
+from rcl_interfaces.srv import GetParameters
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -75,9 +97,38 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformListener
 
+from vlm_prompt import to_detection_prompt
+
 MOVEIT_SUCCESS = 1
+
+# Distinguishes "the planner node is not in the graph" from "it did not answer",
+# because only the first is worth refusing to start over.
+DEAD_PLANNER = 'planner-not-running'
+
 ATTACHED_OBJECT_ID = 'vlm_target'
 TABLE_OBJECT_ID = 'work_surface'
+
+WS = os.path.dirname(os.path.realpath(__file__))
+DEFAULT_STATES_FILE = os.path.join(WS, 'pick_place_states.yaml')
+PRE_PICK_STATE = 'pre_pick_state'
+DROP_STATE = 'drop_state'
+
+# Default READY pose, joint1..joint7 in radians: elbow up with the tool clear of
+# the work area, so the camera sees the table unobstructed. Captured off the
+# right arm while it was held in that pose, which is why the numbers are not
+# round -- the RViz Joints tab showed -47, 0, 0, 133, 0, 0, -23 degrees, and
+# these are the same pose to better than half a degree. Every value is inside
+# the URDF limits (joint4 is 2.324 against an upper limit of 2.443).
+# Jog to whatever pose you want and call /pick_place/capture_ready for its list.
+READY_JOINT_POSITIONS = [
+    -0.828374,
+    0.000191,
+    -0.000191,
+    2.324140,
+    -0.000191,
+    -0.000191,
+    -0.391966,
+]
 
 # Retry ladder. Each entry is a whole fresh attempt: re-detect, then apply these
 # modifiers. Escalating beats repeating -- a failed grasp usually has a single
@@ -89,7 +140,7 @@ STRATEGIES = [
     {'name': 'yaw+90', 'yaw_offset': math.pi / 2, 'z_offset': 0.0, 'refresh_octomap': False},
     {'name': 'lower-8mm', 'yaw_offset': 0.0, 'z_offset': -0.008, 'refresh_octomap': False},
     {'name': 'yaw+90-lower', 'yaw_offset': math.pi / 2, 'z_offset': -0.008, 'refresh_octomap': False},
-    {'name': 'home-refresh', 'yaw_offset': 0.0, 'z_offset': 0.0, 'refresh_octomap': True},
+    {'name': 'ready-refresh', 'yaw_offset': 0.0, 'z_offset': 0.0, 'refresh_octomap': True},
 ]
 
 
@@ -131,7 +182,7 @@ class PickPlaceOrchestrator(Node):
         super().__init__('pick_place_orchestrator')
         self.cb = ReentrantCallbackGroup()
 
-        self.declare_parameter('arm', 'left')
+        self.declare_parameter('arm', 'right')
         self.declare_parameter('prompt', 'detect screwdriver')
         self.declare_parameter('pipeline_id', 'cumotion')
         self.declare_parameter('planning_time', 5.0)
@@ -139,13 +190,15 @@ class PickPlaceOrchestrator(Node):
         self.declare_parameter('acceleration_scaling', 0.15)
         self.declare_parameter('motion_timeout', 60.0)
 
-        self.declare_parameter('home_joint_positions', [0.0] * 7)
-        self.declare_parameter('approach_height', 0.12)
+        self.declare_parameter('ready_joint_positions', READY_JOINT_POSITIONS)
+        self.declare_parameter('approach_height', 0.05)
         self.declare_parameter('grasp_z_offset', -0.005)
         self.declare_parameter('min_grasp_z', 0.01)
         self.declare_parameter('position_tolerance', 0.01)
         self.declare_parameter('orientation_tolerance', 0.05)
 
+        self.declare_parameter('states_file', DEFAULT_STATES_FILE)
+        self.declare_parameter('place_mode', 'state')
         self.declare_parameter('place_position', [0.35, 0.30, 0.25])
         self.declare_parameter('place_yaw', 0.0)
         self.declare_parameter('place_approach_height', 0.15)
@@ -185,6 +238,11 @@ class PickPlaceOrchestrator(Node):
         ]
         self.base_frame = 'world'
 
+        self.place_mode = p('place_mode').value
+        if self.place_mode not in ('state', 'ready', 'position'):
+            raise ValueError("place_mode must be 'state', 'ready' or 'position'")
+        self.states_file = p('states_file').value
+
         self.prompt = p('prompt').value
         if not self.prompt.lower().startswith('detect'):
             self.prompt = f'detect {self.prompt}'
@@ -192,6 +250,8 @@ class PickPlaceOrchestrator(Node):
         self._lock = threading.Lock()
         self._latest_detections = None
         self._finger_position = None
+        self._failures = []
+        self._arm_positions = {}
         self._busy = False
         self._abort = threading.Event()
 
@@ -213,6 +273,8 @@ class PickPlaceOrchestrator(Node):
         self.prompt_pub = self.create_publisher(String, '/vlm/prompt', latched)
         self.state_pub = self.create_publisher(String, '/pick_place/state', latched)
 
+        self.create_subscription(String, '/pick_place/prompt', self._on_prompt, 10,
+                                 callback_group=self.cb)
         self.create_subscription(String, '/vlm/detections', self._on_detections, 10,
                                  callback_group=self.cb)
         self.create_subscription(JointState, '/joint_states', self._on_joint_states, 10,
@@ -222,20 +284,69 @@ class PickPlaceOrchestrator(Node):
                             callback_group=self.cb)
         self.create_service(Trigger, '/pick_place/abort', self._srv_abort,
                             callback_group=self.cb)
+        self.create_service(Trigger, '/pick_place/capture_ready',
+                            self._srv_capture_ready, callback_group=self.cb)
 
         self._set_state('IDLE')
         self.get_logger().info(
             f'arm={self.arm} group={self.group} tcp={self.tcp_frame} '
             f'pipeline={p("pipeline_id").value}')
-        place = p('place_position').value
-        self.get_logger().warn(
-            f'place_position is {list(place)} -- verify this is reachable for the '
-            f'{self.arm} arm in RViz before running on hardware')
+        ready = [round(v, 4) for v in p('ready_joint_positions').value]
+        self.get_logger().info(f'ready pose (rad) {ready}')
+        if self.place_mode == 'state':
+            self.get_logger().info(f'states file {self.states_file}')
+            states = self.load_states()
+            for name in (PRE_PICK_STATE, DROP_STATE):
+                entry = states.get(name)
+                if entry is None:
+                    self.get_logger().warn(
+                        f'{name} is not recorded yet -- run '
+                        f'"python3 record_states.py {name}" before starting a '
+                        'cycle')
+                else:
+                    self.get_logger().info(
+                        f'{name} tool at {entry.get("tcp_xyz")}')
+        elif self.place_mode == 'ready':
+            self.get_logger().warn(
+                'place_mode is "ready": the object is released at the ready pose, '
+                'so it drops from whatever height that pose holds the tool at. '
+                'Check what is underneath before the first run.')
+        else:
+            place = p('place_position').value
+            self.get_logger().warn(
+                f'place_position is {list(place)} -- verify this is reachable for '
+                f'the {self.arm} arm in RViz before running on hardware')
 
         if p('auto_start').value:
             self.create_timer(3.0, self._auto_start_once, callback_group=self.cb)
 
     # -- plumbing ------------------------------------------------------------
+
+    def _note_failure(self, stage, message):
+        self._failures.append((stage, message))
+
+    def _failure_summary(self):
+        """Which stage failed most often -- not merely which failed last.
+
+        Attempts can fail at different stages: a marginal pre_pick plan on one,
+        an out-of-reach object on the next. Reporting only the last one is
+        actively misleading -- it once pointed at pre_pick_state, which failed
+        twice, while the pre-grasp failed three times because the object was
+        90 mm beyond the arm. So report the dominant stage, and count the rest.
+        """
+        if not self._failures:
+            return 'no attempt ran'
+        counts = {}
+        for stage, message in self._failures:
+            entry = counts.setdefault(stage, [0, message])
+            entry[0] += 1
+        stage, (count, message) = max(counts.items(), key=lambda item: item[1][0])
+        summary = f'{count} of {len(self._failures)} attempts failed at {stage}'
+        others = ', '.join(f'{s} x{c}' for s, (c, _m) in sorted(counts.items())
+                           if s != stage)
+        if others:
+            summary += f' (also {others})'
+        return f'{summary}. {message}'
 
     def _set_state(self, state, detail=''):
         text = state if not detail else f'{state}: {detail}'
@@ -255,6 +366,29 @@ class PickPlaceOrchestrator(Node):
             return None
         return future.result()
 
+    def _on_prompt(self, msg):
+        """Retarget the next cycle, so the UI can change what to pick.
+
+        Refused while a cycle is running: self.prompt is what detect() matches
+        replies against, and swapping it mid-cycle would leave the retry ladder
+        hunting for a different object than the one it started on.
+        """
+        # Normalised the same way the panel does, so that publishing
+        # "pick up the wrench" straight onto this topic behaves identically to
+        # typing it into the panel.
+        wanted = to_detection_prompt(msg.data)
+        if not wanted:
+            self.get_logger().warn(f'ignoring prompt "{msg.data}": no object in it')
+            return
+        with self._lock:
+            if self._busy:
+                self.get_logger().warn(
+                    f'ignoring prompt "{wanted}": a cycle is already running')
+                return
+            self.prompt = wanted
+        self.get_logger().info(f'prompt is now "{wanted}"')
+        self.prompt_pub.publish(String(data=wanted))
+
     def _on_detections(self, msg):
         try:
             payload = json.loads(msg.data)
@@ -265,9 +399,12 @@ class PickPlaceOrchestrator(Node):
             self._latest_detections = payload
 
     def _on_joint_states(self, msg):
-        if self.finger_joint in msg.name:
-            with self._lock:
+        with self._lock:
+            if self.finger_joint in msg.name:
                 self._finger_position = msg.position[msg.name.index(self.finger_joint)]
+            for joint in self.arm_joints:
+                if joint in msg.name:
+                    self._arm_positions[joint] = msg.position[msg.name.index(joint)]
 
     def _auto_start_once(self):
         for timer in list(self.timers):
@@ -276,6 +413,26 @@ class PickPlaceOrchestrator(Node):
 
     def _srv_start(self, _request, response):
         response.success, response.message = self._start_cycle()
+        return response
+
+    def _srv_capture_ready(self, _request, response):
+        """Report the arm's current joint values as a ready_joint_positions list.
+
+        Jog the arm to the pose you want in RViz, call this, and paste the list
+        back as -p ready_joint_positions:="[...]". Beats reading angles off the
+        Joints tab, which only shows them rounded to the degree.
+        """
+        with self._lock:
+            missing = [j for j in self.arm_joints if j not in self._arm_positions]
+            values = [self._arm_positions.get(j) for j in self.arm_joints]
+        if missing:
+            response.success = False
+            response.message = f'no /joint_states yet for {missing}'
+            return response
+        formatted = '[' + ', '.join(f'{v:.6f}' for v in values) + ']'
+        self.get_logger().info(f'ready_joint_positions:="{formatted}"')
+        response.success = True
+        response.message = formatted
         return response
 
     def _srv_abort(self, _request, response):
@@ -372,11 +529,19 @@ class PickPlaceOrchestrator(Node):
             f'{label}: xyz=({position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f})')
         return self._send_move_goal(req, label)
 
-    def move_to_home(self):
-        positions = list(self.get_parameter('home_joint_positions').value)
+    def _move_to_joints(self, positions, label):
+        """Joint-space goal, used for every named posture.
+
+        A joint goal is the one kind cuMotion takes for either arm regardless of
+        its ee_link: it is turned into a pose by running FK on the merged goal
+        state, so no link name is compared. It is also repeatable -- the same
+        seven numbers give the same posture every time, which a pose goal on a
+        redundant 7-DOF arm does not.
+        """
         if len(positions) != len(self.arm_joints):
             self.get_logger().error(
-                f'home_joint_positions needs {len(self.arm_joints)} values')
+                f'{label} needs {len(self.arm_joints)} joint values, got '
+                f'{len(positions)}')
             return False
         req = self._base_request()
         constraints = Constraints()
@@ -388,7 +553,21 @@ class PickPlaceOrchestrator(Node):
             jc.weight = 1.0
             constraints.joint_constraints.append(jc)
         req.goal_constraints = [constraints]
-        return self._send_move_goal(req, 'HOME')
+        return self._send_move_goal(req, label)
+
+    def move_to_ready(self):
+        positions = list(self.get_parameter('ready_joint_positions').value)
+        return self._move_to_joints(positions, 'READY')
+
+    def move_to_state(self, name, states):
+        """Replay a pose recorded by record_states.py."""
+        entry = states.get(name)
+        if not entry or not entry.get('joints'):
+            self.get_logger().error(
+                f'{name} is not in {self.states_file}; record it with '
+                f'"python3 record_states.py {name}"')
+            return False
+        return self._move_to_joints(list(entry['joints']), name.upper())
 
     def command_gripper(self, position, label):
         """Drive the gripper and wait for it to settle.
@@ -509,6 +688,143 @@ class PickPlaceOrchestrator(Node):
         result = self._await(self.octomap_client.call_async(Trigger.Request()), 5.0)
         return bool(result and result.success)
 
+    def _planner_parameter(self, name):
+        """One parameter off the cuMotion node.
+
+        Queried one name per call on purpose: if any name in a GetParameters
+        request is declared-but-unset, the whole reply comes back with values=[]
+        rather than a PARAMETER_NOT_SET entry per name -- measured against the
+        running planner. Batching tool_frame (usually unset) with robot (always
+        set) therefore returns nothing for either.
+
+        Returns DEAD_PLANNER if the node is not there at all, None if it is
+        there but did not answer, '' if the parameter is unset, otherwise its
+        value.
+        """
+        client = self.create_client(GetParameters,
+                                   '/cumotion_planner/get_parameters',
+                                   callback_group=self.cb)
+        try:
+            if not client.wait_for_service(timeout_sec=5.0):
+                return DEAD_PLANNER
+            result = self._await(
+                client.call_async(GetParameters.Request(names=[name])), 5.0)
+        finally:
+            self.destroy_client(client)
+        if result is None:
+            return None
+        if not result.values:
+            return ''
+        return result.values[0].string_value
+
+    def planner_ee_link(self):
+        """Which link cuMotion will actually accept Cartesian goals for.
+
+        tool_frame wins if it is set; otherwise it is the ee_link in the robot
+        config the node was launched with. Returns None if neither could be
+        determined.
+        """
+        tool_frame = self._planner_parameter('tool_frame')
+        if tool_frame is DEAD_PLANNER or tool_frame is None:
+            return tool_frame
+        if tool_frame:
+            return tool_frame
+        robot_file = self._planner_parameter('robot')
+        if robot_file is DEAD_PLANNER or not robot_file:
+            return None
+        try:
+            import yaml
+            with open(robot_file) as handle:
+                config = yaml.safe_load(handle)
+            return config['robot_cfg']['kinematics']['ee_link']
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            self.get_logger().warn(f'could not read ee_link from {robot_file}: {exc}')
+            return None
+
+    def load_states(self):
+        """Read the recorded poses. Re-read every cycle, on purpose.
+
+        That way re-recording a pose with record_states.py takes effect on the
+        next pick without restarting the stack -- which matters because the
+        stack takes a PaliGemma load to come back up.
+        """
+        path = self.states_file
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path) as handle:
+                data = yaml.safe_load(handle) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            self.get_logger().error(f'could not read {path}: {exc}')
+            return {}
+        recorded_arm = data.get('arm')
+        if recorded_arm and recorded_arm != self.arm:
+            # Joint values are per-arm: the arms are mirrored, so replaying a
+            # left-arm recording on the right arm is a different posture, not a
+            # mirrored one.
+            self.get_logger().error(
+                f'{path} was recorded for the {recorded_arm} arm but this is the '
+                f'{self.arm} arm; re-record it with '
+                f'"python3 record_states.py --arm {self.arm}"')
+            return {}
+        return data.get('states') or {}
+
+    def check_states(self, states):
+        """Every pose the cycle will need, before it moves anything."""
+        needed = [PRE_PICK_STATE]
+        if self.place_mode == 'state':
+            needed.append(DROP_STATE)
+        missing = [n for n in needed if not (states.get(n) or {}).get('joints')]
+        if missing:
+            self.get_logger().error(
+                f'missing {", ".join(missing)} in {self.states_file}. Record with: '
+                f'python3 record_states.py {" ".join(missing)}')
+            return False
+        return True
+
+    def check_planner_tool_frame(self):
+        """cuMotion has exactly one ee_link and rejects pose goals aimed elsewhere.
+
+        openarm.yml sets ee_link to openarm_left_hand_tcp, so with the default
+        config every right-arm pose goal comes back INVALID_LINK_NAME -- but only
+        at PREGRASP, after the gripper has already opened. Catching it up front
+        turns that into one line of text instead of a half-executed cycle.
+
+        The node reads tool_frame once at construction, so this cannot be fixed
+        at runtime: it needs a relaunch of the robot.
+        """
+        if self.get_parameter('pipeline_id').value != 'cumotion':
+            return True
+        ee_link = self.planner_ee_link()
+        if ee_link is DEAD_PLANNER:
+            # Worth a hard stop rather than a warning: with no planner every
+            # pose goal fails, so the cycle would walk the whole retry ladder
+            # and report "every pick strategy was exhausted" -- which reads as
+            # a grasping problem when the planner simply is not running. It has
+            # crashed here before (SIGFPE, exit code -8), so this is a state
+            # the stack really does reach.
+            self.get_logger().error(
+                '/cumotion_planner is not running -- nothing can be planned. '
+                'Check the launch output for "cumotion_goal_set_planner_node ... '
+                'process has died", and restart the robot.')
+            return False
+        if ee_link is None:
+            self.get_logger().warn(
+                'could not determine cuMotion\'s ee_link; continuing without the '
+                'check. A mismatch shows up as INVALID_LINK_NAME at PREGRASP.')
+            return True
+        if ee_link != self.tcp_frame:
+            self.get_logger().error(
+                f'cuMotion takes Cartesian goals for {ee_link}, but this cycle '
+                f'needs {self.tcp_frame}. Relaunch the robot with '
+                f'tool_frame:={self.tcp_frame} '
+                '(native/run_launch_everything.sh '
+                f'tool_frame:={self.tcp_frame}), or run this with arm:='
+                f'{"left" if self.arm == "right" else "right"}.')
+            return False
+        self.get_logger().info(f'cuMotion plans Cartesian goals for {ee_link}')
+        return True
+
     # -- perception ----------------------------------------------------------
 
     def detect(self, min_count=1):
@@ -619,19 +935,26 @@ class PickPlaceOrchestrator(Node):
                 'probably occluding it -- trusting fingers')
         return True
 
-    def verify_place(self):
+    def verify_place(self, reference=None):
+        """Was the object seen near where it was released?
+
+        `reference` is where the release actually happened -- the tool position
+        in place_mode "ready", place_position otherwise. Advisory either way: a
+        box occludes what is inside it.
+        """
+        if reference is None:
+            reference = list(self.get_parameter('place_position').value)
         payload = self.detect(min_count=0)
         if payload is None:
             return False
-        place = list(self.get_parameter('place_position').value)
         radius = self.get_parameter('place_radius').value
         for d in payload.get('detections', []):
-            if dist(d['point'][:2], place[:2]) < radius:
-                self.get_logger().info('object seen at the box')
+            if dist(d['point'][:2], reference[:2]) < radius:
+                self.get_logger().info('object seen where it was released')
                 return True
         self.get_logger().warn(
-            'object not seen at the box -- it may be occluded inside it, or the '
-            'release missed')
+            'object not seen at the release point -- it may be occluded, or it '
+            'rolled after the drop')
         return False
 
     # -- the cycle -----------------------------------------------------------
@@ -647,7 +970,23 @@ class PickPlaceOrchestrator(Node):
                 self._busy = False
 
     def _cycle(self):
+        if not self.check_planner_tool_frame():
+            self._set_state('FAILED', 'the planner is unusable for this arm')
+            return
+        self._failures = []
+        states = self.load_states()
+        if not self.check_states(states):
+            self._set_state('FAILED', 'recorded states are missing')
+            return
         self.add_table()
+
+        # Start from the ready pose: it is the posture the rest of the cycle
+        # assumes, and it clears the arm out of the camera's view of the table
+        # before the first detection.
+        self._set_state('READY', 'moving to the observation pose')
+        if not self.move_to_ready():
+            self._set_state('FAILED', 'could not reach the ready pose')
+            return
 
         picked_point = None
         for attempt, strategy in enumerate(STRATEGIES):
@@ -657,36 +996,44 @@ class PickPlaceOrchestrator(Node):
             self._set_state('ATTEMPT',
                             f'{attempt + 1}/{len(STRATEGIES)} ({strategy["name"]})')
             if attempt > 0:
-                if not self.move_to_home():
+                if not self.move_to_ready():
                     continue
                 if strategy['refresh_octomap']:
                     self.refresh_octomap()
-            picked_point = self._attempt_pick(strategy)
+            picked_point = self._attempt_pick(strategy, states)
             if picked_point is not None:
                 break
         else:
-            self._set_state('FAILED', 'every pick strategy was exhausted')
-            self.move_to_home()
+            self._set_state(
+                'FAILED',
+                f'every pick strategy was exhausted -- {self._failure_summary()}')
+            self.move_to_ready()
             return
 
-        self._set_state('HOME', 'carrying the object')
-        if not self.move_to_home():
-            self._set_state('FAILED', 'could not return home while holding')
+        self._set_state('READY', 'carrying the object')
+        if not self.move_to_ready():
+            self._set_state('FAILED', 'could not return to ready while holding')
             return
 
-        if not self._place():
+        if not self._place(states):
             self._set_state('FAILED', 'place failed')
             return
 
-        self._set_state('HOME', 'cycle complete')
-        self.move_to_home()
+        # place_mode "ready" releases at the observation pose, so the arm is
+        # already where this would send it.
+        if self.place_mode != 'ready':
+            self._set_state('READY', 'cycle complete')
+            self.move_to_ready()
         self._set_state('DONE')
 
-    def _attempt_pick(self, strategy):
+    def _attempt_pick(self, strategy, states):
         self._set_state('LOCATE', self.prompt)
         payload = self.detect(min_count=1)
         if payload is None or not payload.get('detections'):
             self._set_state('LOCATE', 'nothing detected')
+            self._note_failure('LOCATE', (
+                f'nothing matched "{self.prompt}" -- check /vlm/debug_image, and '
+                'that the detector has finished loading'))
             return None
 
         detection = payload['detections'][0]
@@ -695,16 +1042,44 @@ class PickPlaceOrchestrator(Node):
             f'target at {point} axis_yaw={detection.get("axis_yaw")} '
             f'depth={detection["depth_m"]} m from {detection["depth_px"]} px')
 
-        self._set_state('OPEN_GRIPPER')
-        if not self.command_gripper(self.get_parameter('gripper_open').value, 'OPEN'):
+        # Staged through pre_pick_state rather than going straight at the
+        # object: the observation pose is chosen to keep the arm out of the
+        # camera's view, which is not necessarily a good posture to start a
+        # descent from.
+        self._set_state('PRE_PICK')
+        if not self.move_to_state(PRE_PICK_STATE, states):
+            self._note_failure('PRE_PICK', (
+                f'could not plan to {PRE_PICK_STATE}; re-record it somewhere the '
+                'arm can reach from the ready pose'))
             return None
 
         self._set_state('PREGRASP')
         if not self.move_to_pose(pregrasp, quat, 'PREGRASP'):
+            # By far the most common real cause, and the one that used to hide
+            # behind "every pick strategy was exhausted": the object is simply
+            # outside the arm's envelope. Say where it was and what the limit is
+            # instead of making the reader go and measure it.
+            self._note_failure('PREGRASP', (
+                f'could not plan to the pre-grasp above '
+                f'({point[0]:.3f}, {point[1]:.3f}, {point[2]:.3f}) -- most often '
+                f'the object is out of the {self.arm} arm\'s reach. Verify with: '
+                f'python3 native/tests/check_reachability.py --arm {self.arm} '
+                f'--point {pregrasp[0]:.3f} {pregrasp[1]:.3f} {pregrasp[2]:.3f}'))
+            return None
+
+        # Opened here rather than before the approach: the fingers are already
+        # over the object, so an open gripper cannot catch anything on the way
+        # in, and a gripper that fails to open costs no motion.
+        self._set_state('OPEN_GRIPPER')
+        if not self.command_gripper(self.get_parameter('gripper_open').value, 'OPEN'):
             return None
 
         self._set_state('DESCEND')
         if not self.move_to_pose(grasp, quat, 'DESCEND'):
+            self._note_failure('DESCEND', (
+                f'reached the pre-grasp but could not descend to '
+                f'z={grasp[2]:.3f} -- the octomap may have the object itself in '
+                'it, or the grasp is below the work surface'))
             return None
 
         self._set_state('CLOSE_GRIPPER')
@@ -717,6 +1092,9 @@ class PickPlaceOrchestrator(Node):
 
         self._set_state('VERIFY_GRASP')
         if not self.verify_grasp(point):
+            self._note_failure('VERIFY_GRASP', (
+                'the gripper closed but nothing was held -- check '
+                'grasp_finger_min against your object, and the grasp height'))
             self._set_state('VERIFY_GRASP', 'failed, retrying')
             self.command_gripper(self.get_parameter('gripper_open').value, 'OPEN')
             return None
@@ -725,7 +1103,11 @@ class PickPlaceOrchestrator(Node):
         self._set_state('VERIFY_GRASP', 'confirmed')
         return point
 
-    def _place(self):
+    def _place(self, states):
+        if self.place_mode == 'state':
+            return self._place_at_state(states)
+        if self.place_mode == 'ready':
+            return self._place_at_ready()
         place = list(self.get_parameter('place_position').value)
         quat = top_down_quat(self.get_parameter('place_yaw').value)
         above = (place[0], place[1],
@@ -747,7 +1129,48 @@ class PickPlaceOrchestrator(Node):
             return False
 
         self._set_state('VERIFY_PLACE')
-        self.verify_place()          # advisory: the box usually occludes the object
+        self.verify_place(place)     # advisory: the box usually occludes the object
+        return True
+
+    def _place_at_state(self, states):
+        """Carry to the recorded drop_state and release there."""
+        self._set_state('DROP', 'moving to the recorded drop pose')
+        if not self.move_to_state(DROP_STATE, states):
+            return False
+
+        release_point = self.tcp_position()
+        self._set_state('RELEASE', 'at drop_state')
+        if not self.command_gripper(self.get_parameter('gripper_open').value, 'OPEN'):
+            return False
+        self.detach_object()
+
+        self._set_state('VERIFY_PLACE')
+        if release_point is None:
+            self.get_logger().warn(
+                f'no {self.tcp_frame} transform at release; skipping the check')
+        else:
+            self.verify_place(release_point)
+        return True
+
+    def _place_at_ready(self):
+        """Release from the ready pose, where the cycle has already returned to.
+
+        No approach or retreat move: the pose is the drop point, so the object
+        falls the distance between the tool and whatever is below it.
+        """
+        release_point = self.tcp_position()
+
+        self._set_state('RELEASE', 'at the ready pose')
+        if not self.command_gripper(self.get_parameter('gripper_open').value, 'OPEN'):
+            return False
+        self.detach_object()
+
+        self._set_state('VERIFY_PLACE')
+        if release_point is None:
+            self.get_logger().warn(
+                f'no {self.tcp_frame} transform at release; skipping the check')
+        else:
+            self.verify_place(release_point)
         return True
 
 

@@ -140,6 +140,35 @@ export TORCH_EXTENSIONS_DIR="${_NATIVE_DIR}/cache/torch_extensions"
 export TRITON_CACHE_DIR="${_NATIVE_DIR}/cache/triton"
 mkdir -p "${WARP_CACHE_PATH}" "${TORCH_EXTENSIONS_DIR}" "${TRITON_CACHE_DIR}"
 
+# --- 4b. snap contamination -------------------------------------------------
+# A terminal opened inside a snap -- VS Code's, most often, since that is where
+# this workspace gets edited -- exports GTK/GIO variables pointing back into the
+# snap. rviz2 then loads a GTK module from /snap/code, whose RPATH pulls in
+# core20's glibc 2.31 libpthread alongside the host's 2.35, and it dies at
+# startup without drawing anything:
+#
+#   rviz2: symbol lookup error: /snap/core20/current/lib/x86_64-linux-gnu/
+#   libpthread.so.0: undefined symbol: __libc_pthread_init, GLIBC_PRIVATE
+#
+# The symptom is "RViz never opened" while every other node comes up fine, so it
+# reads as a launch-file problem rather than an environment one. GTK_PATH is the
+# variable that actually breaks it -- bisected -- but all of these point into
+# the snap and would do the same to any other GUI node (rqt, the octomap gater's
+# Tk window), so all of them go. Each is cleared only when its value really is
+# inside a snap, which makes this a no-op in an ordinary terminal.
+for _var in GTK_PATH GTK_EXE_PREFIX GIO_MODULE_DIR GDK_PIXBUF_MODULE_FILE \
+            GDK_PIXBUF_MODULEDIR GSETTINGS_SCHEMA_DIR LOCPATH; do
+    case "${!_var:-}" in
+        /snap/*|"${HOME}"/snap/*)
+            unset "${_var}"
+            _snap_scrubbed="${_snap_scrubbed:+${_snap_scrubbed} }${_var}"
+            ;;
+    esac
+done
+if [ -n "${_snap_scrubbed:-}" ]; then
+    echo "note: cleared snap-provided ${_snap_scrubbed} (they crash rviz2)"
+fi
+
 # --- 5. ROS middleware ------------------------------------------------------
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
@@ -201,4 +230,4 @@ echo "  gpu arch  : ${TORCH_CUDA_ARCH_LIST:-<unset>}${NVCC_APPEND_FLAGS:+  (${NV
 echo "  cuda      : ${CUDA_HOME:-<none found>}"
 
 unset _NATIVE_DIR _WS_DIR _OVERLAY_ROOT _OVERLAY_PREFIX _VENV _needed _PROFILE \
-      _CAPS _cuda _ver
+      _CAPS _cuda _ver _var _snap_scrubbed

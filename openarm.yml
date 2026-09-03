@@ -4,4 +4,12 @@ robot_cfg:
     asset_root_path: "/workspaces/isaac_ros-dev/src"
     base_link: "world"
     ee_link: "openarm_left_hand_tcp"
-    link_names: ["openarm_right_hand_tcp"]
+    # Both tool frames are listed so that cuRobo's chain covers both arms
+    # whichever one is the ee_link. cuRobo builds the chain from base_link to
+    # ee_link plus every link_name, so with only the right tcp here, launching
+    # with tool_frame:=openarm_right_hand_tcp would drop the left arm to 0
+    # active joints -- unmodelled, and therefore not something the right arm
+    # would plan around. Measured: 14 active joints with both listed, 7 with
+    # only the right. ee_link itself is appended automatically, so listing it
+    # again is harmless.
+    link_names: ["openarm_left_hand_tcp", "openarm_right_hand_tcp"]

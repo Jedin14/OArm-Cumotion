@@ -34,9 +34,6 @@ sudo mkdir -p /workspaces && sudo ln -s /home/mr/workspaces/isaac_ros-dev /works
 
 ```bash
 sudo ip link set can0 down && sudo ip link set can0 type can bitrate 1000000 dbitrate 5000000 fd on && sudo ip link set can0 up
-```
-
-```bash
 sudo ip link set can1 down && sudo ip link set can1 type can bitrate 1000000 dbitrate 5000000 fd on && sudo ip link set can1 up
 ```
 
@@ -73,7 +70,17 @@ You should see cuMotion warm up in about 3 seconds and print
 `cuMotion is ready for planning queries!`, and `move_group` report
 `MoveGroup context using planning plugin isaac_ros_cumotion_moveit/CumotionPlanner`.
 
-### 3. Rebuild after editing code
+### 3. Or start everything, including the pick-and-place panel
+
+```bash
+native/run_pick_place_demo.sh
+```
+
+Same robot bringup, plus the VLM detector, the pick-and-place orchestrator and a
+panel to type into — see [VLM-guided pick and place](#-vlm-guided-pick-and-place).
+Use `run_launch_everything.sh` above when you only want the robot.
+
+### 4. Rebuild after editing code
 
 ```bash
 native/build_ws.sh
@@ -85,7 +92,7 @@ Or a single package:
 native/build_ws.sh --packages-select openarm_description
 ```
 
-### 4. Editing in VS Code
+### 5. Editing in VS Code
 
 ```bash
 code ~/workspaces/isaac_ros-dev
@@ -116,32 +123,161 @@ detector checks whether each step actually worked — a failed grasp is retried
 with an escalating strategy rather than repeated.
 
 ```
-LOCATE ──► PREGRASP ──► DESCEND ──► CLOSE ──► VERIFY_GRASP ──► LIFT
-   ▲                                             │ failed         │
-   └─────────────────────────────────────────────┘                ▼
-                                       HOME ──► OVER_BOX ──► RELEASE ──► VERIFY_PLACE
+READY ──► LOCATE ──► PRE_PICK ──► PREGRASP ──► OPEN ──► DESCEND ──► CLOSE
+   ▲                                                                  │
+   └──────────────────────── failed ──────────────── VERIFY_GRASP ◄── LIFT
+                                                          │
+                    READY ──► DROP ──► RELEASE ──► VERIFY_PLACE
 ```
 
-With the robot already up (`native/run_launch_everything.sh`), in a second
-terminal:
+Three named postures, all replayed as joint goals:
+
+| | Where it comes from | |
+| --- | --- | --- |
+| **READY** | `ready_joint_positions` | observation pose: the arm starts here and the object is located from here, so it has to leave the camera a clear view |
+| **PRE_PICK** | `pre_pick_state` in the states file | staging pose entered once the object is located, so the descent starts from a known posture |
+| **DROP** | `drop_state` in the states file | where the object is released |
+
+**PREGRASP** is 5 cm (`approach_height`) above the object's detected top surface:
+the arm stops there, opens the gripper, descends onto the object, closes, and
+lifts back to the same 5 cm.
+
+### Everything in one command
+
+```bash
+native/run_pick_place_demo.sh
+```
+
+That starts the robot, MoveIt, cuMotion, the camera, the detector, the
+orchestrator and a small panel you type into — it sets cuMotion's `tool_frame`
+to match the arm itself, so the two cannot disagree. Type what to pick and press
+**Pick**:
+
+```
+┌─ OpenArm pick and place ──────────────────┐
+│ What should the arm pick up?              │
+│ ┌───────────────────────────────────────┐ │
+│ │ pick up the screwdriver               │ │
+│ └───────────────────────────────────────┘ │
+│ detector prompt:  detect screwdriver      │
+│  [ Pick ]  [ Abort ]                      │
+│ PRE_PICK                                  │
+└───────────────────────────────────────────┘
+```
+
+The panel strips the conversational wrapper before the prompt reaches the model —
+`paligemma-3b-pt-224` is a pretrained checkpoint, so `detect screwdriver` is a
+well-formed prompt for it and `pick up the screwdriver` is not. It shows the
+translation live so there is no guessing which of the two the model saw.
+
+PaliGemma takes tens of seconds and several GB of VRAM to load; it loads
+alongside robot bringup, and until it is ready a pick sits in LOCATE. That load
+is why the launch files are otherwise kept separate — when the robot is already
+up, use `pick_place.launch.py` on its own instead.
+
+**Before the first run**, record the two poses the cycle needs (below). Without
+them a pick refuses to start rather than moving somewhere nobody chose.
+
+### Recording pre_pick_state and drop_state
+
+With the robot up, jog the arm in RViz to the pose you want — interactive marker
+or the Joints tab, then Plan & Execute — and capture where it actually landed:
+
+```bash
+python3 record_states.py
+```
+
+It walks through both poses, waiting for Enter at each, and writes
+`pick_place_states.yaml`. Re-record one without touching the other by naming it,
+and check what is on file at any time:
+
+```bash
+python3 record_states.py drop_state
+python3 record_states.py --list
+```
+
+Reading the values back off the robot beats typing them in: the Joints tab only
+shows whole degrees, and an executed plan lands near its goal rather than exactly
+on it. The orchestrator re-reads the file at the start of every cycle, so
+re-recording a pose takes effect on the next pick — no restart, which matters
+when a restart costs a PaliGemma load.
+
+`drop_state` is where the object is *released*, so it falls from whatever height
+that pose holds the tool at. `record_states.py --list` prints the tool position
+of each pose, which is the number to look at before the first run.
+
+### Driving it without the panel
+
+The panel is a client of the ordinary interface, so anything it does can be done
+from a terminal. With the robot already up:
 
 ```bash
 cd /home/mr/workspaces/isaac_ros-dev && source native/setup.bash
+ros2 launch pick_place.launch.py prompt:="detect screwdriver"
 ```
 
-```bash
-ros2 launch pick_place.launch.py prompt:="detect screwdriver" place_position:="[0.35, 0.30, 0.25]"
-```
-
-Wait for `model loaded`, then start a cycle:
+Wait for `model loaded`, then:
 
 ```bash
+ros2 topic pub --once /pick_place/prompt std_msgs/String "{data: 'pick up the wrench'}"
 ros2 service call /pick_place/start std_srvs/srv/Trigger
 ```
 
-`ros2 topic echo /pick_place/state` follows the state machine, and
-`ros2 service call /pick_place/abort std_srvs/srv/Trigger` stops it after the
-current motion. `ros2 launch pick_place.launch.py --show-args` lists every tunable.
+The prompt topic is normalised exactly as the panel does it, so publishing a
+whole sentence works. `ros2 topic echo /pick_place/state` follows the state
+machine and `ros2 service call /pick_place/abort std_srvs/srv/Trigger` stops it
+after the current motion. `ros2 launch pick_place_demo.launch.py --show-args`
+lists every tunable.
+
+### Pick with the right arm, and why that needs a relaunch
+
+**cuMotion accepts Cartesian goals for exactly one link.** It compares every
+pose goal's `link_name` against its own `ee_link` and rejects a mismatch outright:
+
+```
+Link name for Target Pose "openarm_right_hand_tcp" and Planning frame
+"openarm_left_hand_tcp" do not match, relaunch node with
+tool_frame = openarm_right_hand_tcp
+```
+
+`openarm.yml` sets `ee_link` to the **left** hand, so with a default bringup every
+right-arm pose goal fails — measured here, the whole right-hand work area came
+back unreachable for that reason alone, not because the arm cannot get there. The
+node reads `tool_frame` once at construction, so it cannot be fixed at runtime:
+
+```bash
+native/run_launch_everything.sh tool_frame:=openarm_right_hand_tcp
+```
+
+The orchestrator checks this before it moves anything — it reads the planner's
+`tool_frame`, falls back to the `ee_link` in `openarm.yml` when that is unset, and
+refuses to start on a mismatch rather than discovering it at PREGRASP with the
+gripper already open. The *other* arm still takes joint-space goals normally; only
+Cartesian goals are restricted to one link at a time. Both arms stay in cuMotion's
+kinematic chain either way, which is why `openarm.yml` now lists both tool frames
+in `link_names` — with only one listed, pointing `ee_link` at the right hand drops
+the left arm to zero active joints, unmodelled and therefore not something the
+right arm would plan around (measured: 14 active joints with both listed, 7 with
+only the right).
+
+### The ready pose
+
+`ready_joint_positions` is `joint1..joint7` in radians. The default is the
+elbow-up pose with the tool clear of the table, captured off the right arm rather
+than read off the sliders. To use a different one, jog the arm there in RViz and
+ask for the numbers:
+
+```bash
+ros2 service call /pick_place/capture_ready std_srvs/srv/Trigger
+```
+
+It returns a paste-ready list, which beats the Joints tab — that only shows whole
+degrees.
+
+**With the default `place_mode:=ready` the object is released at this pose**, so it
+falls the distance between the tool and whatever is under it. Check what is
+underneath before the first run. `place_mode:=position` restores the older
+behaviour of moving over a separate `place_position` and releasing there.
 
 ### The pieces
 
@@ -151,11 +287,17 @@ current motion. `ros2 launch pick_place.launch.py --show-args` lists every tunab
 | [VLM/run_in_vlm_env.sh](VLM/run_in_vlm_env.sh) | — | environment isolation for the above |
 | [VLM/bootstrap.sh](VLM/bootstrap.sh) | — | builds `VLM/.venv` from `requirements.txt` |
 | [pick_place_orchestrator.py](pick_place_orchestrator.py) | `native/venv` | the state machine, MoveIt + gripper + planning scene |
-| [pick_place.launch.py](pick_place.launch.py) | — | starts both, one set of arguments |
+| [pick_place_ui.py](pick_place_ui.py) | `native/venv` | the panel: type an object, Pick, Abort, live state |
+| [record_states.py](record_states.py) | `native/venv` | capture `pre_pick_state` / `drop_state` into YAML |
+| [vlm_prompt.py](vlm_prompt.py) | `native/venv` | "pick up the X" → "detect X", shared by the panel and the orchestrator |
+| [pick_place_demo.launch.py](pick_place_demo.launch.py) | — | robot + detector + orchestrator + panel, one command |
+| [native/run_pick_place_demo.sh](native/run_pick_place_demo.sh) | — | the above, with the preflight checks |
+| [pick_place.launch.py](pick_place.launch.py) | — | detector + orchestrator only, for an already-running robot |
 | [VLM/pixel_to_world.py](VLM/pixel_to_world.py) | `VLM/.venv` | click any point, get its world coordinate |
 | [native/tests/check_reachability.py](native/tests/check_reachability.py) | `native/venv` | ask MoveIt if the arm can get there |
 | [VLM/test_vlm_geometry.py](VLM/test_vlm_geometry.py) | `VLM/.venv` | pixel → world maths, no camera or model |
 | [native/tests/test_grasp_geometry.py](native/tests/test_grasp_geometry.py) | `native/venv` | grasp pose maths, no robot |
+| [native/tests/test_pick_cycle.py](native/tests/test_pick_cycle.py) | `native/venv` | a whole cycle against a fake robot, no hardware |
 
 ### Interfaces
 
@@ -165,9 +307,11 @@ current motion. `ros2 launch pick_place.launch.py --show-args` lists every tunab
 | `/vlm/detection_poses` | `geometry_msgs/PoseArray` | same points, for RViz |
 | `/vlm/debug_image` | `sensor_msgs/Image` | annotated view |
 | `/vlm/prompt` | `std_msgs/String` | retarget the detector at runtime |
+| `/pick_place/prompt` | `std_msgs/String` | what to pick next; a whole sentence is fine |
 | `/pick_place/state` | `std_msgs/String` | current state machine step |
 | `/pick_place/start` | `std_srvs/Trigger` | run one cycle |
 | `/pick_place/abort` | `std_srvs/Trigger` | stop after the current motion |
+| `/pick_place/capture_ready` | `std_srvs/Trigger` | current arm joints as a `ready_joint_positions` list |
 | `/octomap_gater/refresh` | `std_srvs/Trigger` | let 3 depth frames through |
 
 `vision_msgs` would be the idiomatic type for the detections, but it is not
@@ -190,10 +334,14 @@ Orchestrator — all exposed as launch arguments, `--show-args` lists the rest:
 
 | Parameter | Default | |
 | --- | --- | --- |
-| `place_position` | `[0.35, 0.30, 0.25]` | **placeholder, measure yours** |
+| `arm` | `right` | must match the `tool_frame` the robot was launched with |
+| `ready_joint_positions` | elbow-up pose | the observation pose, `joint1..joint7` in radians |
+| `states_file` | `pick_place_states.yaml` | the poses `record_states.py` writes; re-read every cycle |
+| `place_mode` | `state` | `state` drops at `drop_state`; `ready` at the observation pose; `position` uses `place_position` |
+| `place_position` | `[0.35, 0.30, 0.25]` | `place_mode:=position` only — **placeholder, measure yours** |
 | `grasp_finger_min` | `0.003` | finger position above which the gripper counts as holding something — measure it on your object |
 | `grasp_z_offset` | `-0.005` | applied to the object's detected *top* surface |
-| `approach_height` | `0.12` | pre-grasp height above the grasp |
+| `approach_height` | `0.05` | pre-grasp height above the grasp: where the gripper opens |
 | `use_table_collision` / `table_z` | `false` / `0.0` | explicit work-surface box; worth enabling with `octomap:=static`, where the map can legitimately be empty |
 | `velocity_scaling` | `0.15` | start lower on the first hardware run |
 
@@ -235,9 +383,14 @@ axis is just the box's aspect ratio.
 
 ### Calibrate these two before trusting it
 
-- **`place_position`** — the default `[0.35, 0.30, 0.25]` is a placeholder. Jog
-  the arm over your box in RViz and read the `openarm_left_hand_tcp` position off
-  TF.
+- **`pre_pick_state` and `drop_state`** — nothing ships with sensible defaults for
+  these because they depend on your table. Record them with `record_states.py`,
+  and check the tool height of `drop_state` with `--list` before the first run:
+  that is how far the object falls.
+- **The ready pose** — the default is a sensible elbow-up posture. Jog to the pose
+  you want and capture it with `/pick_place/capture_ready`. Only under
+  `place_mode:=position` does `place_position` matter, and its
+  `[0.35, 0.30, 0.25]` default is a placeholder.
 - **The detection itself** — before any motion, add a `PoseArray` display on
   `/vlm/detection_poses` in RViz. The arrow must land *on* the real object. If it
   is offset, the camera mount measurement in `cam_org.txt` is wrong, not the code.
@@ -264,6 +417,19 @@ source native/setup.bash && python3 native/tests/test_grasp_geometry.py
 Grasp poses: that the tool approach axis lands on world −Z at every yaw, that
 the fingers close perpendicular to the detected object axis, and that the retry
 ladder actually escalates.
+
+```bash
+source native/setup.bash && python3 native/tests/test_pick_cycle.py
+```
+
+A whole cycle against a stubbed robot — `/move_action`, the gripper, TF,
+`/joint_states`, the planning scene, cuMotion's parameters and the detector are
+all faked, so the real orchestrator runs and every goal it sends is recorded.
+It asserts the order of the eight goals, that PRE_PICK and DROP replay the
+recorded joint values, that PREGRASP and LIFT sit `approach_height` above the
+grasp, and that an unrecorded or wrong-arm states file makes the cycle refuse
+without sending a single goal. This is the one that catches a reordered
+sequence, which the geometry tests cannot see.
 
 ### Reach: ask cuMotion, never `/compute_ik`
 
@@ -302,6 +468,27 @@ Practically, for the left arm keep pick targets around **x ≤ 0.40, y ≥ +0.10
 table height. Reach does improve with height, so a riser buys a few centimetres —
 but moving the object into the near-left area is simpler and enough.
 
+The right arm mirrors it. Measured by planning a top-down pose straight through
+cuRobo from the ready pose, empty world, so this is reach and not collision
+(`# ` = plans):
+
+```
+              x=0.25  0.30  0.35  0.40  0.45  0.50
+z=0.42          #     #     #     #     .     .      y = -0.05 .. -0.30, all rows
+z=0.35          #     #     #     #     .     .      y = -0.10 .. -0.25
+z=0.25          #     #     .     .     .     .      y = -0.05 .. -0.30
+```
+
+So **x ≤ 0.40, y ≤ −0.10** at z ≥ 0.35, and only **x ≤ 0.30** if the object sits
+as low as z = 0.25. Nothing at x ≥ 0.45 at any height, exactly as on the left.
+Note the grasp itself is the *low* pose in a cycle, so a pick off a low table is
+the case that runs out of reach first.
+
+Reproduce either arm's figures with `check_reachability.py --arm right`, but
+remember it goes through cuMotion: the robot has to have been launched with a
+matching `tool_frame`, or every cell comes back unreachable for that reason
+instead.
+
 `VLM/pixel_to_world.py` tells you where something *is*; this tells you whether
 the arm can get there. A pick that dies on an opaque MoveIt error code is nearly
 always one of these two.
@@ -336,6 +523,20 @@ work.
   `/camera/camera/color/camera_info` is the one set of intrinsics that describes
   both. Expect ~6–10 Hz on the topics with alignment and RViz running, which is
   ample against a 0.4 s inference period.
+- **No grasp-pose network — the VLM's axis plus a top-down approach is enough.**
+  AnyGrasp, Contact-GraspNet and friends earn their keep on cluttered bins of
+  unknown objects, where the question "where *can* I grip this at all" is
+  genuinely open. That is not this problem: single objects on a flat table, a
+  parallel-jaw gripper, and an arm whose verified envelope is a top-down
+  approach over a small work area. Once the approach is fixed to straight down,
+  the only free parameter left is the wrist angle — one number, which the
+  detector already produces from the depth segmentation, and which the retry
+  ladder already escalates when it is wrong. A grasp network would decide the
+  same number at the cost of a third Python stack (the two here already conflict
+  over torch and numpy), a licence key in AnyGrasp's case, several more GB of
+  VRAM alongside PaliGemma, and 6-DOF poses that mostly fall outside an envelope
+  that only plans top-down anyway. Worth revisiting the day the objects arrive
+  in a pile.
 - **The grasp axis is segmented from depth, not from image contrast.**
   The earlier prototype ran Otsu on the colour crop. On a narrow crop of a
   screwdriver that locks onto the band where the handle meets the shaft and
@@ -407,6 +608,11 @@ native setup uses `native/build` and `native/install`, so the two never collide.
 - **cuMotion Planner (GPU IK)**: cuMotion is the default MoveIt planner for the
   7-DOF arms (`left_joint_trajectory_controller`,
   `right_joint_trajectory_controller`).
+- **One Cartesian link at a time**: cuMotion rejects any pose goal whose
+  `link_name` differs from its `ee_link` (`INVALID_LINK_NAME`), so the arm you can
+  give pose goals to is fixed at bringup by
+  `tool_frame:=openarm_{left,right}_hand_tcp`. `launch_everything.launch.py`
+  defaults it to the right hand. Joint-space goals are unaffected for either arm.
 - **Gripper Planning**: cuMotion **does not support 1-DOF grippers**. Planning for
   them with cuMotion is safely rejected rather than crashing.
   **Always switch the Planning Pipeline to `ompl` in RViz** for `left_gripper` or
@@ -466,3 +672,117 @@ source native/setup.bash && python3 native/tests/test_move_group_planners.py
 If `move_group` dies immediately with `freeglut failed to open display`, you are
 running without a display; use the headless test above, or start from a desktop
 session.
+
+### "every pick strategy was exhausted"
+
+All six attempts failed. The state now names the cause, so read the rest of the
+line before anything else:
+
+```bash
+ros2 topic echo /pick_place/state --once
+```
+
+| It says | What to do |
+| --- | --- |
+| `the planner is unusable for this arm` | see below — usually cuMotion has died |
+| `nothing matched "detect X"` | the detector saw no such object. Check `/vlm/debug_image`, and that it has finished loading — a pick started during the PaliGemma load fails this way six times over |
+| `could not plan to the pre-grasp above (x, y, z)` | almost always **out of reach**. The line includes a ready-made `check_reachability.py` command; for the right arm keep objects around `x ≤ 0.40, y ≤ −0.10` |
+| `could not plan to pre_pick_state` | the recorded staging pose is not reachable from the observation pose; re-record it |
+| `reached the pre-grasp but could not descend` | the octomap probably contains the object itself, or the grasp is under the table |
+| `the gripper closed but nothing was held` | `grasp_finger_min` or the grasp height is wrong for this object |
+
+The out-of-reach case is the one that looks most like a software fault and is
+not: the detector reports a perfectly good position, cuMotion simply cannot get
+the tool there. `/vlm/detections` gives you the coordinate to check:
+
+```bash
+ros2 topic echo /vlm/detections --once --full-length
+```
+
+### cuMotion dies mid-session
+
+It has crashed here with **SIGFPE**, six minutes into a session, leaving only
+this in the launch output:
+
+```
+[ERROR] [cumotion_goal_set_planner_node-5]: process has died [pid ..., exit code -8, ...]
+```
+
+With no planner every pose goal fails, so a pick walks the whole retry ladder and
+blames itself. The orchestrator now checks the planner is in the graph before it
+moves anything and refuses with `the planner is unusable for this arm`, but if a
+cycle is already running when it dies you still get the exhausted-ladder message.
+Confirm with:
+
+```bash
+ros2 node list | grep cumotion || echo "cuMotion is not running"
+```
+
+The fix is to restart the robot; a dead planner cannot be revived in place, since
+it reads `tool_frame` once at construction. Root cause unknown — the launch files
+now run every Python node with `PYTHONUNBUFFERED=1` so that the next crash leaves
+its traceback in `launch.log` instead of losing it in a stdout buffer, which is
+what happened the first time.
+
+### The detector never publishes, but the camera node is running
+
+Check which streams are actually live — and note that **`ros2 topic echo` will
+show nothing even on a healthy RealSense topic**, because it subscribes RELIABLE
+while the camera publishes BEST_EFFORT:
+
+```bash
+ros2 topic hz /camera/camera/color/image_raw
+```
+
+If depth ticks and colour does not, look for a **second camera taking the video
+device numbers**. librealsense pairs a colour stream with the adjacent
+`/dev/videoN` for its metadata, so another UVC device landing in the middle of
+the block breaks colour while leaving depth working:
+
+```bash
+for n in /sys/class/video4linux/video*; do
+    echo "$(basename $n) $(cat $n/name) $(readlink -f $n/device | sed 's|.*/||')"
+done
+```
+
+Every node of the RealSense colour interface (`:1.3` above) should be adjacent.
+If they are split, unplug the other camera and **re-enumerate the RealSense** —
+unplugging alone does not renumber what is already assigned:
+
+```bash
+sudo sh -c 'echo 0 > /sys/bus/usb/devices/2-4.1/authorized; sleep 2; echo 1 > /sys/bus/usb/devices/2-4.1/authorized'
+```
+
+### RViz never opens, but everything else starts
+
+Look for this in the launch output — it scrolls past quickly, and every other
+node comes up fine, so it reads like a launch-file problem when it is not:
+
+```
+rviz2: symbol lookup error: /snap/core20/current/lib/x86_64-linux-gnu/libpthread.so.0:
+undefined symbol: __libc_pthread_init, version GLIBC_PRIVATE
+[ERROR] [rviz2-4]: process has died [pid ..., exit code 127, ...]
+```
+
+That is a terminal opened **inside a snap** — VS Code's integrated terminal is
+the usual one here, since `code` is installed as a snap. The snap exports
+`GTK_PATH` and friends pointing back into itself; rviz2 loads a GTK module from
+`/snap/code`, whose RPATH pulls in core20's glibc 2.31 `libpthread` next to the
+host's 2.35, and it aborts before drawing anything.
+
+`native/setup.bash` now clears those variables when they point into a snap, and
+says so when it does:
+
+```
+note: cleared snap-provided GTK_PATH GTK_EXE_PREFIX ... (they crash rviz2)
+```
+
+So sourcing it is the fix. If RViz still will not start, check nothing re-added
+them after sourcing:
+
+```bash
+source native/setup.bash && env | grep -E '^(GTK_PATH|GIO_MODULE_DIR)=' ; rviz2 --help | head -1
+```
+
+That should print no `GTK_PATH` line and then rviz2's usage. Launching from a
+plain GNOME terminal instead of the VS Code one also avoids it entirely.

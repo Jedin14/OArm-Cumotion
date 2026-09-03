@@ -46,6 +46,10 @@ SUCCESS = 1
 
 
 def load_orchestrator():
+    # Loading by path does not put the workspace on sys.path, and the
+    # orchestrator imports vlm_prompt from beside itself.
+    if WS not in sys.path:
+        sys.path.insert(0, WS)
     path = os.path.join(WS, 'pick_place_orchestrator.py')
     spec = importlib.util.spec_from_file_location('pick_place_orchestrator', path)
     module = importlib.util.module_from_spec(spec)
