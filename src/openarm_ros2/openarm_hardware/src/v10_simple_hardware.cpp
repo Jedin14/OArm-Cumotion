@@ -282,9 +282,16 @@ hardware_interface::return_type OpenArm_v10HW::read(
       double motor_pos = gripper_motors[0].get_position();
       pos_states_[ARM_DOF] = motor_radians_to_joint(motor_pos);
 
-      // Unimplemented: Velocity and torque mapping
+      // Velocity mapping is still unimplemented. Torque is not: it is read
+      // straight off the motor, in Nm, because a grip-force cap is impossible
+      // without it -- the closing force is position error times the fixed
+      // GRIPPER_DEFAULT_KP, so the only way to bound it is to stop advancing
+      // the position command once measured torque says the cap is reached.
+      // Read-only: this changes no command, it only populates the effort state
+      // interface that is already exported for this joint, so the value shows
+      // up in /joint_states for whoever enforces the cap.
       vel_states_[ARM_DOF] = 0;  // gripper_motors[0].get_velocity();
-      tau_states_[ARM_DOF] = 0;  // gripper_motors[0].get_torque();
+      tau_states_[ARM_DOF] = gripper_motors[0].get_torque();
     }
   }
 

@@ -42,3 +42,13 @@ core.*
 
 # Frames dumped by the VLM debug tools (VLM/pixel_to_world.py writes these).
 pixel_to_world_frame.png
+
+# --- test artefacts ----------------------------------------------------------
+# test_vlm_geometry.py renders an annotated frame so the dot and coordinates can
+# be looked at rather than argued about. Useful to open, not to commit.
+VLM/test_debug_render.png
+vlm_detection.png
+
+# Append-only record of every commanded motion, for debugging a run
+# after the fact. Grows without bound; never committed.
+motion_log.jsonl

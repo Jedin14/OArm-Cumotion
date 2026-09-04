@@ -73,6 +73,10 @@ class CumotionActionServer(Node):
         self.declare_parameter('collision_cache_mesh', 20)
         self.declare_parameter('collision_cache_cuboid', 20)
         self.declare_parameter('voxel_size', 0.05)
+        # Clearance the planner keeps from everything in the world, in metres.
+        # cuRobo's own default is 0.01; raising it inflates every obstacle,
+        # including octomap voxels, so trajectories are pushed further away.
+        self.declare_parameter('collision_activation_distance', 0.01)
         self.declare_parameter('read_esdf_world', False)
         self.declare_parameter('publish_curobo_world_as_voxels', False)
         self.declare_parameter('add_ground_plane', False)
@@ -134,6 +138,11 @@ class CumotionActionServer(Node):
                 self.__tool_frame = None
         except rclpy.exceptions.ParameterUninitializedException:
             self.__tool_frame = None
+
+        self.__collision_activation_distance = (
+            self.get_parameter('collision_activation_distance')
+            .get_parameter_value().double_value
+        )
 
         self.__joint_states_topic = (
             self.get_parameter('joint_states_topic').get_parameter_value().string_value
@@ -327,6 +336,7 @@ class CumotionActionServer(Node):
             interpolation_dt=self.__interpolation_dt,
             collision_cache=self.__collision_cache,
             collision_checker_type=CollisionCheckerType.VOXEL,
+            collision_activation_distance=self.__collision_activation_distance,
             ee_link_name=self.__tool_frame,
             finetune_trajopt_iters=self.__trajopt_finetune_iters,
         )
@@ -334,6 +344,10 @@ class CumotionActionServer(Node):
         motion_gen = MotionGen(motion_gen_config)
         self.motion_gen = motion_gen
         self.__robot_base_frame = self.motion_gen.kinematics.base_link
+
+        self.get_logger().info(
+            'collision activation distance: '
+            f'{self.__collision_activation_distance:.3f} m')
 
         self.__world_collision = self.motion_gen.world_coll_checker
         if not self.__add_ground_plane:

@@ -13,19 +13,25 @@ here loads PaliGemma or needs a ROS graph.
 """
 
 import math
+import os
 import sys
 from types import SimpleNamespace
 
 import cv2
 import numpy as np
 
-from vlm_detector_node import (
-    VlmDetectorNode,
+from vlm_geometry import (
+    Intrinsics,
+    render_debug,
     axis_from_mask,
+    axis_yaw_world,
+    build_detections,
     decode_image,
+    deproject,
     object_axis_angle,
     parse_paligemma_coordinates,
     quat_to_rot,
+    sample_depth,
 )
 
 FAILURES = []
@@ -78,8 +84,10 @@ def test_deprojection():
     """fx=fy=400, principal point (424, 240), a pixel 20 px right and 20 up."""
     info = SimpleNamespace(k=[400.0, 0.0, 424.0, 0.0, 400.0, 240.0,
                               0.0, 0.0, 1.0])
-    stub = SimpleNamespace()
-    got = VlmDetectorNode._deproject(stub, info, 444, 220, 0.8)
+    intrinsics = Intrinsics.from_camera_info(info)
+    check('CameraInfo unpacks to fx, fy, cx, cy',
+          list(intrinsics), [400.0, 400.0, 424.0, 240.0])
+    got = deproject(intrinsics, 444, 220, 0.8)
     check('deproject', got, [0.04, -0.04, 0.8])
 
 
@@ -104,18 +112,17 @@ def test_depth_sampling():
     there -- common on shiny or thin objects -- reported "depth invalid" for an
     otherwise clean detection.
     """
-    stub = SimpleNamespace(depth_scale=0.001, min_depth=0.15, max_depth=3.0)
     depth = np.zeros((480, 848), np.uint16)
     depth[200:300, 380:480] = 800                 # object at 0.8 m
     depth[248:252, 428:432] = 0                   # dropout at the centre
     box = [380, 200, 480, 300]
 
-    z, n_px = VlmDetectorNode._sample_depth(stub, depth, box)
+    z, n_px = sample_depth(depth, box, 0.001, 0.15, 3.0)
     check('median depth survives a centre dropout', z, 0.8)
     print(f'pass  sampled {n_px} valid pixels')
 
     empty = np.zeros((480, 848), np.uint16)
-    z_none, n_none = VlmDetectorNode._sample_depth(stub, empty, box)
+    z_none, n_none = sample_depth(empty, box, 0.001, 0.15, 3.0)
     check('all-invalid depth returns None', [z_none is None, n_none], [True, 0])
 
 
@@ -222,6 +229,140 @@ def test_object_axis_fallbacks():
     check_equal('degenerate box -> no angle', (angle, source), (None, 'empty'))
 
 
+def test_build_detections():
+    """The records both consumers read, from one function.
+
+    build_detections is shared by the node and by vlm_detect.py so that the dot
+    drawn on the debug image and the coordinate the orchestrator drives to come
+    out of the same code. A box with no usable depth has to survive into the
+    overlay while staying out of the detections: seeing a box with no depth is
+    the whole diagnosis when an object refuses to be picked.
+    """
+    intrinsics = Intrinsics(400.0, 400.0, 424.0, 240.0)
+    rot = quat_to_rot(1.0, 0.0, 0.0, 0.0)          # Rx(pi)
+    trans = np.array([0.5, 0.0, 1.0])
+
+    depth = np.zeros((480, 848), np.uint16)
+    depth[200:300, 380:480] = 800                  # near object at 0.8 m
+    depth[100:160, 600:700] = 1200                 # far object at 1.2 m
+    # Third box deliberately over a depth hole.
+    raw = [
+        {'box': [380, 200, 480, 300], 'center': (430, 250)},
+        {'box': [600, 100, 700, 160], 'center': (650, 130)},
+        {'box': [50, 50, 120, 120], 'center': (85, 85)},
+    ]
+
+    detections, overlay = build_detections(
+        np.zeros((480, 848, 3), np.uint8), depth, raw, intrinsics, rot, trans,
+        0.001, 0.15, 3.0, 0.03)
+
+    check_equal('two boxes had depth', len(detections), 2)
+    check_equal('all three are on the overlay', len(overlay), 3)
+    check_equal('the depthless box is on the overlay with depth None',
+                [o[1]['depth_m'] for o in overlay].count(None), 1)
+    check_equal('nearest first', [d['depth_m'] for d in detections],
+                [0.8, 1.2])
+
+    near = detections[0]
+    check_equal('centre pixel is carried through', near['center_px'], [430, 250])
+    check('camera xyz', near['point_cam'], [0.012, 0.02, 0.8])
+    # Rx(pi) sends optical +y to world -y and +z to world -z, then the mount
+    # offset is added.
+    check('world xyz', near['point'], [0.512, -0.02, 0.2])
+    check_equal('every field the orchestrator reads is present',
+                sorted(near.keys()),
+                ['axis_source', 'axis_yaw', 'bbox_px', 'center_px', 'depth_m',
+                 'depth_px', 'image_angle_deg', 'point', 'point_cam'])
+
+    empty, empty_overlay = build_detections(
+        np.zeros((480, 848, 3), np.uint8), depth, [], intrinsics, rot, trans,
+        0.001, 0.15, 3.0, 0.03)
+    check_equal('no boxes gives no detections', (empty, empty_overlay), ([], []))
+
+
+def test_oversized_box_rejected():
+    """A box covering the frame is the model shrugging, not a detection.
+
+    paligemma-3b-pt-224 always answers. Asked for something absent it returns a
+    band across the whole view; the centre of that band became a grasp target
+    in the middle of a table, out of reach of both arms, and the failure read
+    as a reach problem three steps later.
+    """
+    intrinsics = Intrinsics(400.0, 400.0, 424.0, 240.0)
+    depth = np.full((480, 848), 750, np.uint16)      # good depth everywhere
+    color = np.zeros((480, 848, 3), np.uint8)
+
+    # The real shape, as observed: the box was the entire frame. On the debug
+    # image that reads as a thin border right around the edge -- easy to miss,
+    # because the eye goes to the green axis contour drawn inside it.
+    band = [{'box': [0, 0, 848, 480], 'center': (423, 239)}]
+    detections, overlay = build_detections(
+        color, depth, band, intrinsics, np.eye(3), np.zeros(3),
+        0.001, 0.15, 3.0, 0.03)
+    check_equal('a whole-table band is not a detection', detections, [])
+    check_equal('but it stays on the overlay', len(overlay), 1)
+    check_equal('with the reason given',
+                'covers' in (overlay[0][1].get('rejected') or ''), True)
+
+    # A plausible object-sized box in the same frame must survive.
+    small = [{'box': [400, 220, 450, 262], 'center': (425, 241)}]
+    detections, _ = build_detections(
+        color, depth, small, intrinsics, np.eye(3), np.zeros(3),
+        0.001, 0.15, 3.0, 0.03)
+    check_equal('an object-sized box is kept', len(detections), 1)
+
+    # And the threshold is adjustable rather than hard-wired.
+    detections, _ = build_detections(
+        color, depth, band, intrinsics, np.eye(3), np.zeros(3),
+        0.001, 0.15, 3.0, 0.03, max_box_fraction=0.0)
+    check_equal('max_box_fraction 0 disables the filter', len(detections), 1)
+
+
+def test_debug_render():
+    """The annotated frame really carries a dot and the coordinates.
+
+    Checked by rendering, not by reading the code: the dot is the thing being
+    asked for, and it is easy to draw it off-screen or in the background colour
+    and not notice.
+    """
+    intrinsics = Intrinsics(400.0, 400.0, 424.0, 240.0)
+    depth = np.zeros((480, 848), np.uint16)
+    depth[200:300, 380:480] = 800
+    color = np.full((480, 848, 3), 40, np.uint8)
+    raw = [{'box': [380, 200, 480, 300], 'center': (430, 250)}]
+
+    detections, overlay = build_detections(
+        color, depth, raw, intrinsics, np.eye(3), np.zeros(3),
+        0.001, 0.15, 3.0, 0.03)
+    canvas = render_debug(color, depth, overlay, 'detect screwdriver',
+                          hud=['test render'], depth_scale=0.001)
+
+    check_equal('the canvas matches the frame size', canvas.shape, color.shape)
+    check_equal('and is not just a copy of the input',
+                bool(np.any(canvas != color)), True)
+
+    # A red dot at the reported centre: render_debug draws (0, 0, 255) there.
+    cx, cy = detections[0]['center_px']
+    patch = canvas[cy - 3:cy + 4, cx - 3:cx + 4]
+    reddest = patch.reshape(-1, 3)
+    is_red = ((reddest[:, 2] > 200) & (reddest[:, 0] < 80)
+              & (reddest[:, 1] < 80)).any()
+    check_equal('a red dot sits on the reported centre pixel', bool(is_red), True)
+
+    # And the coordinate text is on there. Rendered text is not readable back,
+    # so check that the region below the box gained light pixels where the
+    # xyz line is drawn.
+    x1, _, _, y2 = detections[0]['bbox_px']
+    text_band = canvas[y2 + 4:y2 + 70, x1:x1 + 260]
+    check_equal('coordinate text is drawn under the box',
+                bool((text_band > 200).any()), True)
+
+    out = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                       'test_debug_render.png')
+    cv2.imwrite(out, canvas)
+    print(f'pass  wrote {out} -- open it to see the dot and the coordinates')
+
+
 def test_axis_yaw():
     """Image angle -> world yaw, through the same Rx(pi) camera.
 
@@ -233,16 +374,16 @@ def test_axis_yaw():
     info = SimpleNamespace(k=[400.0, 0.0, 424.0, 0.0, 400.0, 240.0,
                               0.0, 0.0, 1.0])
     rot = quat_to_rot(1.0, 0.0, 0.0, 0.0)
-    stub = SimpleNamespace()
-    got_h = VlmDetectorNode._axis_yaw_world(stub, 0.0, info, rot, 0.8)
-    got_v = VlmDetectorNode._axis_yaw_world(stub, 90.0, info, rot, 0.8)
+    intrinsics = Intrinsics.from_camera_info(info)
+    got_h = axis_yaw_world(0.0, intrinsics, rot, 0.8)
+    got_v = axis_yaw_world(90.0, intrinsics, rot, 0.8)
     check('horizontal image axis -> yaw 0', got_h, 0.0)
     check('vertical image axis -> yaw -90 deg', got_v, -math.pi / 2)
 
     # An image axis that maps onto world Z has no projection in the XY plane,
     # so there is no yaw to report and the node must say so rather than guess.
     rot_x_up = np.array([[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]])
-    degenerate = VlmDetectorNode._axis_yaw_world(stub, 0.0, info, rot_x_up, 0.8)
+    degenerate = axis_yaw_world(0.0, intrinsics, rot_x_up, 0.8)
     check('axis along world Z -> no yaw', [degenerate is None], [True])
 
 
@@ -256,6 +397,9 @@ def main():
     test_object_axis_prefers_depth()
     test_object_axis_fallbacks()
     test_axis_yaw()
+    test_build_detections()
+    test_oversized_box_rejected()
+    test_debug_render()
 
     print()
     if FAILURES:

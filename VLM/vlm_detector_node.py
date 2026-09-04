@@ -35,6 +35,7 @@ box and apt-installing it would need root; every other message type here ships
 with ros-humble-desktop. Schema:
 
   {"stamp": <float secs>, "frame_id": "world", "prompt": "detect screwdriver",
+   "image_size": [width, height],
    "detections": [{"bbox_px": [x1,y1,x2,y2], "center_px": [cx,cy],
                    "depth_m": 0.62, "point_cam": [x,y,z], "point": [x,y,z],
                    "axis_yaw": 1.23, "image_angle_deg": 12.3,
@@ -49,221 +50,47 @@ does that.
 """
 
 import json
-import math
-import re
 import threading
 import time
 
 import cv2
 import numpy as np
 import rclpy
-import torch
-from PIL import Image as PILImage
 from geometry_msgs.msg import Pose, PoseArray
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
-from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
 
-LOC_PATTERN = re.compile(r'<loc(\d{4})><loc(\d{4})><loc(\d{4})><loc(\d{4})>')
+# torch, transformers and PIL are imported inside _load_model, not here.
+# They cost seconds and gigabytes, and importing this module for its
+# re-exported geometry should not pay that -- nor should it fail on a python
+# whose PIL is too old for transformers, which is what
+# "module 'PIL.Image' has no attribute 'Resampling'" was.
 
-
-def quat_to_rot(x, y, z, w):
-    """Quaternion -> 3x3 rotation matrix. Avoids a tf2_geometry_msgs/PyKDL dep."""
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ])
-
-
-def yaw_to_quat(yaw):
-    return (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
-
-
-def decode_image(msg):
-    """sensor_msgs/Image -> numpy array, for the encodings this pipeline emits."""
-    if msg.encoding in ('16UC1', 'mono16'):
-        return np.frombuffer(msg.data, np.uint16).reshape(msg.height, msg.width)
-    if msg.encoding == 'rgb8':
-        arr = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.width, 3)
-        return arr[:, :, ::-1].copy()          # to BGR, what cv2 expects
-    if msg.encoding == 'bgr8':
-        return np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.width, 3).copy()
-    raise ValueError(f'unsupported encoding {msg.encoding}')
-
-
-def parse_paligemma_coordinates(output_text, img_width, img_height):
-    """Unchanged from the original prototype: <locNNNN> quadruples -> pixel boxes."""
-    detections = []
-    for match in LOC_PATTERN.findall(output_text):
-        ymin, xmin, ymax, xmax = [int(v) / 1024.0 for v in match]
-        x1, y1 = int(xmin * img_width), int(ymin * img_height)
-        x2, y2 = int(xmax * img_width), int(ymax * img_height)
-        detections.append({
-            'box': [x1, y1, x2, y2],
-            'center': (int((x1 + x2) / 2), int((y1 + y2) / 2)),
-        })
-    return detections
-
-
-def clamp_box(box, shape):
-    x1, y1, x2, y2 = box
-    h, w = shape[:2]
-    return max(0, x1), max(0, y1), min(w, x2), min(h, y2)
-
-
-def axis_from_mask(mask, origin, min_area=30):
-    """Long axis of the biggest blob in `mask`, in degrees, plus its corners.
-
-    The angle is such that the axis direction is (cos a, sin a) in pixel
-    coordinates. minAreaRect's own angle describes the rect's first edge, which
-    is the short one whenever width < height, so the +90 puts it back on the
-    long axis. Verified against OpenCV 5, whose rect angles run in [-90, 0):
-    every orientation comes back correct modulo 180 degrees, which is all an
-    undirected grasp axis needs.
-    """
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None, None
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < min_area:
-        return None, None
-
-    rect = cv2.minAreaRect(largest)
-    (rw, rh), angle = rect[1], rect[2]
-    if rw < rh:
-        angle += 90.0
-    return angle, np.intp(cv2.boxPoints(rect)) + list(origin)
-
-
-def object_axis_angle(image, depth, box, z_ref, depth_scale, depth_tol=0.03):
-    """Object long axis in the image. Returns (degrees, corners, source).
-
-    Segmentation is by depth, not intensity. Otsu on the colour crop -- what
-    the prototype's calculate_orientation did -- keys on whatever contrast
-    happens to be inside the box, and on a narrow crop of a screwdriver it
-    latches onto the boundary between shaft and handle and reports an axis
-    ~80 degrees off the true one. Depth ignores texture entirely: anything
-    within a few centimetres of the object's own median depth is the object.
-
-    Intensity is kept as a fallback for objects the depth sensor cannot see
-    (thin, dark, shiny), and the box's own aspect ratio as a last resort, since
-    an elongated box already tells you which way the object lies.
-    """
-    x1, y1, x2, y2 = clamp_box(box, image.shape)
-    if x2 <= x1 or y2 <= y1:
-        return None, None, 'empty'
-
-    depth_crop = depth[y1:y2, x1:x2].astype(np.float32) * depth_scale
-    mask = ((np.abs(depth_crop - z_ref) < depth_tol) & (depth_crop > 0)).astype(np.uint8)
-    angle, corners = axis_from_mask(mask, (x1, y1))
-    if angle is not None:
-        return angle, corners, 'depth'
-
-    gray = cv2.cvtColor(image[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    angle, corners = axis_from_mask(thresh, (x1, y1))
-    if angle is not None:
-        return angle, corners, 'intensity'
-
-    return (0.0 if (x2 - x1) >= (y2 - y1) else -90.0), None, 'bbox'
-
-
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-
-
-def put_lines(canvas, lines, x, y, colour, scale=0.42, line_h=15):
-    """Text block with a dark backing, clamped to stay inside the canvas."""
-    h, w = canvas.shape[:2]
-    widest = max((cv2.getTextSize(t, FONT, scale, 1)[0][0] for t in lines),
-                 default=0)
-    x = max(2, min(x, w - widest - 4))
-    y = max(line_h, min(y, h - line_h * len(lines) - 2))
-
-    overlay = canvas.copy()
-    cv2.rectangle(overlay, (x - 3, y - line_h + 3),
-                  (x + widest + 3, y + line_h * (len(lines) - 1) + 5),
-                  (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.45, canvas, 0.55, 0, canvas)
-
-    for i, text in enumerate(lines):
-        cv2.putText(canvas, text, (x, y + i * line_h), FONT, scale, colour, 1,
-                    cv2.LINE_AA)
-
-
-def colorize_depth(depth, depth_scale, near=0.2, far=2.0):
-    """Depth to a viewable rainbow, the way rs.colorizer did in the prototype."""
-    metres = depth.astype(np.float32) * depth_scale
-    norm = np.clip((metres - near) / max(far - near, 1e-6), 0.0, 1.0)
-    view = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
-    view[metres <= 0] = 0                       # dropouts stay black, not red
-    return view
-
-
-def render_debug(color, depth, items, prompt, hud=(), dashboard=False,
-                 depth_scale=0.001):
-    """Annotated view of what the detector saw and what it produced.
-
-    `items` is [(corners, record), ...] in detection order, where record is the
-    same dict published on /vlm/detections -- so what you read on the image and
-    what the orchestrator acts on cannot drift apart.
-    """
-    canvas = color.copy()
-    label = prompt.replace('detect ', '')
-
-    for index, (corners, record) in enumerate(items):
-        x1, y1, x2, y2 = record['bbox_px']
-        has_depth = record.get('depth_m') is not None
-        box_colour = (0, 165, 255) if has_depth else (0, 0, 255)
-
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), box_colour, 2)
-        cv2.circle(canvas, tuple(record['center_px']), 4, (0, 0, 255), -1)
-        if corners is not None:
-            cv2.drawContours(canvas, [corners], 0, (0, 255, 0), 2)
-
-        if not has_depth:
-            put_lines(canvas, [f'#{index} {label}', 'no valid depth'],
-                      x1, y2 + 16, (0, 0, 255))
-            continue
-
-        wx, wy, wz = record['point']
-        yaw = record['axis_yaw']
-        lines = [
-            f'#{index} {label}  d={record["depth_m"]:.3f}m',
-            f'xyz {wx:+.3f} {wy:+.3f} {wz:+.3f}',
-            (f'yaw {math.degrees(yaw):+.1f}deg' if yaw is not None
-             else 'yaw unavailable') + f'  img {record["image_angle_deg"]:+.0f}',
-            f'axis={record["axis_source"]}  depth_px={record["depth_px"]}',
-        ]
-        # Below the box when there is room, above it otherwise.
-        below = y2 + 16
-        put_lines(canvas, lines, x1,
-                  below if below + 15 * len(lines) < canvas.shape[0] else y1 - 62,
-                  (255, 255, 255))
-
-    header = list(hud)
-    if not items:
-        header.insert(0, f'scanning for "{label}" - nothing detected')
-    else:
-        header.insert(0, f'target: {label}')
-    put_lines(canvas, header, 8, 18, (0, 255, 255), scale=0.45, line_h=17)
-
-    if dashboard:
-        # Boxes go on the depth panel too: this is where you see *why* a
-        # detection had no depth -- a black hole where the object should be.
-        depth_view = colorize_depth(depth, depth_scale)
-        for corners, record in items:
-            x1, y1, x2, y2 = record['bbox_px']
-            cv2.rectangle(depth_view, (x1, y1), (x2, y2), (255, 255, 255), 2)
-            cv2.circle(depth_view, tuple(record['center_px']), 4, (0, 0, 0), -1)
-            if corners is not None:
-                cv2.drawContours(depth_view, [corners], 0, (0, 0, 0), 1)
-        canvas = np.hstack((canvas, depth_view))
-    return canvas
+# Geometry, parsing and the overlay live in vlm_geometry so they can be
+# imported without rclpy, torch or transformers -- see that module.
+# Re-exported here because both this node and vlm_detect.py import them.
+from vlm_geometry import (  # noqa: F401
+    FONT,
+    Intrinsics,
+    LOC_PATTERN,
+    axis_from_mask,
+    axis_yaw_world,
+    build_detections,
+    clamp_box,
+    colorize_depth,
+    decode_image,
+    deproject,
+    object_axis_angle,
+    parse_paligemma_coordinates,
+    put_lines,
+    quat_to_rot,
+    render_debug,
+    sample_depth,
+    yaw_to_quat,
+)
 
 
 class VlmDetectorNode(Node):
@@ -317,15 +144,7 @@ class VlmDetectorNode(Node):
         self.pub_poses = self.create_publisher(PoseArray, '/vlm/detection_poses', 10)
         self.pub_debug = self.create_publisher(Image, '/vlm/debug_image', 1)
 
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model_id = p('model_id').value
-        self.get_logger().info(f'loading {model_id} onto {self.device} ...')
-        self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = PaliGemmaForConditionalGeneration.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16 if self.device == 'cuda' else torch.float32,
-        ).to(self.device)
-        self.get_logger().info('model loaded')
+        self._load_model(p('model_id').value)
 
         # Inference blocks for a few hundred ms; keeping it off the executor
         # thread means camera callbacks and tf keep flowing while it runs.
@@ -333,6 +152,23 @@ class VlmDetectorNode(Node):
         self._worker = threading.Thread(target=self._inference_loop, daemon=True)
         self._worker.start()
         self.get_logger().info(f'detecting: {self.prompt!r}')
+
+    def _load_model(self, model_id):
+        """Import and load PaliGemma. The heavy dependencies live here only."""
+        import torch
+        from PIL import Image as PILImage
+        from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
+
+        self.torch = torch
+        self.pil_image = PILImage
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.get_logger().info(f'loading {model_id} onto {self.device} ...')
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.model = PaliGemmaForConditionalGeneration.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16 if self.device == 'cuda' else torch.float32,
+        ).to(self.device)
+        self.get_logger().info('model loaded')
 
     # -- subscriptions -------------------------------------------------------
 
@@ -370,33 +206,6 @@ class VlmDetectorNode(Node):
 
     # -- geometry ------------------------------------------------------------
 
-    def _sample_depth(self, depth, box):
-        """Median depth over the inner half of the box.
-
-        The original prototype read the single centre pixel, so one dropout at the
-        object centre sent it down the "depth reading is invalid" path even with
-        a perfectly good detection all around it.
-        """
-        x1, y1, x2, y2 = box
-        h, w = depth.shape
-        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-        half_w = max(2.0, (x2 - x1) * 0.25)
-        half_h = max(2.0, (y2 - y1) * 0.25)
-        ix1 = max(0, int(cx - half_w))
-        ix2 = min(w, int(cx + half_w) + 1)
-        iy1 = max(0, int(cy - half_h))
-        iy2 = min(h, int(cy + half_h) + 1)
-        patch = depth[iy1:iy2, ix1:ix2].astype(np.float32) * self.depth_scale
-        valid = patch[(patch > self.min_depth) & (patch < self.max_depth)]
-        if valid.size == 0:
-            return None, 0
-        return float(np.median(valid)), int(valid.size)
-
-    def _deproject(self, info, u, v, z):
-        fx, fy = info.k[0], info.k[4]
-        cx, cy = info.k[2], info.k[5]
-        return np.array([(u - cx) * z / fx, (v - cy) * z / fy, z])
-
     def _lookup_camera_to_target(self, source_frame, stamp):
         tf = self.tf_buffer.lookup_transform(
             self.target_frame, source_frame, stamp,
@@ -404,25 +213,6 @@ class VlmDetectorNode(Node):
         t = tf.transform.translation
         q = tf.transform.rotation
         return quat_to_rot(q.x, q.y, q.z, q.w), np.array([t.x, t.y, t.z])
-
-    def _axis_yaw_world(self, angle_deg, info, rot, z):
-        """Image-plane long axis -> yaw in the world XY plane.
-
-        The camera is pitched 60deg forward, so the image angle is not a world
-        yaw. Turn it into a camera-frame direction first (a pixel step maps to
-        dx/fx*z, dy/fy*z at constant depth), rotate that into the world, then
-        project onto XY.
-        """
-        a = math.radians(angle_deg)
-        fx, fy = info.k[0], info.k[4]
-        d_cam = np.array([math.cos(a) * z / fx, math.sin(a) * z / fy, 0.0])
-        n = np.linalg.norm(d_cam)
-        if n < 1e-9:
-            return None
-        d_world = rot @ (d_cam / n)
-        if abs(d_world[0]) < 1e-6 and abs(d_world[1]) < 1e-6:
-            return None                        # axis points straight up: no yaw
-        return math.atan2(d_world[1], d_world[0])
 
     # -- main loop -----------------------------------------------------------
 
@@ -467,9 +257,10 @@ class VlmDetectorNode(Node):
 
         inference_started = time.time()
         inputs = self.processor(text=prompt,
-                                images=PILImage.fromarray(color[:, :, ::-1]),
+                                images=self.pil_image.fromarray(
+                                    color[:, :, ::-1]),
                                 return_tensors='pt').to(self.device)
-        with torch.no_grad():
+        with self.torch.no_grad():
             generated = self.model.generate(**inputs, max_new_tokens=100)
         text = self.processor.batch_decode(generated, skip_special_tokens=False)[0]
         elapsed = time.time() - inference_started
@@ -484,51 +275,20 @@ class VlmDetectorNode(Node):
                 throttle_duration_sec=5.0)
             return
 
-        detections = []
-        corners_by_index = []
-        for det in raw:
-            box, center = det['box'], det['center']
-            z, n_px = self._sample_depth(depth, box)
-            if z is None:
-                # Keep it for the overlay: seeing a box with no depth is the
-                # whole diagnosis when an object refuses to be picked.
-                corners_by_index.append((None, {
-                    'bbox_px': [int(v) for v in box],
-                    'center_px': [int(center[0]), int(center[1])],
-                    'depth_m': None,
-                }))
-                continue
-            point_cam = self._deproject(info, center[0], center[1], z)
-            point_world = rot @ point_cam + trans
-
-            angle, corners, axis_source = object_axis_angle(
-                color, depth, box, z, self.depth_scale,
-                self.get_parameter('axis_depth_tolerance').value)
-            axis_yaw = (self._axis_yaw_world(angle, info, rot, z)
-                        if angle is not None else None)
-
-            record = {
-                'bbox_px': [int(v) for v in box],
-                'center_px': [int(center[0]), int(center[1])],
-                'depth_m': round(z, 4),
-                'point_cam': [round(float(v), 4) for v in point_cam],
-                'point': [round(float(v), 4) for v in point_world],
-                'axis_yaw': None if axis_yaw is None else round(axis_yaw, 4),
-                'image_angle_deg': None if angle is None else round(float(angle), 2),
-                'axis_source': axis_source,
-                'depth_px': n_px,
-            }
-            detections.append(record)
-            corners_by_index.append((corners, record))
-
-        # Sort nearest-first so consumers can just take detections[0].
-        detections.sort(key=lambda d: d['depth_m'])
+        detections, corners_by_index = build_detections(
+            color, depth, raw, Intrinsics.from_camera_info(info), rot, trans,
+            self.depth_scale, self.min_depth, self.max_depth,
+            self.get_parameter('axis_depth_tolerance').value)
 
         now = self.get_clock().now()
         payload = {
             'stamp': now.nanoseconds * 1e-9,
             'frame_id': self.target_frame,
             'prompt': prompt,
+            # Needed to say which half of the camera view a detection is in,
+            # which is how the orchestrator picks an arm. center_px on its own
+            # cannot answer that without knowing the frame width.
+            'image_size': [width, height],
             'detections': detections,
         }
         self.pub_json.publish(String(data=json.dumps(payload)))

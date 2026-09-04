@@ -16,9 +16,17 @@
 left_arm:
   kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
   kinematics_solver_search_resolution: 0.0050000000000000001
-  kinematics_solver_timeout: 0.0050000000000000001
+  # 5 ms was the generated default and it is far too short for a 7-DOF arm
+  # with a full 6-DOF pose goal: KDL is a randomly-seeded iterative solver, and
+  # a single 5 ms attempt fails on poses that are perfectly reachable -- which
+  # turned into "out of reach" refusals on objects the arm could pick.
+  kinematics_solver_timeout: 0.05
 
 right_arm:
   kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
   kinematics_solver_search_resolution: 0.0050000000000000001
-  kinematics_solver_timeout: 0.0050000000000000001
+  # 5 ms was the generated default and it is far too short for a 7-DOF arm
+  # with a full 6-DOF pose goal: KDL is a randomly-seeded iterative solver, and
+  # a single 5 ms attempt fails on poses that are perfectly reachable -- which
+  # turned into "out of reach" refusals on objects the arm could pick.
+  kinematics_solver_timeout: 0.05

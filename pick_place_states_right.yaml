@@ -1,0 +1,19 @@
+# Arm poses for the VLM pick-and-place cycle.
+# Written by record_states.py -- re-record with:
+#     python3 record_states.py <state_name>
+# joints are openarm_<arm>_joint1..joint7 in radians. tcp_xyz is where
+# that pose puts the tool, in the world frame, and is informational.
+arm: right
+states:
+  pre_pick_state:
+    joints: [-1.080148, 0.002861, -0.001717, 2.178416, 0.00248, -0.002861, 0.480087]
+    joint_names: [openarm_right_joint1, openarm_right_joint2, openarm_right_joint3,
+      openarm_right_joint4, openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
+    tcp_xyz: [0.1784, -0.1735, 0.4974]
+    recorded: '2026-09-03T10:59:31'
+  drop_state:
+    joints: [-0.396162, 0.185206, -0.310712, 2.180323, 0.141718, 0.536164, -0.663577]
+    joint_names: [openarm_right_joint1, openarm_right_joint2, openarm_right_joint3,
+      openarm_right_joint4, openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
+    tcp_xyz: [0.2146, -0.0112, 0.456]
+    recorded: '2026-09-03T11:00:22'

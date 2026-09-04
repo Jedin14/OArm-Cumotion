@@ -36,6 +36,8 @@ import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import SetParameters
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
@@ -43,10 +45,41 @@ from std_srvs.srv import Trigger
 from vlm_prompt import to_detection_prompt
 
 WS = os.path.dirname(os.path.realpath(__file__))
-DEFAULT_STATES_FILE = os.path.join(WS, 'pick_place_states.yaml')
+DEFAULT_STATES_FILE = 'auto'
 
 # States that mean the cycle is over, so the buttons can be re-enabled.
-TERMINAL = ('DONE', 'FAILED', 'ABORTED', 'IDLE')
+# Imported rather than repeated: keeping a second copy here is how OUT_OF_REACH
+# ended up leaving Pick greyed out with no way to try another object.
+try:
+    from pick_place_orchestrator import TERMINAL_STATES as TERMINAL
+except ImportError:                              # panel run without the rest
+    TERMINAL = ('DONE', 'FAILED', 'ABORTED', 'OUT_OF_REACH', 'IDLE')
+
+# Torque cap at the gripper motor, in Nm -- the same units and default as
+# DEFAULT_GRIPPER_TORQUE_CAP_NM in the exoskeleton bridge. 2.5 Nm is roughly
+# 59.5 N at the finger over the 42.0 mm/rad transmission.
+DEFAULT_TORQUE_CAP_NM = 2.5
+MAX_TORQUE_CAP_NM = 8.0
+
+
+def state_files(path):
+    """The states files to report on.
+
+    "auto" is what the launch files pass, because the orchestrator derives the
+    real name from its arm and the panel does not know which arm that is. So
+    report on every per-arm file that exists, plus the pre-split one.
+    """
+    if path and path != 'auto':
+        return [path]
+    found = [os.path.join(WS, f'pick_place_states_{arm}.yaml')
+             for arm in ('left', 'right')]
+    found = [p for p in found if os.path.exists(p)]
+    # Only mention the pre-split file when nothing has replaced it, so a
+    # migrated setup does not report the same arm twice.
+    legacy = os.path.join(WS, 'pick_place_states.yaml')
+    if not found and os.path.exists(legacy):
+        found.append(legacy)
+    return found
 
 
 def recorded_states(path):
@@ -55,9 +88,9 @@ def recorded_states(path):
         import yaml
         with open(path) as handle:
             data = yaml.safe_load(handle) or {}
-        return sorted((data.get('states') or {}).keys())
+        return data.get('arm'), sorted((data.get('states') or {}).keys())
     except Exception:                                # noqa: BLE001 - advisory
-        return []
+        return None, []
 
 
 class UiNode(Node):
@@ -73,15 +106,22 @@ class UiNode(Node):
 
         self.create_subscription(String, '/pick_place/state', self._on_state, 10,
                                  callback_group=cb)
+        self.params_client = self.create_client(
+            SetParameters, '/pick_place_orchestrator/set_parameters',
+            callback_group=cb)
         self.start_client = self.create_client(Trigger, '/pick_place/start',
                                                callback_group=cb)
         self.abort_client = self.create_client(Trigger, '/pick_place/abort',
                                                callback_group=cb)
+        self.open_client = self.create_client(Trigger, '/pick_place/open_gripper',
+                                              callback_group=cb)
+        self.grip_client = self.create_client(Trigger, '/pick_place/grip',
+                                              callback_group=cb)
 
     def _on_state(self, msg):
         self.events.put(('state', msg.data))
 
-    def _call(self, client, label):
+    def _call(self, client, label, reenable=False):
         if not client.wait_for_service(timeout_sec=2.0):
             self.events.put(('log', f'{label}: orchestrator not running'))
             self.events.put(('done', ''))
@@ -96,10 +136,42 @@ class UiNode(Node):
                 self.events.put(('done', ''))
                 return
             self.events.put(('log', f'{label}: {result.message}'))
-            if not result.success:
+            if reenable or not result.success:
                 self.events.put(('done', ''))
 
         future.add_done_callback(finished)
+
+    def set_torque_cap(self, newton_metres):
+        """Push the grip torque cap to the orchestrator before a cycle.
+
+        A plain parameter set is enough: close_gripper_to_cap reads
+        gripper_torque_cap on every close, so a value set now applies to the
+        very next grasp without restarting anything.
+        """
+        if not self.params_client.wait_for_service(timeout_sec=2.0):
+            self.events.put(('log', 'could not set torque cap: orchestrator not running'))
+            return False
+        parameter = Parameter(
+            name='gripper_torque_cap',
+            value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
+                                 double_value=float(newton_metres)))
+        future = self.params_client.call_async(
+            SetParameters.Request(parameters=[parameter]))
+
+        def finished(fut):
+            try:
+                results = fut.result().results
+            except Exception as exc:                 # noqa: BLE001 - shown to user
+                self.events.put(('log', f'grip force not set: {exc}'))
+                return
+            if results and not results[0].successful:
+                self.events.put(('log', f'torque cap rejected: {results[0].reason}'))
+            else:
+                self.events.put(
+                    ('log', f'grip torque cap {newton_metres:.2f} Nm'))
+
+        future.add_done_callback(finished)
+        return True
 
     def start(self, prompt):
         self.prompt_pub.publish(String(data=prompt))
@@ -111,6 +183,12 @@ class UiNode(Node):
 
     def abort(self):
         self._call(self.abort_client, 'abort')
+
+    def open_gripper(self):
+        self._call(self.open_client, 'open', reenable=True)
+
+    def grip(self):
+        self._call(self.grip_client, 'grip', reenable=True)
 
 
 class Panel:
@@ -142,6 +220,17 @@ class Panel:
         self.translated.pack(anchor='w')
         self.entry.bind('<KeyRelease>', lambda _e: self.show_translation())
 
+        force_row = tk.Frame(frame)
+        force_row.pack(fill='x', pady=(8, 0))
+        tk.Label(force_row, text='Grip torque cap').pack(side='left')
+        self.force = tk.Spinbox(
+            force_row, from_=0.1, to=MAX_TORQUE_CAP_NM, increment=0.1, width=6,
+            format='%.1f')
+        self.force.delete(0, 'end')
+        self.force.insert(0, f'{DEFAULT_TORQUE_CAP_NM:.1f}')
+        self.force.pack(side='left', padx=6)
+        tk.Label(force_row, text='Nm').pack(side='left')
+
         buttons = tk.Frame(frame)
         buttons.pack(fill='x', pady=8)
         self.pick_button = tk.Button(buttons, text='Pick', width=12,
@@ -150,6 +239,19 @@ class Panel:
         self.abort_button = tk.Button(buttons, text='Abort', width=12,
                                       state='disabled', command=self.on_abort)
         self.abort_button.pack(side='left', padx=6)
+
+        # Gripper on its own, for testing the cap by hand: Open, put something
+        # between the fingers, Grip, and read the torque it stopped at off the
+        # log. No arm motion is involved.
+        hand = tk.Frame(frame)
+        hand.pack(fill='x')
+        tk.Label(hand, text='Gripper only:').pack(side='left')
+        self.open_button = tk.Button(hand, text='Open', width=8,
+                                     command=self.on_open)
+        self.open_button.pack(side='left', padx=6)
+        self.grip_button = tk.Button(hand, text='Grip', width=8,
+                                     command=self.on_grip)
+        self.grip_button.pack(side='left')
 
         self.state_label = tk.Label(frame, text='IDLE',
                                     font=('TkDefaultFont', 13, 'bold'))
@@ -196,28 +298,71 @@ class Panel:
             text=f'detector prompt:  {prompt}' if prompt else 'type an object')
 
     def check_states(self):
-        names = recorded_states(self.states_file)
-        missing = [n for n in ('pre_pick_state', 'drop_state') if n not in names]
-        if missing:
-            self.write(f'! {", ".join(missing)} not recorded yet -- run: '
-                       f'python3 record_states.py {" ".join(missing)}')
-        else:
-            self.write(f'recorded poses: {", ".join(names)}')
+        found = state_files(self.states_file)
+        if not found:
+            self.write('! no poses recorded yet -- run: python3 record_states.py')
+            return
+        for path in found:
+            arm, names = recorded_states(path)
+            missing = [n for n in ('pre_pick_state', 'drop_state')
+                       if n not in names]
+            label = f'{arm or "?"} arm ({os.path.basename(path)})'
+            if missing:
+                self.write(f'! {label}: {", ".join(missing)} missing -- run: '
+                           f'python3 record_states.py --arm {arm or "right"} '
+                           f'{" ".join(missing)}')
+            else:
+                self.write(f'{label}: {", ".join(names)}')
 
     def busy(self, is_busy):
-        self.pick_button.configure(state='disabled' if is_busy else 'normal')
+        state = 'disabled' if is_busy else 'normal'
+        self.pick_button.configure(state=state)
+        self.open_button.configure(state=state)
+        self.grip_button.configure(state=state)
         self.abort_button.configure(state='normal' if is_busy else 'disabled')
 
     # -- events ------------------------------------------------------------
+
+    def torque_cap(self):
+        """The spinbox value in Nm, or None if it is not a usable cap."""
+        try:
+            newton_metres = float(self.force.get())
+        except ValueError:
+            return None
+        if not 0.0 < newton_metres <= MAX_TORQUE_CAP_NM:
+            return None
+        return newton_metres
 
     def on_pick(self):
         prompt = to_detection_prompt(self.entry.get())
         if not prompt:
             self.write('! type what to pick first')
             return
+        cap = self.torque_cap()
+        if cap is None:
+            self.write(f'! grip torque cap must be a number between 0 and '
+                       f'{MAX_TORQUE_CAP_NM:.0f} Nm')
+            return
+        self.node.set_torque_cap(cap)
         self.busy(True)
         self.state_label.configure(text='starting...')
         self.node.start(prompt)
+
+    def on_open(self):
+        self.write('opening the gripper')
+        self.busy(True)
+        self.node.open_gripper()
+
+    def on_grip(self):
+        cap = self.torque_cap()
+        if cap is None:
+            self.write(f'! grip torque cap must be a number between 0 and '
+                       f'{MAX_TORQUE_CAP_NM:.0f} Nm')
+            return
+        self.node.set_torque_cap(cap)
+        self.write(f'closing to {cap:.2f} Nm')
+        self.busy(True)
+        self.node.grip()
 
     def on_abort(self):
         self.write('abort requested')

@@ -325,7 +325,13 @@ def main(args=None):
     except KeyboardInterrupt:
         cumotion_action_server.get_logger().info('KeyboardInterrupt, shutting down.\n')
     cumotion_action_server.destroy_node()
-    rclpy.shutdown()
+    # Guarded, like cumotion_planner.py and robot_segmenter.py already are.
+    # rclpy's signal handler shuts the context down before spin() returns, so
+    # an unguarded shutdown raised RCLError('rcl_shutdown already called') on
+    # every clean stop -- a traceback and exit 1 that read as a crash in
+    # launch.log, right next to the real crashes this node does take.
+    if rclpy.ok():
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

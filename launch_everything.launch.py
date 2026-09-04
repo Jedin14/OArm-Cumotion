@@ -17,6 +17,7 @@ def generate_launch_description():
     octomap_mode = LaunchConfiguration('octomap')
     enable_4d = LaunchConfiguration('4d')
     tool_frame = LaunchConfiguration('tool_frame')
+    collision_distance = LaunchConfiguration('collision_activation_distance')
     
     declare_fake_hardware = DeclareLaunchArgument(
         'use_fake_hardware',
@@ -46,6 +47,15 @@ def generate_launch_description():
     # can be given Cartesian goals -- from RViz or from pick_place_orchestrator.
     # The other arm still takes joint-space goals. Both arms stay in the
     # kinematic chain either way; see the note in openarm.yml.
+    # cuRobo's own default is 0.01 m. 0.03 keeps the arm 2 cm further off
+    # everything in the octomap, which is the knob to reach for when it clips
+    # obstacles it planned around -- it inflates every voxel, so raising it too
+    # far will make tight approaches unplannable.
+    declare_collision_distance = DeclareLaunchArgument(
+        'collision_activation_distance',
+        default_value='0.03',
+        description='Clearance cuMotion keeps from every obstacle, metres.'
+    )
     declare_tool_frame = DeclareLaunchArgument(
         'tool_frame',
         default_value='openarm_right_hand_tcp',
@@ -79,6 +89,7 @@ def generate_launch_description():
             'robot_file': '/workspaces/isaac_ros-dev/openarm.yml',
             'robot_filepath': '/workspaces/isaac_ros-dev/openarm.yml',
             'tool_frame': tool_frame,
+            'collision_activation_distance': collision_distance,
         }],
         output='screen',
         # cuMotion is a Python node and launch pipes its stdout, so without this
@@ -98,6 +109,7 @@ def generate_launch_description():
         declare_octomap,
         declare_4d,
         declare_tool_frame,
+        declare_collision_distance,
         demo_launch,
         cumotion_node
     ]
