@@ -31,12 +31,15 @@ ORCHESTRATOR_ARGS = [
      'Which arm to use. It must match the tool_frame the robot was launched '
      'with -- cuMotion takes Cartesian goals for one link only, and the '
      'orchestrator refuses to start on a mismatch.'),
-    ('home_joint_positions', '[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]',
+    ('home_joint_positions', '[0.0, 0.0, 0.0, 0.20, 0.0, 0.0, 0.0]',
      'HOME, joint1..joint7 in radians: where the arm rests, observes from, '
-     'and returns to, and the only pose the octomap is captured from. Seven '
-     'zeros is the "home" group state in the SRDF, which folds the arm out '
-     'of the camera view. Jog somewhere else and call '
-     '/pick_place/capture_ready for its numbers.'),
+     'and returns to, and the only pose the octomap is captured from. This is '
+     'the "home" group state in the SRDF -- which folds the arm out of the '
+     'camera view -- except for joint4. The SRDF asks that joint for 0.0, '
+     'which is exactly its URDF lower limit, and the elbow stops 8.9 degrees '
+     'short of it; 0.20 rad clears the floor so the posture can actually be '
+     'held. Jog somewhere else and call /pick_place/capture_ready for its '
+     'numbers.'),
     ('arm_selection', 'by_side',
      '"by_side" chooses the arm before moving: the half of the camera frame '
      'the object is in is preferred, and whichever arm can actually reach it '
@@ -69,7 +72,7 @@ ORCHESTRATOR_ARGS = [
     ('approach_height', '0.05',
      'Pre-grasp height above the grasp, metres: the arm stops here, opens the '
      'gripper, then descends.'),
-    ('transit_height', '0.20',
+    ('transit_height', '0.15',
      'Height above the grasp at which the long free-space move ends, metres. '
      'Nothing plans a straight line, so a single move to a point just above '
      'the object can arrive from the side and push it away; below this height '
@@ -97,6 +100,29 @@ ORCHESTRATOR_ARGS = [
      'reach-checked ends with min_grasp_z as a hard floor; the alternative is '
      'a free-space plan for the same 5 cm, which drove the gripper into the '
      'table.'),
+    ('stage_drop_through_pre_pick', 'true',
+     'Carry the object out through the pre-pick pose instead of going '
+     'straight from the lift to the drop. The lift ends low over the work '
+     'surface and the drop pose is across it; a direct joint goal came back '
+     'INVALID_MOTION_PLAN three times, which is what a path swinging through '
+     'the octomap looks like. pre_pick is above the table by construction and '
+     'is already the waypoint used on the way back.'),
+    ('gripper_octomap_exemption', 'true',
+     'Exempt only the gripper links from the octomap, rather than switching '
+     'collision checking off for the whole arm. The descent needs an '
+     'exemption for one narrow reason -- on a top-down grasp the object being '
+     'picked up is itself in the map, so the fingers must enter its voxels -- '
+     'and that says nothing about the forearm or the elbow, which with '
+     'checking off entirely are free to sweep into the table. Applied as an '
+     'allowed-collision-matrix entry for one leg and withdrawn afterwards.'),
+    ('descend_ignores_octomap', 'true',
+     'On the vertical column legs, do not ask for a collision-checked line at '
+     'all -- go straight to the unchecked one. On a top-down grasp the target '
+     'is itself in the octomap, so the checked line stalls about a centimetre '
+     'above the object whatever the voxel size; asking first costs a planning '
+     'round trip and can fly a partial checked line that leaves the tool '
+     'somewhere the rest does not solve from. Per leg: only where '
+     'approach_ignores_octomap already grants the exemption.'),
     ('cartesian_min_fraction', '0.98',
      'Refuse a partial Cartesian path rather than execute it -- a descent that '
      'stops short leaves the gripper closing on air.'),
@@ -146,15 +172,35 @@ ORCHESTRATOR_ARGS = [
     ('table_z', '0.0',
      'Height of the work surface top face, world frame. Only used when '
      'use_table_collision is true.'),
-    ('velocity_scaling', '0.3',
+    ('velocity_scaling', '0.4',
      'Fraction of joint velocity limits. cuMotion applies min(velocity, '
      'acceleration) as a time dilation of the path it already optimised, so '
      'this changes speed and not the path.'),
-    ('acceleration_scaling', '0.3', 'Fraction of joint acceleration limits.'),
-    ('gripper_max_effort', '2.0',
-     'Grip force limit in newtons -- finger_joint1 is prismatic, so its effort '
-     'is a force. NOTE: the v10 hardware interface currently discards it, '
-     'which is why gripper_torque_cap exists; see the README.'),
+    ('acceleration_scaling', '0.4', 'Fraction of joint acceleration limits.'),
+    ('detection_reuse_age', '10.0',
+     'How old a detection may be and still be picked from without asking the '
+     'detector again. choose_arm detects to decide which arm reaches and the '
+     'first attempt wanted its own detection a few seconds later -- two '
+     'inference waits at the same stationary object, 22.6 s of a measured '
+     '76 s cycle. A failed attempt takes nearer a minute, so 10 s reuses the '
+     'one and re-detects the other. 0 disables reuse.'),
+    ('grasp_finger_min', '0.003',
+     'Finger position above which the gripper counts as holding something. '
+     'Set to -1.0 to rehearse on fake hardware, where mock_components '
+     'reports the finger exactly where it was commanded and the check can '
+     'never pass. native/run_pick_place_demo.sh --fake does that for you.'),
+    ('object_moved_eps', '0.05',
+     'How far the object must have moved for a place to count, metres. Set '
+     'to 0.0 on fake hardware, where the object never physically moves so '
+     're-detection always finds it back at the pick point.'),
+    ('gripper_max_effort', '20.0',
+     'max_effort on the GripperCommand goal. Inert on this hardware: the v10 '
+     'interface drives the gripper as a position command with a fixed KP and '
+     'passes no effort term at all, so nothing reads this and '
+     'gripper_torque_cap is what actually bounds the grip. Left at the '
+     "controller's own stall-detection value. It was 2.0 here against 20.0 in "
+     'the declaration, which the launch silently won -- a contradiction worth '
+     'not leaving in place even where it changes nothing.'),
     ('gripper_torque_cap', '2.5',
      'Grip limit as torque at the gripper motor, in Nm -- the same units as '
      'the exoskeleton bridge. 2.5 Nm is about 59.5 N at the finger over the '
@@ -167,6 +213,143 @@ ORCHESTRATOR_ARGS = [
     ('home_pose_tolerance', '0.05',
      'How close the measured joints must be to HOME, radians, before the map '
      'may be captured.'),
+    ('home_settle_tolerance', '0.20',
+     'How far a *stopped* joint may stand off HOME and still count as '
+     'arrived, radians. For the joint that cannot reach its commanded value '
+     'at all -- see home_joint_positions. Without it the cycle failed with '
+     '"could not reach home" while the arm was sitting at home.'),
+    ('joint_still_speed', '0.05',
+     'Speed below which a joint counts as stopped, rad/s. Separates "as '
+     'close as this hardware gets" from "still on its way".'),
+    ('joint_limit_margin', '0.02',
+     'Keep commanded postures this far off the position limits, radians. A '
+     'goal on a limit cannot be held, and gives cuRobo no room on that '
+     'joint.'),
+    ('approach_frame', 'tool',
+     'How the move above the object is aimed. "tool" solves the full '
+     'hand_tcp pose here and sends the chosen solution as a joint goal. '
+     '"wrist" solves for joint7\'s centre with joint7 left out and tilts it '
+     'afterwards -- measured within a few thousandths of a radian of "tool" '
+     'once that tilt is accounted for, 0.172 against 0.175 at the pre-grasp, '
+     'so it buys no headroom and costs a separately pinned grasp yaw. '
+     '"planner" sends a pose goal and lets cuMotion pick the configuration, '
+     'which is what this did before -- and what left joint3 and joint5 '
+     'sitting on their stops, where no straight line can continue. What does '
+     'the work in either of the first two is *choosing* the solution instead '
+     'of taking the first one offered.'),
+    ('grasp_jaw_flip', 'true',
+     'Also try the grasp with the jaws turned 180 degrees. A parallel gripper '
+     'closes on the same two faces either way round, so it is the same grasp '
+     '-- but a very different posture: 0.000 rad of joint headroom one way, '
+     '0.172 the other.'),
+    ('grasp_yaw_free', 'false',
+     'Leave the grasp yaw to the solver instead of pinning it to the '
+     "object's axis. Keep it off for anything that is not round: the jaws "
+     "close along the tool frame's y, which is link6's y-axis, and joint7 "
+     'turns about that very axis so it cannot move it -- an unconstrained '
+     'solve therefore picks the closing angle arbitrarily. Measured: a '
+     'straight-line descent onto a point 6.3 mm from target, then the '
+     'gripper shutting to 0 mm at 1.14 Nm against a 2.5 Nm cap.'),
+    ('approach_tilt_stage', 'false',
+     'Send the joint7 tilt as its own move once the arm is over the object. '
+     'Off by default: the tool hangs 180.1 mm off that joint, so tilting last '
+     'swings it through a 116 mm arc immediately before the descent, and '
+     'costs a second plan. The wrist partition is in the solve -- which still '
+     'leaves joint7 out -- and does not have to be copied by the execution.'),
+    ('grasp_tilt_max', '0.35',
+     'How far off vertical the gripper may come down, radians. A strictly '
+     'top-down grasp is six constraints on seven joints at a fixed point, and '
+     'near the edge of the envelope there is often no solution clear of the '
+     'joint stops at all -- measured, all 25 of them against a limit. 0.35 is '
+     '20 degrees, which on most objects grips just as well. Vertical is tried '
+     'first and tilts in increasing order, so nothing tilts that need not; 0 '
+     'restores the strict behaviour.'),
+    ('grasp_tilt_steps', '2',
+     'Tilt magnitudes to try between 0 and grasp_tilt_max.'),
+    ('grasp_tilt_azimuths', '4',
+     'Directions to try each tilt in: 4 is away, left, toward, right.'),
+    ('reach_orientations', '3',
+     'Orientations the reach probe may try per point. It sends a planning '
+     'request for each, so the full tilt set would make an unreachable object '
+     'cost a minute of probing; the pre-flight explores the rest.'),
+    ('posture_margin', '0.10',
+     'Joint-limit headroom, radians, an approach posture should have. A '
+     'threshold rather than a score: past it, more headroom buys nothing and '
+     'the ranking prefers the posture nearest the staging pose instead -- one '
+     'with 0.493 rad of headroom that the arm had to reconfigure across the '
+     'workspace to reach left TRANSIT sitting for 20 seconds with the tool '
+     'not moving. If nothing clears it the roomiest is used anyway; the '
+     'pre-flight is the real gate.'),
+    ('posture_seeds', '48',
+     'Random restarts per posture solve. About a second, once per pick '
+     'attempt.'),
+    ('single_descent', 'true',
+     'One descent instead of two. The cycle used to stop at the pre-grasp, '
+     'open the gripper there and descend again -- two lines to solve, two '
+     'settles, two offset corrections and a visible pause in mid-air, for a '
+     'stop nothing needed. With this the gripper opens above the object and a '
+     'single straight line goes all the way to the grasp.'),
+    ('check_planner_ready', 'true',
+     "Before the cycle, ask the planner to plan a goal to the arm's own "
+     'current posture. Plan-only, so nothing moves, and it cannot fail for '
+     'reasons about the target -- which is the difference between "the '
+     'planner is not planning" and a report blaming the recorded pre-pick '
+     'pose.'),
+    ('linear_transit', 'true',
+     'Fly the long move above the object as a straight line as well -- the '
+     'same motion as dragging the end-effector arrow in RViz. Pre-flighted '
+     'like the rest: the line is planned from the staging posture and the '
+     'descent legs from its end, so it is only used when the whole column '
+     'still flies from where the line leaves the arm. Everything below the '
+     'transit was already a Cartesian line; this leg was the last joint-space '
+     'move between the staging pose and the grasp.'),
+    ('preflight_descent', 'true',
+     'Prove the descent before the arm leaves its rest pose. Candidate '
+     'postures come from the kinematic chain and /compute_cartesian_path '
+     'takes an explicit start state, so "does a straight line down solve from '
+     'the posture I intend to be in" is answerable without moving. Without '
+     'it, the cycle found out at the pre-grasp -- gripper already open, 18% '
+     'of the line solvable -- and went back to pre-pick and home to start '
+     'again.'),
+    ('preflight_candidates', '6',
+     'Postures the pre-flight may probe. Each costs up to four '
+     '/compute_cartesian_path calls and no motion, which trades a few seconds '
+     'before moving against minutes of failed attempts after.'),
+    ('retry_after_preflight', 'false',
+     'Run the retry ladder even after a pre-flight has passed. Off by '
+     'default: the next rung finds the same geometry, so the only visible '
+     'effect is the arm travelling back to pre-pick and home for another '
+     'identical attempt. Stochastic planner failures are resent in place by '
+     'plan_attempts either way.'),
+    ('pose_tolerance', '0.005',
+     'How close the *tool* has to end up, metres. A move MoveIt calls SUCCESS '
+     'has satisfied the joint controller tolerance, which is a different '
+     'thing: the tool was landing 13.7 mm low at z=0.405 and 33.5 mm low at '
+     'z=0.555, in the direction gravity pulls.'),
+    ('pose_abort_limit', '0.15',
+     'How far out the tool may settle before a leg counts as failed, metres. '
+     'Not an accuracy standard -- legs here routinely settle 25 to 52 mm out '
+     'and still pick the object up, and the one successful grasp landed '
+     '32.2 mm from its commanded point. This is the distance past which the '
+     'tool is somewhere else entirely: a left-arm descent reported '
+     'fraction=1.0 and settled 287 mm from the target, and was recorded as '
+     'ok. 0 disables the check.'),
+    ('pose_settle_time', '4.0',
+     'Seconds to let the tool creep onto its target before judging it. The '
+     "servo's integral term is slow -- held at one target the error went 19.3 "
+     'to 10.7 mm over about eleven seconds -- so waiting is what closes it. '
+     'Commanding the same target again does not move the arm at all.'),
+    ('pose_offset_correction', 'false',
+     'After settling, aim past the target once by the error still remaining. '
+     'Off. It was built for an error that was repeatable and almost purely '
+     'vertical (dz -13.8, -14.0, -14.0, -14.0 mm across four passes) and the '
+     'error is no longer that: measured since, it improved two transits and '
+     'made one transit and three descents worse. On the approach it also does '
+     'harm beyond its own leg -- aiming past the transit point commanded a '
+     'position 13.7 mm higher and 17.6 mm out in y, so the descent started '
+     'from somewhere the pre-flight had not checked and had to travel '
+     'sideways as well as down, ending 52.7 mm out. A few millimetres above '
+     'the object is harmless; the descent is a fresh line to the grasp.'),
     ('descend_linear_only', 'true',
      'Refuse the descent and the retreat when no straight line can be had, '
      'rather than substituting free-space hops. The hops are not a milder '
@@ -178,6 +361,21 @@ ORCHESTRATOR_ARGS = [
      'How often to sample the arm during a move, seconds, for the motion log. '
      'Endpoints alone cannot tell a straight descent from one that swings '
      'sideways on the way. 0 keeps only the endpoints.'),
+    ('motion_log_heartbeat', '1.0',
+     'Seconds between heartbeat records while a cycle runs. Without them a '
+     'stall is a silent gap in the file and there is no telling a wedged '
+     'planner from an arm crawling somewhere. 0 disables them.'),
+    ('cartesian_partial_min', '0.5',
+     'Smallest share of a straight line worth flying. Above this it is '
+     'executed and the remainder requested as another line, so the whole move '
+     'stays straight. Refusing partials was wrong: a leg whose line solved '
+     '95.65% was thrown away for curved hops that aborted against the table.'),
+    ('cartesian_segments', '4',
+     'How many straight segments one leg may take.'),
+    ('cartesian_min_gain', '0.002',
+     'Least distance a segment must gain, metres, before another is tried. A '
+     'line that stalls in the same place is stalling against something, and '
+     'pushing further walks the gripper into it.'),
     ('motion_sample_limit', '40',
      'Most samples kept per motion; beyond this the middle is thinned and the '
      'ends preserved.'),

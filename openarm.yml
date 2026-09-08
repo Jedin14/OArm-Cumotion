@@ -13,3 +13,27 @@ robot_cfg:
     # only the right. ee_link itself is appended automatically, so listing it
     # again is harmless.
     link_names: ["openarm_left_hand_tcp", "openarm_right_hand_tcp"]
+
+    # The posture every plan is pulled toward in the null space, and the one
+    # cuRobo falls back on when a goal leaves the arm free to choose.
+    #
+    # Without a cspace block cuRobo derives this from the URDF and lands on
+    # the *midpoint of every joint's range* -- joint2 at -1.571, joint4 at
+    # 1.197. Mid-range is not a posture anyone would adopt: shoulder rolled
+    # ninety degrees, elbow half open. With seven joints for a six-DOF goal
+    # there is a whole null space to spend, and that is what it was being
+    # spent on.
+    #
+    # This is pre_pick_state from pick_place_states_<arm>.yaml instead --
+    # elbow well bent at 2.18 rad, upper arm down, forearm forward. The arm
+    # reaches from a posture that looks like reaching.
+    #
+    # Everything below is cuRobo's own default, restated because the schema
+    # takes the block whole. Change retract_config, not these.
+    cspace:
+      joint_names: [openarm_left_joint1, openarm_left_joint2, openarm_left_joint3, openarm_left_joint4, openarm_left_joint5, openarm_left_joint6, openarm_left_joint7, openarm_right_joint1, openarm_right_joint2, openarm_right_joint3, openarm_right_joint4, openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
+      retract_config: [1.080148, -0.002861, 0.001717, 2.178416, -0.00248, 0.002861, -0.480087, -1.080148, 0.002861, -0.001717, 2.178416, 0.00248, -0.002861, 0.480087]
+      null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      max_acceleration: 10.0
+      max_jerk: 500.0

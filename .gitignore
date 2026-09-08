@@ -49,6 +49,11 @@ pixel_to_world_frame.png
 VLM/test_debug_render.png
 vlm_detection.png
 
+# Scratch states file and motion log written by test_pick_cycle.py. Named per
+# process so two copies of the suite cannot clobber each other.
+native/tests/.test_states.*.yaml
+native/tests/.test_motion_log.*.jsonl
+
 # Append-only record of every commanded motion, for debugging a run
 # after the fact. Grows without bound; never committed.
 motion_log.jsonl

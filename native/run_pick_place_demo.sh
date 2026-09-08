@@ -4,10 +4,23 @@
 # detector, the pick-and-place orchestrator, and the panel you type into.
 #
 #   native/run_pick_place_demo.sh
-#   native/run_pick_place_demo.sh use_fake_hardware:=true    # rehearsal
+#   native/run_pick_place_demo.sh --fake                     # rehearsal
 #   native/run_pick_place_demo.sh arm:=left
 #
 # Any pick_place_demo.launch.py argument can be appended; --show-args lists them.
+#
+# --fake is the rehearsal: the arms are simulated by mock_components and the
+# whole sequence plays out in RViz, while the camera, the depth stream and the
+# PaliGemma detector are all real. So the object really is found where it is,
+# and only the moving is pretend. It needs no CAN bus and no arms plugged in.
+#
+# It also neutralises the two checks that cannot pass on simulated arms, which
+# is the difference between watching a cycle and watching the retry ladder burn
+# six attempts: mock_components reports the finger exactly where it was
+# commanded, so the grip never registers, and the object never physically
+# moves, so the place is never confirmed. --fake sets grasp_finger_min:=-1.0
+# and object_moved_eps:=0.0 for that reason and no other -- never pass those on
+# real hardware, they are exactly what makes the retries work.
 #
 # Bring the CAN interfaces up first -- still the one part that needs root,
 # because it configures kernel network devices:
@@ -47,9 +60,29 @@ if [[ -z "${DISPLAY:-}" ]]; then
 fi
 
 # Skip the CAN check when the arms are simulated -- a rehearsal needs no bus.
+#
+# --fake expands here rather than being passed through, so that the CAN check
+# below sees it too. Expanded arguments go first in ARGS, so anything the
+# caller writes after --fake still wins: a repeated launch argument takes its
+# last value.
 FAKE_HARDWARE=false
+ARGS=()
 for arg in "$@"; do
-    [[ "${arg}" == "use_fake_hardware:=true" ]] && FAKE_HARDWARE=true
+    case "${arg}" in
+        --fake|--sim)
+            FAKE_HARDWARE=true
+            ARGS+=(use_fake_hardware:=true
+                   grasp_finger_min:=-1.0
+                   object_moved_eps:=0.0)
+            ;;
+        use_fake_hardware:=true)
+            FAKE_HARDWARE=true
+            ARGS+=("${arg}")
+            ;;
+        *)
+            ARGS+=("${arg}")
+            ;;
+    esac
 done
 
 if [[ "${FAKE_HARDWARE}" == false ]]; then
@@ -57,7 +90,7 @@ if [[ "${FAKE_HARDWARE}" == false ]]; then
         if ! ip link show "${iface}" &> /dev/null; then
             echo "error: ${iface} does not exist." >&2
             echo "Plug the adapter in, or rehearse without the arms:" >&2
-            echo "  native/run_pick_place_demo.sh use_fake_hardware:=true" >&2
+            echo "  native/run_pick_place_demo.sh --fake" >&2
             exit 1
         fi
         if ! ip link show "${iface}" | grep -q "state UP"; then
@@ -74,7 +107,7 @@ fi
 # Advisory only, never fatal: record_states.py needs the robot running, so the
 # very first bringup is legitimately the one where these do not exist yet.
 STATES_FILE="${WS_DIR}/pick_place_states.yaml"
-for arg in "$@"; do
+for arg in "${ARGS[@]}"; do
     [[ "${arg}" == states_file:=* ]] && STATES_FILE="${arg#states_file:=}"
 done
 if [[ ! -f "${STATES_FILE}" ]]; then
@@ -95,4 +128,4 @@ exec ros2 launch "${WS_DIR}/pick_place_demo.launch.py" \
     use_fake_hardware:=false \
     right_can_interface:=can0 \
     left_can_interface:=can1 \
-    "$@"
+    ${ARGS[@]+"${ARGS[@]}"}

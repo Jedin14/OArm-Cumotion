@@ -97,6 +97,18 @@ def generate_launch_description():
         # with SIGFPE (exit code -8) leaving nothing but launch's own "process
         # has died" line, which says nothing about why.
         additional_env={'PYTHONUNBUFFERED': '1'},
+        # Bring it back when it dies, because it does. SIGFPE (exit code -8) in
+        # most launches on 2026-09-07, and the whole cell is useless without it:
+        # move_group's cumotion pipeline forwards every goal to this node, so a
+        # dead planner turns even a joint goal to a recorded posture into
+        # TIMED_OUT.
+        #
+        # The delay is for the CUDA kernels it loads on startup -- it logs
+        # nothing at all while it does, and respawning faster than it can come
+        # up would just churn. The orchestrator's readiness probe covers the
+        # window where it is back but not yet planning.
+        respawn=True,
+        respawn_delay=4.0,
     )
     
     is_static = PythonExpression(["'", octomap_mode, "' == 'static'"])

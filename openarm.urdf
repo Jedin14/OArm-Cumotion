@@ -163,7 +163,7 @@
     <parent link="openarm_left_link3"/>
     <child link="openarm_left_link4"/>
     <axis xyz="0 1 0"/>
-    <limit effort="27" lower="0.0" upper="2.443461" velocity="5.445426"/>
+    <limit effort="27" lower="-0.05" upper="2.443461" velocity="5.445426"/>
   </joint>
   <link name="openarm_left_link5">
     <visual name="openarm_left_link5_visual">
@@ -384,7 +384,7 @@
     <parent link="openarm_right_link3"/>
     <child link="openarm_right_link4"/>
     <axis xyz="0 1 0"/>
-    <limit effort="27" lower="0.0" upper="2.443461" velocity="5.445426"/>
+    <limit effort="27" lower="-0.05" upper="2.443461" velocity="5.445426"/>
   </joint>
   <link name="openarm_right_link5">
     <visual name="openarm_right_link5_visual">

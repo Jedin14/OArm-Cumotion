@@ -1,0 +1,1 @@
+VLM/run_in_vlm_env.sh vlm_detect.py "screwdriver" --once --source realsense

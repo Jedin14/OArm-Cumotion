@@ -67,6 +67,70 @@
         <joint name="openarm_right_joint6" value="0"/>
         <joint name="openarm_right_joint7" value="0"/>
     </group_state>
+    <!-- The poses the pick-and-place cycle stages through, so they can be
+         selected from RViz's MotionPlanning panel as well as replayed by
+         pick_place_orchestrator.py. Kept in step with the recordings in
+         pick_place_states_<arm>.yaml, which record_states.py writes and the
+         orchestrator reads at runtime; re-record there and copy the numbers
+         here if they change.
+
+         pick_home is not the "home" group state above: that one asks joint4
+         for 0.0, which is its own lower limit and a posture the elbow cannot
+         hold, so the cycle uses 0.20 rad instead. -->
+    <group_state name="pick_home" group="right_arm">
+        <joint name="openarm_right_joint1" value="0.000000"/>
+        <joint name="openarm_right_joint2" value="0.000000"/>
+        <joint name="openarm_right_joint3" value="0.000000"/>
+        <joint name="openarm_right_joint4" value="0.200000"/>
+        <joint name="openarm_right_joint5" value="0.000000"/>
+        <joint name="openarm_right_joint6" value="0.000000"/>
+        <joint name="openarm_right_joint7" value="0.000000"/>
+    </group_state>
+    <group_state name="pre_pick" group="right_arm">
+        <joint name="openarm_right_joint1" value="-1.080148"/>
+        <joint name="openarm_right_joint2" value="0.002861"/>
+        <joint name="openarm_right_joint3" value="-0.001717"/>
+        <joint name="openarm_right_joint4" value="2.178416"/>
+        <joint name="openarm_right_joint5" value="0.002480"/>
+        <joint name="openarm_right_joint6" value="-0.002861"/>
+        <joint name="openarm_right_joint7" value="0.480087"/>
+    </group_state>
+    <group_state name="drop" group="right_arm">
+        <joint name="openarm_right_joint1" value="-0.396162"/>
+        <joint name="openarm_right_joint2" value="0.185206"/>
+        <joint name="openarm_right_joint3" value="-0.310712"/>
+        <joint name="openarm_right_joint4" value="2.180323"/>
+        <joint name="openarm_right_joint5" value="0.141718"/>
+        <joint name="openarm_right_joint6" value="0.536164"/>
+        <joint name="openarm_right_joint7" value="-0.663577"/>
+    </group_state>
+    <group_state name="pick_home" group="left_arm">
+        <joint name="openarm_left_joint1" value="0.000000"/>
+        <joint name="openarm_left_joint2" value="0.000000"/>
+        <joint name="openarm_left_joint3" value="0.000000"/>
+        <joint name="openarm_left_joint4" value="0.200000"/>
+        <joint name="openarm_left_joint5" value="0.000000"/>
+        <joint name="openarm_left_joint6" value="0.000000"/>
+        <joint name="openarm_left_joint7" value="0.000000"/>
+    </group_state>
+    <group_state name="pre_pick" group="left_arm">
+        <joint name="openarm_left_joint1" value="1.080148"/>
+        <joint name="openarm_left_joint2" value="-0.002861"/>
+        <joint name="openarm_left_joint3" value="0.001717"/>
+        <joint name="openarm_left_joint4" value="2.178416"/>
+        <joint name="openarm_left_joint5" value="-0.002480"/>
+        <joint name="openarm_left_joint6" value="0.002861"/>
+        <joint name="openarm_left_joint7" value="-0.480087"/>
+    </group_state>
+    <group_state name="drop" group="left_arm">
+        <joint name="openarm_left_joint1" value="0.396162"/>
+        <joint name="openarm_left_joint2" value="-0.185206"/>
+        <joint name="openarm_left_joint3" value="0.310712"/>
+        <joint name="openarm_left_joint4" value="2.180323"/>
+        <joint name="openarm_left_joint5" value="-0.141718"/>
+        <joint name="openarm_left_joint6" value="-0.536164"/>
+        <joint name="openarm_left_joint7" value="0.663577"/>
+    </group_state>
     <group_state name="hands_up" group="left_arm">
         <joint name="openarm_left_joint1" value="0"/>
         <joint name="openarm_left_joint2" value="0"/>

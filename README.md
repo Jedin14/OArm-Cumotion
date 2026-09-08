@@ -80,6 +80,10 @@ Same robot bringup, plus the VLM detector, the pick-and-place orchestrator and a
 panel to type into — see [VLM-guided pick and place](#-vlm-guided-pick-and-place).
 Use `run_launch_everything.sh` above when you only want the robot.
 
+Add `--fake` to rehearse with no arms and no CAN bus: the motion is simulated
+and watched in RViz, the camera and the detector are real. See
+[Dry-running on fake hardware](#dry-running-on-fake-hardware).
+
 ### 4. Rebuild after editing code
 
 ```bash
@@ -123,11 +127,11 @@ detector checks whether each step actually worked — a failed grasp is retried
 with an escalating strategy rather than repeated.
 
 ```
-HOME ─► LOCATE ─► PRE_PICK ─► TRANSIT ─► PREGRASP ─► OPEN ─► DESCEND ─► CLOSE
-  ▲                                                                      │
-  └──────────────────────── failed ──────────────── VERIFY_GRASP ◄── LIFT
-                                                          │
-  HOME ◄── PRE_PICK ◄── VERIFY_PLACE ◄── RELEASE ◄── DROP ◄┘
+HOME ─► LOCATE ─► PREFLIGHT ─► PRE_PICK ─► TRANSIT ─► OPEN ─► DESCEND ─► CLOSE
+  ▲                                                                       │
+  └────── PRE_PICK ◄── CLEAR ◄── failed ──────────── VERIFY_GRASP ◄── LIFT
+                                                           │
+  HOME ◄── PRE_PICK ◄── VERIFY_PLACE ◄── RELEASE ◄── DROP ◄─┘
 ```
 
 **HOME is the only pose the arm rests, observes and maps from.** There used to
@@ -138,6 +142,20 @@ deliberately held it out over the table — *in* frame. One pose does both jobs.
 The way out is the way in: LIFT, DROP, then back through PRE_PICK to HOME.
 PRE_PICK is reachable from both ends, which is what makes it a safe waypoint
 rather than a dash home across the workspace.
+
+**A pick that fails leaves by the same door.** Every failure below TRANSIT —
+the descent stopping short, the jaws closing on nothing, the grasp not
+verifying, the cycle crashing — leaves the arm extended down at the object,
+and PRE_PICK and HOME are *joint* goals: the short path in joint space from
+reaching over the table to folded at the side goes through the table.
+Measured, left arm, run `1788859355`: DESCEND fine, the grip closed on
+nothing at 1.912 Nm, and the very next record is HOME as a joint goal from
+tcp `z=0.3715`. It dragged across the surface on the way.
+
+So the first thing any exit does is `CLEAR` — straight back up the descent
+line, gripper left exactly as it is — and only then PRE_PICK and HOME.
+`clear_the_surface()` is a no-op once the tool is above the pre-grasp height,
+which on the successful path it already is.
 
 Three named postures, all replayed as joint goals:
 
@@ -173,14 +191,16 @@ LIFT comes back up the same line, because a retreat that bows drags whatever is
 now in the gripper across the table it came off.
 
 ```
-        TRANSIT      z = grasp + 0.20   ← the free-space move ends here
+        TRANSIT      z = grasp + 0.20   ← the approach ends here,
+           │                              and the gripper opens here
            │
-           │  hops of descend_step, straight down
-        PREGRASP     z = grasp + 0.05   ← gripper opens
+           │  ONE straight line, all the way down
            │
         DESCEND      z = grasp          ← gripper closes to the torque cap
            │
-        LIFT         z = grasp + 0.05   ← same line, back up
+           │  one straight line, back up
+           │
+        LIFT         z = grasp + 0.20   ← clear of the surface to carry
 ```
 
 Set `transit_height:=0` to go straight to the pre-grasp in one move, which is
@@ -863,6 +883,647 @@ already shut the context down by the time `spin()` returns, it raised
 `RCLError: rcl_shutdown already called` and exited 1 with a traceback. It is
 guarded now, so a death in that log is a real one.
 
+### The arm sags, and the planner was not told
+
+Feedback is fine — the motion log shows positions, velocities and **motor
+efforts** all updating, and `finger_effort` swinging −0.70 → +0.14 as the
+gripper closes. Gravity compensation is implemented too: KDL `JntToGravity`
+feedforward plus an integral term, `Kp` 100, `Kd` 5.5.
+
+What the log showed is that the tool still does not arrive where it is sent:
+
+```
+TRANSIT   target[+0.336 -0.168 +0.555]  tcp[+0.303 -0.163 +0.521]  dz -33.5 mm
+PREGRASP  target[+0.336 -0.168 +0.405]  tcp[+0.321 -0.164 +0.391]  dz -13.7 mm
+```
+
+Always **downward**, repeatable, and **growing with extension**. Joint by
+joint it lands on the elbow: `joint4` sits 14–28 mrad from its target while
+holding 4.4–5.0 Nm, with the same sign every run.
+
+**The cause was in the gravity model.** The KDL chain ran
+`base_link → link7`, so everything past `link7` was left out:
+
+| beyond `link7` | mass |
+| --- | --- |
+| `hand` | 0.3500 kg |
+| `right_finger` | 0.0360 kg |
+| `left_finger` | 0.0360 kg |
+| **unmodelled total** | **0.4221 kg** |
+
+That is comparable to `link7`'s own 0.466 kg, and it hangs at the longest
+moment arm on the arm — precisely the load that sags the pitch joints, and
+precisely why the error grows as the arm extends. `tip_link` is now the hand.
+Both joints to it are **fixed**, so the chain still has exactly `ARM_DOF`
+movable joints and the existing sanity check still holds; only the fingers'
+0.072 kg stays out. **This is C++ and needs a rebuild:**
+
+```bash
+native/build_ws.sh --packages-select openarm_hardware
+```
+
+### Arriving is not the same as being told you arrived
+
+Independently of the servo work, the orchestrator used to trust that a move
+which returned SUCCESS had landed on the commanded pose. It had not: SUCCESS
+means the *joint trajectory controller's* tolerance was met, which is a
+different and looser thing than the tool being in the right place. A grasp
+planned on that assumption closes above the object.
+
+So the achieved pose is **measured and corrected** — but not by re-commanding,
+which was my first attempt and was simply wrong. The log shows why:
+
+```
+PREGRASP cartesian ok  19.3 mm      target z=0.412  landed z=0.398  dz -13.8
+PREGRASP cartesian ok  19.0 mm      target z=0.412  landed z=0.398  dz -14.0
+PREGRASP cartesian ok  18.8 mm      target z=0.412  landed z=0.398  dz -14.0
+PREGRASP cartesian ok  18.6 mm      target z=0.412  landed z=0.399  dz -13.0
+PREGRASP did-not-converge 18.6
+```
+
+Ten re-issued passes went 19.3 → 18.6 mm and gave up, then eight stepped hops
+followed — **eighteen moves on one leg**, arriving no closer. The intermediate
+samples say it all: during a re-issued pass the tool does not move, all eight
+samples reading `tcp[+0.3426 -0.3062 +0.4094]`. The joints are already at their
+solution; the error is between that solution and reality, so commanding it
+again changes nothing.
+
+Two things do work, and both are in the log:
+
+- **Waiting.** Held at one target the error went
+  `19.3 → 19.0 → 18.8 → 18.6 → 15.5 → 13.4 → 11.5 → 10.7 mm` over about eleven
+  seconds — the servo's integral term pulling in slowly. `settle_at` waits for
+  that (`pose_settle_time`, 4 s), and stops early once it stops improving
+  rather than burning the whole timeout on a 0.2 mm/s creep.
+- **Aiming past it.** The residual is repeatable — `dz -13.8, -14.0, -14.0,
+  -14.0` across four passes at the same target — so the target is commanded
+  once more, offset by the measured error (`pose_offset_correction`).
+
+At most **two moves** per leg instead of eighteen, and a leg that lands
+accurately costs exactly one.
+
+Reading the achieved pose needs the same care as the joint states:
+`tcp_position(newer_than=…)` insists on a transform stamped after the move,
+because `rclpy.time.Time()` returns the latest *available*, and immediately
+after a move that is still the pose from before it.
+
+### Closing on nothing
+
+A close that reaches the shut aperture without the torque ever passing the cap
+had nothing between the fingers, and the cycle now **fails at the close** and
+says so. Straight from the log:
+
+```
+commanded 0.040884  finger 0.042018  effort +0.501 Nm
+...  22 steps ...
+commanded 0.000000  finger 0.002492  effort +1.160 Nm
+```
+
+Flat at about 0.5 Nm — friction — against a 2.5 Nm cap, fingers shut to
+2.5 mm. Meanwhile the descent that preceded it reported `error_mm=3.6`, so the
+**tool did reach its commanded grasp**: the object was not where it was
+detected. Worth separating, because those two need completely different fixes,
+and the cycle used to carry on and attempt the lift, the carry and the drop
+with an empty gripper.
+
+### A retreat that has no line settles for less
+
+`LIFT` asked for 20 cm straight up and got `fraction=0.125` checked, `0.0`
+unchecked — there is no line that long from down at the grasp. Refusing to lift
+at all is worse than lifting less, so the retreat now falls back to the
+pre-grasp height, which the approach already proved reachable, and warns that
+the carry starts lower.
+
+### A residual is not distance left to fly
+
+A leg that flies 95.8% and then returns `fraction=0.0` for the last 12 mm is
+not blocked — that gap **is** the standing offset, and asking for a line to a
+pose the arm cannot hold returns 0% for ever. That used to fail the leg and
+hand it to eight curved hops. It is now passed to `settle_at` and the offset
+correction, which are the only things that can close it
+(`pose_residual_limit`, 25 mm).
+
+The shortcut applies **only when there is no line at all**. While segments are
+still gaining ground they are flying real distance, and stopping at 20 mm
+because that happens to be offset-sized would abandon a leg that was working.
+
+### A goal on a joint limit is never reached
+
+Symptom: the arm is sitting at home, and the cycle refuses to start —
+`could not reach home`, or the panel's Pick doing nothing.
+
+What the robot said, with the arm at rest:
+
+```
+$ ros2 topic echo --once /right_joint_trajectory_controller/controller_state
+reference.positions[3]: 0.0          # joint4, commanded
+feedback.positions[3]:  0.15583      # joint4, measured
+error.positions[3]:    -0.15583
+```
+
+`0.15583` rad, constant to five decimals across 301 samples over 3 s, at
+0.02 Nm of effort — and joint4 tracks 0.70 to 2.15 rad perfectly in the same
+motion log. So it is not a servo fault and not sag. It is a floor:
+
+```
+$ python3 -c "..."   # from openarm.urdf
+openarm_right_joint4  lower=0.0  upper=2.443461
+```
+
+The SRDF `home` group state asks joint4 for **0.0, which is exactly its lower
+limit**, and the hardware stops 8.9° short of it. So the elbow can never
+arrive, the move reports success or exhausts its retries depending on the run,
+and every later "is the arm home?" check sees 0.156 rad of error and fails the
+cycle — with the arm parked at home.
+
+Three changes, because there are three separate mistakes there:
+
+* **HOME no longer sits on the limit.** `home_joint_positions` puts joint4 at
+  `0.20` rad. At a folded-down posture that is 11° at the elbow: the arm still
+  hangs by the base, still out of the camera's frame, and the goal is one the
+  joint can hold.
+* **No commanded posture is allowed onto a limit.** `clamp_to_limits` pulls
+  every joint goal `joint_limit_margin` (0.02 rad) inside the bounds read from
+  `/robot_description`, and says so once per joint. It also stops handing
+  cuRobo's trajopt a joint with no room on one side.
+* **A settled standing offset counts as arrived.** `at_home_pose` accepts an
+  error up to `home_settle_tolerance` (0.20 rad) when the arm has *stopped*
+  (`joint_still_speed`), naming the joint in the log. Still moving, or further
+  out than that, still fails — a move cut short is still caught. Being a few
+  degrees off at a folded posture does not put the arm back in the camera's
+  view, which is what the check is actually guarding.
+
+The failure message now names the joint rather than saying "could not reach
+home": `joint4 is 0.156 rad off (+0.156 vs +0.020 commanded)`.
+
+### Why the descent was not a straight line
+
+Symptom, over several runs: the arm goes above the object, the straight-line
+descent covers half or four-fifths of the way and then reports
+`fraction=0.0`, and the fallback flies eight curved hops instead — including
+one that swings the whole arm through 157 degrees.
+
+The motion log says exactly what happened. From run `1788771153`, the joint
+values at each end of the planned Cartesian path:
+
+```
+PREGRASP  fraction=0.5652
+  plan start [-1.219, 2.982,  0.196, 0.736, -0.263, -0.026, 1.364]
+  plan end   [-1.396, 3.013,  0.079, 0.659, -0.148, -0.068, 1.157]
+              ^^^^^^ joint1, and its lower limit is -1.396263
+```
+
+**The line does not stop early. It stops when joint1 runs out.** The right
+arm's joint1 travels `[-1.396, +3.491]` — 80 degrees one way, 200 the other —
+and the transit pose goal had put the arm on the *short* side. A Cartesian
+path cannot continue past a joint's stop, so the remaining 44% returns 0%
+whether collision checking is on or off.
+
+Then the pose fallback flips to the other branch, between two waypoints 20 mm
+apart:
+
+```
+PREGRASP 5/8  [-1.366, 3.022,  0.041, 0.706, -0.126, -0.073, 1.052]
+PREGRASP 6/8  [+1.372, 0.415, -1.569, 0.575, -1.583,  0.200, 1.364]
+               ^^^^^^ joint1 swings 157 degrees
+```
+
+That is the "circular path" — a redundant 7-DOF arm has many solutions for
+one tool pose, and a pose goal is free to pick a different one each time. The
+branch it lands in reaches the object but sits **on** two stops: joint3 0.013
+rad and joint5 0.018 rad from their limits. From there the descent managed
+`fraction=0.8182` and then 0.0, the 12.9 mm offset correction got no line at
+all, and the lift needed three segments and another flip.
+
+#### It is not the planner's fault: there is no comfortable posture
+
+Solving the tool pose the cycle asks for — position, gripper down, jaws at the
+object's yaw — at that object position, over 48 random seeds:
+
+| what is asked for | solved | roomiest solution's worst joint |
+|---|---|---|
+| tool position + down + jaw yaw (what the code asked) | 25/48 | **0.000 rad** — on the stop |
+| the same grasp with the jaws turned 180° | 17/48 | 0.172 rad |
+| joint7's centre + link6 able to tilt (wrist partition) | 17/48 | **0.381 rad**, 0.175 after the tilt |
+
+The first row is the important one. **Every solution is against a stop**, and
+the roomiest of the 25 is the posture the robot actually used. cuMotion and
+`/compute_ik` both return the first solution they find, so nine times in ten
+that is a posture with nowhere left to go.
+
+#### So the posture is chosen here, not by the planner
+
+`arm_kinematics.py` reads `/robot_description`, walks the joint tree, and
+solves for postures directly — with the joint-limit headroom as the thing
+being maximised. It sends the answer as a **joint goal**, which cuMotion
+accepts for either arm whatever its `ee_link` is, and which gives the same
+posture every time.
+
+Two changes to what is asked for, both of which cost nothing:
+
+* **The jaws are symmetric.** A parallel gripper closes on the same two faces
+  whichever way round it arrives, so the grasp yaw and the yaw turned by 180°
+  are the same grasp — and very different postures. Trying both takes the
+  roomiest solution from 0.000 to 0.172 rad. `grasp_jaw_flip`.
+* **joint7 is a pitch carrying the whole hand.** The tool sits **180.1 mm**
+  from joint7's centre, so that one joint swings it through a 180 mm arc.
+  Approaching with the hand already pointing down means dragging that 180 mm
+  of gripper below the wrist the whole way, *and* it makes joints 1–6 solve a
+  harder problem. So the approach is planned for **joint7's centre**, with
+  joint7 left out of it, and the hand is tilted down once the arm is over the
+  object — which is `approach_frame: wrist`, the default.
+
+The wrist objective is four constraints instead of six: the wrist point, plus
+"link6's y-axis is horizontal", which is what has to hold for joint7 alone to
+be able to bring the hand to vertical. joint7 appears in none of them — the
+wrist point lies on its axis, and link6 is upstream of it. Verified against
+finite differences to 3e-7, and the resulting posture, once tilted, puts the
+tool **0.3 mm** from the target pointing straight down.
+
+```
+$ python3 native/tests/test_arm_kinematics.py
+headroom: robot 0.013 rad, tool-pose solve 0.000, jaws flipped 0.172,
+          wrist solve 0.175
+```
+
+Falling back is always allowed: with no `/robot_description`, no numpy, or no
+solution, the approach reverts to a pose goal and says so in the log.
+`approach_frame: planner` restores the old behaviour outright.
+
+The reach check tries both grasp directions too. It ends the cycle outright,
+so refusing a point that is reachable with the jaws the other way round would
+be the worst kind of false negative.
+
+One thing worth knowing about the retry ladder while reading this: at the
+measured object position, asking for the grasp yaw **rotated 60 or 90 degrees**
+has *no solution at all* — 0 from 400 seeds. The `yaw+90` and `yaw+90-lower`
+rungs cannot succeed there however many times they are tried. They are still
+worth having for an object elsewhere in the envelope; they are simply not the
+recovery for this failure.
+
+### The descent does not consult the octomap
+
+On a top-down grasp the target **is** an obstacle. The octomap holds the object
+being picked up and the table under it, so the gripper is required to enter
+occupied voxels to reach the thing it is grasping — measured, a
+collision-checked line solved 100% of the 20 cm drop to the pre-grasp and 25%
+of the last 5 cm, stalling about a centimetre above the object.
+
+The checked attempt was therefore never going to succeed, and asking for it
+first cost a planning round trip and risked flying a *partial* checked line
+that left the tool somewhere the remainder did not solve from. So the column
+legs now go straight to the unchecked line (`descend_ignores_octomap`).
+
+The exemption stays **per leg**. It applies only where the caller already
+marked the leg exempt — the short straight vertical ones, between ends whose
+reach was checked, with `min_grasp_z` as a hard floor and the gripper open.
+Everything else is planned against the collision world as before, and the
+tests check that a leg without the exemption is still asked the checked way.
+
+The pre-flight asks the same way the descent will. Probing checked when the
+descent flies unchecked would have it refusing postures that work.
+
+**The trade-off, stated plainly.** The 15 cm transit-to-pre-grasp leg solved
+100% *checked* in one measured run — so on that leg the map check was working,
+and it is now skipped along with the rest. The exemption is granted per leg by
+`approach_ignores_octomap`, and both legs of the column have it, so both go
+unchecked. If the map check is worth keeping on the upper leg, that parameter
+needs splitting into "upper" and "final" rather than one flag for the column;
+the ends of both legs are reach-checked and `min_grasp_z` still floors the
+descent either way.
+
+### The jaws have to close *across* the object
+
+joint7 turns about link6's y-axis. The fingers slide along the hand's y — and
+the hand's y **is** link6's y, because a rotation about an axis cannot move
+that axis. Measured: swinging joint7 over its whole range leaves link6's y and
+the hand's y identical to four decimals while the tool's z goes from `+0.765`
+to `-0.988`.
+
+So the direction the jaws close in is fixed by joints 1–6 alone, and the
+original wrist objective — "the wrist is here, and link6's y is horizontal" —
+never said *which way* horizontal. The closing angle was whatever the solver
+landed on. In the reproducible case that is **17.1° off** the object's axis,
+and in general it is unbounded.
+
+The consequence, from run `1788776708`:
+
+```
+DESCEND  cartesian  ok  fraction=1.0  points=49  error_mm=6.3
+CLOSE    ...  22 steps  ...  finger 0.0 mm  torque 1.14 Nm  cap 2.50 Nm
+CLOSE    closed-on-nothing
+```
+
+A complete straight-line descent onto a point 6.3 mm from target, and then
+the gripper shutting on air.
+
+Pinning the azimuth costs the partition **nothing** — joint7 was never in
+those equations, and the Jacobian's joint7 column is still identically zero.
+The objective is now five constraints on six joints instead of four: wrist
+position, and link6's y along ±the object's axis (± because a parallel gripper
+closes on the same two faces either way round). Measured after the change:
+jaws `0.000°` off, tool still 0.4 mm from target, still 0.44 rad of headroom.
+
+`grasp_yaw_free` restores the loose behaviour, and should stay off for
+anything that is not round. Note this is a different knob from
+`grasp_tilt_max`: the yaw is *which way the jaws face*, the tilt is *how far
+off vertical the gripper comes down*.
+
+#### Ranking by the wrong posture threw the usable ones away
+
+Pinning the jaws exposed a second mistake, in the *selection* rather than the
+objective. Candidates were ranked by the untilted solve's headroom and only
+then filtered for whether joint7 could tilt them into line — so the ranking
+discarded the good answers before anything looked at them. At the transit
+point:
+
+```
+rank  1: untilted +0.497  tilt -90.0  off 20.8 deg  ->  unusable
+rank  2: untilted +0.485  tilt -90.0  off 14.9 deg  ->  unusable
+...
+rank  7: untilted +0.324  tilt -90.0  off 25.4 deg  ->  unusable
+rank  8: untilted +0.263  tilt +76.2  off  0.1 deg  ->  0.240 rad, usable
+```
+
+The seven roomiest postures all needed joint7 **beyond its own ±90° limit**
+and landed 15–25° short of vertical. Keeping the top six kept six unusable
+postures. The score is now the headroom of the posture that will actually be
+commanded — tilt applied, infeasible ones dropped first — and every candidate
+that comes back puts the hand exactly down with the tool inside a millimetre
+of target.
+
+The lesson generalises: score the thing you are going to do, not an
+intermediate step towards it.
+
+Note this does **not** on its own prove the grip will now succeed. An
+arbitrary closing angle is one way to close on nothing; a detection whose x/y
+is off by more than half the 44 mm jaw opening, or whose depth read the table
+rather than the object, is another. `VLM/run_in_vlm_env.sh vlm_detect.py
+"<noun>" --once` on the actual scene is what separates them.
+
+### The tilt is not a separate move
+
+The tool sits 180.1 mm from joint7's centre, so tilting it *after* arriving
+over the object swings the tool through an arc — measured at **116 mm**, from
+`[0.4668, -0.2293, 0.5754]` to `[0.3521, -0.2350, 0.5569]`, immediately before
+the descent. That is exactly the curved motion all the straight-line work
+exists to remove, and it cost a second plan (which needed a retry).
+
+The partition belongs to the *solve*, which still leaves joint7 out
+entirely. The execution does not have to copy it: the tilt angle is known
+before anything moves, so it goes out as part of the same joint goal and the
+approach ends with the hand already pointing down. `approach_tilt_stage`
+restores the two-move version for a case where carrying the gripper 180 mm
+below the wrist through the approach would be the greater risk.
+
+### Voxel size
+
+`octomap_resolution` in
+`src/openarm_ros2/openarm_bimanual_moveit_config/config/sensors_3d.yaml` is
+**0.02** m, down from 0.05. At 50 mm a screwdriver and the table under it
+merged into a single block — coarser than the object being picked. The cost is
+leaf count, which for an octree scales with observed surface rather than
+volume (about 6x here), so `max_range` and the updater's
+`far_clipping_plane_distance` come down from 5.0 m to 1.5 m to match: the work
+surface is well inside a metre of the base, and voxelising the rest of the room
+at 20 mm is pure cost.
+
+**This needs an install to take effect** — the native tree holds a real copy of
+the config, not a symlink to `src/`:
+
+```bash
+native/build_ws.sh --packages-select openarm_bimanual_moveit_config
+```
+
+Still at its original value, and worth a look if fine voxels do not help as
+much as expected: `padding_offset: 0.20` in the same file. That is the depth
+padding used to mask the robot out of its own camera view, ten times MoveIt's
+usual 0.02, and it erases real geometry near the arm along with the arm. It
+was presumably set to stop the arm being captured — which is now handled by
+capturing the map only at HOME, with the arm out of frame.
+
+### Letting go of strictly top-down
+
+A vertical approach is six constraints on seven joints at a fixed point, and
+near the edge of the envelope there is frequently no solution clear of the
+joint stops at all. `grasp_tilt_max` lets the gripper come down off vertical --
+0.35 rad, 20 degrees -- which on most objects is the same grasp and a much
+larger set to choose from.
+
+Vertical is offered first, both ways round, then tilts in increasing
+magnitude across four directions, and the search stops as soon as it has a
+posture with adequate headroom. So a tilt is only ever used because vertical
+could not be.
+
+Whether it helps depends entirely on where the object is. Measured, best
+worst-joint headroom over 32 seeds:
+
+| point | best vertical | best tilted |
+|---|---|---|
+| pre-grasp `x=0.406 z=0.409` | **+0.159** | +0.039 |
+| transit `x=0.406 z=0.559` | +0.242 | **+0.490** |
+| further out `x=0.460 z=0.409` | **no solution at all** | +0.000 |
+| nearer `x=0.320 z=0.409` | **+0.183** | +0.178 |
+
+It doubles the headroom at the transit point and is the only thing that
+reaches at all 5 cm further out. At the object position that had been failing,
+though, vertical with the jaws flipped is still the best option — so the tilt
+is worth having, and was not what was blocking that pick.
+
+Each orientation costs a posture solve of about a second, and there are up to
+eighteen of them, which is why the search exits early and why the reach probe
+takes only `reach_orientations` of them.
+
+### One descent, and the gripper opens before it
+
+There used to be a stop at the pre-grasp: down to 5 cm above the object, open
+the gripper there, then down again. Two lines to solve, two settles, two
+offset corrections, and the arm visibly pausing in mid-air — for a stop
+nothing needed. The gripper opens just as well at the transit height, 20 cm
+up, where there is nothing for open fingers to catch on, and a gripper that
+fails to open there has cost no motion at all.
+
+So the grasp is now:
+
+```
+above the object   →   OPEN   →   one line straight down   →   CLOSE   →   one line up
+```
+
+The pre-flight proves that single line before the arm leaves home, so it is
+validated rather than attempted. `single_descent: false` brings the pre-grasp
+stop back, and there is a test asserting the column really does become two
+legs again — the option is real, not a dead parameter.
+
+### cuMotion is restarted when it dies
+
+It dies. SIGFPE, exit code −8, in most launches on 2026-09-07, and the cell is
+useless without it: move_group's `cumotion` pipeline forwards every goal to
+that node, so a dead planner turns even a joint goal to a recorded posture
+into `TIMED_OUT` — and the failure reads as though the recorded pose were at
+fault.
+
+`respawn=True` with a 4 second delay, in `launch_everything.launch.py`. The
+delay is for the CUDA kernels it loads at startup, during which it logs
+nothing at all; `check_planner_ready` covers the window where it is back but
+not yet planning, by asking it to plan a goal to the posture the arm is
+already in. No motion, and a failure there cannot be about the target.
+
+That last point is what the check is for. Measured: the node was started in
+the same second a cycle began, three attempts at a plain joint goal to a
+recorded posture came back `TIMED_OUT`, and the report told the operator to
+re-record the pose. Nothing was wrong with the pose.
+
+### Straight lines the whole way down
+
+The descent, the pre-grasp and the lift were real Cartesian lines. The long
+move from the staging pose to above the object was not — it was a joint goal
+to a chosen posture, and it is the leg you watch the arm make.
+
+It is now **pre-flight candidate zero**, tried before any posture:
+
+1. probe a straight line from the staging posture to above the object,
+2. probe the descent legs *from where that line ends*,
+3. if the whole chain solves, fly the approach as a line and send no posture
+   goal at all.
+
+```
+PREFLIGHT: pre-flight passed on a straight-line approach --
+           approach 100%, pre-grasp 100%, grasp 100%. No posture goal needed.
+```
+
+So `PRE_PICK → above object → pre-grasp → grasp → lift` is one continuous set
+of straight lines: the motion you get dragging the end-effector arrow in RViz.
+The posture path stays underneath for when no line exists, and the log says
+which was used — `ok-linear`, or a candidate number.
+
+`HOME ↔ PRE_PICK` stay joint-space. Those are recorded postures, and a
+straight line between two postures is not a meaningful request.
+
+### Headroom is a threshold, travel is the tie-break
+
+A posture can be excellent by every criterion above and still be the wrong
+one. From run `1788777730`:
+
+```
+PREFLIGHT  ok  candidate 1 of 6  legs pre-grasp 100% grasp 100%  margin 0.4931
+PRE_PICK   ok
+TRANSIT    heartbeat running  tcp=[0.1784, -0.1737, 0.4983]
+TRANSIT    heartbeat running  tcp=[0.1784, -0.1737, 0.4982]
+...  20 seconds, the tool not moving ...
+```
+
+The best headroom of the session, both descent legs proved, and the
+free-space plan to *take the posture up* never came back. With
+`motion_timeout` at 60 s and three attempts it would have stood there for
+three minutes.
+
+That is the criterion that was missing: nothing scored how far the arm has to
+travel to reach the chosen posture. Past `posture_margin` more headroom buys
+nothing — a joint with 0.3 rad to spare is no freer in practice than one with
+0.15 — while a posture on the other side of the workspace is a far harder
+plan and a far longer move. So the ranking is now:
+
+1. postures joint7 can actually tilt into line (wrist mode only),
+2. then those with **at least** `posture_margin` of headroom,
+3. ordered by **least travel from the staging pose** — `max |Δjoint|` against
+   `pre_pick_state`, which is where the approach is actually made from, not
+   where the arm stands while the pre-flight runs.
+
+If nothing clears the threshold the order falls back to roomiest-first rather
+than refusing: the pre-flight is the real gate, and it checks the descent from
+whichever posture is chosen. Both numbers are logged, so a run says what was
+picked and what it was picked over:
+
+```
+PREFLIGHT: pre-flight passed on candidate 1 of 6 -- pre-grasp 100%,
+           grasp 100%, 0.135 rad of joint headroom, 2.91 rad of travel
+           from the staging pose
+```
+
+### The tool frame, after all
+
+`approach_frame` defaults to `tool`: solve the full `hand_tcp` pose here, take
+the roomiest solution, send it as one joint goal.
+
+The wrist partition stays available and is off. Measured at the same target,
+once the tilt joint7 needs is accounted for, the two are within a few
+thousandths of a radian — **0.172 against 0.175** at the pre-grasp, **0.247
+against 0.240** at the transit point. It bought no measurable headroom, and it
+cost three things: the grasp yaw is not part of a wrist point so it had to be
+pinned separately, the tilt had to be solved and range-checked, and the
+postures the objective liked best were ones joint7 could not tilt into line at
+all.
+
+What actually did the work was never the frame. It was **choosing** the
+solution rather than taking the planner's first one — and that applies to
+either frame.
+
+### Nothing is discovered mid-descent
+
+Symptom: `HOME → PRE_PICK → TRANSIT → PREGRASP → OPEN_GRIPPER → DESCEND`, and
+then the whole thing starts again from pre-pick and home.
+
+From run `1788775217`, the joints on arrival at the pre-grasp — **before** the
+gripper opened:
+
+```
+PREGRASP  ok    [-1.363, 2.936, 0.044, 1.084, -0.218, -0.073, 0.741]
+                joint1 -1.363, and its limit is -1.396263: 0.033 rad left
+DESCEND  short  fraction=0.1818 checked, 0.1818 unchecked
+DESCEND  refused-no-line
+PRE_PICK ...    back to the staging pose, and round again
+```
+
+The descent needed joint1 to keep going negative. It had 33 milliradians. So
+18% of the line solved, `descend_linear_only` correctly refused to substitute
+a curve, and the attempt died — standing over the object with the gripper
+open.
+
+**None of that needed the arm to move to find out.** The geometry was fixed
+from the moment the object was detected, and `/compute_cartesian_path` takes
+an explicit `start_state`, so it will answer questions about a posture the arm
+is not in yet. So it is asked first:
+
+1. Solve several *distinct* candidate postures for the approach point
+   (`arm_kinematics.approach_candidates`, ranked by joint headroom, near
+   duplicates merged — eight genuinely different arm configurations at the
+   position above).
+2. For each, from that posture as the start state, probe the line down to the
+   pre-grasp and on to the grasp — checked, then unchecked, the same two ways
+   the real descent asks.
+3. Take the first candidate whose whole column solves. Nothing has moved yet.
+4. If none does, **refuse before moving**, and say what the best one managed.
+
+```
+PREFLIGHT: pre-flight passed on candidate 1 of 6 -- pre-grasp 100%, grasp
+           100%, 0.381 rad of joint headroom
+```
+
+or
+
+```
+PREFLIGHT: no straight-line descent exists from any of the 6 postures that
+           reach (0.406, -0.218, 0.559). The best managed pre-grasp 18%,
+           grasp 0%. Nothing moved. This is the arm running out of travel
+           along the descent, not an obstacle -- bring the object closer to
+           the base, or try the other arm.
+```
+
+Joint headroom alone would not have caught this: the posture that failed was
+*comfortable* by that measure until the descent asked it to travel in one
+particular direction. Only planning the line says so.
+
+#### And a proved cycle does not retry by going home
+
+The six-rung ladder exists for cuMotion's stochastic `TRAJOPT_FAIL` and for
+yaw/height variants. Once the column has been checked in advance, the next
+rung will find the same geometry — so the only visible effect of retrying is
+the arm travelling back to pre-pick and home for another identical go. After
+a passed pre-flight a failure therefore ends the cycle with its reason
+(`retry_after_preflight` restores the old behaviour). Stochastic planner
+failures are unaffected: `_send_move_goal` already resends in place,
+`plan_attempts` times, without moving anywhere.
+
 ### The motion log
 
 Every commanded motion is appended to `motion_log.jsonl`, one JSON object per
@@ -883,9 +1544,20 @@ CLOSE_GRIPPER  CLOSE              gripper    ok         0.042 ... 0.016
 ```
 
 Each record carries `measured` (joint positions, velocities and efforts, plus
-the finger and its effort), `before` for the same taken ahead of the move, and
-`tcp`. Cartesian records add `fraction` and `checked`, so a refused straight
+the finger and its effort), `before` for the same taken ahead of the move,
+`tcp`, and `run`/`cycle` ids — the file is append-only across runs, and without
+those a reader cannot tell one run's long idle gap from a robot that sat still. Cartesian records add `fraction` and `checked`, so a refused straight
 line is distinguishable from a blocked one; failed goals add `code`.
+
+**Where the time went.** Cartesian records also carry `plan_s` and `exec_s`,
+the detector's `LOCATE` record carries `secs`, and `PREFLIGHT` carries the
+`secs` its probes cost. Those exist because a cycle's wall clock is nothing
+like where it looks: in run `1788859355`, `TRANSIT` wrote its first record
+**18.59 s** after the state began — all of it inside a single `cartesian_move`
+call — while `LOCATE` spanned 10 s and then 12.6 s, windows that also hold the
+reachability probes and the pre-flight. Nothing in the log separated the
+detector's own latency from the probes, or planning from flying, so every
+answer about "why is it slow" was a guess. These four numbers end that.
 
 Moves that actually ran also carry **intermediate samples**: `path` is the
 measured joints and TCP taken every `motion_sample_period` (0.1 s) *while the
@@ -925,13 +1597,19 @@ attempts for nothing. `redetect` in `STRATEGIES` is the flag.
 ```bash
 source native/setup.bash
 python3 native/tests/test_pick_cycle.py       # the cycle, against a fake robot
+python3 native/tests/test_arm_kinematics.py   # FK against the robot, posture choice
 python3 native/tests/test_mirror_states.py    # the mirror rule and --play
 python3 native/tests/test_grasp_geometry.py   # grasp frames and the retry ladder
 ```
 
-`test_pick_cycle.py` forces `ROS_DOMAIN_ID=77` (override with
-`PICK_TEST_DOMAIN`) because it serves its own `/move_action`, `/joint_states`
-and gripper action. On the default domain those collide with a running stack —
+`test_arm_kinematics.py` needs no ROS and no robot: it checks the chain against
+joint values the real arm reported in `motion_log.jsonl`, its Jacobians against
+finite differences, and its limits against the URDF's own numbers.
+
+`test_pick_cycle.py` uses `ROS_DOMAIN_ID` 77 plus its process id modulo 20
+(override with `PICK_TEST_DOMAIN`) because it serves its own `/move_action`, `/joint_states`
+and gripper action, and two copies of the suite must not find each other
+either. On the default domain those collide with a running stack —
 two action servers on one name, two joint-state publishers — and the checks
 start reading the real arm instead of the modelled one. Worse, a goal with
 `plan_only` false could reach the real `move_group` and move the robot.
@@ -1121,6 +1799,7 @@ Orchestrator — all exposed as launch arguments, `--show-args` lists the rest:
 | `place_mode` | `state` | `state` drops at `drop_state`; `ready` at the observation pose; `position` uses `place_position` |
 | `place_position` | `[0.35, 0.30, 0.25]` | `place_mode:=position` only — **placeholder, measure yours** |
 | `grasp_finger_min` | `0.003` | finger position above which the gripper counts as holding something — measure it on your object |
+| `grasp_miss_warn` | `0.010` | how far the jaws may sit from the commanded grasp before `CLOSE_GRIPPER` logs `off-target`. Reporting only; nothing refuses on it |
 | `grasp_z_offset` | `-0.005` | applied to the object's detected *top* surface |
 | `workspace_radius` | `1.0` | m in x-y from the base; a detection beyond this is refused before anything moves |
 | `check_reach` | `true` | check reach before moving, and refuse with "out of reach" only if both `/compute_ik` and a plan-only cuMotion query say no |
@@ -1139,8 +1818,17 @@ Orchestrator — all exposed as launch arguments, `--show-args` lists the rest:
 | `cartesian_step` | `0.005` | m; interpolation step for that line — smaller is straighter |
 | `cartesian_min_fraction` | `0.98` | refuse a partial line rather than execute it and close on air |
 | `approach_ignores_octomap` | `true` | let every leg of the vertical column retry its straight line unchecked — the grasped object is itself in the octomap |
+| `descend_ignores_octomap` | `true` | on those legs, do not ask for a checked line at all — go straight to the unchecked one |
 | `retreat_height` | `0.20` | m above the grasp that the object is lifted to before being carried; `0` means back to the pre-grasp only |
 | `descend_linear_only` | `true` | refuse `DESCEND`/`LIFT` when no straight line exists rather than substituting curved hops |
+| `pose_tolerance` | `0.005` | m; how close the **tool** must end up, checked from TF rather than trusted |
+| `pose_settle_time` | `4.0` | s to let the tool creep onto its target before judging; exits early once it stops improving |
+| `pose_offset_correction` | `true` | after settling, aim past the target once by the error remaining |
+| `pose_residual_limit` | `0.025` | m; a gap this small with no line available is treated as the standing offset, not path |
+| `cartesian_partial_min` | `0.5` | smallest share of a line worth flying before continuing the rest |
+| `cartesian_segments` | `4` | straight segments allowed per leg |
+| `cartesian_min_gain` | `0.002` | m a segment must gain before another is tried |
+| `motion_log_heartbeat` | `1.0` | s between heartbeat records while a cycle runs; `0` disables |
 | `motion_log` | `motion_log.jsonl` | append-only record of every motion; empty disables |
 | `motion_sample_period` | `0.1` | s between samples taken *during* a move; `0` keeps only the endpoints |
 | `motion_sample_limit` | `40` | most samples kept per motion |
@@ -1148,11 +1836,31 @@ Orchestrator — all exposed as launch arguments, `--show-args` lists the rest:
 | `seeded_descent` | `true` | solve the column with IK seeded from the posture above and send **joint** goals, so lowering the tool cannot reconfigure the arm |
 | `max_joint_jump` | `0.5` | rad; reject an IK solution moving any joint further than this from its seed — that is a flip, not a descent |
 | `plan_attempts` | `3` | resends of a goal that failed for a retryable reason — cuMotion misses ~14.5% of goals with `TRAJOPT_FAIL` |
-| `velocity_scaling` / `acceleration_scaling` | `0.3` | cuMotion applies `min` of the two as a **time dilation** of the path it already optimised, so this changes speed, not geometry |
+| `velocity_scaling` / `acceleration_scaling` | `0.4` | a **time dilation** of the path already planned, so this changes speed, not geometry. A bigger lever on cycle time than it looks: `_retime` divides every timestamp by it, so `0.3` stretched a trajectory 3.33× and `0.4` stretches it 2.5× — a quarter off every leg |
+| `detection_reuse_age` | `10.0` | how old a detection may be and still be picked from without asking the detector again. `choose_arm` detects to decide which arm can reach, and the first attempt then wanted one of its own — two inference waits at the same stationary object, 22.6 s of a measured 76 s cycle. A failed attempt takes nearer a minute, so this reuses the one and re-detects the other. `0` disables reuse |
 | `gripper_torque_cap` | `2.5` | grip torque cap in **Nm at the motor** (≈59.5 N at the finger, 5.25 mm of finger overshoot); enforced by stepping the close and stopping at the cap |
 | `gripper_close_step` | `0.002` | coarse close step, m; quarter steps are used near the cap |
-| `refresh_octomap_at_ready` | `true` | capture the octomap only at the ready pose |
-| `ready_pose_tolerance` | `0.05` | rad; how close the measured joints must be to READY before the map may be captured |
+| `refresh_octomap_at_home` | `true` | capture the octomap only at HOME |
+| `home_joint_positions` | `[0, 0, 0, 0.20, 0, 0, 0]` | HOME, joint1..7 in rad. The SRDF `home` group state except for joint4 — `0.0` there is exactly that joint's URDF lower limit and the elbow stops 8.9° short of it |
+| `home_pose_tolerance` | `0.05` | rad; how close the measured joints must be to HOME before the map may be captured |
+| `home_settle_tolerance` | `0.20` | rad; how far a **stopped** joint may stand off HOME and still count as arrived |
+| `joint_still_speed` | `0.05` | rad/s below which a joint counts as stopped — separates "as close as this hardware gets" from "still on its way" |
+| `joint_limit_margin` | `0.02` | rad; keep commanded postures this far off the position limits. A goal on a limit cannot be held |
+| `approach_frame` | `tool` | how the move above the object is aimed: `tool` solves the full tool pose here and sends the roomiest solution as a joint goal, `wrist` solves for joint7's centre and tilts joint7 afterwards, `planner` sends a pose goal and lets cuMotion choose (the old behaviour) |
+| `grasp_jaw_flip` | `true` | also consider the grasp with the jaws turned 180° — the same grasp, often a much roomier posture |
+| `grasp_yaw_free` | `false` | leave the closing angle to the solver. Off: the jaws close along link6's y, which joint7 cannot move, so an unconstrained solve picks the angle arbitrarily |
+| `grasp_tilt_max` | `0.35` | rad the gripper may come down off vertical. Vertical is tried first and tilts in increasing order, so nothing tilts that need not. `0` restores strict top-down |
+| `grasp_tilt_steps` / `grasp_tilt_azimuths` | `2` / `4` | tilt magnitudes between 0 and the max, and directions for each |
+| `reach_orientations` | `3` | orientations the reach probe may try per point — it sends a planning request for each, so the full tilt set would make an unreachable object cost a minute |
+| `approach_tilt_stage` | `false` | send the joint7 tilt as its own move after arriving. Off: tilting at the end swings the tool through a 116 mm arc right before the descent |
+| `posture_margin` | `0.10` | rad of joint-limit headroom an approach posture should have. A **threshold**: past it the ranking prefers the posture nearest the staging pose instead |
+| `posture_seeds` | `48` | random restarts per posture solve. 48 takes about a second and is run once per pick attempt |
+| `single_descent` | `true` | one line from the approach height straight to the grasp, with the gripper opened before it. `false` restores the stop at the pre-grasp |
+| `check_planner_ready` | `true` | before the cycle, ask the planner to plan a goal to the arm's *own current posture*. Plan-only, no motion, and it cannot fail for reasons about the target |
+| `linear_transit` | `true` | fly the long move above the object as a straight line too, when one solves from the staging pose and the descent still flies from where it ends |
+| `preflight_descent` | `true` | prove the descent from the intended posture, before the arm leaves its rest pose. A refusal here costs no motion at all |
+| `preflight_candidates` | `6` | postures the pre-flight may probe. Each costs up to four `/compute_cartesian_path` calls and no motion |
+| `retry_after_preflight` | `false` | run the retry ladder even after a pre-flight passed. Off, because the next rung finds the same geometry and the arm travels home for nothing |
 | `arm_selection` | `fixed` | `by_side` decides the arm from the object's world y |
 | `use_table_collision` / `table_z` | `false` / `0.0` | explicit work-surface box; worth enabling with `octomap:=static`, where the map can legitimately be empty |
 | `velocity_scaling` | `0.15` | start lower on the first hardware run |
@@ -1377,20 +2085,35 @@ always one of these two.
 
 ### Dry-running on fake hardware
 
-With `use_fake_hardware:=true` the camera and the detector are real and only the
-arm is simulated, so it is a genuine rehearsal of the motion sequence — but
-**grasp verification is guaranteed to fail there**, and the ladder will burn all
-six attempts. `mock_components` reports the finger exactly where it was
-commanded, which is below the holding threshold, and the object never physically
-moves so the re-detection always finds it back at the pick point. Neutralise
-both checks for the rehearsal:
-
 ```bash
-ros2 launch pick_place.launch.py grasp_finger_min:=-1.0 object_moved_eps:=0.0
+native/run_pick_place_demo.sh --fake
 ```
 
-Drop both arguments on real hardware — they are exactly what makes the retries
-work.
+The arms are simulated by `mock_components` and the whole sequence plays out in
+RViz, while **the camera, the depth stream and the detector are all real** — so
+the object really is found where it is, and only the moving is pretend. No CAN
+bus, no arms plugged in.
+
+`--fake` also neutralises the two checks that cannot pass on simulated arms,
+which is the difference between watching a cycle and watching the retry ladder
+burn all six attempts: `mock_components` reports the finger exactly where it was
+commanded, so the grip never registers, and the object never physically moves,
+so the place is never confirmed. It expands to
+
+```bash
+use_fake_hardware:=true grasp_finger_min:=-1.0 object_moved_eps:=0.0
+```
+
+and it expands in the script rather than being passed through, so the CAN check
+sees it too. Anything you write after `--fake` still wins — a repeated launch
+argument takes its last value:
+
+```bash
+native/run_pick_place_demo.sh --fake arm:=left prompt:='detect mug'
+```
+
+Never pass those last two arguments on real hardware. They are exactly what
+makes the retries work.
 
 ### Why it is built this way
 
@@ -1571,7 +2294,7 @@ ros2 topic echo /pick_place/state --once
 | `could not plan to the pre-grasp above (x, y, z)` | almost always **out of reach**. The line includes a ready-made `check_reachability.py` command; for the right arm keep objects around `x ≤ 0.40, y ≤ −0.10` |
 | `could not plan to pre_pick_state` | the recorded staging pose is not reachable from the observation pose; re-record it |
 | `reached the pre-grasp but could not descend` | the octomap probably contains the object itself, or the grasp is under the table |
-| `the gripper closed but nothing was held` | `grasp_finger_min` or the grasp height is wrong for this object |
+| `the gripper closed but nothing was held` | `grasp_finger_min` or the grasp height is wrong for this object — **read the `CLOSE_GRIPPER` line above it first**: if it says `off-target`, the jaws were not where they were sent and nothing about the detector or the fingers is wrong. Measured once at 29 mm high with the descent plan ending exactly on the point |
 
 The out-of-reach case is the one that looks most like a software fault and is
 not: the detector reports a perfectly good position, cuMotion simply cannot get

@@ -1,6 +1,18 @@
 octomap_frame: world
-octomap_resolution: 0.05
-max_range: 5.0
+# Voxel edge length, metres. 0.05 was coarser than the things being picked up:
+# a screwdriver is a couple of centimetres across, so at 50 mm it and the
+# table under it merged into one block, and the gripper could not be given a
+# path to it that was not "inside an obstacle". 0.02 resolves the object from
+# the surface.
+#
+# The cost is leaf count, which for an octree scales with observed *surface*
+# rather than volume -- about 6x here -- and is why max_range is cut to the
+# work area below rather than left at the sensor's 5 m.
+octomap_resolution: 0.02
+# The work surface is well inside a metre of the base; anything past that is
+# the room, and voxelising the room at 20 mm is pure cost. workspace_radius in
+# the orchestrator refuses detections beyond 1.0 m for the same reason.
+max_range: 1.5
 sensors:
   - realsense_depth
 realsense_depth:
@@ -8,7 +20,9 @@ realsense_depth:
   image_topic: /camera/camera/depth/image_rect_raw
   queue_size: 5
   near_clipping_plane_distance: 0.3
-  far_clipping_plane_distance: 5.0
+  # Matched to max_range above: depth past the work area is discarded before
+  # it ever becomes voxels.
+  far_clipping_plane_distance: 1.5
   shadow_threshold: 0.2
   padding_scale: 2.0
   padding_offset: 0.20

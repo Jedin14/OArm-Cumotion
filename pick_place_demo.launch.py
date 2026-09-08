@@ -48,6 +48,7 @@ WS = os.path.dirname(os.path.realpath(__file__))
 FORWARDED = ['arm', 'arm_selection', 'prompt', 'states_file', 'place_mode',
              'approach_height',
              'velocity_scaling', 'acceleration_scaling', 'gripper_max_effort',
+             'detection_reuse_age', 'grasp_finger_min', 'object_moved_eps',
              'refresh_octomap_at_home', 'use_table_collision', 'table_z']
 
 
@@ -77,15 +78,19 @@ def generate_launch_description():
             'approach_height', default_value='0.05',
             description='Pre-grasp height above the object, metres.'),
         DeclareLaunchArgument(
-            'velocity_scaling', default_value='0.3',
+            'velocity_scaling', default_value='0.4',
             description='Fraction of joint velocity limits. Time-scales the '
                         'planned path, so it costs tracking margin not accuracy.'),
         DeclareLaunchArgument(
-            'acceleration_scaling', default_value='0.3',
+            'acceleration_scaling', default_value='0.4',
             description='Fraction of joint acceleration limits.'),
         DeclareLaunchArgument(
-            'gripper_max_effort', default_value='2.0',
-            description='Grip force limit, newtons. Adjustable in the panel.'),
+            'gripper_max_effort', default_value='20.0',
+            description='max_effort on the GripperCommand goal. Inert on this '
+                        'hardware -- gripper_torque_cap is what bounds the '
+                        'grip. This layer had 2.0 against 20.0 in '
+                        'pick_place.launch.py, and this layer is the one the '
+                        'demo script uses.'),
         DeclareLaunchArgument(
             'refresh_octomap_at_home', default_value='true',
             description='Capture the octomap only at HOME, never at READY -- '
@@ -116,6 +121,20 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'ui', default_value='true',
             description='Start the panel. false leaves the service interface.'),
+        DeclareLaunchArgument(
+            'detection_reuse_age', default_value='10.0',
+            description='How old a detection may be and still be picked from '
+                        'without asking the detector again. 0 disables '
+                        'reuse.'),
+        DeclareLaunchArgument(
+            'grasp_finger_min', default_value='0.003',
+            description='Finger position above which the gripper counts as '
+                        'holding something. -1.0 to rehearse on fake '
+                        'hardware.'),
+        DeclareLaunchArgument(
+            'object_moved_eps', default_value='0.05',
+            description='How far the object must have moved for a place to '
+                        'count, metres. 0.0 to rehearse on fake hardware.'),
     ]
 
     # One link, one arm: openarm_<arm>_hand_tcp. Deriving it here rather than

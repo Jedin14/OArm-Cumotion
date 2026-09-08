@@ -160,7 +160,20 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_init(
   // gravity vector (0, 0, -9.81) is correctly applied in the world frame,
   // accounting for any mounting rotations of the arms.
   std::string base_link = kdl_tree.getRootSegment()->first;
-  std::string tip_link = "openarm_" + arm_prefix_ + "link7";
+  // Tip at the hand, not link7. The hand and fingers weigh 0.4221 kg -- close
+  // to link7's own 0.466 kg -- and hang at the longest moment arm on the arm,
+  // so leaving them out of the gravity model is an uncompensated load exactly
+  // where it costs most. Measured before this change: a repeatable elbow
+  // (joint4) error of 14-28 mrad in the direction gravity pulls, holding
+  // 4.4-5.0 Nm, giving a tool that arrived 13.7 mm low at z=0.405 and 33.5 mm
+  // low at z=0.555 -- the sag grows with extension, and it is why the gripper
+  // closed above the object.
+  //
+  // Safe for the joint-count check below: right_openarm_hand_joint is fixed,
+  // so the chain still has exactly ARM_DOF movable joints. The fingers hang
+  // off the hand on prismatic joints and stay out of the chain, leaving only
+  // their 0.072 kg unmodelled.
+  std::string tip_link = "openarm_" + arm_prefix_ + "hand";
   KDL::Chain kdl_chain;
   if (!kdl_tree.getChain(base_link, tip_link, kdl_chain)) {
     RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"), "Failed to extract KDL chain from %s to %s", base_link.c_str(), tip_link.c_str());
