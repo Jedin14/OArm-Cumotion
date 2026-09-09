@@ -131,7 +131,9 @@ HOME ─► LOCATE ─► PREFLIGHT ─► PRE_PICK ─► TRANSIT ─► OPEN �
   ▲                                                                       │
   └────── PRE_PICK ◄── CLEAR ◄── failed ──────────── VERIFY_GRASP ◄── LIFT
                                                            │
-  HOME ◄── PRE_PICK ◄── VERIFY_PLACE ◄── RELEASE ◄── DROP ◄─┘
+  HOME ◄── PRE_PICK ◄── CLOSE ◄── VERIFY_PLACE ◄── RELEASE ◄── DROP ◄── PRE_PICK
+                                                                          ▲
+                                                                          └── LIFT
 ```
 
 **HOME is the only pose the arm rests, observes and maps from.** There used to
@@ -139,9 +141,14 @@ be a separate READY as well, and having two was the whole problem: the octomap
 must be captured with the arm out of the camera's frame, and the old READY
 deliberately held it out over the table — *in* frame. One pose does both jobs.
 
-The way out is the way in: LIFT, DROP, then back through PRE_PICK to HOME.
-PRE_PICK is reachable from both ends, which is what makes it a safe waypoint
-rather than a dash home across the workspace.
+The way out is the way in: **LIFT** with the object held, **PRE_PICK**,
+**DROP**, open, **shut the jaws again at the drop pose**, then back through
+**PRE_PICK** to **HOME**. PRE_PICK is reachable from both ends, which is what
+makes it a safe waypoint rather than a dash home across the workspace, and the
+trip home is made closed — 44 mm of open fingers on a moving arm is something
+looking for an edge to catch on, and the arm ends the cycle in the shape it
+started it. Identical for either arm: the whole path runs off the chosen arm's
+recorded states, with no left/right branch in it.
 
 **A pick that fails leaves by the same door.** Every failure below TRANSIT —
 the descent stopping short, the jaws closing on nothing, the grasp not
@@ -1800,7 +1807,11 @@ Orchestrator — all exposed as launch arguments, `--show-args` lists the rest:
 | `place_position` | `[0.35, 0.30, 0.25]` | `place_mode:=position` only — **placeholder, measure yours** |
 | `grasp_finger_min` | `0.003` | finger position above which the gripper counts as holding something — measure it on your object |
 | `grasp_miss_warn` | `0.010` | how far the jaws may sit from the commanded grasp before `CLOSE_GRIPPER` logs `off-target`. Reporting only; nothing refuses on it |
-| `grasp_z_offset` | `-0.005` | applied to the object's detected *top* surface |
+| `grasp_z_offset` | `0.010` | added to the object's detected *top* surface. **Positive: the tool stops above it.** Measured grips came in at 14.7 mm and 25 mm above the detected top, both with the arm stopping short of its command, so there is real tolerance here — what the jaws do not tolerate is being sent *below* the object. `-0.005` only ever worked because the arm stopped 36 mm short of what it was told (`error_mm 40.6`, `plan_error_mm 0.0`); once it tracked better the same command pressed into the table. Raise it if the arm presses down, lower it if the jaws close above the object |
+| `home_requires_pre_pick` | `true` | whether HOME may be commanded when `pre_pick` could not be reached on the way back. HOME is a **joint** goal to a folded posture, and from a low, extended one the short path in joint space goes through the work surface. Measured, run `1788869179` cycle 2: `CLEAR` got the tool to z = 0.4286, `PRE_PICK_STATE` came back exhausted, and HOME was sent anyway — the arm swept out to x = 0.44 and *down* to z = 0.358, across the object it had just failed to pick. With this on, the retreat lifts higher and tries pre_pick once more, then **stops and reports** rather than sweeping. Leaving the arm over the table is bad; dragging it across the table is worse |
+| `descend_close_gap` | `false` | fly the remainder when the descent stops short of the grasp. The descent's plan ends on the point and the arm does not — measured **15.5, 29 and 36 mm** above it across three runs, `plan_error_mm 0.0` every time. That varies by 20 mm, so `grasp_z_offset` cannot dial it out: the offset that grips one run closes on air or presses the table the next, and both have happened. A **continuation of the one descent** — same vertical line, straight down from where the tool actually is, same collision settings and travel budget. x and y are left alone: the jaws span 40 mm and grips have worked 17 mm off laterally. **Off by default**: the run that prompted this turned out to have gripped fine with the tool 9.8 mm above the commanded grasp and the arm's joint efforts flat through the whole close — what discarded that grasp was `close_gripper_to_cap` reading the *commanded* finger position instead of the measured one. No measured grasp has needed the gap flown, and flying it drives the tool toward the table. Turn it on if a descent ever does stop short enough to miss |
+| `descend_gap_max` | `0.06` | largest gap, m, treated as tracking error and flown. Beyond it something else is wrong, and it is reported rather than flown blind |
+| `grasp_max_depth` | `0.0` | how far *below* the detected top of the object the tool may be commanded, m. The object rests on the surface, so its top face is the only surface reference available without being told where the table is — and `0.0` means the descent never aims below it. **This is the floor `min_grasp_z` is not**: `min_grasp_z` is measured from the base and set at 0.01, while this table stands at z = 0.34. It also bounds the retry ladder, whose `lower-8mm` rungs subtract height after a missed grip — precisely how the tool gets pressed into the surface |
 | `workspace_radius` | `1.0` | m in x-y from the base; a detection beyond this is refused before anything moves |
 | `check_reach` | `true` | check reach before moving, and refuse with "out of reach" only if both `/compute_ik` and a plan-only cuMotion query say no |
 | `ik_attempts` | `3` | KDL tries per query — it is randomly seeded, so one failure means little |
@@ -2294,6 +2305,11 @@ ros2 topic echo /pick_place/state --once
 | `could not plan to the pre-grasp above (x, y, z)` | almost always **out of reach**. The line includes a ready-made `check_reachability.py` command; for the right arm keep objects around `x ≤ 0.40, y ≤ −0.10` |
 | `could not plan to pre_pick_state` | the recorded staging pose is not reachable from the observation pose; re-record it |
 | `reached the pre-grasp but could not descend` | the octomap probably contains the object itself, or the grasp is under the table |
+| *the gripper turns red in RViz, then every move fails with −2* | the jaws are inside the octomap and the arm's own **start state** is in collision, so no plan from it is valid. The descent leaves them among the voxels of the object they came for, so the gripper's octomap exemption is held for the whole time the arm is on the column — descent, close and the way back up — and `release_column()` is the one place that ends it. If this recurs, check that nothing clears `self._column` without going through it |
+| `STOPPED: cannot reach pre_pick` | deliberate. The arm is parked clear of the surface because HOME from where it stands would sweep across the table. Usually the octomap is blocking the plan — `ros2 service call /clear_octomap std_srvs/srv/Empty`, then drive it out with `record_states.py --play`. `home_requires_pre_pick:=false` accepts the sweep instead |
+| *the jaws shut on air after a descent that landed accurately* | the commanded height is wrong for **this object**, not the motion. Measured, run `1788869179` cycle 2: DESCEND landed 1.4 mm from its commanded z and the jaws closed 11 mm above a screwdriver. `grasp_z_offset` is measured from the detector's z, which is not reliably the graspable height — a tall roll of tape tolerates +10 mm, a screwdriver does not. The ladder's `lower-8mm` rungs are the automatic answer and now run on a missed grip; lower `grasp_z_offset` if it happens every time |
+| *the arm presses down into the work surface* | the descent is aiming below the object. `grasp_z_offset` is added to the detected **top** of the object, so a negative value asks the tool to go below it; `grasp_max_depth` (`0.0`) is the floor that stops it, and `min_grasp_z` is **not** — that one is measured from the base. Note the two mask each other: the arm has been stopping tens of millimetres short of what it was told, so a command that is too deep can look fine until tracking improves |
+| `closed-on-nothing` *while the arm is visibly holding the object* | fixed — the check compared the **commanded** finger position, which at the end of a full close is always 0.0, against `grasp_finger_min`. It now reads the measured position. Across 14 real closes the two cases separate cleanly: empty is 0.0025–0.0026 m at 1.14–1.24 Nm, holding is 0.0039–0.0175 m at 1.84–2.46 Nm, and `grasp_finger_min` (0.003) already sat in the gap. A thin object gripped below the torque cap now logs `held-under-cap` |
 | `the gripper closed but nothing was held` | `grasp_finger_min` or the grasp height is wrong for this object — **read the `CLOSE_GRIPPER` line above it first**: if it says `off-target`, the jaws were not where they were sent and nothing about the detector or the fingers is wrong. Measured once at 29 mm high with the descent plan ending exactly on the point |
 
 The out-of-reach case is the one that looks most like a software fault and is

@@ -82,7 +82,14 @@ ARM = 'right'
 OBJECT_POINT = [0.35, -0.18, 0.05]
 OBJECT_YAW = 0.4
 APPROACH_HEIGHT = 0.05
-GRASP_Z_OFFSET = -0.005
+# The shipped default, and deliberately positive: the tool stops 10 mm above
+# the detected top of the object rather than below it. Measured on the one
+# real cycle that gripped and placed -- the fingers reached the torque cap
+# with the tool 14.7 mm above the detected top while the descent had been
+# commanded 5 mm below it. The old -0.005 only ever worked because the arm
+# stopped 36 mm short of what it was told, and once it tracked better the
+# same command pressed into the table.
+GRASP_Z_OFFSET = 0.010
 PRE_PICK_JOINTS = [-0.5, 0.1, -0.2, 1.9, 0.05, -0.3, 0.7]
 DROP_JOINTS = [0.9, 0.2, -0.1, 1.5, 0.0, 0.2, -0.4]
 READY_JOINTS = [-0.828374, 0.000191, -0.000191, 2.324140,
@@ -214,11 +221,21 @@ class FakeRobot(Node):
         self.pending_cartesian = None
         self.last_fraction = None
         self.nothing_to_grip = False
+        # How far apart the jaws physically stop when nothing_to_grip is set.
+        # 0.0 is air. A thin object -- a roll of tape measured at ~4 mm --
+        # stalls them above that while the torque still never reaches the
+        # cap, and that is the case the empty check kept calling empty.
+        self.finger_floor = 0.0
         # Published in /joint_states. Non-zero means "still moving".
         self.joint_speed = 0.011
         # Reply for plan-only goals, when the planner is to be modelled as
         # up but unable to plan. None means answer normally.
         self.plan_only_code = None
+        # A code returned for every executing (non-plan-only) goal, for as
+        # long as it is set. move_fail_codes pops one entry per goal, which
+        # cannot model "this posture is simply unreachable from here" -- the
+        # case where the retreat has to decide whether to fly HOME anyway.
+        self.joint_code = None
         # Radians of detour to put into a Cartesian path, so a path that keeps
         # the tool on the line while the arm sweeps can be tested.
         self.sweep_rad = 0.0
@@ -379,7 +396,9 @@ class FakeRobot(Node):
                             if arm in self.ik_unreachable
                             else MoveItErrorCodes.SUCCESS)
             else:
-                code = (self.move_fail_codes.pop(0) if self.move_fail_codes
+                code = (self.joint_code if self.joint_code is not None
+                        else self.move_fail_codes.pop(0)
+                        if self.move_fail_codes
                         else MoveItErrorCodes.SUCCESS)
             # The arm arrives. Without this the reported joints never move, so
             # anything that gates on *measured* position -- the octomap's
@@ -407,9 +426,12 @@ class FakeRobot(Node):
                 # only torque is friction. Measured on the robot -- 22 steps
                 # from 40.9 mm to 2.5 mm with the effort flat near 0.5 Nm
                 # against a 2.5 Nm cap.
-                self.finger = max(0.0, position)
-                self.torque = 0.5
-                self.holding = False
+                self.finger = max(self.finger_floor, position)
+                # Loaded, but never to the cap: measured 1.84-2.13 Nm on the
+                # three runs that gripped something thin and were called
+                # empty, against 1.14-1.24 Nm on the four that gripped air.
+                self.torque = 1.9 if self.finger_floor > 0.0 else 0.5
+                self.holding = self.finger_floor > 0.0
             elif position < OBJECT_HALF_WIDTH:
                 # The fingers stall on the object; the motor holds a position
                 # error, and the torque that error produces is what a cap has
@@ -766,15 +788,20 @@ def main():
         # The sequence the cycle is supposed to walk, in order. Checked as a
         # subsequence so retries or extra detail lines cannot break it.
         # The sequence, in the order it was asked for: home, pre-pick,
-        # transit, above the object, open, down, grab, back above, drop, open,
-        # pre-pick, home. HOME is the only rest/observation pose -- there is no
-        # separate READY any more.
+        # transit, above the object, open, down, grab, lift with it closed,
+        # pre-pick, drop, open, shut the jaws there, pre-pick, home. HOME is
+        # the only rest/observation pose -- there is no separate READY any
+        # more.
         # No PREGRASP: with single_descent the gripper opens above the object
         # and one line goes all the way to the grasp, so there is no stop 5 cm
         # up to be in this list.
+        # The second CLOSE_GRIPPER is the one at the drop pose: the arm goes
+        # back through pre_pick to home with the jaws shut rather than with
+        # 44 mm of open fingers hunting for something to catch on.
         wanted = ['HOME', 'LOCATE', 'PRE_PICK', 'TRANSIT',
                   'OPEN_GRIPPER', 'DESCEND', 'CLOSE_GRIPPER', 'LIFT',
-                  'VERIFY_GRASP', 'DROP', 'RELEASE', 'VERIFY_PLACE',
+                  'VERIFY_GRASP', 'PRE_PICK', 'DROP', 'RELEASE',
+                  'VERIFY_PLACE', 'CLOSE_GRIPPER',
                   'PRE_PICK', 'HOME', 'DONE']
         index, missing = 0, []
         for step in wanted:
@@ -786,6 +813,21 @@ def main():
         check('states appear in the documented order', missing, [])
         check('no READY pose survives -- HOME does its job',
               [s for s in steps if s == 'READY'], [])
+        # Asked for explicitly: the jaws shut at the drop pose, and the trip
+        # home is made closed. The last gripper command of the cycle is a
+        # close, and it lands after the release rather than before it.
+        with robot.lock:
+            grip_order = list(robot.gripper_commands)
+        check('the last gripper command of the cycle shuts the jaws',
+              grip_order[-1] <= 0.0 + 1e-9, True)
+        opened = max(i for i, g in enumerate(grip_order)
+                     if g >= orchestrator.get_parameter('gripper_open').value)
+        check('and it comes after the release, not before it',
+              len(grip_order) - 1 > opened, True)
+        check('the close at the drop is between VERIFY_PLACE and the way home',
+              steps.index('VERIFY_PLACE')
+              < len(steps) - 1 - steps[::-1].index('CLOSE_GRIPPER')
+              < len(steps) - 1 - steps[::-1].index('HOME'), True)
 
         with robot.lock:
             goals = [g for g in robot.goals if not g['plan_only']]
@@ -1009,11 +1051,21 @@ def main():
 
         # The close is a staircase now, not one goal: it steps down and stops
         # at the cap, so assert the shape rather than three exact values.
+        #
+        # And the cycle ends on a close, not on the release: the jaws are shut
+        # again at the drop pose so the trip back through pre_pick to home is
+        # made with a narrow profile. So the release is the *last open*, not
+        # the last command, and the grasp close is the staircase before it.
         check('the gripper opened first', round(grips[0], 3), 0.044)
-        check('and opened again to release', round(grips[-1], 3), 0.044)
-        check('the close stepped rather than slamming shut', len(grips) > 3, True)
+        release_at = max(i for i, g in enumerate(grips) if round(g, 3) == 0.044)
+        check('and opened again to release', release_at > 0, True)
+        grasp_close = grips[1:release_at]
+        check('the close stepped rather than slamming shut',
+              len(grasp_close) > 3, True)
         check('and stopped at the cap instead of fully closing',
-              min(grips) > 0.0, True)
+              min(grasp_close) > 0.0, True)
+        check('the cycle ends with the jaws shut at the drop, not open',
+              round(grips[-1], 3), 0.0)
         check('grip torque cap is the 2.5 Nm default',
               orchestrator.get_parameter('gripper_torque_cap').value, 2.5)
         # 0.3 -> 0.4. _retime divides every timestamp by this, so the old
@@ -1190,6 +1242,75 @@ def main():
         check('a centimetre below the floor still clamps, not rejects',
               orchestrator.implausible_detection(
                   dict(good, point=[0.35, -0.18, min_z - slack / 2])), None)
+
+        # min_grasp_z is not a table floor and must not be mistaken for one.
+        # It is measured from the base and set at 0.01; the real table stands
+        # at z=0.34, so it would never stop a grasp 20 mm too deep. That is
+        # grasp_max_depth's job, and it is measured from the detected top of
+        # the object -- which rests on the surface, and is the only surface
+        # reference available without being told where the table is.
+        # A grip that missed is not the same failure as a descent that would
+        # not fly, and the remedies are opposite: nothing recovers a line the
+        # pre-flight already proved and the arm then cannot follow, whereas a
+        # grip that shut on air is exactly what the ladder's 8-mm-lower rungs
+        # are for. They were indistinguishable at the call site, so
+        # retry_after_preflight stopped the cycle after one attempt.
+        # Measured, run 1788869179 cycle 2: DESCEND landed 1.4 mm from its
+        # commanded height -- the motion was near perfect -- and the jaws
+        # closed on air 11 mm above a screwdriver.
+        orchestrator_src = open(
+            os.path.join(WS, 'pick_place_orchestrator.py')).read()
+        check('a missed grip has its own answer, distinct from None',
+              module.GRASP_MISSED is not None, True)
+        check('and the attempt returns it rather than a bare failure',
+              'return GRASP_MISSED' in orchestrator_src, True)
+        check('the ladder carries on after one, whatever '
+              'retry_after_preflight says',
+              re.search(r'if picked_point is GRASP_MISSED:'
+                        r'(?:\n\s*(?:#[^\n]*)?[^\n]*)*?\n\s*continue',
+                        orchestrator_src) is not None, True)
+        # And it does not repeat itself: a rung offering the same yaw at the
+        # same height will miss identically, for the ~60 s a full approach
+        # costs. Only exact repeats are skipped -- a different yaw is a
+        # different grasp on a screwdriver, and a rung that re-detects gets a
+        # fresh height.
+        shapes, order = set(), []
+        for st in module.STRATEGIES:
+            shape = (round(st['yaw_offset'], 6), round(st['z_offset'], 6))
+            if shape in shapes and not st['redetect']:
+                continue
+            order.append(st['name'])
+            shapes.add(shape)
+        check('a ladder where every rung misses skips only the duplicate',
+              order, ['nominal', 'yaw+90', 'lower-8mm', 'yaw+90-lower',
+                      'remap-from-home'])
+        check('and it does reach a rung that goes lower',
+              any(module.STRATEGIES[[s['name'] for s in module.STRATEGIES]
+                                    .index(n)]['z_offset'] < 0.0
+                  for n in order), True)
+
+        check('the shipped grasp offset stops above the object, not below it',
+              orchestrator.get_parameter('grasp_z_offset').value > 0.0, True)
+        nominal = next(st for st in module.STRATEGIES
+                       if st['name'] == 'nominal')
+        deeper = dict(nominal, z_offset=-0.050)
+        point = [0.35, -0.18, 0.30]
+        grasp, _pregrasp, _quat, _pt = orchestrator.grasp_from_detection(
+            dict(good, point=point), deeper)
+        check('a strategy that asks 50 mm deeper is clamped to the object top',
+              round(grasp[2], 6), round(point[2], 6))
+        # The rungs that do exist stay useful: -8 mm off a +15 mm offset is
+        # still 7 mm above the surface, so the ladder can retry lower without
+        # driving the tool into the table.
+        for name in ('lower-8mm', 'yaw+90-lower'):
+            rung = next(st for st in module.STRATEGIES if st['name'] == name)
+            low, _pg, _q, _p = orchestrator.grasp_from_detection(
+                dict(good, point=point), rung)
+            check(f'the {name} rung still lands above the surface',
+                  low[2] >= point[2] - 1e-9, True)
+            check(f'and {name} really does aim lower than nominal',
+                  low[2] < point[2]
+                  + orchestrator.get_parameter('grasp_z_offset').value, True)
 
         # Seeded IK, on its own. This is the mechanism that stops a 5 cm
         # descent from flipping the arm, so its failure modes matter.
@@ -1389,6 +1510,66 @@ def main():
             recent = [json.loads(line) for line in handle if line.strip()]
         check('the log names it',
               any(e['outcome'] == 'closed-on-nothing' for e in recent), True)
+
+        # Whether anything is held is answered by where the fingers *are*,
+        # not by what they were last told. This compared the last commanded
+        # step -- always 0.0 at the end of a full close -- against a 3 mm
+        # floor, so every close that ran to the end was called empty whatever
+        # the jaws were doing. Measured across 14 real closes:
+        #
+        #   empty     measured finger 0.0025-0.0026 m, effort 1.14-1.24 Nm
+        #   holding   measured finger 0.0039-0.0175 m, effort 1.84-2.46 Nm
+        #
+        # Two bands, nothing between them, and grasp_finger_min already in
+        # the gap at 0.003. Three runs in that table were rejected while
+        # gripping something 4 mm thick at ~1.9 Nm -- one a roll of tape the
+        # arm was visibly holding.
+        floor = orchestrator.get_parameter('grasp_finger_min').value
+        with robot.lock:
+            robot.nothing_to_grip = True     # never loads to the cap
+            robot.finger_floor = floor + 0.001
+            robot.finger = OPEN_FINGER
+            robot.torque = 0.0
+        time.sleep(0.4)
+        check('jaws that stop above the floor are holding, not empty -- '
+              'even though the last command was 0.0',
+              orchestrator.close_gripper_to_cap(), True)
+        with open(log_path) as handle:
+            recent = [json.loads(line) for line in handle if line.strip()]
+        held = [e for e in recent if e['outcome'] == 'held-under-cap']
+        check('and the log says so', bool(held), True)
+        check('recording the measured finger, not just the command',
+              held[-1]['finger'] > floor and held[-1]['target'] <= floor, True)
+        with robot.lock:
+            robot.finger_floor = 0.0         # jaws really do shut on air
+            robot.finger = OPEN_FINGER
+            robot.torque = 0.0
+        time.sleep(0.4)
+        check('and jaws that shut all the way really are empty',
+              orchestrator.close_gripper_to_cap(), False)
+
+        # close_gripper is the plain one: no grasp check, because at the drop
+        # pose there is deliberately nothing between the fingers and a
+        # 'closed on nothing' verdict there would be correct and useless.
+        with robot.lock:
+            robot.nothing_to_grip = True
+            robot.finger_floor = 0.0
+            robot.finger = OPEN_FINGER
+            robot.torque = 0.0
+            robot.gripper_commands.clear()
+        time.sleep(0.4)
+        check('a plain close succeeds on an empty gripper',
+              orchestrator.close_gripper('CLOSE_AT_DROP'), True)
+        with robot.lock:
+            shut = list(robot.gripper_commands)
+        check('in one command, not a stepped search for the cap',
+              len(shut), 1)
+        check('and it really does shut them', shut[-1] <= 0.0 + 1e-9, True)
+        with robot.lock:
+            robot.nothing_to_grip = False
+            robot.finger = OPEN_FINGER
+            robot.torque = 0.0
+        time.sleep(0.4)
         with robot.lock:
             robot.nothing_to_grip = False
             robot.finger = OPEN_FINGER
@@ -1458,10 +1639,155 @@ def main():
         # The lift is only worth having if it is on all of the paths, and the
         # one that mattered -- the failed grip -- was the one without it.
         orch_src = open(os.path.join(WS, 'pick_place_orchestrator.py')).read()
+        # The gripper's octomap exemption has to outlive the descent leg.
+        # It used to be withdrawn in descend_column's finally, per leg -- and
+        # the descent leaves the jaws inside the voxels of the object they
+        # came for, so handing them back to collision checking there makes
+        # the arm's own start state invalid. That is the gripper turning red
+        # in RViz. Measured, run 1788863209: CLEAR succeeded on its own fresh
+        # exemption and then PRE_PICK_STATE and HOME both returned -2,
+        # INVALID_MOTION_PLAN, with the arm stranded over the table.
+        # Legs flown here really move the fake arm, and the seeded-column
+        # test further down reads the posture it is left in -- so put it back.
+        with robot.lock:
+            keep_joints = list(robot.joints)
+            keep_tcp = list(robot.tcp)
+        orchestrator._column = ([0.34, 0.12, 0.30], [0.34, 0.12, 0.45], quat)
+        orchestrator._octomap_exempt = True
+        orchestrator.descend_column((0.34, 0.12), 0.40, 0.38, quat, 'HOLDS')
+        check('a leg flown on the column leaves the gripper exempt',
+              orchestrator._octomap_exempt, True)
+        check('and the column is still held', orchestrator._column is not None,
+              True)
+        orchestrator.release_column()
+        check('releasing the column withdraws the exemption',
+              orchestrator._octomap_exempt, False)
+        check('and forgets the column', orchestrator._column, None)
+        orchestrator._octomap_exempt = True
+        orchestrator.descend_column((0.34, 0.12), 0.40, 0.38, quat, 'NOHOLD')
+        check('a leg flown off the column withdraws it as before',
+              orchestrator._octomap_exempt, False)
+        # Two: the field's declaration in __init__, and release_column
+        # itself. Anywhere else and the exemption outlives the column or the
+        # column outlives the exemption, which is the bug this pair exists to
+        # prevent.
+        cleared_in = [name for name in re.findall(
+            r'\n    def ([a-z_]+)\(', orch_src)
+            if 'self._column = None' in orch_src.split(
+                f'\n    def {name}(')[1].split('\n    def ')[0]]
+        check('nothing but __init__ and release_column clears the column',
+              cleared_in, ['__init__', 'release_column'])
+
+        # And the descent gap: the plan ends on the point, the arm stops
+        # short of it by an amount that varied 15.5 -> 36 mm across three
+        # runs, and no offset can track that.
+        # Off by default. It was added on the belief that the grip failed
+        # because the jaws stopped too high; run 1788863209 gripped a roll of
+        # tape with the tool 9.8 mm above the commanded grasp and the active
+        # arm's joint efforts flat all the way through the close. What
+        # discarded that grasp was the finger check comparing the commanded
+        # position instead of the measured one. Driving the tool a centimetre
+        # closer to the table to fix a problem that is not there is the wrong
+        # trade, so the mechanism stays and the default does not.
+        check('closing the descent gap is off by default',
+              orchestrator.get_parameter('descend_close_gap').value, False)
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'descend_close_gap', value=True)])
+        grasp_at = [0.34, 0.12, 0.30]
+        with robot.lock:
+            robot.cartesian_requests.clear()
+            robot.tcp = [0.34, 0.12, 0.32]        # 20 mm short
+        time.sleep(0.6)
+        check('a 20 mm shortfall is flown',
+              orchestrator.close_descent_gap(grasp_at, quat), True)
+        with robot.lock:
+            lines = list(robot.cartesian_requests)
+        check('as a straight line down to the commanded height',
+              bool(lines) and abs(lines[-1]['xyz'][2] - grasp_at[2]) < 1e-6,
+              True)
+        check('leaving x and y alone -- the jaws span 40 mm and a lateral '
+              'move at grasp height is the one thing worth not doing',
+              abs(lines[-1]['xyz'][0] - 0.34) < 1e-6, True)
+        with robot.lock:
+            robot.cartesian_requests.clear()
+            robot.tcp = [0.34, 0.12, 0.302]       # 2 mm short
+        time.sleep(0.6)
+        check('a 2 mm shortfall is not worth a move',
+              orchestrator.close_descent_gap(grasp_at, quat), False)
+        with robot.lock:
+            check('and sends nothing', len(robot.cartesian_requests), 0)
+            robot.tcp = [0.34, 0.12, 0.45]        # 150 mm short
+        time.sleep(0.6)
+        check('and a gap far past descend_gap_max is reported, not flown',
+              orchestrator.close_descent_gap(grasp_at, quat), False)
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'descend_close_gap', value=False)])
+        with robot.lock:
+            check('because that is not tracking error',
+                  len(robot.cartesian_requests), 0)
+            robot.tcp = [0.34, 0.12, 0.45]
+        orchestrator.release_column()
+        with robot.lock:
+            robot.joints = keep_joints
+            robot.tcp = keep_tcp
+            robot.ik_requests.clear()
+            robot.cartesian_requests.clear()
+        time.sleep(0.6)
+
+        # HOME is a joint goal to a folded posture. Commanded from a low,
+        # extended one the short path in joint space goes through the work
+        # surface -- so when pre_pick cannot be reached on the way back, the
+        # arm stops rather than sweeping. Measured, run 1788869179 cycle 2:
+        # CLEAR got the tool to z=0.4286, PRE_PICK_STATE came back exhausted,
+        # and HOME was sent anyway; the arm swept out to x=0.44 and down to
+        # z=0.358 across the object it had just failed to pick.
+        check('home is not allowed without pre_pick by default',
+              orchestrator.get_parameter('home_requires_pre_pick').value, True)
+        states_now = orchestrator.load_states()
+        with robot.lock:
+            robot.joint_code = -2          # every joint goal is refused
+            robot.cartesian_available = False   # and no line out either
+            before = moved(robot)
+        time.sleep(0.6)
+        seen_before = len(states)
+        orchestrator._column = None
+        check('the retreat refuses rather than flying home',
+              orchestrator._retreat_to_home(states_now, 'a test'), False)
+        with robot.lock:
+            sent = motions(robot)[before:]
+        home_goals = [g for g in sent if g['kind'] == 'joint'
+                      and max(abs(a - b) for a, b in
+                              zip(g['joints'], HOME_JOINTS)) < 1e-3]
+        check('and no HOME goal was sent at all', home_goals, [])
+        check('saying so in the state', 'STOPPED'
+              in ' '.join(states[seen_before:]), True)
+        with open(log_path) as handle:
+            recent = [json.loads(line) for line in handle if line.strip()]
+        check('and in the log',
+              any(e['outcome'] == 'refused-no-pre-pick' for e in recent), True)
+        with robot.lock:
+            # None, not 1. Setting it to SUCCESS leaves the lever *engaged*,
+            # so move_fail_codes is never consulted again and every later
+            # test that injects a planner failure silently gets a success --
+            # six of them did.
+            robot.joint_code = None
+            robot.cartesian_available = True
+        time.sleep(0.6)
+
+        # The intent, not the layout: whatever else the failed-grip branch
+        # does, it gets the arm off the surface before it returns. A regex
+        # pinning the two lines adjacent broke the moment a _note_failure
+        # call was added between them, which is a change to neither.
+        missed_branch = orch_src.split(
+            'if not self.close_gripper_to_cap():')[1].split(
+                '\n        self._set_state')[0]
+        # Anchored on the statement, not the word: the branch's own comment
+        # contains "return without recording anything", and matching that
+        # compared the lift against a comment.
         check('a failed grip lifts clear before returning',
-              re.search(r'if not self\.close_gripper_to_cap\(\):'
-                        r'(?:\n\s*#[^\n]*)*\n\s*self\.clear_the_surface',
-                        orch_src) is not None, True)
+              'self.clear_the_surface' in missed_branch
+              and missed_branch.index('self.clear_the_surface')
+              < missed_branch.index('return GRASP_MISSED'), True)
         check('so does a failed descent',
               "self.clear_the_surface('after a failed descent')" in orch_src,
               True)
@@ -2476,6 +2802,28 @@ def main():
             asked = [r['avoid_collisions'] for r in robot.cartesian_requests]
         check('having refused the checked attempt and the unchecked retry',
               len(asked) >= 2 and any(asked) and not all(asked), True)
+        # The refusal now says what refused it. A joint-travel refusal and a
+        # reach shortfall look identical from the caller and have opposite
+        # fixes, and the DESCEND failure message used to assert the second
+        # whatever the cause -- so run 1788868354, whose line solved 100%
+        # checked and unchecked, was reported to the operator as the arm
+        # running out of reach.
+        check('the refusal reason names the joint travel, not reach',
+              orchestrator._column_refusal is not None
+              and 'rad on one joint' in orchestrator._column_refusal, True)
+        check('and does not blame reach', 'runs out of travel'
+              in (orchestrator._column_refusal or ''), False)
+
+        # And the pre-flight now applies the same budget, so a posture whose
+        # descent would be refused is rejected before the arm flies to
+        # TRANSIT for nothing. probe_cartesian reports the cost for it.
+        with robot.lock:
+            robot.cartesian_requests.clear()
+        _f, _e, cost = orchestrator.probe_cartesian(
+            list(READY_JOINTS), (xy[0], xy[1], 0.25), quat)
+        check('the probe reports what the line would cost',
+              cost is not None and cost > budget, True)
+
         with robot.lock:
             robot.sweep_rad = 0.0
 
@@ -2613,10 +2961,19 @@ def main():
             before = moved(robot)
             executed = len(robot.executed)
         posture = [0.9, 0.3, -0.4, 0.8, 0.2, 0.1, -0.5]
-        fraction, end = orchestrator.probe_cartesian(posture, pregrasp_pt, quat)
+        fraction, end, travel = orchestrator.probe_cartesian(
+            posture, pregrasp_pt, quat)
         check('the probe gets a fraction back', fraction, 1.0)
         check('and the joint values the line would end at',
               end is not None and len(end) == 7, True)
+        # And what the line would cost to fly. A line can solve 100% and be
+        # unflyable: /compute_cartesian_path constrains the tool, not the arm.
+        # Measured, run 1788868354 -- the descent solved completely checked
+        # and unchecked and cost 3.07 rad on one joint against a 1.5 rad
+        # budget, so cartesian_move refused it after the arm had already flown
+        # to TRANSIT, because the pre-flight had only looked at the fraction.
+        check('and what flying it would cost in joint travel',
+              travel is not None and travel >= 0.0, True)
         with robot.lock:
             asked = list(robot.cartesian_requests)
             check('the probe moved nothing', moved(robot), before)

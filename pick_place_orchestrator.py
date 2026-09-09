@@ -6,7 +6,9 @@
       |                                                             v
       +------------- PRE_PICK <- CLEAR <- failed ------- VERIFY_GRASP <- CLOSE
                                                           |
-      HOME <- PRE_PICK <- VERIFY_PLACE <- RELEASE <- DROP <+- LIFT
+      HOME <- PRE_PICK <- CLOSE <- VERIFY_PLACE <- RELEASE <- DROP <- PRE_PICK
+                                                                        ^
+                                                                        +- LIFT
 
 HOME is the only pose the arm rests, observes and maps from. There used to be a
 separate READY as well, which held the arm out over the table so the camera
@@ -22,9 +24,19 @@ planned as a free trajectory bows away from the vertical, and a single move to
 a point above the object can arrive from the side and low, sweeping the object
 off the table before the gripper is over it.
 
-The way out is the way in: LIFT, then DROP, then back through PRE_PICK to HOME.
+The way out is the way in: LIFT with the object held, PRE_PICK, DROP, open,
+shut the jaws again at the drop pose, then back through PRE_PICK to HOME. The
+trip home is made closed -- 44 mm of open fingers on a moving arm is something
+looking for an edge to catch on, and the arm ends the cycle in the shape it
+started it.
 PRE_PICK is a posture reachable from both ends, which is what makes it a safe
 waypoint rather than a straight dash home across the workspace.
+
+HOME is only ever commanded from PRE_PICK. It is a joint goal to a folded
+posture, and the short path in joint space from a low, extended one goes
+through the work surface -- so when pre_pick cannot be reached on the way back
+the arm lifts higher, tries once more, and then stops and reports rather than
+sweeping. See home_requires_pre_pick.
 
 A pick that *fails* leaves by the same door. Every failure below TRANSIT --
 the descent stopping short, the jaws closing on nothing, the grasp not
@@ -161,6 +173,16 @@ RETRYABLE_MOVEIT_CODES = (
 # Distinguishes "the planner node is not in the graph" from "it did not answer",
 # because only the first is worth refusing to start over.
 DEAD_PLANNER = 'planner-not-running'
+# _attempt_pick returns this when the motion all worked and the jaws still
+# found nothing. Distinct from None -- a failure of the *motion* -- because
+# the remedies are opposite: nothing recovers a descent that will not fly from
+# the posture the pre-flight already proved, whereas a grip that missed is
+# exactly what the ladder's 8-mm-lower rungs are for. Measured, run
+# 1788869179 cycle 2: DESCEND landed 1.4 mm from its commanded height and the
+# jaws closed on air 11 mm above a screwdriver, and the cycle gave up after
+# one attempt because the two cases were indistinguishable here.
+GRASP_MISSED = object()
+
 # _attempt_pick returns this instead of None when the object is simply not
 # reachable. None means "this attempt failed, try the next strategy"; this
 # means "no strategy will help", and the ladder stops.
@@ -539,7 +561,86 @@ class PickPlaceOrchestrator(Node):
         # KDL is randomly seeded, so a failure is worth repeating before it is
         # believed. Its "yes" is conclusive; its "no" is not.
         self.declare_parameter('ik_attempts', 3)
-        self.declare_parameter('grasp_z_offset', -0.005)
+        # -0.005 -> +0.015: stop 15 mm *above* the detected top of the
+        # object rather than 5 mm below it.
+        #
+        # Measured, run 1788862221, the one cycle that gripped and placed:
+        # the detector put the object top at z=0.354, the descent was
+        # commanded to 0.349, and the tool was at z=0.36869 when the fingers
+        # reached the torque cap -- point + 14.7 mm. So the height that
+        # actually grips is a good 20 mm above the height being asked for,
+        # and the only reason the old offset ever worked is that the arm
+        # stopped 36 mm short of it (error_mm 40.6, plan_error_mm 0.0 -- the
+        # plan was right, the arm did not follow it there). Track the
+        # trajectory any better and the same command drives into the table,
+        # which is what happened.
+        #
+        # Two more millimetres of the gap are the close itself: the tool sank
+        # 0.38452 -> 0.36869, 15.8 mm, while the fingers were closing.
+        # 0.015 -> 0.010, asked for: five millimetres lower. Still above the
+        # detected top, and still floored by grasp_max_depth, so the descent
+        # cannot aim into the surface. For reference the two measured grips
+        # came in at point + 14.7 mm and point + 25 mm, both with the arm
+        # stopping short of its command -- so the jaws have real tolerance
+        # here. What they do not tolerate is being sent below the object.
+        self.declare_parameter('grasp_z_offset', 0.010)
+        # How far *below* the detected top of the object the tool may be
+        # commanded, metres. The detected point is the top face of something
+        # resting on the work surface, so it is the one surface reference
+        # available without being told where the table is -- and 0.0 means
+        # the descent never aims below it.
+        #
+        # This is the floor min_grasp_z is not. min_grasp_z is measured from
+        # the base and set at 0.01 to catch a depth reading that comes back
+        # metres away and below the floor; this table stands at z=0.34, so it
+        # would never have stopped a grasp 20 mm too deep. It also bounds the
+        # ladder: the lower-8mm and yaw+90-lower rungs subtract height on a
+        # retry, which after a missed grip is precisely how the tool gets
+        # pressed into the surface.
+        self.declare_parameter('grasp_max_depth', 0.0)
+        # Fly the remainder when the descent stops short of the grasp.
+        #
+        # The descent's plan ends on the point and the arm does not: measured
+        # 15.5, 29 and 36 mm above the commanded grasp across three runs,
+        # with plan_error_mm 0.0 every time -- the trajectory was right and
+        # the controller stopped following it, which nothing catches because
+        # the joint trajectory controller has no `constraints` block and so
+        # reports SUCCESS the instant a trajectory ends.
+        #
+        # That cannot be dialled out with grasp_z_offset, because it moves
+        # 20 mm between runs: the offset that grips one run closes on air or
+        # presses the table the next. Both have now happened. Measuring the
+        # gap and flying it is the only thing that makes the grasp height
+        # repeatable.
+        #
+        # It is a continuation of the one descent, not a second one: the same
+        # vertical line, straight down from where the tool actually is, same
+        # collision settings and same joint-travel budget. x and y are left
+        # alone deliberately -- the jaws span 40 mm and the successful grip
+        # was 17 mm off laterally, so sideways error is tolerable where
+        # 30 mm of height is not, and a lateral move at grasp height is the
+        # one thing worth not doing down there.
+        #
+        # Default OFF. It was added on the belief that the grip was failing
+        # because the jaws stopped too high; the log said otherwise. Run
+        # 1788863209 gripped a roll of tape with the tool 9.8 mm above the
+        # commanded grasp and the active arm's joint efforts flat all the way
+        # through the close -- no contact with anything but the object. What
+        # discarded that grasp was the finger check above comparing the
+        # commanded finger position instead of the measured one.
+        #
+        # So there is no evidence the shortfall breaks a grasp: every close
+        # that reached the object did so despite shortfalls of 15-36 mm.
+        # Driving the tool the last centimetre down, toward the table and
+        # deeper into the octomap, to fix a problem that is not there would
+        # be the wrong trade. Turn it on if a descent ever does stop short
+        # enough to miss.
+        self.declare_parameter('descend_close_gap', False)
+        # Below this the gap is not worth a move; above it something other
+        # than tracking error is wrong and flying blind into it is not the
+        # answer.
+        self.declare_parameter('descend_gap_tolerance', 0.005)
+        self.declare_parameter('descend_gap_max', 0.06)
         self.declare_parameter('min_grasp_z', 0.01)
         # Bounds a detection has to satisfy before the arm is asked to move.
         #
@@ -654,6 +755,13 @@ class PickPlaceOrchestrator(Node):
         # failed with "could not reach home" -- the arm at home, refusing to
         # move.
         self.declare_parameter('home_settle_tolerance', 0.20)
+        # Whether HOME may be commanded when pre_pick could not be reached on
+        # the way back. HOME is a joint goal to a folded posture; from a low,
+        # extended one the short path in joint space goes through the work
+        # surface. Off means the arm stops and reports instead -- leaving it
+        # parked over the table is bad, dragging it across the table is
+        # worse.
+        self.declare_parameter('home_requires_pre_pick', True)
         # Speed below which a joint counts as stopped, rad/s. The standing
         # reading is +/-0.011 rad/s of noise.
         self.declare_parameter('joint_still_speed', 0.05)
@@ -898,9 +1006,15 @@ class PickPlaceOrchestrator(Node):
         # The posture the pre-flight settled on, for approach_above to use
         # instead of solving again.
         self._preflight_choice = None
-        # Whether the gripper is currently allowed to touch the octomap. Set
-        # for one leg at a time and always withdrawn.
+        # Whether the gripper is currently allowed to touch the octomap. Held
+        # for as long as the arm is on the column; release_column ends it.
         self._octomap_exempt = False
+        # Why the last column leg was refused, in words, or None. The DESCEND
+        # failure message used to assume every refusal was a reach shortfall
+        # and said so -- 'the arm runs out of travel along the line' -- when
+        # the real reason was the joint-travel guard, with the line solving
+        # 100%. Two different faults with opposite fixes, reported as one.
+        self._column_refusal = None
         # Whether cuMotion will accept a pose goal for this arm's tool.
         # None until checked; False refuses pose goals instead of sending
         # ones that come back INVALID_LINK_NAME.
@@ -1630,6 +1744,12 @@ class PickPlaceOrchestrator(Node):
             self.get_parameter('approach_ignores_octomap').value
             and self.get_parameter('descend_ignores_octomap').value)
 
+        # The same budget cartesian_move enforces when the leg is really
+        # flown. Checking it here is the point: a candidate whose descent
+        # solves 100% and costs 3 rad is not a candidate, and finding that
+        # out after the arm has flown to TRANSIT costs the whole approach.
+        budget = self.get_parameter('column_max_joint_travel').value
+
         # Candidate zero: no posture goal at all, just a straight line from
         # where the approach starts. Tried first because it is the motion
         # asked for -- the arm travelling in a line, as if the end-effector
@@ -1637,31 +1757,46 @@ class PickPlaceOrchestrator(Node):
         # flies from wherever that line leaves the arm.
         if self.get_parameter('linear_transit').value and self._approach_from:
             for candidate_quat in self.grasp_quat_options(quat):
-                flown, landed = self.probe_cartesian(
+                flown, landed, _ = self.probe_cartesian(
                     self._approach_from, approach, candidate_quat,
                     avoid_collisions=True)
                 if flown is None or flown < wanted or landed is None:
                     continue
                 legs = [('approach', flown)]
                 reached, worst = landed, flown
+                costly = None
                 for leg_label, target in wanted_legs:
-                    part, end = self.probe_cartesian(
+                    part, end, cost = self.probe_cartesian(
                         reached, target, candidate_quat,
                         avoid_collisions=checked_first)
                     if part is None:
                         break
                     if part < wanted and checked_first:
-                        loose, loose_end = self.probe_cartesian(
+                        loose, loose_end, loose_cost = self.probe_cartesian(
                             reached, target, candidate_quat,
                             avoid_collisions=False)
                         if loose is not None and loose > part:
-                            part, end = loose, loose_end
+                            part, end, cost = loose, loose_end, loose_cost
                     legs.append((leg_label, part))
                     worst = min(worst, part)
+                    # Solving is not the same as being flyable. The guard in
+                    # cartesian_move will refuse this leg for exactly this
+                    # number, so refuse it here where nothing has moved yet.
+                    if budget > 0.0 and cost is not None and cost > budget:
+                        costly = (leg_label, cost)
+                        break
                     if end is not None:
                         reached = end
                     if part < wanted:
                         break
+                if costly is not None:
+                    self.get_logger().info(
+                        f'{label}: the straight-line approach solves, but its '
+                        f'{costly[0]} leg would cost {costly[1]:.2f} rad on '
+                        f'one joint against a {budget:.2f} rad budget -- the '
+                        f'tool would trace the line while the arm swings '
+                        f'across the workspace. Trying a posture instead.')
+                    continue
                 if worst >= wanted:
                     detail = ', '.join(f'{n} {v * 100:.0f}%' for n, v in legs)
                     self.get_logger().info(
@@ -1683,8 +1818,9 @@ class PickPlaceOrchestrator(Node):
             if entry['tilt'] is not None:
                 start[6] = entry['tilt']
             legs, worst, reached = [], 1.0, start
+            costly = None
             for leg_label, target in wanted_legs:
-                fraction, end = self.probe_cartesian(
+                fraction, end, cost = self.probe_cartesian(
                     reached, (target[0], target[1], target[2]), entry['quat'],
                     avoid_collisions=checked_first)
                 if fraction is None:
@@ -1697,19 +1833,33 @@ class PickPlaceOrchestrator(Node):
                     # reaching for is itself in the octomap, so the pre-flight
                     # has to ask the same way or it would reject every
                     # top-down grasp.
-                    unchecked, end_unchecked = self.probe_cartesian(
-                        reached, (target[0], target[1], target[2]),
-                        entry['quat'], avoid_collisions=False)
+                    unchecked, end_unchecked, unchecked_cost = \
+                        self.probe_cartesian(
+                            reached, (target[0], target[1], target[2]),
+                            entry['quat'], avoid_collisions=False)
                     if unchecked is not None and unchecked > fraction:
                         fraction, end = unchecked, end_unchecked
+                        cost = unchecked_cost
                 legs.append((leg_label, fraction))
                 worst = min(worst, fraction)
+                # Same budget the flown leg is held to, applied before
+                # anything moves.
+                if budget > 0.0 and cost is not None and cost > budget:
+                    costly = (leg_label, cost)
+                    worst = 0.0
+                    break
                 if end is not None:
                     reached = end
                 if fraction < floor:
                     break
             entry['legs'] = legs
             entry['worst_leg'] = worst
+            entry['costly'] = costly
+            if costly is not None:
+                self.get_logger().info(
+                    f'{label}: candidate {index} solves but its {costly[0]} '
+                    f'leg costs {costly[1]:.2f} rad on one joint against a '
+                    f'{budget:.2f} rad budget; rejected before moving.')
             if best is None or worst > best['worst_leg']:
                 best = entry
             detail = ', '.join(f'{name} {value * 100:.0f}%'
@@ -2477,6 +2627,18 @@ class PickPlaceOrchestrator(Node):
         return self.command_gripper(
             self.get_parameter('gripper_open').value, label)
 
+    def close_gripper(self, label='CLOSE'):
+        """Shut the jaws, with no grasp check.
+
+        Deliberately not close_gripper_to_cap: that one steps in, watches the
+        torque and reports whether anything ended up between the fingers.
+        Here there is nothing to grip -- the object has just been let go --
+        so a 'closed on nothing' verdict would be both correct and useless.
+        One command, and the arm leaves with a narrow profile instead of
+        44 mm of open fingers.
+        """
+        return self.command_gripper(0.0, label)
+
     def close_gripper_to_cap(self):
         """Close until measured torque reaches the cap, then stop advancing.
 
@@ -2539,28 +2701,57 @@ class PickPlaceOrchestrator(Node):
         self.get_logger().info(
             f'closed to {position:.4f} m without reaching {cap:.3f} Nm '
             f'(torque {torque:.3f} Nm)')
-        # Fully shut with the fingers never loaded means there was nothing
-        # between them. Measured: 22 steps from 40.9 mm down to 2.5 mm with
-        # the effort flat at about 0.5 Nm -- friction, not an object -- against
-        # a 2.5 Nm cap. Saying so here saves the lift, the carry and the drop,
-        # all of which were being attempted with an empty gripper.
+        # Whether anything is between the fingers is answered by where the
+        # fingers *are*, not by what they were last told.
+        #
+        # This compared `position` -- the last commanded step, which at the
+        # end of a full close is always 0.0 -- against a 3 mm floor, so every
+        # close that ran to the end was declared empty whatever the jaws were
+        # actually doing. It threw away working grasps: measured across 14
+        # real closes,
+        #
+        #   empty      measured finger 0.0025-0.0026 m, effort 1.14-1.24 Nm
+        #   holding    measured finger 0.0039-0.0175 m, effort 1.84-2.46 Nm
+        #
+        # -- two bands with nothing between them, and grasp_finger_min at
+        # 0.003 already sitting in the gap. Three runs in that table were
+        # rejected as empty while gripping something ~4 mm thick at ~1.9 Nm;
+        # one of them was a roll of tape the arm was visibly holding. The
+        # parameter was right all along and was being compared with the wrong
+        # number.
+        #
+        # The commanded value stays in the message, because a close that ran
+        # all the way to 0.0 mm without the cap is still worth seeing.
         floor = self.get_parameter('grasp_finger_min').value
-        if position <= floor:
+        measured = self.finger_position()
+        if measured is None:
+            self.get_logger().warn(
+                'no finger feedback, so whether anything is held can only be '
+                'guessed from the last command')
+            measured = position
+        if measured <= floor:
             self.get_logger().error(
-                f'the gripper closed to {position * 1000:.1f} mm without the '
-                f'torque ever passing {cap:.2f} Nm (peak '
-                f'{torque:.2f} Nm) -- there was nothing between the fingers. '
-                f'Either the object is not where it was detected, or the '
-                f'jaws are not where they were sent. Read the CLOSE_GRIPPER '
-                f'line just above: it prints the measured jaw position '
-                f'against the commanded grasp, and says off-target when they '
-                f'disagree. Measured once at 29 mm high with the descent '
-                f'plan ending exactly on the point -- nothing about the '
-                f'detector or the fingers was wrong.')
+                f'the gripper closed to {measured * 1000:.1f} mm (commanded '
+                f'{position * 1000:.1f} mm) without the torque ever passing '
+                f'{cap:.2f} Nm (peak {torque:.2f} Nm) -- there was nothing '
+                f'between the fingers. Either the object is not where it was '
+                f'detected, or the jaws are not where they were sent. Read '
+                f'the CLOSE_GRIPPER line just above: it prints the measured '
+                f'jaw position against the commanded grasp, and says '
+                f'off-target when they disagree.')
             self.log_motion('CLOSE', 'gripper', 'closed-on-nothing',
                             target=round(float(position), 6),
+                            finger=round(float(measured), 6),
                             torque=round(torque, 3), cap=cap)
             return False
+        self.get_logger().info(
+            f'the fingers stopped {measured * 1000:.1f} mm apart at '
+            f'{torque:.2f} Nm without reaching the {cap:.2f} Nm cap -- thin, '
+            f'but held. Below {floor * 1000:.1f} mm would be nothing.')
+        self.log_motion('CLOSE', 'gripper', 'held-under-cap',
+                        target=round(float(position), 6),
+                        finger=round(float(measured), 6),
+                        torque=round(torque, 3), cap=cap)
         return True
 
     def finger_position(self):
@@ -2992,6 +3183,24 @@ class PickPlaceOrchestrator(Node):
                 return None
         t = tf.transform.translation
         return (t.x, t.y, t.z)
+
+    def tcp_orientation(self):
+        """How the tool is currently held, as (x, y, z, w).
+
+        For legs that should not change the tool's attitude -- rising
+        straight up out of trouble, say, where re-deriving a top-down
+        orientation would rotate the wrist at the same time.
+        """
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.base_frame, self.tcp_frame, rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0))
+        except Exception as exc:                     # noqa: BLE001 - reported
+            self.get_logger().warn(
+                f'no {self.tcp_frame} orientation: {exc}')
+            return None
+        q = tf.transform.rotation
+        return (q.x, q.y, q.z, q.w)
 
     # -- grasp geometry ------------------------------------------------------
 
@@ -3498,9 +3707,20 @@ class PickPlaceOrchestrator(Node):
                         avoid_collisions=True):
         """Would a straight line to `position` solve from `start_joints`?
 
-        Plans and throws the trajectory away. Returns (fraction, end_joints),
-        or (None, None) if the service could not answer at all -- note that
-        0.0 is a real answer and None is not.
+        Returns (fraction, end_joints, travel) -- or (None, None, None) if
+        the service could not answer at all; note that a fraction of 0.0 is a
+        real answer and None is not.
+
+        travel is the worst per-joint distance the trajectory would cost,
+        which is the other half of the question. A line can solve 100% and
+        still be unflyable: /compute_cartesian_path constrains the *tool*, so
+        it will happily return a path whose every waypoint is on the line
+        while the shoulder and elbow sweep across the workspace. Measured,
+        run 1788868354: the descent solved 100% checked and unchecked and
+        cost 3.07 rad on one joint against a 1.5 rad budget, so the guard in
+        cartesian_move refused it -- after the arm had already flown to
+        TRANSIT for nothing, because the pre-flight had only ever looked at
+        the fraction.
 
         This is the whole point of the pre-flight. Joint headroom says a
         posture is comfortable; it does not say a line out of it solves. The
@@ -3511,12 +3731,13 @@ class PickPlaceOrchestrator(Node):
         state costs one service call and no motion at all.
         """
         if not self.cartesian_client.wait_for_service(timeout_sec=2.0):
-            return None, None
+            return None, None, None
         request = self._cartesian_request(position, quat, avoid_collisions,
                                           start_joints=start_joints)
         result = self._await(self.cartesian_client.call_async(request), 20.0)
         if result is None or result.error_code.val != MOVEIT_SUCCESS:
-            return (0.0, None) if result is not None else (None, None)
+            return (0.0, None, None) if result is not None \
+                else (None, None, None)
         points = result.solution.joint_trajectory.points
         names = list(result.solution.joint_trajectory.joint_names)
         end = None
@@ -3524,7 +3745,8 @@ class PickPlaceOrchestrator(Node):
             index = {n: i for i, n in enumerate(names)}
             if all(j in index for j in self.arm_joints):
                 end = [points[-1].positions[index[j]] for j in self.arm_joints]
-        return float(result.fraction), end
+        return (float(result.fraction), end,
+                self.joint_travel(result.solution))
 
     def joint_travel(self, trajectory):
         """Worst per-joint distance travelled along a trajectory, radians.
@@ -3641,6 +3863,14 @@ class PickPlaceOrchestrator(Node):
                     f'{max_travel:.2f} rad a leg this short should need. The '
                     f'tool would follow the line while the arm swings across '
                     f'the workspace. Refusing.')
+                self._column_refusal = (
+                    f'the line to it solves completely, but flying it would '
+                    f'cost {travel:.2f} rad on one joint against a '
+                    f'{max_travel:.2f} rad budget -- the tool would trace the '
+                    f'line while the arm swings across the workspace, which '
+                    f'is how it hit the table before. This is geometry, not '
+                    f'reach: no retry from the same posture improves it, and '
+                    f'the pre-flight should have rejected the posture')
                 self.log_motion(label, 'cartesian', 'refused-joint-travel',
                                 target=[round(v, 5) for v in position],
                                 checked=avoid_collisions,
@@ -4045,14 +4275,26 @@ class PickPlaceOrchestrator(Node):
 
     def descend_column(self, xy, from_z, to_z, quat, label,
                        uncheck_collisions=False, linear_only=False):
+        self._column_refusal = None
         try:
             return self._descend_column(xy, from_z, to_z, quat, label,
                                         uncheck_collisions, linear_only)
         finally:
-            # Never leave the gripper exempt. The exemption is for one leg;
-            # left in place it would silently apply to the carry, the drop and
-            # everything after.
-            if self._octomap_exempt:
+            # Withdraw it only once the arm is off the column.
+            #
+            # This used to withdraw per leg, and that is what turned the
+            # gripper red in RViz. The descent leaves the jaws inside the
+            # voxels of the object they came for; hand them back to collision
+            # checking there and the *start state* is in collision, so every
+            # plan from it is invalid. Measured, run 1788863209: CLEAR
+            # succeeded -- it re-granted its own exemption -- and then
+            # PRE_PICK_STATE and HOME both came back -2,
+            # INVALID_MOTION_PLAN, with the arm stranded over the table.
+            #
+            # self._column is set for exactly the span that matters: from the
+            # moment the descent starts to the moment the tool is clear
+            # again. release_column() is what ends it.
+            if self._octomap_exempt and self._column is None:
                 self.allow_gripper_in_octomap(False)
                 self._octomap_exempt = False
 
@@ -4290,6 +4532,19 @@ class PickPlaceOrchestrator(Node):
 
         grasp_z = point[2] + self.get_parameter('grasp_z_offset').value \
             + strategy['z_offset']
+        # Never below the detected top of the object by more than
+        # grasp_max_depth. The object rests on the work surface, so its top
+        # face is the only thing here that knows where that surface roughly
+        # is -- min_grasp_z is measured from the base and cannot help.
+        floor = point[2] - self.get_parameter('grasp_max_depth').value
+        if grasp_z < floor:
+            self.get_logger().warn(
+                f'grasp z {grasp_z:.3f} is {(floor - grasp_z) * 1000:.0f} mm '
+                f'below the {floor:.3f} the detected object top allows; '
+                f'clamping. The object sits on the surface, so going below '
+                f'its top face presses the tool into the table -- raise '
+                f'grasp_max_depth only if you mean to.')
+            grasp_z = floor
         min_z = self.get_parameter('min_grasp_z').value
         if grasp_z < min_z:
             self.get_logger().warn(
@@ -4396,7 +4651,7 @@ class PickPlaceOrchestrator(Node):
 
     def _cycle(self):
         self._failures = []
-        self._column = None
+        self.release_column()
         self._holding = False
         self._last_detection = None
         self._last_payload = None
@@ -4475,10 +4730,29 @@ class PickPlaceOrchestrator(Node):
             return
 
         picked_point = None
+        # The (yaw, height) pairs whose jaws already shut on nothing. A grip
+        # that missed is a geometry problem, and a rung offering the same yaw
+        # at the same height will miss the same way -- for the ~60 s a full
+        # approach costs. Measured, run 1788869179 cycle 2: 'nominal' closed
+        # 11 mm above a screwdriver and 'retry' is nominal again, so it would
+        # have repeated it exactly.
+        #
+        # Only exact repeats are skipped. A different yaw is a different grasp
+        # on a screwdriver, and a rung that re-detects gets a fresh height
+        # estimate, so both are still worth their turn.
+        missed = set()
         for attempt, strategy in enumerate(STRATEGIES):
             if self._abort.is_set():
                 self._set_state('ABORTED')
                 return
+            shape = (round(strategy['yaw_offset'], 6),
+                     round(strategy['z_offset'], 6))
+            if shape in missed and not strategy['redetect']:
+                self.get_logger().info(
+                    f'skipping {strategy["name"]}: the jaws already shut on '
+                    f'nothing at this yaw and height, and this rung offers '
+                    f'neither a new one nor a fresh look')
+                continue
             self._set_state('ATTEMPT',
                             f'{attempt + 1}/{len(STRATEGIES)} ({strategy["name"]})')
             if attempt > 0:
@@ -4494,6 +4768,21 @@ class PickPlaceOrchestrator(Node):
                 # No strategy recovers this: a different yaw or 8 mm lower is
                 # still outside the envelope. The state already says why.
                 return
+            if picked_point is GRASP_MISSED:
+                missed.add(shape)
+                # The motion all worked and the jaws found nothing, which is
+                # the one failure the ladder is actually for: its lower-8mm
+                # rungs exist because the commanded height can be wrong for
+                # an object even when every move is right. So carry on down
+                # the ladder rather than stopping, whatever
+                # retry_after_preflight says -- that guard is about descents
+                # that will not fly, and this descent flew.
+                picked_point = None
+                self.get_logger().info(
+                    'the grip missed but the motion was sound, so the next '
+                    'rung is worth trying: this is what the lower-8mm '
+                    'strategies are for')
+                continue
             if picked_point is not None:
                 break
             # A failure *after* the geometry was proved is not something the
@@ -4555,17 +4844,57 @@ class PickPlaceOrchestrator(Node):
         Used after a failed place as well as a successful one. Leaving the arm
         stopped where it failed, extended over the table and often still
         holding the object, is the worst outcome available.
+
+        But going home *anyway* when pre_pick could not be reached is worse
+        still, and that is what this used to do. Measured, run 1788869179
+        cycle 2: CLEAR got the tool up to z=0.4286, PRE_PICK_STATE came back
+        exhausted, and HOME was then commanded from there as a joint goal --
+        the arm swept out to x=0.44 and down to z=0.358 on its way to folded,
+        across the object it had just failed to pick. HOME is only safe from
+        the staging pose. If pre_pick will not go, the arm stops where it is
+        and says so.
         """
         # Before the staging pose, which is a joint goal: if the arm is still
         # down at the object, that goal is what sweeps it across the surface.
         self.clear_the_surface(why)
         self._set_state('PRE_PICK', f'on the way back, {why}')
-        if not self.move_to_state(PRE_PICK_STATE, states):
+        if self.move_to_state(PRE_PICK_STATE, states):
+            self._set_state('HOME', why)
+            return self.move_to_home()
+
+        # One more try, from higher up: the usual reason pre_pick refuses from
+        # here is that the gripper is still inside the octomap of the thing it
+        # was reaching for, and a few more centimetres of clearance is the
+        # whole fix.
+        lifted = self.lift_to_clearance('PRE_PICK retry')
+        if lifted and self.move_to_state(PRE_PICK_STATE, states):
+            self._set_state('HOME', why)
+            return self.move_to_home()
+
+        if not self.get_parameter('home_requires_pre_pick').value:
             self.get_logger().warn(
-                'could not stage through pre_pick on the way back; going '
-                'straight home')
-        self._set_state('HOME', why)
-        self.move_to_home()
+                'pre_pick will not go, and home_requires_pre_pick is off, so '
+                'HOME is being commanded from here anyway -- this is a joint '
+                'goal from wherever the arm is standing and it can sweep '
+                'across the work surface')
+            self._set_state('HOME', why)
+            return self.move_to_home()
+
+        self._set_state(
+            'STOPPED',
+            'cannot reach pre_pick, and HOME from here would sweep the arm '
+            'across the work surface')
+        self.get_logger().error(
+            'the arm is parked where it stands. pre_pick could not be '
+            'reached on the way back, and HOME is a joint goal -- commanding '
+            'it from a low, extended posture is what drags the arm across '
+            'the table, so it is not being sent. Clear whatever is blocking '
+            'the plan (the octomap usually: ros2 service call '
+            '/clear_octomap std_srvs/srv/Empty) and drive it out with '
+            'record_states.py --play, or set home_requires_pre_pick:=false '
+            'to accept the sweep.')
+        self.log_motion('HOME', 'joint', 'refused-no-pre-pick')
+        return False
 
     def arm_candidates(self, detection, payload):
         """The arms to consider, best first.
@@ -4910,14 +5239,20 @@ class PickPlaceOrchestrator(Node):
             unchecked = (self.get_parameter('approach_ignores_octomap').value
                          and self.get_parameter(
                              'descend_ignores_octomap').value)
-            blame = ('the collision world may hold the object itself, or the '
-                     'grasp is below the work surface'
-                     if not unchecked else
-                     'collision checking was already off for this leg, so '
-                     'this is reach rather than an obstacle: the arm runs out '
-                     'of travel along the line. Most often it is not standing '
-                     'where the pre-flight assumed -- compare the commanded '
-                     'and measured joints in the motion log at TRANSIT')
+            # Say what actually refused it. A refusal for joint travel and a
+            # refusal for reach look identical from here and have opposite
+            # fixes, and this message used to assert the second whatever the
+            # cause -- so a descent whose line solved 100% was reported as
+            # the arm running out of reach.
+            blame = self._column_refusal or (
+                'the collision world may hold the object itself, or the '
+                'grasp is below the work surface'
+                if not unchecked else
+                'collision checking was already off for this leg, so this is '
+                'reach rather than an obstacle: the arm runs out of travel '
+                'along the line. Most often it is not standing where the '
+                'pre-flight assumed -- compare the commanded and measured '
+                'joints in the motion log at TRANSIT')
             self._note_failure('DESCEND', (
                 f'arrived above the object but could not descend to '
                 f'z={grasp[2]:.3f} -- {blame}'))
@@ -4932,8 +5267,12 @@ class PickPlaceOrchestrator(Node):
         # the only symptom was 'closed-on-nothing' at 1.9 Nm. Say it plainly
         # instead, because no gripper setting fixes a gripper in the wrong
         # place.
+        self.close_descent_gap(grasp, quat)
+
         self._set_state('CLOSE_GRIPPER')
         at_jaws = self.tcp_position()
+        # Recorded before the close, so the failure below can quote it.
+        self._grasp_commanded = list(grasp)
         if at_jaws is not None:
             short = at_jaws[2] - grasp[2]
             sideways = math.hypot(at_jaws[0] - grasp[0],
@@ -4952,11 +5291,23 @@ class PickPlaceOrchestrator(Node):
                                 target=list(grasp), tcp=list(at_jaws),
                                 error_mm=round(miss * 1000.0, 1))
         if not self.close_gripper_to_cap():
+            # Note it. This used to return without recording anything, so
+            # _failure_summary found an empty list and reported 'no attempt
+            # ran' -- to an operator who had just watched the arm descend and
+            # close. Measured, run 1788869179 cycle 2.
+            landed = at_jaws[2] if at_jaws else None
+            self._note_failure('CLOSE_GRIPPER', (
+                'the descent arrived'
+                + (f' within {abs(landed - grasp[2]) * 1000:.0f} mm of the '
+                   f'commanded z={grasp[2]:.3f}' if landed is not None else '')
+                + ', and the jaws then shut on nothing. The height is wrong '
+                  'for this object rather than the motion: lower '
+                  'grasp_z_offset, or let the ladder try 8 mm lower'))
             # Up first, jaws left closed. The grip failing does not make the
             # arm any less extended over the table, and closed jaws are the
             # slimmest thing to lift back through whatever is down there.
             self.clear_the_surface('the grip closed on nothing')
-            return None
+            return GRASP_MISSED
 
         # Straight back up, and well clear -- not just back to the pre-grasp.
         # The next move carries the object to the drop pose as a free-space
@@ -4973,8 +5324,10 @@ class PickPlaceOrchestrator(Node):
         # Off the column and clear. Everything after this -- the carry, the
         # drop, the retreat -- is above the surface and has its own way out,
         # so leaving the column set would have the retreat fly one more line
-        # straight up from wherever the drop left the tool, for nothing.
-        self._column = None
+        # straight up from wherever the drop left the tool, for nothing. It
+        # also hands the gripper back to the octomap, which is safe now and
+        # was not while the jaws were down among the voxels.
+        self.release_column()
 
         self._set_state('VERIFY_GRASP')
         if not self.verify_grasp(point):
@@ -4989,6 +5342,53 @@ class PickPlaceOrchestrator(Node):
         self._holding = True
         self._set_state('VERIFY_GRASP', 'confirmed')
         return point
+
+    def close_descent_gap(self, grasp, quat):
+        """Fly whatever height the descent did not.
+
+        Reads where the tool actually is and, if it is sitting above the
+        commanded grasp, continues straight down the same column to it. See
+        descend_close_gap for why this is not a second descent and why
+        grasp_z_offset cannot do the job instead.
+
+        Advisory: a gap that will not fly leaves the jaws where they are and
+        the close reports off-target, which is the same outcome as before
+        this existed.
+        """
+        if not self.get_parameter('descend_close_gap').value:
+            return False
+        here = self.fresh_tcp()
+        if here is None:
+            self.get_logger().warn(
+                'no fresh tool transform after the descent, so the height it '
+                'actually reached is unknown; closing where it stands')
+            return False
+        gap = here[2] - grasp[2]
+        if gap <= self.get_parameter('descend_gap_tolerance').value:
+            return False
+        limit = self.get_parameter('descend_gap_max').value
+        if gap > limit:
+            self.get_logger().error(
+                f'the descent stopped {gap * 1000:.0f} mm above the grasp, '
+                f'more than the {limit * 1000:.0f} mm descend_gap_max allows '
+                f'for tracking error. That is not the controller falling '
+                f'short -- check the commanded grasp height against the '
+                f'object, and the DESCEND record\'s fraction and '
+                f'plan_error_mm. Closing where it stands.')
+            self.log_motion('DESCEND_GAP', 'cartesian', 'refused-too-far',
+                            target=[round(v, 5) for v in grasp],
+                            tcp=[round(v, 5) for v in here],
+                            error_mm=round(gap * 1000, 1))
+            return False
+        self.get_logger().info(
+            f'the descent stopped {gap * 1000:.0f} mm above the grasp with '
+            f'its plan ending on the point, so the controller did not finish '
+            f'following it; flying the remainder straight down.')
+        return bool(self.descend_column(
+            here, here[2], grasp[2], quat, 'DESCEND_GAP',
+            uncheck_collisions=self.get_parameter(
+                'approach_ignores_octomap').value,
+            linear_only=self.get_parameter('descend_linear_only').value))
 
     def lift_column(self, start, pregrasp, quat, label='LIFT'):
         """Rise up the line the tool is standing on, as far as it solves.
@@ -5025,6 +5425,57 @@ class PickPlaceOrchestrator(Node):
                 return True
         return False
 
+    def release_column(self):
+        """The arm is off the column: forget it, and re-arm the octomap.
+
+        The gripper's octomap exemption is held for the whole time the arm is
+        down among the voxels -- the descent, the close, and the way back up
+        -- because handing the jaws back to collision checking while they are
+        still inside the map makes the arm's own start state invalid and
+        every subsequent plan fails on it. This is the one place that ends
+        that, so the two cannot get out of step.
+        """
+        self._column = None
+        if self._octomap_exempt:
+            self.allow_gripper_in_octomap(False)
+            self._octomap_exempt = False
+
+    def lift_to_clearance(self, label):
+        """Get the tool higher, straight up from wherever it is.
+
+        The recovery when a joint goal is refused from down near the work
+        surface. The usual cause is the gripper still being inside the
+        octomap of the object it was reaching for, which makes the arm's own
+        start state invalid and every plan out of it fail -- and a few more
+        centimetres of clearance is the whole fix.
+
+        Distinct from clear_the_surface, which flies the recorded column and
+        is a no-op once the tool is above the pre-grasp height. This one has
+        no column to work from: it goes up from here, with the gripper exempt
+        from the octomap for the leg, because the map is exactly what is in
+        the way.
+        """
+        here = self.fresh_tcp()
+        if here is None:
+            self.get_logger().warn(
+                f'{label}: no tool transform, so there is no telling which '
+                f'way is up')
+            return False
+        # The attitude it is already in. Re-deriving a top-down quaternion
+        # here would rotate the wrist while rising, which is not what "get
+        # out of the way" means.
+        quat = self.tcp_orientation() or top_down_quat(0.0)
+        exempt = False
+        if self.get_parameter('gripper_octomap_exemption').value:
+            exempt = self.allow_gripper_in_octomap(True)
+            self._octomap_exempt = exempt
+        try:
+            return bool(self.lift_column(list(here), None, quat, label))
+        finally:
+            if exempt:
+                self.allow_gripper_in_octomap(False)
+                self._octomap_exempt = False
+
     def clear_the_surface(self, why):
         """Get the tool up off the work surface before anything else moves.
 
@@ -5053,7 +5504,7 @@ class PickPlaceOrchestrator(Node):
         # still lands tens of millimetres out.
         here = self.tcp_position()
         if here is not None and here[2] >= clear_at - 0.01:
-            self._column = None
+            self.release_column()
             return True
         start = list(here) if here is not None else list(grasp)
         self._set_state('CLEAR', why)
@@ -5064,7 +5515,7 @@ class PickPlaceOrchestrator(Node):
                 f'still down at the object and there is no straight line up '
                 f'from where it is standing. Move it clear by hand, or with '
                 f'record_states.py --play, before restarting.')
-        self._column = None
+        self.release_column()
         return lifted
 
     def _place(self, states):
@@ -5134,6 +5585,20 @@ class PickPlaceOrchestrator(Node):
                 f'no {self.tcp_frame} transform at release; skipping the check')
         else:
             self.verify_place(release_point)
+
+        # Shut the jaws before leaving, at the drop pose itself. The trip back
+        # through pre_pick to home is then made with a closed gripper rather
+        # than 44 mm of open fingers hunting for something to catch on, and
+        # the arm ends the cycle in the shape it started it. After
+        # verify_place, not before: that check looks for the object at the
+        # release point and should see the scene as the release left it.
+        self._set_state('CLOSE_GRIPPER', 'shutting the jaws at the drop')
+        if not self.close_gripper('CLOSE_AT_DROP'):
+            # Not fatal. The object is placed and the cycle has done its job;
+            # an open gripper on the way home is untidy, not unsafe.
+            self.get_logger().warn(
+                'could not shut the jaws at the drop pose; going home with '
+                'the gripper open')
         return True
 
     def _place_at_home(self):
@@ -5158,6 +5623,13 @@ class PickPlaceOrchestrator(Node):
                 f'no {self.tcp_frame} transform at release; skipping the check')
         else:
             self.verify_place(release_point)
+
+        # Same as the drop pose: the arm does not sit at rest with its fingers
+        # wide open.
+        self._set_state('CLOSE_GRIPPER', 'shutting the jaws after the release')
+        if not self.close_gripper('CLOSE_AT_DROP'):
+            self.get_logger().warn(
+                'could not shut the jaws after releasing; leaving them open')
         return True
 
 

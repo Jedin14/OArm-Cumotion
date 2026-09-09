@@ -49,6 +49,8 @@ FORWARDED = ['arm', 'arm_selection', 'prompt', 'states_file', 'place_mode',
              'approach_height',
              'velocity_scaling', 'acceleration_scaling', 'gripper_max_effort',
              'detection_reuse_age', 'grasp_finger_min', 'object_moved_eps',
+             'grasp_z_offset', 'grasp_max_depth', 'descend_close_gap',
+             'descend_gap_max', 'home_requires_pre_pick',
              'refresh_octomap_at_home', 'use_table_collision', 'table_z']
 
 
@@ -135,6 +137,32 @@ def generate_launch_description():
             'object_moved_eps', default_value='0.05',
             description='How far the object must have moved for a place to '
                         'count, metres. 0.0 to rehearse on fake hardware.'),
+        DeclareLaunchArgument(
+            'grasp_z_offset', default_value='0.010',
+            description='Added to the detected top of the object to get the '
+                        'grasp height. Positive: the tool stops above it. '
+                        'Raise it if the arm presses into the surface, lower '
+                        'it if the jaws close above the object.'),
+        DeclareLaunchArgument(
+            'grasp_max_depth', default_value='0.0',
+            description='How far below the detected top of the object the '
+                        'tool may be commanded, metres. The floor '
+                        'min_grasp_z is not.'),
+        DeclareLaunchArgument(
+            'descend_close_gap', default_value='false',
+            description='Fly the remainder when the descent stops short of '
+                        'the grasp -- straight down the same line, as a '
+                        'continuation of the one descent. Off by default; '
+                        'no measured grasp has needed it.'),
+        DeclareLaunchArgument(
+            'home_requires_pre_pick', default_value='true',
+            description='Refuse HOME when pre_pick could not be reached on '
+                        'the way back, rather than sweeping the arm across '
+                        'the work surface to get there.'),
+        DeclareLaunchArgument(
+            'descend_gap_max', default_value='0.06',
+            description='Largest gap, metres, treated as tracking error and '
+                        'flown rather than reported.'),
     ]
 
     # One link, one arm: openarm_<arm>_hand_tcp. Deriving it here rather than

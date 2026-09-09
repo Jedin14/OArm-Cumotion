@@ -143,9 +143,47 @@ ORCHESTRATOR_ARGS = [
      "Times to resend a goal that failed for a retryable reason. cuMotion's "
      'optimiser returns TRAJOPT_FAIL on roughly 14.5% of goals that plan fine '
      'on another try.'),
-    ('grasp_z_offset', '-0.005',
-     'Added to the detected surface height to get the grasp height.'),
-    ('min_grasp_z', '0.01', 'Hard floor on grasp height, metres.'),
+    ('grasp_z_offset', '0.010',
+     'Added to the detected top of the object to get the grasp height. '
+     'Positive: the tool stops above it. Measured grips came in at 14.7 mm '
+     'and 25 mm above the detected top, both with the arm stopping short of '
+     'its command, so there is real tolerance here -- what the jaws do not '
+     'tolerate is being sent below the object. A negative value was what '
+     'pressed the tool into the table once the arm started tracking its '
+     'trajectory properly.'),
+    ('home_requires_pre_pick', 'true',
+     'Whether HOME may be commanded when pre_pick could not be reached on '
+     'the way back. HOME is a joint goal to a folded posture, and from a low '
+     'extended one the short path in joint space goes through the work '
+     'surface -- measured once as a sweep out to x=0.44 and down to z=0.358 '
+     'across the object the arm had just failed to pick. On, the retreat '
+     'lifts higher, retries pre_pick, then stops and reports.'),
+    ('descend_close_gap', 'false',
+     'Fly the remainder when the descent stops short of the grasp. The '
+     'descent plan ends on the point and the arm does not -- measured 15.5, '
+     '29 and 36 mm above it across three runs, plan_error_mm 0.0 every time. '
+     'That varies by 20 mm, so grasp_z_offset cannot dial it out: the offset '
+     'that grips one run closes on air or presses the table the next. A '
+     'continuation of the same descent, straight down the same line. Off by '
+     'default: the run that prompted it turned out to have gripped fine at '
+     '9.8 mm above the commanded grasp, and what discarded that grasp was '
+     'the finger check reading the commanded position instead of the '
+     'measured one. Turn it on if a descent ever does stop short enough to '
+     'miss.'),
+    ('descend_gap_max', '0.06',
+     'Largest gap, metres, that is treated as tracking error and flown. '
+     'Beyond it something else is wrong and the jaws close where they are.'),
+    ('grasp_max_depth', '0.0',
+     'How far below the detected top of the object the tool may be '
+     'commanded, metres. The object rests on the work surface, so its top '
+     'face is the only surface reference available without being told where '
+     'the table is. This is the floor min_grasp_z is not -- min_grasp_z is '
+     'measured from the base, and this table stands at z=0.34. It also '
+     'bounds the ladder, whose lower-8mm rungs subtract height on a retry.'),
+    ('min_grasp_z', '0.01',
+     'Hard floor on grasp height above the base, metres. A sanity clamp on a '
+     'bad depth reading -- one came back 0.74 m below the floor -- not a '
+     'table floor; grasp_max_depth is that.'),
     ('max_z_clamp', '0.05',
      'How far below min_grasp_z a detection may be and still be clamped, '
      'metres. Further than this and the depth reading is wrong, so x and y '
