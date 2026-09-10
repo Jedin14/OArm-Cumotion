@@ -111,6 +111,23 @@ class VlmDetectorNode(Node):
         self.declare_parameter('max_depth', 3.0)
         self.declare_parameter('max_stamp_skew', 0.08)
         self.declare_parameter('axis_depth_tolerance', 0.03)
+        # When to run at all.
+        #
+        # 'continuous' is what this used to do unconditionally: a full
+        # model.generate every inference_period, for ever, whether or not
+        # anybody had asked for anything. Measured on the robot -- 6.4 GB of
+        # VRAM held permanently and the GPU busy between cycles, on a machine
+        # where cuMotion and anything else have to fit alongside.
+        #
+        # 'on_demand' runs only after a prompt arrives, for active_window
+        # seconds, which is what a pick actually needs: the orchestrator
+        # publishes the prompt and then waits for one fresh detection.
+        self.declare_parameter('inference_mode', 'on_demand')
+        self.declare_parameter('active_window', 6.0)
+        # Seconds of idleness after which the weights are moved off the GPU
+        # and the cache emptied. 0 keeps them resident, which costs 6.4 GB and
+        # saves the second or so it takes to move them back.
+        self.declare_parameter('idle_unload_after', 20.0)
         self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('show_window', False)        # needs a DISPLAY
         self.declare_parameter('debug_dashboard', False)    # colour + depth
@@ -123,6 +140,14 @@ class VlmDetectorNode(Node):
         self.max_stamp_skew = p('max_stamp_skew').value
         self.period = p('inference_period').value
         self.prompt = p('prompt').value
+        self.mode = p('inference_mode').value
+        self.active_window = p('active_window').value
+        self.idle_unload_after = p('idle_unload_after').value
+        # Until when inference is wanted. Started in the past so an on-demand
+        # node comes up idle: nothing has asked for anything yet.
+        self._wanted_until = 0.0
+        self._idle_since = time.time()
+        self._on_gpu = True
 
         self._lock = threading.Lock()
         self._color = None
@@ -203,6 +228,12 @@ class VlmDetectorNode(Node):
         if text != self.prompt:
             self.prompt = text
             self.get_logger().info(f'target changed to {text!r}')
+        # Every prompt is a request, including a repeat of the one already
+        # set. The orchestrator republishes the same text each time it wants
+        # a look -- at LOCATE, and again to verify the grasp and the place --
+        # so treating an unchanged prompt as nothing to do would leave those
+        # waiting for a frame that never comes.
+        self._wanted_until = time.time() + self.active_window
 
     # -- geometry ------------------------------------------------------------
 
@@ -219,13 +250,62 @@ class VlmDetectorNode(Node):
     def _inference_loop(self):
         while not self._stop.is_set():
             started = time.time()
-            try:
-                self._step()
-            except Exception as exc:                       # keep the node alive
-                self.get_logger().warn(f'inference step failed: {exc}')
+            if self._wanted():
+                self._ensure_loaded()
+                try:
+                    self._step()
+                except Exception as exc:                   # keep the node alive
+                    self.get_logger().warn(f'inference step failed: {exc}')
+                self._idle_since = time.time()
+            else:
+                self._maybe_unload()
             remaining = self.period - (time.time() - started)
             if remaining > 0:
                 self._stop.wait(remaining)
+
+    def _wanted(self):
+        """Is anybody waiting on a detection right now?"""
+        if self.mode != 'on_demand':
+            return True
+        return time.time() < self._wanted_until
+
+    def _ensure_loaded(self):
+        """Put the weights back on the GPU if they were parked."""
+        # _load_model runs before the worker starts, so this is belt and
+        # braces -- but the loop must not be the thing that crashes if that
+        # order ever changes.
+        if self._on_gpu or getattr(self, 'model', None) is None:
+            return
+        moved = time.time()
+        self.model.to(self.device)
+        self._on_gpu = True
+        self.get_logger().info(
+            f'weights back on {self.device} in {time.time() - moved:.1f} s')
+
+    def _maybe_unload(self):
+        """Give the GPU back after a spell with nothing asked of it.
+
+        The weights go to host memory rather than being dropped, so coming
+        back costs a transfer rather than a reload from disk -- about a second
+        against tens. Worth it: 6.4 GB is most of a 16 GB card, and cuMotion,
+        the octomap and anything else have to live in what is left.
+        """
+        after = self.idle_unload_after
+        if not self._on_gpu or after <= 0 or getattr(self, 'device', '') != 'cuda':
+            return
+        if getattr(self, 'model', None) is None:
+            return
+        if time.time() - self._idle_since < after:
+            return
+        self.model.to('cpu')
+        self._on_gpu = False
+        try:
+            self.torch.cuda.empty_cache()
+        except Exception:                                  # noqa: BLE001
+            pass
+        self.get_logger().info(
+            f'idle for {after:.0f} s, so the weights are off the GPU. The '
+            f'next prompt brings them back, about a second later.')
 
     def _step(self):
         with self._lock:

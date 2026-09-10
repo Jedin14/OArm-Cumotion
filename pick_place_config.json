@@ -1,0 +1,30 @@
+{
+  "arm": "auto",
+  "prompt": "tape",
+  "sequence": [
+    "open_gripper",
+    "descend",
+    "grasp",
+    "lift",
+    "verify_grasp",
+    "pre_pick",
+    "drop",
+    "release",
+    "verify_place",
+    "shut_jaws",
+    "pre_pick",
+    "home"
+  ],
+  "settings": {
+    "acceleration_scaling": 0.6,
+    "approach_height": 0.05,
+    "column_max_joint_travel": 1.5,
+    "descend_close_gap": true,
+    "grasp_z_offset": 0.01,
+    "gripper_torque_cap": 2.5,
+    "home_requires_pre_pick": true,
+    "retreat_height": 0.2,
+    "transit_height": 0.1,
+    "velocity_scaling": 0.8
+  }
+}

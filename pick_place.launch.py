@@ -41,9 +41,13 @@ ORCHESTRATOR_ARGS = [
      'held. Jog somewhere else and call /pick_place/capture_ready for its '
      'numbers.'),
     ('arm_selection', 'by_side',
-     '"by_side" chooses the arm before moving: the half of the camera frame '
-     'the object is in is preferred, and whichever arm can actually reach it '
-     'gets the job. "fixed" always uses `arm`, for single-arm work.'),
+     '"by_side" takes the half of the camera frame the object is in and gets '
+     'on with it -- the camera half is right nearly every time, and asking '
+     'the solvers instead cost 87 seconds between the first look and the '
+     'second, measured, for the same answer. Nothing is given up: the '
+     'pre-flight settles whether the pick is possible for the arm chosen, '
+     'before anything moves, so a wrong guess costs a pre-flight rather than '
+     'a motion. "by_reach" asks the solvers first; "fixed" always uses arm.'),
     ('arm_order', 'camera_half',
      'Order the arms are considered in: "camera_half" prefers the half the '
      'object is in and falls back to the other arm; "right_then_left" and '
@@ -143,6 +147,13 @@ ORCHESTRATOR_ARGS = [
      "Times to resend a goal that failed for a retryable reason. cuMotion's "
      'optimiser returns TRAJOPT_FAIL on roughly 14.5% of goals that plan fine '
      'on another try.'),
+    ('pick_place_config', 'pick_place_config.json',
+     'Where the editable sequence and the UI-settable parameters live. Read '
+     'at bringup and written by the web UI, so a run starts where the last '
+     'one left off. Empty uses the built-in order and the launch arguments. '
+     'Not called config_file: realsense2_camera declares one of those and '
+     'opens it as YAML, and launch configurations reach into included '
+     'launch files.'),
     ('grasp_z_offset', '0.010',
      'Added to the detected top of the object to get the grasp height. '
      'Positive: the tool stops above it. Measured grips came in at 14.7 mm '
@@ -151,6 +162,13 @@ ORCHESTRATOR_ARGS = [
      'tolerate is being sent below the object. A negative value was what '
      'pressed the tool into the table once the arm started tracking its '
      'trajectory properly.'),
+    ('disengage_on_failure', 'true',
+     'Take the motors off once a failed cycle has parked the arm somewhere '
+     'the collision world says is free. openarm_hardware disables the motors '
+     'when its component is deactivated, and these are direct-drive with no '
+     'brakes -- so the arm is held up by nothing afterwards. Only ever done '
+     'after a refuge is reached, never with the arm stranded over the '
+     'table.'),
     ('home_requires_pre_pick', 'true',
      'Whether HOME may be commanded when pre_pick could not be reached on '
      'the way back. HOME is a joint goal to a folded posture, and from a low '
@@ -158,18 +176,84 @@ ORCHESTRATOR_ARGS = [
      'surface -- measured once as a sweep out to x=0.44 and down to z=0.358 '
      'across the object the arm had just failed to pick. On, the retreat '
      'lifts higher, retries pre_pick, then stops and reports.'),
-    ('descend_close_gap', 'false',
+    ('regrasp_attempts', '3',
+     'How many times to go back down and try the same grasp when the '
+     'detector says the object never moved. The fingers cannot tell a grip '
+     'from a fingertip resting on an edge; the object still being where it '
+     'was can. Bounded because the same grasp failing the same way three '
+     'times will not work on the fourth, and each go costs a descent.'),
+    ('fake_hardware', 'false',
+     'Whether the arms are mock_components rather than motors. Used for one '
+     'thing: deciding whether a saved setting that switches a check off may '
+     'be honoured. The rehearsal needs those values and the arms must never '
+     'see them, and pick_place_config.json cannot tell which run is reading '
+     'it. pick_place_demo.launch.py passes use_fake_hardware straight '
+     'through to this.'),
+    ('verify_detect_tries', '2',
+     'How many times to ask the detector before believing it when it says '
+     'there is nothing there. One empty frame is not an answer: at that '
+     'moment the arm is hovering directly over the object, which is the one '
+     'place guaranteed to hide it from the camera. An empty answer no longer '
+     'confirms a grasp either way -- see verify_grasp.'),
+    ('contact_torque_margin', '4.0',
+     'Stop a move when a joint pulls this many Nm harder than it was pulling '
+     'contact_torque_window ago, and back the arm off to where it was '
+     'contact_rewind_seconds before. A rolling baseline, and a relative one: '
+     'the shoulder carries the whole arm while the wrist carries a gripper, '
+     'so one absolute number would either miss a wrist collision or fire '
+     'constantly on joint1. Gravity took joint1 from +3.4 to -10.5 Nm across '
+     'one measured transit, so the comparison has to be against a moment '
+     'ago, not against the start of the move. 0 disables it; fake hardware '
+     'reports no efforts, so it never fires there.'),
+    ('contact_torque_window', '0.4',
+     'How far back the rolling torque baseline looks, seconds.'),
+    ('contact_torque_hold', '0.25',
+     'How long the excess torque has to last before it counts, seconds. An '
+     'acceleration transient passes; something the arm is leaning on does '
+     'not.'),
+    ('contact_lag_rad', '0.25',
+     'How far behind its own trajectory the arm has to fall, rad, before '
+     'high torque is read as contact rather than as its own weight. The half '
+     'of the test gravity cannot fake. The worst honest tracking error '
+     'measured at full speed was 0.126 rad. 0 drops the lag test; the stall '
+     'test still applies.'),
+    ('contact_rewind_seconds', '2.0',
+     'How far back to rewind after a contact stop, seconds.'),
+    ('contact_retreat_speed', '0.5',
+     'How fast to retrace those seconds on the way back out, rad/s. The one '
+     'move in the cycle driven straight at the controller with no collision '
+     'check, safe only because every waypoint is a posture the arm measured '
+     'itself in moments earlier.'),
+    ('preflight_lift', 'true',
+     'Include the lift in what the pre-flight proves, so the way out of the '
+     'column is checked before the arm goes into it. Without it a descent '
+     'can pass and its lift then be refused with the object already gripped '
+     'at the bottom of the column -- measured twice, at 2.97 and 3.01 rad '
+     'against a 1.5 rad budget. Checked to the pre-grasp height, which is '
+     'what lift_column falls back to.'),
+    ('descend_recheck', 'true',
+     "Re-probe the descent from the arm's measured posture once it has "
+     'arrived, rather than trusting where the pre-flight predicted the '
+     'approach would end. Measured: the pre-flight passed a column, TRANSIT '
+     'landed 32.6 mm off, and the descent then cost 6.42 rad against a 1.5 '
+     'rad budget and was refused -- a whole approach flown for a descent '
+     'that was never the one checked. One service call per orientation, no '
+     'motion.'),
+    ('descend_close_gap', 'true',
      'Fly the remainder when the descent stops short of the grasp. The '
      'descent plan ends on the point and the arm does not -- measured 15.5, '
      '29 and 36 mm above it across three runs, plan_error_mm 0.0 every time. '
      'That varies by 20 mm, so grasp_z_offset cannot dial it out: the offset '
      'that grips one run closes on air or presses the table the next. A '
-     'continuation of the same descent, straight down the same line. Off by '
-     'default: the run that prompted it turned out to have gripped fine at '
-     '9.8 mm above the commanded grasp, and what discarded that grasp was '
-     'the finger check reading the commanded position instead of the '
-     'measured one. Turn it on if a descent ever does stop short enough to '
-     'miss.'),
+     'continuation of the same descent, straight down the same line. On by '
+     'default since run 1789014831, where it stopped short enough to miss: '
+     'of four right-arm descents, the two that gripped stopped 3.2 and '
+     '4.0 mm from the grasp and the two that missed stopped 18.1 and '
+     '18.9 mm out with 15 mm of it height, jaws closing on air above the '
+     'object. All tracking error -- at the end of those moves the joints '
+     'were still 29 mrad from the last point of their own trajectory, '
+     'against 9-11 mrad on the two that worked. The risk it was off for, '
+     'pressing into the table, is what the contact guard now watches.'),
     ('descend_gap_max', '0.06',
      'Largest gap, metres, that is treated as tracking error and flown. '
      'Beyond it something else is wrong and the jaws close where they are.'),
@@ -306,7 +390,43 @@ ORCHESTRATOR_ARGS = [
      'Tilt magnitudes to try between 0 and grasp_tilt_max.'),
     ('grasp_tilt_azimuths', '4',
      'Directions to try each tilt in: 4 is away, left, toward, right.'),
-    ('reach_orientations', '3',
+    ('use_grasp_model', 'true',
+     "Take the grasp from GraspNet when it has one, instead of synthesising "
+     'a top-down pose from the detector box. It answers what the synthesised '
+     'pose only guesses at -- where on the object, at what height, in which '
+     'direction, and how far the jaws must open -- all read off the point '
+     'cloud. Whether the arm can get there stays the pre-flight\'s job. '
+     'Falls back to the synthesised grasp whenever nothing usable is '
+     'proposed, which is common: GraspNet was trained for a 100 mm gripper '
+     'and this one spans 44 mm. Needs grasp_model:=true to have anything to '
+     'listen to.'),
+    ('grasp_model_max_age', '30.0',
+     'How old a candidate list may be, seconds, before it is treated as '
+     'being about some earlier look.'),
+    ('grasp_model_max_offset', '0.08',
+     'How far a candidate list\'s object may be from the one being picked, '
+     'metres, before it is treated as being about something else.'),
+    ('request_grasps', 'true',
+     'Ask the grasp server for candidates on reaching the staging pose. Only '
+     'a topic publish -- nothing acts on the answer yet -- so it is free to '
+     'leave on, and it is how the candidates get looked at on real data '
+     'before anything is wired to them.'),
+    ('grasp_yaw_options', '3',
+     'Alternative grasp yaws to try when nothing that respects the '
+     "detector's axis estimate flies, spread over 180 degrees (half a turn "
+     'is the jaw flip, already covered). Tried last: a tilt still grips the '
+     'correct faces, a yaw change is a different grasp, and on a screwdriver '
+     'the measured axis is right. Measured: a roll of tape the pre-flight '
+     'refused outright flew its whole column at 90 degrees and at no other '
+     'yaw. 0 treats the axis as fixed.'),
+    ('arm_choice_cheap', 'true',
+     'Choose the arm on KDL alone, taking "cannot tell" as "use the half of '
+     'the frame the object is in". The solvers behind KDL exist to '
+     'second-guess its "no" and are where the time goes -- 2.9 s per '
+     'orientation per height per arm, measured, whether they find anything '
+     'or not, which was 52 s before the robot moved. The pre-flight settles '
+     'whether the pick is possible for whichever arm is chosen.'),
+    ('reach_orientations', '10',
      'Orientations the reach probe may try per point. It sends a planning '
      'request for each, so the full tilt set would make an unreachable object '
      'cost a minute of probing; the pre-flight explores the rest.'),
@@ -439,6 +559,17 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'model_id', default_value='google/paligemma-3b-pt-224',
             description='HuggingFace model id for the detector.'),
+        DeclareLaunchArgument(
+            'inference_mode', default_value='on_demand',
+            description='on_demand runs the detector only after a prompt '
+                        'arrives, which is what a pick needs. continuous is '
+                        'the old behaviour: a full generate every 0.4 s for '
+                        'ever, holding 6.4 GB and the GPU with it.'),
+        DeclareLaunchArgument(
+            'idle_unload_after', default_value='20.0',
+            description='Seconds idle before the weights move off the GPU. '
+                        'Coming back costs about a second. 0 keeps them '
+                        'resident.'),
     ]
     declarations += [
         DeclareLaunchArgument(name, default_value=default, description=description)
@@ -457,6 +588,9 @@ def generate_launch_description():
             '--ros-args',
             '-p', ['prompt:=', prompt],
             '-p', ['model_id:=', model_id],
+            '-p', ['inference_mode:=', LaunchConfiguration('inference_mode')],
+            '-p', ['idle_unload_after:=',
+                   LaunchConfiguration('idle_unload_after')],
         ],
         name='vlm_detector',
         output='screen',

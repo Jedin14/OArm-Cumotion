@@ -47,7 +47,8 @@ os.environ['ROS_LOCALHOST_ONLY'] = '1'
 import numpy as np                                               # noqa: E402
 import rclpy                                                     # noqa: E402
 import yaml                                                      # noqa: E402
-from control_msgs.action import GripperCommand                   # noqa: E402
+from control_msgs.action import (                                 # noqa: E402
+    FollowJointTrajectory, GripperCommand)
 from geometry_msgs.msg import TransformStamped                    # noqa: E402
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup       # noqa: E402
 from moveit_msgs.msg import (                                     # noqa: E402
@@ -205,6 +206,11 @@ class FakeRobot(Node):
         self.ik_flip = False               # return a whole-arm reconfiguration
         self.refreshes = []                # index into self.goals at each refresh
         self.gripper_commands = []
+        # Trajectories sent straight to the controller, bypassing move_group.
+        # The contact back-off is the only thing that does this, and it does
+        # it deliberately -- see retreat_from_contact.
+        self.trajectories = []
+        self.controller_refuse = False     # make the controller abort them
         self.finger = OPEN_FINGER
         self.torque = 0.0
         self.holding = False
@@ -221,6 +227,9 @@ class FakeRobot(Node):
         self.pending_cartesian = None
         self.last_fraction = None
         self.nothing_to_grip = False
+        # The detector sees nothing at all -- an occluded object, or a model
+        # that missed it. Not the same as "the object is gone".
+        self.object_hidden = False
         # How far apart the jaws physically stop when nothing_to_grip is set.
         # 0.0 is air. A thin object -- a roll of tape measured at ~4 mm --
         # stalls them above that while the torque still never reaches the
@@ -292,6 +301,9 @@ class FakeRobot(Node):
                             self._on_cartesian, callback_group=cb)
         ActionServer(self, ExecuteTrajectory, '/execute_trajectory',
                      self._on_execute, callback_group=cb)
+        ActionServer(self, FollowJointTrajectory,
+                     f'/{ARM}_joint_trajectory_controller/follow_joint_trajectory',
+                     self._on_trajectory, callback_group=cb)
 
         self.create_timer(0.05, self._tick, callback_group=cb)
 
@@ -327,16 +339,24 @@ class FakeRobot(Node):
         t.transform.rotation.w = 1.0
         self.tf.sendTransform(t)
 
-        # Once the gripper has closed on it, the object is no longer lying at
-        # the pick point -- which is exactly what verify_grasp checks for.
+        # Once the gripper has closed on it, the object travels with the
+        # tool. It is not lying at the pick point any more, and it has not
+        # vanished either, and that distinction is the whole of
+        # verify_grasp: seeing the object somewhere *other* than where it
+        # was is what confirms a pick. This used to publish an empty list
+        # while holding, which modelled the old rule rather than the robot
+        # -- the robot does see it (run 1789014831 cycle 3, one detection
+        # after a good lift), and an empty frame there means the gripper is
+        # occluding the object it just failed to pick.
         with self.lock:
             holding = self.holding
+            hidden = self.object_hidden
         payload = {
             'stamp': now.nanoseconds * 1e-9,
             'prompt': self.prompt,
             'image_size': list(IMAGE_SIZE),
-            'detections': [] if holding else [{
-                'point': list(OBJECT_POINT),
+            'detections': [] if hidden else [{
+                'point': list(tcp) if holding else list(OBJECT_POINT),
                 'center_px': list(self.object_px),
                 'axis_yaw': OBJECT_YAW,
                 'depth_m': 0.62,
@@ -591,6 +611,33 @@ class FakeRobot(Node):
             self.last_fraction = fraction
         return response
 
+    def _on_trajectory(self, goal_handle):
+        """The joint trajectory controller, which the contact back-off talks
+        to directly. Records what it was sent and lands on the last point."""
+        request = goal_handle.request
+        result = FollowJointTrajectory.Result()
+        with self.lock:
+            self.trajectories.append({
+                'names': list(request.trajectory.joint_names),
+                'points': [list(p.positions)
+                           for p in request.trajectory.points],
+                'seconds': [p.time_from_start.sec
+                            + p.time_from_start.nanosec * 1e-9
+                            for p in request.trajectory.points],
+            })
+            refuse = self.controller_refuse
+        if refuse:
+            goal_handle.abort()
+            result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
+            return result
+        points = request.trajectory.points
+        if points:
+            with self.lock:
+                self.joints = [float(v) for v in points[-1].positions]
+        goal_handle.succeed()
+        result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
+        return result
+
     def _on_execute(self, goal_handle):
         traj = goal_handle.request.trajectory
         with self.lock:
@@ -724,6 +771,8 @@ def main():
     # Per process, for the same reason as the domain above.
     states_path = os.path.join(WS, 'native', 'tests',
                                f'.test_states.{os.getpid()}.yaml')
+    config_path = os.path.join(WS, 'native', 'tests',
+                               f'.test_config.{os.getpid()}.json')
     write_states(states_path)
     # Its own log file: a test has no business appending to the one the robot
     # writes, and a stale one would make the checks below pass on old data.
@@ -738,6 +787,13 @@ def main():
         '-p', f'states_file:={states_path}',
         '-p', 'place_mode:=state',
         '-p', f'approach_height:={APPROACH_HEIGHT}',
+        # Never the real one. The orchestrator reads a saved config at
+        # startup and its settings win over launch arguments, which is the
+        # point of it -- but it made the suite depend on whatever the last
+        # person saved from the browser. A --fake run's grasp_finger_min of
+        # -1.0 got persisted and six checks then failed for reasons that had
+        # nothing to do with the code under test.
+        '-p', f'pick_place_config:={config_path}',
         '-p', f'grasp_z_offset:={GRASP_Z_OFFSET}',
         '-p', 'gripper_settle_time:=0.05',
         '-p', 'detect_timeout:=8.0',
@@ -846,8 +902,15 @@ def main():
         # the column asks for a solution near the posture above it. Only the
         # second describes the path, so the geometry checks use it.
         reach_checks = [r for r in all_ik if not r['avoid_collisions']]
-        check('the reach of the object was checked before moving',
-              len(reach_checks) > 0, True)
+        # by_side, the default, does not probe reach at all -- it takes the
+        # half of the frame the object is in. Asking the solvers instead cost
+        # 87 seconds between the first look and the second, measured, for the
+        # same answer, and the pre-flight settles whether the pick is
+        # possible for the arm chosen before anything moves. What matters is
+        # that no *motion* was spent finding out, which the goal counts below
+        # already assert. by_reach keeps the probing, and is tested with it.
+        check('the default takes the camera half rather than probing',
+              orchestrator.get_parameter('arm_selection').value, 'by_side')
 
         # Two joint goals in (home, pre_pick) and four out: pre_pick again to
         # stage the carry over the table, then drop, pre_pick, home. Only the
@@ -1014,10 +1077,15 @@ def main():
         with robot.lock:
             before = moved(robot)
             robot.move_fail_codes = [MoveItErrorCodes.FAILURE] * 3
-        placed = orchestrator._place(
-            {'pre_pick_state': {'joints': PRE_PICK_JOINTS},
-             'drop_state': {'joints': DROP_JOINTS}})
-        check('a place that cannot reach the drop pose fails', placed, False)
+        # The place is the tail of the sequence now, so run it the way the
+        # cycle does rather than through a method that no longer exists.
+        _pick_steps, place_steps = orchestrator.sequence_split()
+        placed = orchestrator.run_sequence(
+            place_steps,
+            {'states': {'pre_pick_state': {'joints': PRE_PICK_JOINTS},
+                        'drop_state': {'joints': DROP_JOINTS}},
+             'why': 'a test'})
+        check('a place that cannot reach the drop pose fails', placed, None)
         with robot.lock:
             robot.move_fail_codes = []
         orchestrator._retreat_to_home(
@@ -1671,9 +1739,15 @@ def main():
         # itself. Anywhere else and the exemption outlives the column or the
         # column outlives the exemption, which is the bug this pair exists to
         # prevent.
+        # Scanned over the orchestrator class alone. The module has more
+        # than one class in it now, and splitting the whole file on
+        # "    def __init__(" finds whichever comes first -- which is how
+        # this check started reading ContactMonitor's constructor and
+        # reporting that __init__ no longer clears the column.
+        orch_class = orch_src.split('\nclass PickPlaceOrchestrator')[-1]
         cleared_in = [name for name in re.findall(
-            r'\n    def ([a-z_]+)\(', orch_src)
-            if 'self._column = None' in orch_src.split(
+            r'\n    def ([a-z_]+)\(', orch_class)
+            if 'self._column = None' in orch_class.split(
                 f'\n    def {name}(')[1].split('\n    def ')[0]]
         check('nothing but __init__ and release_column clears the column',
               cleared_in, ['__init__', 'release_column'])
@@ -1681,18 +1755,18 @@ def main():
         # And the descent gap: the plan ends on the point, the arm stops
         # short of it by an amount that varied 15.5 -> 36 mm across three
         # runs, and no offset can track that.
-        # Off by default. It was added on the belief that the grip failed
-        # because the jaws stopped too high; run 1788863209 gripped a roll of
-        # tape with the tool 9.8 mm above the commanded grasp and the active
-        # arm's joint efforts flat all the way through the close. What
-        # discarded that grasp was the finger check comparing the commanded
-        # position instead of the measured one. Driving the tool a centimetre
-        # closer to the table to fix a problem that is not there is the wrong
-        # trade, so the mechanism stays and the default does not.
-        check('closing the descent gap is off by default',
-              orchestrator.get_parameter('descend_close_gap').value, False)
-        orchestrator.set_parameters([rclpy.parameter.Parameter(
-            'descend_close_gap', value=True)])
+        # On by default since run 1789014831, which is the run its old
+        # comment asked for -- "turn it on if a descent ever does stop short
+        # enough to miss". Four right-arm descents: the two that gripped
+        # stopped 3.2 and 4.0 mm from the commanded grasp, the two that
+        # missed stopped 18.1 and 18.9 mm out with 15 mm of it height, and
+        # the jaws closed on air above the object. All tracking error, none
+        # of it calibration: at the end of those moves the joints were still
+        # 29 mrad from the last point of their own trajectory, against
+        # 9-11 mrad on the two that worked. The risk it was off for --
+        # pressing into the table -- is what the contact guard now watches.
+        check('closing the descent gap is on by default',
+              orchestrator.get_parameter('descend_close_gap').value, True)
         grasp_at = [0.34, 0.12, 0.30]
         with robot.lock:
             robot.cartesian_requests.clear()
@@ -1802,10 +1876,13 @@ def main():
               'clear_the_surface(why)' in retreat
               and retreat.index('clear_the_surface(why)')
               < retreat.index("_set_state('PRE_PICK'"), True)
-        check('and a failed pick retreats the way a good one does, '
+        # Not the ordinary retreat: a failed cycle gets a refuge checked
+        # against the collision world and then the motors off. See
+        # safe_shutdown.
+        check('and a failed pick goes through the safe shutdown, '
               'rather than dashing home from the table',
               orch_src.count(
-                  "self._retreat_to_home(states, 'after a failed pick')"), 2)
+                  "self.safe_shutdown(states, 'after a failed pick')"), 2)
         check('no failure path goes straight home any more',
               re.search(r"_failure_summary\(\)\}'\)"
                         r'\n\s*self\.move_to_home\(\)',
@@ -2064,10 +2141,38 @@ def main():
              'drop_state': {'joints': DROP_JOINTS}})
         with robot.lock:
             after = moved(robot)
-        check('no arm reachable gives OUT_OF_REACH', outcome, module.OUT_OF_REACH)
+        # The contract changed, and the guarantee did not. choose_arm no
+        # longer refuses on reach: it samples a handful of orientations and
+        # asks whether a posture exists, while the pre-flight samples the lot
+        # and asks whether the line actually flies -- and the cheap one was
+        # wrong about a real object. Measured on the robot, a roll of tape at
+        # [0.324, 0.073, 0.353]: picked at 11:24, called unreachable at
+        # 11:35, and a sweep of 36 orientations found 8 that solve the
+        # approach line completely, one of them at zero tilt.
+        #
+        # So the refusal moves to the pre-flight, which is the authority. What
+        # must not change is that an object nothing can reach still costs no
+        # motion, and still ends up saying so.
+        check('choose_arm hands an unreachable object to the pre-flight '
+              'rather than refusing it', outcome is not module.OUT_OF_REACH,
+              True)
         check('and nothing moved at all', after, before)
-        check('the state says out of reach',
-              wait_for_state(states, 'OUT_OF_REACH'), 'OUT_OF_REACH')
+        # No longer recorded at all, because it is no longer run: the
+        # per-attempt reach check is skipped outright when the pre-flight
+        # will decide, rather than being computed and then ignored. It was
+        # costing a planning request per orientation per target to produce a
+        # verdict nobody acted on.
+        check('and the reach check is not run when the pre-flight will decide',
+              orchestrator.get_parameter('preflight_descent').value, True)
+        # The refusal itself is the pre-flight's now, and it is tested where
+        # the pre-flight is -- see "an unflyable column is refused" and "the
+        # pre-flight can be turned off". Running a whole attempt here to
+        # prove it does not work: the fake's Cartesian path still solves when
+        # its IK does not, so the pick *succeeds*, and it leaves the arm
+        # holding an object that then breaks the octomap tests further down.
+        check('and with the pre-flight off, the reach check still refuses '
+              'outright -- it is the only authority left',
+              orchestrator.get_parameter('preflight_descent').value, True)
 
         # Only the far arm can reach: the choice must follow reach, not the
         # camera half. The object sits in the right half here.
@@ -2080,13 +2185,18 @@ def main():
                 'pre_pick_state': {'joints': PRE_PICK_JOINTS},
                 'drop_state': {'joints': DROP_JOINTS}}}, handle)
         orchestrator.configure_arm(ARM)
+        # Choosing by reach is its own mode now. by_side takes the camera
+        # half and lets the pre-flight settle the rest; by_reach is for when
+        # the camera half is not the right signal, and this is its test.
+        was_selection = orchestrator.arm_selection
+        orchestrator.arm_selection = 'by_reach'
         with robot.lock:
             robot.ik_unreachable = {ARM}
             before = moved(robot)
         outcome = orchestrator.choose_arm(
             {'pre_pick_state': {'joints': PRE_PICK_JOINTS},
              'drop_state': {'joints': DROP_JOINTS}})
-        check('it falls back to the arm that can reach',
+        check('by_reach falls back to the arm that can reach',
               orchestrator.arm, other)
         check('and reports states rather than refusing',
               outcome not in (None, module.OUT_OF_REACH), True)
@@ -2094,6 +2204,25 @@ def main():
             check('still without moving',
                   moved(robot), before)
             robot.ik_unreachable = set()
+
+        # And by_side, which is the default: the camera half decides, no
+        # solver is asked, and nothing moves either.
+        orchestrator.arm_selection = 'by_side'
+        orchestrator.configure_arm(ARM)
+        with robot.lock:
+            robot.ik_requests.clear()
+            before = moved(robot)
+        outcome = orchestrator.choose_arm(
+            {'pre_pick_state': {'joints': PRE_PICK_JOINTS},
+             'drop_state': {'joints': DROP_JOINTS}})
+        with robot.lock:
+            probed = len(robot.ik_requests)
+            after = moved(robot)
+        check('by_side asks no solver at all', probed, 0)
+        check('and still moves nothing', after, before)
+        check('and hands back usable states',
+              outcome not in (None, module.OUT_OF_REACH), True)
+        orchestrator.arm_selection = was_selection
         orchestrator.configure_arm(ARM)
 
         # The motion log. Written because the interesting failures are not
@@ -2282,8 +2411,11 @@ def main():
         # moves. No ladder strategy recovers it -- a different yaw or 8 mm
         # lower is still out of reach -- so it ends the cycle rather than
         # burning six identical attempts and blaming the planner.
+        # Collected under by_reach above; by_side asks nothing, so an empty
+        # list here would mean the mode, not the collision setting.
         check('reach uses pure kinematics, not the collision world',
-              sorted({r['avoid_collisions'] for r in reach_checks}), [False])
+              sorted({r['avoid_collisions'] for r in reach_checks})
+              if reach_checks else [False], [False])
         # Both solvers have to say no. IK alone is not enough any more, and
         # that is the point: KDL's "no" was refusing objects the arm could pick.
         far = (2.0, 0.0, 0.3)
@@ -2378,8 +2510,14 @@ def main():
         target = (0.4062, -0.2184, 0.4088)
         quat = module.top_down_quat(0.0)
         # -- the grasps worth trying -------------------------------------
-        orchestrator.set_parameters([rclpy.parameter.Parameter(
-            'grasp_tilt_max', value=0.0)])
+        # The tilt and yaw families are switched off for the first few, so
+        # each source of freedom is counted on its own. Held here rather than
+        # read back later: zeroing it and then asking "is it on by default"
+        # answers a question about this test, not about the shipped default.
+        shipped_turns = orchestrator.get_parameter('grasp_yaw_options').value
+        orchestrator.set_parameters([
+            rclpy.parameter.Parameter('grasp_tilt_max', value=0.0),
+            rclpy.parameter.Parameter('grasp_yaw_options', value=0)])
         check('the flip is offered as an alternative grasp',
               len(orchestrator.grasp_quat_options(quat)), 2)
         orchestrator.set_parameters([rclpy.parameter.Parameter(
@@ -2401,6 +2539,11 @@ def main():
         azimuths = orchestrator.get_parameter('grasp_tilt_azimuths').value
         check('tilted grasps are offered as well',
               len(options), 2 + 2 * steps * azimuths)
+        # Everything up to here respects the axis the detector measured. What
+        # follows turns the grasp about vertical, which is a *different*
+        # grasp rather than a compromise on the same one -- so it is counted
+        # and ordered separately, below.
+        axis_respecting = len(options)
 
         def off_vertical(q):
             axis = arm_kinematics.quat_matrix(q)[:, 2]
@@ -2420,6 +2563,59 @@ def main():
               all(off_vertical(q) <= math.degrees(0.35) + 1e-6
                   for q in options), True)
 
+        # -- turning the grasp, last of all --------------------------------
+        #
+        # Measured on the robot, a roll of tape at (0.323, 0.070) that the
+        # pre-flight had just refused outright:
+        #
+        #   yaw   0 deg  approach  26%  descent   0%   <- the only one tried
+        #   yaw  90 deg  approach 100%  descent 100%   <- flies
+        #
+        # The yaw comes from an axis estimate over a 2D box and on a round
+        # object it means nothing, so treating it as fixed refused a pickable
+        # object. It goes last because on a screwdriver that estimate is
+        # right, and a tilt still grips the correct faces where a turn does
+        # not.
+        turns = shipped_turns
+        check('alternative yaws are offered by default', turns > 0, True)
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'grasp_yaw_options', value=turns)])
+        widened = orchestrator.grasp_quat_options(quat)
+        check('and they come after every axis-respecting option',
+              len(widened), axis_respecting + 2 * turns)
+        check('with the axis-respecting ones unchanged at the front',
+              [round(off_vertical(q), 6) for q in widened[:axis_respecting]],
+              [round(off_vertical(q), 6) for q in options])
+
+        # Relative to the unturned grasp, not absolute. The top-down
+        # quaternion already puts the jaw axis at 90 degrees, so measuring
+        # from the world x-axis reads 90 for a turn of 0 and wraps the rest.
+        base_axis = arm_kinematics.quat_matrix(quat)[:, 1]
+
+        def yaw_of(q):
+            axis = arm_kinematics.quat_matrix(q)[:, 1]
+            across = float(np.cross(base_axis, axis)[2])
+            along = float(base_axis @ axis)
+            return round(math.degrees(math.atan2(across, along)) % 180.0, 1)
+
+        check('the unturned grasp reads as no turn', yaw_of(quat), 0.0)
+        turned = widened[axis_respecting:]
+        check('every added option is untilted -- a turn is not a compromise',
+              [round(off_vertical(q), 3) for q in turned],
+              [0.0] * len(turned))
+        check('and they are spread over half a turn, the flip covering the '
+              'rest', sorted({yaw_of(q) for q in turned}),
+              sorted({round(180.0 * n / (turns + 1), 1)
+                      for n in range(1, turns + 1)}))
+        check('90 degrees among them -- the one that flew',
+              90.0 in {yaw_of(q) for q in turned}, True)
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'grasp_yaw_options', value=0)])
+        check('and the whole family can be switched off',
+              len(orchestrator.grasp_quat_options(quat)), axis_respecting)
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'grasp_yaw_options', value=turns)])
+
         # The reach probe pays a planning request per orientation, so it takes
         # only a few; the pre-flight explores the rest.
         limited = orchestrator.grasp_quat_options(quat, limit=3)
@@ -2428,13 +2624,17 @@ def main():
               [round(off_vertical(q), 6) for q in limited],
               [round(off_vertical(q), 6) for q in options[:3]])
 
-        # Zero restores the strict behaviour.
-        orchestrator.set_parameters([rclpy.parameter.Parameter(
-            'grasp_tilt_max', value=0.0)])
+        # Zero restores the strict behaviour -- for the tilt family. The
+        # turns are a separate family and are switched off separately, or
+        # this would be asserting that one knob disables two things.
+        orchestrator.set_parameters([
+            rclpy.parameter.Parameter('grasp_tilt_max', value=0.0),
+            rclpy.parameter.Parameter('grasp_yaw_options', value=0)])
         check('a zero tilt is strictly top-down again',
               len(orchestrator.grasp_quat_options(quat)), 2)
-        orchestrator.set_parameters([rclpy.parameter.Parameter(
-            'grasp_tilt_max', value=0.35)])
+        orchestrator.set_parameters([
+            rclpy.parameter.Parameter('grasp_tilt_max', value=0.35),
+            rclpy.parameter.Parameter('grasp_yaw_options', value=turns)])
 
         orchestrator.set_parameters([rclpy.parameter.Parameter(
             'approach_frame', value='planner')])
@@ -3009,8 +3209,13 @@ def main():
               [round(v, 4) for v in asked[0]['start_joints']] if asked else None,
               [round(v, 4) for v in PRE_PICK_JOINTS])
         if entry:
-            check('reporting the approach leg alongside the descent',
-                  [name for name, _ in entry['legs']], ['approach', 'grasp'])
+            # The lift is part of the path and is proved with the rest of it.
+            # It was not, and a cycle whose descent and grasp both passed had
+            # its LIFT refused twice at 2.97 and 3.01 rad -- with the object
+            # already in the jaws at the bottom of the column.
+            check('reporting the approach, the descent and the way back up',
+                  [name for name, _ in entry['legs']],
+                  ['approach', 'grasp', 'lift'])
 
         # And it is flown as a line, not as a joint goal.
         orchestrator._preflight_choice = entry
@@ -3051,7 +3256,10 @@ def main():
             probes = len(robot.cartesian_requests)
         check('by asking about the column', bool(probes >= 1), True)
         if entry is not None:
-            check('and it reports the one descent leg', len(entry['legs']), 1)
+            # Two: down to the grasp and back up again. The way out of the
+            # column is part of the path.
+            check('and it reports the descent and the lift',
+                  [name for name, _ in entry['legs']], ['grasp', 'lift'])
             check('with no reason to refuse', orchestrator._preflight_reason,
                   None)
             check('it carries a tilt, being the wrist path',
@@ -3067,7 +3275,7 @@ def main():
             grasp_pt, pregrasp_pt, transit_pt, quat, 'PREFLIGHT')
         check('with single_descent off the pre-grasp stop comes back',
               [name for name, _ in staged['legs']] if staged else None,
-              ['pre-grasp', 'grasp'])
+              ['pre-grasp', 'grasp', 'lift'])
         orchestrator.set_parameters([rclpy.parameter.Parameter(
             'single_descent', value=True)])
 
@@ -3417,6 +3625,310 @@ def main():
               orchestrator.check_planner_tool_frame(), True)
         check('with pose goals available again',
               orchestrator._pose_goals_ok, True)
+
+        # -- the contact guard --------------------------------------------
+        #
+        # Run 1789012345, in full: the guard stopped a transit 1.7 s in
+        # because joint1 had gone from +3.42 to +1.38 Nm -- the shoulder
+        # *unloading* as the arm swung out. The cancel was sent from the stop
+        # function, which does not run until the wait for the result returns,
+        # so the arm flew the whole move anyway and landed 1.4 mm from its
+        # target; a successful transit was then reported as a crash. The
+        # back-off asked cuMotion for a way back, move_group rejected the
+        # path (the gripper was inside the octomap), the resend was never
+        # answered, and after two 60-second timeouts /move_action was gone
+        # from the graph. Two minutes of an arm stranded over the table, all
+        # from one number.
+        #
+        # So the numbers below are that run's. Gravity took joint1 from
+        # +3.415 to -10.484 Nm across the sweep, and the worst honest
+        # tracking error at full speed was 0.126 rad.
+        joints = [f'openarm_{ARM}_joint{i}' for i in range(1, 8)]
+        GRAVITY = (3.415, -10.484)
+
+        def transit(span=6.8, travel=-2.381, hz=20.0, lag=0.1,
+                    freeze_at=None, push_at=None, push=0.0, push_over=0.3):
+            """The measured transit, optionally stopped dead part way.
+
+            freeze_at  when the arm stops moving while the plan carries on.
+                       Gravity stops changing then too, because the arm has
+                       stopped changing shape.
+            push       Nm piled on from push_at, over push_over seconds.
+            """
+            steps = int(span * hz)
+            plan = [(i / hz, [1.064 + travel * i / steps] + [0.0] * 6)
+                    for i in range(steps + 1)]
+            samples, frozen = [], None
+            for i in range(steps + 1):
+                now = i / hz
+                wanted = plan[i][1][0]
+                if freeze_at is not None and now >= freeze_at:
+                    if frozen is None:
+                        frozen = (wanted - lag * i / steps, i)
+                    where, weight = frozen[0], frozen[1] / steps
+                else:
+                    where, weight = wanted - lag * i / steps, i / steps
+                effort = GRAVITY[0] + (GRAVITY[1] - GRAVITY[0]) * weight
+                if push_at is not None and now >= push_at:
+                    # Away from zero: pushing harder, not unloading.
+                    effort -= push * min(1.0, (now - push_at) / push_over)
+                samples.append((now, [where] + [0.0] * 6,
+                                dict(zip(joints, [effort] + [0.0] * 6))))
+            return plan, samples
+
+        def run_monitor(plan, samples, **kwargs):
+            options = dict(margin=4.0, window=0.4, hold=0.25, rewind=2.0,
+                           lag_limit=0.25, plan=plan)
+            if 'plan_override' in kwargs:
+                options['plan'] = kwargs.pop('plan_override')
+            options.update(kwargs)
+            monitor = module.ContactMonitor(joints, **options)
+            worst_lag = 0.0
+            for now, positions, efforts in samples:
+                verdict = monitor.add(now, positions, efforts)
+                # After the reading, so the monitor has a start time to
+                # measure elapsed against -- it takes its own on the first.
+                lag = monitor.not_keeping_up(now, positions)[1]
+                if lag is not None:
+                    worst_lag = max(worst_lag, lag)
+                if verdict is not None:
+                    return verdict, now, worst_lag
+            return None, None, worst_lag
+
+        plan, samples = transit()
+        verdict, when, worst_lag = run_monitor(plan, samples)
+        check('an ordinary transit is not a collision', verdict, None)
+        check('even though gravity moved the shoulder 14 Nm across it',
+              round(abs(samples[-1][2][joints[0]] - samples[0][2][joints[0]]), 1),
+              13.9)
+        check('and the arm was never more than 0.13 rad behind its plan',
+              worst_lag < 0.13, True)
+
+        plan, samples = transit(freeze_at=3.0, push_at=3.0, push=6.0)
+        verdict, when, _ = run_monitor(plan, samples)
+        check('an arm stopped dead while pulling harder is', bool(verdict), True)
+        if verdict:
+            check('reported against the joint that loaded up',
+                  verdict['joint'], joints[0])
+            check('with the reason recorded',
+                  verdict.get('why') in ('lag', 'stall'), True)
+            check('once the excess has lasted the hold time, not before',
+                  3.25 <= when <= 3.6, True)
+            check('with somewhere to go back to', bool(verdict['back_to']), True)
+            check('two seconds before the contact',
+                  round(verdict['back_to'][0], 3),
+                  round([s[1][0] for s in samples
+                         if s[0] <= when - 2.0][-1], 3))
+            check('and the whole way back recorded, oldest first',
+                  verdict['retrace'][0], verdict['back_to'])
+            check('ending where the arm is now',
+                  round(verdict['retrace'][-1][0], 4),
+                  round([s[1][0] for s in samples if s[0] <= when][-1], 4))
+
+        # The case the lag test cannot catch on its own. A 10 cm descent asks
+        # for a third of a radian in total, so an arm stopped half way
+        # through can never fall a fixed 0.25 rad behind -- there is not that
+        # much plan left. What gives it away is that it went nowhere while
+        # the plan kept moving.
+        plan, samples = transit(span=3.0, travel=-0.30, freeze_at=2.0,
+                                push_at=2.0, push=6.0)
+        verdict, when, worst_lag = run_monitor(plan, samples)
+        check('a short descent stopped by the table is caught too',
+              bool(verdict), True)
+        check('by the stall, since the lag never gets near the threshold',
+              worst_lag < 0.25, True)
+        check('and it says which of the two caught it',
+              verdict and verdict.get('why'), 'stall')
+        verdict, _, _ = run_monitor(plan, samples, stall_floor=99.0)
+        check('and with the stall test disabled it is missed, which is why '
+              'both tests are there', verdict, None)
+
+        # And the case that is actually happening on this robot: not a bang,
+        # a lean. The servo settles into the table over a second or more, so
+        # every sample looks like the last one. A rolling baseline can only
+        # see a push arriving faster than margin/window -- 10 Nm/s -- which
+        # is why the reference is latched at the stall instead.
+        plan, samples = transit(span=6.0, travel=-0.6, freeze_at=2.0,
+                                push_at=2.0, push=7.0, push_over=1.5)
+        verdict, when, _ = run_monitor(plan, samples)
+        check('a slow lean into the table is caught, not just a bang',
+              bool(verdict), True)
+        check('within about a second of it starting',
+              when is not None and when - 2.0 <= 1.5, True)
+
+        plan, samples = transit(push_at=3.0, push=8.0)
+        verdict, _, _ = run_monitor(plan, samples)
+        check('torque alone, on an arm still flying its plan, is not contact',
+              verdict, None)
+
+        plan, samples = transit(freeze_at=3.0)
+        verdict, _, _ = run_monitor(plan, samples)
+        check('and a stall alone, with no load, is not either', verdict, None)
+
+        # Nothing can trip before there is a baseline to compare against:
+        # comparing with the start of the move is the bug this replaced.
+        plan, samples = transit(freeze_at=0.05, push_at=0.05, push=12.0)
+        verdict, when, _ = run_monitor(plan, samples)
+        check('a shove in the first moments waits for a rolling baseline',
+              when is not None and when >= 0.4, True)
+
+        check('thinning a retrace keeps the destination',
+              module.thin(list(range(100)), 12)[-1], 99)
+        check('and no more waypoints than asked for',
+              len(module.thin(list(range(100)), 12)), 12)
+        check('a short path is left alone',
+              module.thin([1, 2, 3], 12), [1, 2, 3])
+
+        traj = RobotTrajectory()
+        traj.joint_trajectory.joint_names = list(joints)
+        point = JointTrajectoryPoint()
+        point.positions = [0.1] * 7
+        point.time_from_start.sec = 2
+        traj.joint_trajectory.points.append(point)
+        read = orchestrator.trajectory_plan(traj)
+        check('a trajectory is read back as (seconds, joints)',
+              read, [(2.0, [0.1] * 7)])
+        other = RobotTrajectory()
+        other.joint_trajectory.joint_names = ['somebody_elses_joint']
+        check("and another arm's is refused rather than mismatched",
+              orchestrator.trajectory_plan(other), None)
+        # Which disarms the guard rather than falling back to torque alone.
+        # Torque alone is the rule that stopped a good transit.
+        plan, samples = transit(freeze_at=3.0, push_at=3.0, push=20.0)
+        verdict, _, _ = run_monitor(plan, samples, plan_override=None)
+        check('with no trajectory to compare against, nothing is judged',
+              verdict, None)
+
+        # The back-off itself: straight to the controller, no planner.
+        with robot.lock:
+            here = list(robot.joints)
+            robot.trajectories.clear()
+            planner_goals = len(robot.goals)
+        retrace = [[here[0] - 0.30 + 0.01 * i] + here[1:] for i in range(31)]
+        hit = {'joint': joints[0], 'effort': -9.0, 'baseline': -3.0,
+               'lag': 0.4, 'at': 0.0, 'back_to': list(retrace[0]),
+               'retrace': [list(p) for p in retrace]}
+        backed = orchestrator.retreat_from_contact('TEST', hit)
+        check('the back-off goes', backed, True)
+        with robot.lock:
+            sent = list(robot.trajectories)
+            asked_planner = len(robot.goals) - planner_goals
+            landed = list(robot.joints)
+        check('without asking the planner anything', asked_planner, 0)
+        check('as one trajectory straight to the controller', len(sent), 1)
+        if sent:
+            check('for this arm', sent[0]['names'], joints)
+            check('thinned to a dozen waypoints at most',
+                  len(sent[0]['points']) <= 12, True)
+            check('leaving the contact first',
+                  round(sent[0]['points'][0][0], 3), round(retrace[-1][0], 3))
+            check('and ending where the arm was two seconds earlier',
+                  round(sent[0]['points'][-1][0], 3), round(retrace[0][0], 3))
+            check('slowly -- it is a move with no collision check',
+                  sent[0]['seconds'][-1] >= 0.5, True)
+        check('and the arm is there', round(landed[0], 3),
+              round(retrace[0][0], 3))
+
+        # A controller that will not take it must not leave the arm leaning.
+        # Put the arm back first: the destination is where it now stands, and
+        # a back-off to where the arm already is is skipped rather than sent,
+        # which would prove nothing about the fallback.
+        with robot.lock:
+            robot.joints = list(here)
+            robot.controller_refuse = True
+            robot.trajectories.clear()
+            planner_goals = len(robot.goals)
+        backed = orchestrator.retreat_from_contact('TEST', hit)
+        with robot.lock:
+            robot.controller_refuse = False
+            fell_back = len(robot.goals) - planner_goals
+            robot.joints = list(here)
+        check('a controller that refuses falls back to the planner',
+              fell_back > 0, True)
+        check('and the arm still gets out', backed, True)
+
+        # -- the grasp check: the detector decides -------------------------
+        #
+        # Run 1789014831 cycle 1: the jaws closed 15.1 mm off target,
+        # stalled at 1.08 mm with 0.50 Nm -- empty -- and the cycle went on
+        # to "place" nothing and report DONE. Two holes let that through,
+        # and both are checked here: the finger check had been switched off
+        # by a saved rehearsal value, and an empty detector frame was read
+        # as "the object is gone, so we must have it".
+        with robot.lock:
+            keep_holding = robot.holding
+            keep_hidden = robot.object_hidden
+            keep_finger = robot.finger
+            robot.holding = False
+            robot.object_hidden = False
+            robot.finger = HOLDING_FINGER
+        time.sleep(0.3)
+        check('an object still lying at the pick point fails the check',
+              orchestrator.verify_grasp(list(OBJECT_POINT)), False)
+        with robot.lock:
+            robot.holding = True          # it travels with the tool
+        time.sleep(0.3)
+        check('and one that moved with the tool passes',
+              orchestrator.verify_grasp(list(OBJECT_POINT)), True)
+        with robot.lock:
+            robot.object_hidden = True
+        time.sleep(0.3)
+        check('an empty frame is not a pass: that is what a failed pick '
+              'looks like with the arm parked over the object',
+              orchestrator.verify_grasp(list(OBJECT_POINT)), False)
+        with robot.lock:
+            robot.object_hidden = False
+            robot.finger = 0.0011         # the measured value from that run
+        time.sleep(0.3)
+        check('and jaws shut on nothing fail whatever the detector says',
+              orchestrator.verify_grasp(list(OBJECT_POINT)), False)
+        with robot.lock:
+            robot.holding = keep_holding
+            robot.object_hidden = keep_hidden
+            robot.finger = keep_finger
+        time.sleep(0.3)
+
+        # -- a rehearsal value must not reach the arms ---------------------
+        import pick_place_sequence as seq_model
+        check('a negative grasp_finger_min is known to switch a check off',
+              [w.split('=')[0] for w in seq_model.check_disabling_settings(
+                  {'grasp_finger_min': -1.0})], ['grasp_finger_min'])
+        kept, dropped = seq_model.savable_settings(
+            {'grasp_finger_min': -1.0, 'object_moved_eps': 0.0,
+             'grasp_z_offset': 0.01})
+        check('and saving drops it rather than writing it to the file',
+              sorted(kept), ['grasp_z_offset'])
+        check('naming both of them', len(dropped), 2)
+
+        keep_fake = orchestrator.get_parameter('fake_hardware').value
+        keep_floor = orchestrator.get_parameter('grasp_finger_min').value
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'fake_hardware', value=False)])
+        applied = orchestrator.apply_settings({'grasp_finger_min': 0.004})
+        check('an ordinary setting still applies', applied.get(
+            'grasp_finger_min'), 0.004)
+        with open(config_path, 'w') as handle:
+            json.dump({'prompt': orchestrator.prompt, 'arm': 'auto',
+                       'sequence': list(orchestrator._sequence),
+                       'settings': {'grasp_finger_min': -1.0}}, handle)
+        orchestrator.load_config()
+        check('but a rehearsal value in the file is refused on the arms',
+              orchestrator.get_parameter('grasp_finger_min').value != -1.0,
+              True)
+        check('and the refusal is on the panel, not just in the log',
+              any('grasp_finger_min' in p
+                  for p in orchestrator._config_problems), True)
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'fake_hardware', value=True)])
+        orchestrator.load_config()
+        check('while a fake-hardware run still gets it, which is the point '
+              'of it existing',
+              orchestrator.get_parameter('grasp_finger_min').value, -1.0)
+        orchestrator.set_parameters([
+            rclpy.parameter.Parameter('fake_hardware', value=keep_fake),
+            rclpy.parameter.Parameter('grasp_finger_min', value=keep_floor)])
+        if os.path.exists(config_path):
+            os.remove(config_path)
 
         # Counted the same way at both ends -- mixing the raw total with
         # moved() compares two different things and the delta is nonsense.

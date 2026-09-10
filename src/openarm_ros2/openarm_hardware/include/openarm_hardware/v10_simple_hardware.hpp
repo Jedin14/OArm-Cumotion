@@ -157,6 +157,9 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
 
   // Helper methods
   void return_to_zero();
+  // Seed the command buffers from the measured state, so activating the
+  // hardware does not move the arm. See the definition.
+  void hold_current_position();
   bool parse_config(const hardware_interface::HardwareInfo& info);
   void generate_joint_names();
 

@@ -53,7 +53,8 @@ DEFAULT_STATES_FILE = 'auto'
 try:
     from pick_place_orchestrator import TERMINAL_STATES as TERMINAL
 except ImportError:                              # panel run without the rest
-    TERMINAL = ('DONE', 'FAILED', 'ABORTED', 'OUT_OF_REACH', 'IDLE')
+    TERMINAL = ('DONE', 'FAILED', 'ABORTED', 'OUT_OF_REACH', 'STOPPED',
+                'IDLE')
 
 # Torque cap at the gripper motor, in Nm -- the same units and default as
 # DEFAULT_GRIPPER_TORQUE_CAP_NM in the exoskeleton bridge. 2.5 Nm is roughly
@@ -207,11 +208,14 @@ class Panel:
         frame = tk.Frame(self.root, padx=12, pady=12)
         frame.pack(fill='both', expand=True)
 
-        tk.Label(frame, text='What should the arm pick up?',
+        tk.Label(frame, text='Object \u2014 just the word',
                  font=('TkDefaultFont', 11, 'bold')).pack(anchor='w')
 
         self.entry = tk.Entry(frame, font=('TkDefaultFont', 12))
-        self.entry.insert(0, 'pick up the screwdriver')
+        # The word on its own. "pick up the screwdriver" still works --
+        # to_detection_prompt strips the lead-in either way -- but asking for
+        # a sentence invited one, and the detector never wanted it.
+        self.entry.insert(0, 'screwdriver')
         self.entry.pack(fill='x', pady=(6, 2))
         self.entry.bind('<Return>', lambda _e: self.on_pick())
         self.entry.focus_set()

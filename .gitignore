@@ -43,6 +43,13 @@ core.*
 # Frames dumped by the VLM debug tools (VLM/pixel_to_world.py writes these).
 pixel_to_world_frame.png
 
+# --- third-party models ------------------------------------------------------
+# graspnet-baseline, its venv and its weights. Fetched by
+# grasp/fetch_graspnet.sh, never committed: it is SJTU's, under an
+# academic/non-profit noncommercial research licence, so this repository must
+# not redistribute it. The venv is ~7 GB besides.
+third_party/
+
 # --- test artefacts ----------------------------------------------------------
 # test_vlm_geometry.py renders an annotated frame so the dot and coordinates can
 # be looked at rather than argued about. Useful to open, not to commit.
@@ -52,6 +59,7 @@ vlm_detection.png
 # Scratch states file and motion log written by test_pick_cycle.py. Named per
 # process so two copies of the suite cannot clobber each other.
 native/tests/.test_states.*.yaml
+native/tests/.test_config.*.json
 native/tests/.test_motion_log.*.jsonl
 
 # Append-only record of every commanded motion, for debugging a run

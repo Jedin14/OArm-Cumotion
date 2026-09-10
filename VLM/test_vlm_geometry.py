@@ -176,6 +176,28 @@ def test_axis_from_mask():
     angle, _ = axis_from_mask(speck, (0, 0))
     check_equal('sub-threshold blob -> None', angle, None)
 
+    # A round object has no long axis, and reporting one anyway is what put
+    # the jaws across a roll of tape at -86 degrees in run 1789014831 -- the
+    # same object read as -169, -86, 0 and 0 degrees across four detections.
+    # The blob is still returned, so the overlay can draw what it measured.
+    disc = np.zeros((240, 320), np.uint8)
+    cv2.circle(disc, (160, 120), 40, 255, -1)
+    angle, corners = axis_from_mask(disc, (0, 0))
+    check_equal('a disc reports no axis at all', angle, None)
+    check_equal('but is still a blob, so the overlay can show it',
+                corners is not None, True)
+    # ... and one that is only slightly out of round still reports none,
+    # because a hair of elongation is not a grasp axis.
+    oval = np.zeros((240, 320), np.uint8)
+    cv2.ellipse(oval, (160, 120), (42, 40), 0, 0, 360, 255, -1)
+    angle, _ = axis_from_mask(oval, (0, 0))
+    check_equal('nor does a 1.05:1 oval', angle, None)
+    # A 2:1 one does.
+    bar = np.zeros((240, 320), np.uint8)
+    cv2.ellipse(bar, (160, 120), (80, 40), 0, 0, 360, 255, -1)
+    angle, _ = axis_from_mask(bar, (0, 0))
+    check_equal('a 2:1 ellipse still has one', angle is not None, True)
+
 
 def test_object_axis_prefers_depth():
     """The real failure this replaced: a vertical object read as horizontal.

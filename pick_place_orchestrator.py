@@ -38,10 +38,17 @@ through the work surface -- so when pre_pick cannot be reached on the way back
 the arm lifts higher, tries once more, and then stops and reports rather than
 sweeping. See home_requires_pre_pick.
 
-A pick that *fails* leaves by the same door. Every failure below TRANSIT --
-the descent stopping short, the jaws closing on nothing, the grasp not
-verifying, the cycle crashing outright -- leaves the arm extended down at the
-object, and PRE_PICK and HOME are joint goals: the short path in joint space
+A pick that *fails* does not leave by that door at all: see safe_shutdown.
+It has an arm somewhere unplanned, often still holding the object and often
+with its own start state already in collision, so it gets a refuge checked
+against the collision world before anything moves, and the motors off once it
+is parked.
+
+A pick that fails below TRANSIT still comes back up the same way first. Every
+failure below TRANSIT -- the descent stopping short, the jaws closing on
+nothing, the grasp not verifying, the cycle crashing outright -- leaves the
+arm extended down at the object, and PRE_PICK and HOME are joint
+goals: the short path in joint space
 from reaching down over the table to folded at the side goes through the
 table. So the first thing any exit does is CLEAR, straight back up the
 descent line, gripper left exactly as it is. clear_the_surface() is a no-op
@@ -112,7 +119,7 @@ import threading
 import time
 
 import rclpy
-from control_msgs.action import GripperCommand
+from control_msgs.action import FollowJointTrajectory, GripperCommand
 from geometry_msgs.msg import PoseStamped
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
@@ -130,7 +137,10 @@ from moveit_msgs.msg import (
 import yaml
 from moveit_msgs.msg import PlanningSceneComponents
 from moveit_msgs.srv import (ApplyPlanningScene, GetCartesianPath,
-                             GetPlanningScene, GetPositionIK)
+                             GetPlanningScene, GetPositionIK,
+                             GetStateValidity)
+from controller_manager_msgs.srv import SetHardwareComponentState
+from lifecycle_msgs.msg import State as LifecycleState
 from rcl_interfaces.srv import GetParameters
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -142,10 +152,12 @@ from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import String
 from std_srvs.srv import Empty, Trigger
 from tf2_ros import Buffer, TransformListener
+from trajectory_msgs.msg import JointTrajectoryPoint
 
 from vlm_prompt import to_detection_prompt
 
 import arm_kinematics
+import pick_place_sequence as sequence_model
 
 MOVEIT_SUCCESS = 1
 
@@ -191,7 +203,14 @@ OUT_OF_REACH = 'out-of-reach'
 # Every state a cycle can end on. The panel imports this to decide when to
 # re-enable its buttons: a terminal state it does not recognise leaves Pick
 # greyed out with no way back, which is what adding OUT_OF_REACH did.
-TERMINAL_STATES = ('DONE', 'FAILED', 'ABORTED', 'OUT_OF_REACH', 'IDLE')
+#
+# STOPPED belongs here for the same reason. It is where safe_shutdown ends
+# when nothing safe could be reached -- the arm is stranded, the motors are
+# still on, and there is nothing further coming. Leaving the buttons dead
+# then is the worst moment to do it: clearing the octomap and asking again
+# is exactly what the operator needs to be able to do.
+TERMINAL_STATES = ('DONE', 'FAILED', 'ABORTED', 'OUT_OF_REACH', 'STOPPED',
+                   'IDLE')
 
 ATTACHED_OBJECT_ID = 'vlm_target'
 TABLE_OBJECT_ID = 'work_surface'
@@ -323,6 +342,221 @@ def dist(a, b):
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
 
+def thin(items, limit):
+    """At most `limit` of them, evenly spaced, keeping the first and last.
+
+    Used on a retrace: two seconds of 50 Hz samples is a hundred waypoints
+    describing a path a dozen would describe as well, and the last one is
+    the destination, so it is the one that must survive.
+    """
+    if limit < 2 or len(items) <= limit:
+        return list(items)
+    step = (len(items) - 1) / float(limit - 1)
+    kept = [items[int(round(i * step))] for i in range(limit - 1)]
+    kept.append(items[-1])
+    return kept
+
+
+class ContactMonitor:
+    """Decides, reading by reading, whether the arm is leaning on something.
+
+    Kept apart from the thread that feeds it so the rule can be tested
+    against recorded runs, because every wrong answer this has given was the
+    rule misreading ordinary motion rather than anything to do with threads,
+    and the numbers that produced them are all in motion_log.jsonl.
+
+    Contact has to show in two independent ways before a move is stopped:
+
+      torque   a joint's |effort| is `margin` Nm above what that same joint
+               was pulling `window` seconds ago, and has stayed there for
+               `hold` seconds. The baseline rolls, so the gravity that takes
+               joint1 from +3.4 to -10.5 Nm over one transit is never in the
+               comparison -- only a step is.
+      motion   the arm is `lag_limit` rad or more behind the trajectory it is
+               flying, or it has stopped making progress along it: moving
+               less than `stall_share` of what the plan asked for over the
+               last `hold` seconds, when the plan asked for at least
+               `stall_floor`.
+
+    Neither alone is safe. Torque alone stopped a perfectly good transit --
+    on the shoulder *unloading* as it swung out, 3.42 to 1.38 Nm, run
+    1789012345 -- and the cycle then spent two minutes failing to recover
+    from a move that had worked. Motion alone fires on any servo that is
+    merely slow. Together they are what an arm being held up looks like:
+    pulling harder and getting nowhere.
+
+    The two motion tests are not redundant. Lag catches a long free-space
+    move stopped early, where the plan runs away from the arm. Stall catches
+    a short one -- a 10 cm descent asks for maybe 0.3 rad in total, so the
+    lag can never grow to a fixed threshold, and what gives it away is that
+    the arm went nowhere while the plan kept moving.
+    """
+
+    def __init__(self, joint_names, *, margin, window, hold, rewind,
+                 lag_limit=0.0, plan=None, stall_floor=0.01,
+                 stall_share=0.3):
+        self.joint_names = list(joint_names)
+        self.margin = margin
+        # Never shorter than the hold: the reference has to come from before
+        # the arm stopped, and noticing the stall costs `hold` on its own.
+        # A window inside that would take its reading from during the push
+        # and measure the climb against itself.
+        self.window = max(window, hold + 0.1)
+        self.hold = hold
+        self.rewind = rewind
+        self.lag_limit = lag_limit
+        # [(seconds from the start of the move, joints in joint_names order)]
+        self.plan = list(plan or [])
+        self.stall_floor = stall_floor
+        self.stall_share = stall_share
+        self.started = None
+        self.samples = []          # (t, positions, {joint: effort})
+        self.since = {}            # joint -> when its excess began
+        # joint -> what it was pulling just before the arm stopped
+        # following its plan. Latched for as long as it is stopped, and
+        # thrown away the moment it is flying again.
+        #
+        # Latched rather than rolling because a rolling baseline can only
+        # see a push that arrives faster than margin/window -- 10 Nm/s on
+        # the defaults. A servo settling into a table takes a second or two
+        # to build up, and every sample of it looks like the last. Against a
+        # fixed pre-stall reading the whole climb counts, and gravity cannot
+        # forge it: an arm that is not moving is not changing shape, so its
+        # gravity torque is not changing either.
+        self.reference = {}
+
+    def add(self, now, positions, efforts):
+        """One reading. Returns the verdict when contact is decided, else None."""
+        if self.started is None:
+            self.started = now
+        usable = (positions is not None
+                  and all(v is not None for v in positions))
+        self.samples.append((now, list(positions) if usable else None,
+                             dict(efforts or {})))
+        horizon = max(self.rewind, self.window, self.hold) * 2.0 + 1.0
+        while len(self.samples) > 2 and now - self.samples[0][0] > horizon:
+            self.samples.pop(0)
+
+        why, lag = self.not_keeping_up(now, positions if usable else None)
+        if not why:
+            # The arm is flying its plan, so whatever the motors are pulling
+            # is what it takes to fly it -- however much that is, and it can
+            # be a lot. Nothing accumulates while this is true.
+            self.since.clear()
+            self.reference.clear()
+            return None
+        for joint in self.joint_names:
+            value = (efforts or {}).get(joint)
+            if joint not in self.reference:
+                # From `window` back, which is before the arm stopped: the
+                # stall itself takes `hold` to notice, and hold is shorter
+                # than window, so this reading is from before the contact.
+                # None while the move is younger than one window, which is
+                # what keeps the guard quiet at the start of every move.
+                was = self.baseline(joint, now - self.window)
+                if was is None:
+                    continue
+                self.reference[joint] = was
+            was = self.reference[joint]
+            if value is None or abs(value) - abs(was) < self.margin:
+                # Not pulling harder than it was before it stopped. Note the
+                # |effort|: this is not the signed change, because the
+                # shoulder crosses zero and keeps going negative on an
+                # ordinary swing, and the signed difference read that as a
+                # 2 Nm collision.
+                self.since.pop(joint, None)
+                continue
+            first = self.since.setdefault(joint, now)
+            if now - first < self.hold:
+                continue
+            return self.verdict(joint, value, was, lag, now, why)
+        return None
+
+    def planned_at(self, elapsed):
+        """Where the trajectory says the arm should be, `elapsed` seconds in."""
+        if not self.plan:
+            return None
+        for seconds, positions in self.plan:
+            if seconds >= elapsed:
+                return positions
+        return self.plan[-1][1]
+
+    def sample_at(self, when):
+        """The last reading taken at or before `when`."""
+        found = None
+        for sample in self.samples:
+            if sample[0] > when:
+                break
+            if sample[1] is not None:
+                found = sample
+        return found
+
+    def baseline(self, joint, when):
+        """That joint's effort as of `when`.
+
+        None when nothing goes back that far, which is what keeps the guard
+        quiet for the first `window` of a move: there is nothing to compare
+        against yet, and comparing against the start of the move is the bug
+        this replaced.
+        """
+        found = None
+        for stamp, _positions, efforts in self.samples:
+            if stamp > when:
+                break
+            value = efforts.get(joint)
+            if value is not None:
+                found = value
+        return found
+
+    def not_keeping_up(self, now, positions):
+        """(why the arm is not flying its trajectory, how far behind it is).
+
+        The reason is 'lag' or 'stall', or None when the arm is keeping up
+        -- and None with no plan to compare against, which disarms the guard
+        entirely. That last is deliberate: without knowing where the arm was
+        supposed to be there is no way to tell an obstacle from the arm's
+        own weight, and judging on torque alone is precisely what stopped a
+        good transit and cost two minutes of recovery.
+        """
+        if positions is None or not self.plan:
+            return None, None
+        elapsed = now - self.started
+        wanted = self.planned_at(elapsed)
+        lag = max(abs(a - b) for a, b in zip(positions, wanted))
+        if self.lag_limit > 0.0 and lag >= self.lag_limit:
+            return 'lag', lag
+        earlier = self.sample_at(now - self.hold)
+        before = self.planned_at(elapsed - self.hold)
+        if earlier is None or before is None:
+            return None, lag
+        asked = max(abs(a - b) for a, b in zip(wanted, before))
+        went = max(abs(a - b) for a, b in zip(positions, earlier[1]))
+        if asked >= self.stall_floor and went < asked * self.stall_share:
+            return 'stall', lag
+        return None, lag
+
+    def verdict(self, joint, effort, baseline, lag, now, why='stall'):
+        """What tripped, and the way back out.
+
+        `retrace` is every posture the arm actually held over the last
+        `rewind` seconds, oldest first. The caller drives it in reverse
+        rather than planning a way out: these are postures the arm measured
+        itself in seconds ago, so the path is known good without asking a
+        planner about a scene the arm is now pressed into.
+        """
+        target = now - self.rewind
+        retrace = [list(s[1]) for s in self.samples
+                   if s[1] is not None and s[0] >= target]
+        older = [s for s in self.samples if s[1] is not None and s[0] <= target]
+        back_to = (list(older[-1][1]) if older
+                   else (list(retrace[0]) if retrace else None))
+        if back_to is not None and (not retrace or retrace[0] != back_to):
+            retrace.insert(0, list(back_to))
+        return {'joint': joint, 'effort': effort, 'baseline': baseline,
+                'lag': lag, 'why': why, 'at': now, 'back_to': back_to,
+                'retrace': retrace}
+
+
 class PickPlaceOrchestrator(Node):
 
     def __init__(self):
@@ -334,6 +568,17 @@ class PickPlaceOrchestrator(Node):
         # the launch arm moves whatever half the object is in, which is not
         # what anyone means by a two-armed robot. "fixed" is still there for
         # single-arm work.
+        # 'by_side' takes the half of the camera frame the object is in and
+        # gets on with it. 'by_reach' asks the solvers which arm can reach
+        # before choosing; 'fixed' always uses arm.
+        #
+        # by_side is the default because the answer is nearly always the same
+        # and the asking is what costs: measured, 87 seconds between the
+        # first look and the second, on a decision the camera half made
+        # correctly for free. The pre-flight then settles whether the pick is
+        # possible for the arm chosen -- properly, and for the arm that will
+        # actually do it -- so a wrong guess costs a pre-flight rather than a
+        # motion.
         self.declare_parameter('arm_selection', 'by_side')
         # Order the arms are considered in. The first that can reach the object
         # gets it.
@@ -621,21 +866,106 @@ class PickPlaceOrchestrator(Node):
         # 30 mm of height is not, and a lateral move at grasp height is the
         # one thing worth not doing down there.
         #
-        # Default OFF. It was added on the belief that the grip was failing
-        # because the jaws stopped too high; the log said otherwise. Run
-        # 1788863209 gripped a roll of tape with the tool 9.8 mm above the
-        # commanded grasp and the active arm's joint efforts flat all the way
-        # through the close -- no contact with anything but the object. What
-        # discarded that grasp was the finger check above comparing the
-        # commanded finger position instead of the measured one.
+        # It was off for a long time, on the evidence that every close
+        # which reached the object did so despite shortfalls of 15-36 mm --
+        # so driving the tool the last centimetre down, toward the table,
+        # looked like a fix for a problem that was not there. That comment
+        # ended "turn it on if a descent ever does stop short enough to
+        # miss", and run 1789014831 is that run.
         #
-        # So there is no evidence the shortfall breaks a grasp: every close
-        # that reached the object did so despite shortfalls of 15-36 mm.
-        # Driving the tool the last centimetre down, toward the table and
-        # deeper into the octomap, to fix a problem that is not there would
-        # be the wrong trade. Turn it on if a descent ever does stop short
-        # enough to miss.
-        self.declare_parameter('descend_close_gap', False)
+        # Four descents on the right arm, all from a transit that landed
+        # 27-32 mm out. The two that gripped stopped 3.2 and 4.0 mm from the
+        # commanded grasp; the two that missed stopped 18.1 and 18.9 mm out,
+        # 15 mm of it height, and the jaws closed on air above the object.
+        # It is all tracking error and none of it calibration: at the end of
+        # those moves the joints were still 29 mrad from the last point of
+        # their own trajectory, against 9-11 mrad on the two that worked.
+        # The controller reports the move done and the arm is not there yet.
+        #
+        # The risk it was off for -- pressing into the table -- is now
+        # watched for: the contact guard stops a move where a joint loads up
+        # while the arm stops following its plan, and backs it out.
+        self.declare_parameter('descend_close_gap', True)
+        # Re-probe the descent from the arm's measured posture once it has
+        # arrived, instead of trusting the pre-flight's model of where the
+        # approach would end.
+        #
+        # Measured, run 1788948709: the pre-flight passed the column, TRANSIT
+        # landed 32.6 mm off, and the descent then cost 6.42 rad against a
+        # 1.5 rad budget and was refused -- a whole approach flown for a
+        # descent that was never the one checked. One service call per
+        # orientation, no motion.
+        self.declare_parameter('descend_recheck', True)
+        # Include the lift in what the pre-flight proves, so the way out of
+        # the column is checked before the arm goes into it.
+        #
+        # Without it the pre-flight blesses a descent whose lift then cannot
+        # be flown, and that is found out with the object gripped at the
+        # bottom of the column -- measured, twice, at 2.97 and 3.01 rad
+        # against a 1.5 rad budget.
+        self.declare_parameter('preflight_lift', True)
+        # Stop a move when a joint pulls this many Nm harder than it was
+        # pulling contact_torque_window ago, and back the arm off to where it
+        # was contact_rewind_seconds before.
+        #
+        # A rolling baseline, not the torque at the start of the move, and a
+        # relative one rather than an absolute: the shoulder carries the whole
+        # arm and the wrist carries a gripper, so one absolute number would
+        # either miss a wrist collision or fire constantly on joint1.
+        #
+        # Measured, run 1789012345: joint1 read +3.42 Nm at the staging pose
+        # and -10.48 Nm seven seconds later at full stretch -- 14 Nm of pure
+        # gravity across one ordinary transit, at about 2.5 Nm/s. Against the
+        # start of the move a 2 Nm margin tripped 1.7 s in, on the shoulder
+        # *unloading*. Over a 0.4 s window that same gravity moves the
+        # baseline by about 1 Nm, so 4 leaves a factor of four in hand.
+        #
+        # 0 disables it. There are no efforts on fake hardware, so it never
+        # fires there.
+        self.declare_parameter('contact_torque_margin', 4.0)
+        # How far back the rolling baseline looks, seconds.
+        self.declare_parameter('contact_torque_window', 0.4)
+        # How long the excess has to last before it counts, seconds. An
+        # acceleration transient passes; a thing the arm is leaning on does
+        # not.
+        self.declare_parameter('contact_torque_hold', 0.25)
+        # How far behind its own trajectory the arm has to fall, rad, for the
+        # torque to be read as contact rather than as its own weight.
+        #
+        # This is the half of the test gravity cannot fake: a servo being
+        # held up falls behind its plan; one flying freely tracks it. Measured
+        # over that same transit, the worst honest tracking error at full
+        # speed was 0.126 rad, so this is roughly double it. 0 drops the lag
+        # test -- the stall test still applies.
+        self.declare_parameter('contact_lag_rad', 0.25)
+        self.declare_parameter('contact_rewind_seconds', 2.0)
+        # How fast to retrace those seconds on the way back out, rad/s. Slow:
+        # this is the one move in the cycle that is driven straight at the
+        # controller without a collision check, and it is only safe because
+        # the postures it visits are ones the arm measured itself in moments
+        # earlier.
+        self.declare_parameter('contact_retreat_speed', 0.5)
+        # How many times to go back down and try the same grasp when the
+        # detector says the object never moved. The fingers cannot tell a
+        # grip from a fingertip on an edge; the object still being there can.
+        #
+        # Bounded because the same grasp failing the same way three times
+        # will not work on the fourth, and each go costs a descent.
+        self.declare_parameter('regrasp_attempts', 3)
+        # Whether the arms are mock_components rather than motors.
+        #
+        # Only used to decide whether a saved setting that switches a check
+        # off may be honoured. The rehearsal needs those values -- fake
+        # fingers never close on anything -- and the arms must never see
+        # them, and a file cannot tell which run it is being read by.
+        self.declare_parameter('fake_hardware', False)
+        # How many times to ask the detector before believing it when it
+        # says there is nothing there.
+        #
+        # One empty answer is not an answer: the arm is hovering directly
+        # over the object at that moment, which is the one place guaranteed
+        # to hide it from the camera.
+        self.declare_parameter('verify_detect_tries', 2)
         # Below this the gap is not worth a move; above it something other
         # than tracking error is wrong and flying blind into it is not the
         # answer.
@@ -762,6 +1092,22 @@ class PickPlaceOrchestrator(Node):
         # parked over the table is bad, dragging it across the table is
         # worse.
         self.declare_parameter('home_requires_pre_pick', True)
+        # Take the motors off once a failed cycle has parked the arm
+        # somewhere the collision world says is free. These are direct-drive
+        # motors with no brakes, so this is only done *after* a refuge is
+        # reached -- never with the arm stranded, where letting go would drop
+        # it onto whatever it is over.
+        self.declare_parameter('disengage_on_failure', True)
+        # Where the editable sequence and the UI-settable parameters live.
+        # Empty disables both and the built-in order is used.
+        #
+        # Not 'config_file'. realsense2_camera's rs_launch.py declares a
+        # launch argument by that name and opens it as YAML, and a launch
+        # configuration set at the top reaches every included launch file --
+        # so naming it that took the whole bringup down with
+        # FileNotFoundError on our own JSON path.
+        self.declare_parameter('pick_place_config',
+                               'pick_place_config.json')
         # Speed below which a joint counts as stopped, rad/s. The standing
         # reading is +/-0.011 rad/s of noise.
         self.declare_parameter('joint_still_speed', 0.05)
@@ -815,6 +1161,40 @@ class PickPlaceOrchestrator(Node):
         # to 0 mm at 1.14 Nm against a 2.5 Nm cap. It closed beside the
         # screwdriver, not across it.
         self.declare_parameter('grasp_yaw_free', False)
+        # How many alternative grasp yaws to try when nothing that respects
+        # the detector's axis estimate flies. Spread over 180 degrees, since
+        # half a turn is the jaw flip and already covered. 3 gives 45, 90 and
+        # 135 degrees.
+        #
+        # Measured: a roll of tape the pre-flight refused outright flew its
+        # whole column at 90 degrees, and at no other yaw. The axis estimate
+        # is made from a 2D box and on a round object it is arbitrary.
+        # 0 restores the old behaviour of treating it as fixed.
+        self.declare_parameter('grasp_yaw_options', 3)
+        # Ask the grasp server for candidates on reaching the staging pose.
+        # Only a topic publish -- nothing acts on the answer yet, so this is
+        # free to leave on and is how the candidates get looked at on real
+        # data before anything is wired to them.
+        self.declare_parameter('request_grasps', True)
+        # Take the grasp from the model when it has one, instead of
+        # synthesising a top-down pose from the detector's box.
+        #
+        # It answers a question the synthesised pose only guesses at -- where
+        # on the object, at what height, in which direction, and how far the
+        # jaws have to open -- all read off the point cloud rather than
+        # assumed. What it does *not* answer is whether the arm can get
+        # there, which is still the pre-flight's job: the model proposes,
+        # ranked, and the pre-flight disposes.
+        #
+        # Falls back to the synthesised grasp whenever the model has nothing
+        # usable, which is not a corner case: GraspNet was trained for a
+        # 100 mm gripper and this one spans 44 mm, so on a wide object every
+        # proposal can be one this robot cannot make.
+        self.declare_parameter('use_grasp_model', True)
+        # How old a candidate list may be, and how near its object must be to
+        # the one being picked, before it is used for this pick.
+        self.declare_parameter('grasp_model_max_age', 30.0)
+        self.declare_parameter('grasp_model_max_offset', 0.08)
         # How far off vertical the gripper may come down, radians.
         #
         # A strictly top-down grasp is six constraints on seven joints at a
@@ -834,7 +1214,47 @@ class PickPlaceOrchestrator(Node):
         # Orientations the reach probe may try per point. It sends a planning
         # request for each, so the full tilt set would make an unreachable
         # object cost a minute of probing; the pre-flight explores the rest.
-        self.declare_parameter('reach_orientations', 3)
+        # How many grasp orientations the reach check tries before calling a
+        # point unreachable.
+        #
+        # It was 3, and the pre-flight tries the lot -- so a point reachable
+        # only at an orientation outside those three was refused before the
+        # thorough check ever ran. Measured on the live robot, a roll of tape
+        # at [0.324, 0.073, 0.353]: the left arm picked it at 11:24 and was
+        # told "out of reach" at 11:35, and a sweep of 36 orientations at the
+        # same point found 8 that solve the approach line completely --
+        # including one at zero tilt. Three samples of an eight-in-thirty-six
+        # target is a coin toss, and it was being reported as geometry.
+        #
+        # grasp_quat_options caps out at 2 + tilt_steps * azimuths, which is
+        # 10 by default, so this is "all of them" rather than a new number.
+        self.declare_parameter('reach_orientations', 10)
+        # How many orientations the *arm choice* tries. Fewer than the
+        # pre-flight's set on purpose: it is deciding which arm, not whether
+        # the object can be picked, and the pre-flight settles the second
+        # question afterwards for whichever arm it picks. At 10 orientations
+        # times three heights times two arms it was 60 planning requests
+        # before the robot had moved at all -- measured at 70 seconds.
+        self.declare_parameter('arm_choice_orientations', 3)
+        # Choose the arm on KDL alone, and take "cannot tell" as "use the
+        # half of the frame the object is in".
+        #
+        # The solvers behind KDL exist to second-guess its "no", and they are
+        # where the time goes: 2.9 seconds per orientation per height per
+        # arm, measured, whether they find anything or not -- 52 seconds
+        # before the robot moved. The pre-flight settles whether the pick is
+        # actually possible, so buying a worse version of that answer first
+        # is the most expensive thing this cycle did.
+        self.declare_parameter('arm_choice_cheap', True)
+        # Ask, before accepting a pre-flight candidate, whether the arm can
+        # actually be planned into the posture the candidate proves the
+        # descent from. One plan-only goal per accepted candidate.
+        #
+        # Without it the pre-flight checks the wrong half: run 1788945589
+        # passed a candidate and TRANSIT -- the joint goal that puts the arm
+        # in that posture -- then returned -2, after the arm had already
+        # driven to the staging pose for nothing.
+        self.declare_parameter('preflight_posture_reachable', True)
         # Prove the planner can plan before the cycle starts, with a plan-only
         # goal to the arm's own current posture. Two seconds, no motion, and it
         # is the difference between "the planner is not planning" and a report
@@ -962,11 +1382,13 @@ class PickPlaceOrchestrator(Node):
         if self.launch_arm not in ('left', 'right'):
             raise ValueError("arm must be 'left' or 'right'")
         self.gripper_clients = {}
+        self.traj_clients = {}
         self.configure_arm(self.launch_arm)
 
         self.arm_selection = p('arm_selection').value
-        if self.arm_selection not in ('fixed', 'by_side'):
-            raise ValueError("arm_selection must be 'fixed' or 'by_side'")
+        if self.arm_selection not in ('fixed', 'by_side', 'by_reach'):
+            raise ValueError(
+                "arm_selection must be 'fixed', 'by_side' or 'by_reach'")
 
         self.place_mode = p('place_mode').value
         if self.place_mode == 'ready':
@@ -1015,6 +1437,15 @@ class PickPlaceOrchestrator(Node):
         # the real reason was the joint-travel guard, with the line solving
         # 100%. Two different faults with opposite fixes, reported as one.
         self._column_refusal = None
+        # The order the cycle runs in, and where it is in it. Loaded from the
+        # config file so an edit in the UI survives a restart, which is the
+        # whole point of it being a file rather than a topic.
+        self._sequence = list(sequence_model.DEFAULT_SEQUENCE)
+        self._config_problems = []
+        self._ctx = None
+        self._step = None
+        # The last thing the grasp server proposed, if anything has.
+        self._grasps = None
         # Whether cuMotion will accept a pose goal for this arm's tool.
         # None until checked; False refuses pose goals instead of sending
         # ones that come back INVALID_LINK_NAME.
@@ -1041,6 +1472,12 @@ class PickPlaceOrchestrator(Node):
                             else motion_log)
         self._busy = False
         self._abort = threading.Event()
+        # Whether move_group has ever answered, and when it last failed to.
+        # Not for deciding anything -- for saying the right thing when it
+        # stops, and for not spending ten seconds per goal waiting for a
+        # server that has gone away mid-cycle.
+        self._planner_answered = False
+        self._planner_stalled = None
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -1078,14 +1515,42 @@ class PickPlaceOrchestrator(Node):
         # it -- see allow_gripper_in_octomap.
         self.scene_query_client = self.create_client(
             GetPlanningScene, '/get_planning_scene', callback_group=self.cb)
+        # Asks the collision world -- octomap included -- whether a posture is
+        # legal, without planning to it. The failure path checks a refuge
+        # before driving to it, rather than finding out by arriving.
+        self.validity_client = self.create_client(
+            GetStateValidity, '/check_state_validity',
+            callback_group=self.cb)
+        # Deactivating a hardware component calls its on_deactivate, and
+        # openarm_hardware's calls disable_all() -- which is what taking the
+        # motors off actually means here.
+        self.hardware_client = self.create_client(
+            SetHardwareComponentState,
+            '/controller_manager/set_hardware_component_state',
+            callback_group=self.cb)
 
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.prompt_pub = self.create_publisher(String, '/vlm/prompt', latched)
         self.state_pub = self.create_publisher(String, '/pick_place/state', latched)
+        # The same transitions again as JSON, for anything that wants to act
+        # on them rather than print them: the flow chart highlights the live
+        # step, and a state string with free text after a colon is no use for
+        # that.
+        self.status_pub = self.create_publisher(
+            String, '/pick_place/status', latched)
+        # Asks the grasp server for candidates about a point. Published from
+        # the staging pose rather than from home: that is where the arm
+        # actually is when the descent is planned, and the camera sees the
+        # object from the same place the pre-flight measures from.
+        self.grasp_request_pub = self.create_publisher(
+            String, '/grasp/request', 10)
 
         self.create_subscription(String, '/pick_place/prompt', self._on_prompt, 10,
                                  callback_group=self.cb)
         self.create_subscription(String, '/vlm/detections', self._on_detections, 10,
+                                 callback_group=self.cb)
+        self.create_subscription(String, '/grasp/candidates',
+                                 self._on_grasp_candidates, latched,
                                  callback_group=self.cb)
         self.create_subscription(JointState, '/joint_states', self._on_joint_states, 10,
                                  callback_group=self.cb)
@@ -1106,6 +1571,18 @@ class PickPlaceOrchestrator(Node):
                             self._srv_open_gripper, callback_group=self.cb)
         self.create_service(Trigger, '/pick_place/grip',
                             self._srv_grip, callback_group=self.cb)
+        # The web UI edits the config file and then asks for it to be read
+        # back, rather than pushing a sequence over a custom message type.
+        # One source of truth, and it is the file -- so what the UI shows,
+        # what the robot runs and what survives a restart cannot drift apart.
+        self.create_service(Trigger, '/pick_place/reload_config',
+                            self._srv_reload_config, callback_group=self.cb)
+        self.create_service(Trigger, '/pick_place/save_config',
+                            self._srv_save_config, callback_group=self.cb)
+
+        # Before the first state is published, so the UI's very first frame
+        # already carries the saved order rather than the built-in one.
+        self.load_config()
 
         heartbeat = self.get_parameter('motion_log_heartbeat').value
         if self._motion_log and heartbeat > 0.0:
@@ -1200,6 +1677,15 @@ class PickPlaceOrchestrator(Node):
                 self, GripperCommand, f'/{arm}_gripper_controller/gripper_cmd',
                 callback_group=self.cb)
         self.gripper_client = self.gripper_clients[arm]
+        # The controller itself, for the escape from a contact. Everything
+        # else in the cycle goes through move_group; this deliberately does
+        # not, because move_group is one of the things being escaped from.
+        if arm not in self.traj_clients:
+            self.traj_clients[arm] = ActionClient(
+                self, FollowJointTrajectory,
+                f'/{arm}_joint_trajectory_controller/follow_joint_trajectory',
+                callback_group=self.cb)
+        self.traj_client = self.traj_clients[arm]
 
         # Joint readings are per-arm, so a switch must not compare the new
         # arm's ready pose against the old arm's measurements.
@@ -1240,6 +1726,185 @@ class PickPlaceOrchestrator(Node):
         text = state if not detail else f'{state}: {detail}'
         self.state_pub.publish(String(data=text))
         self.get_logger().info(f'[{state}] {detail}'.rstrip())
+        self.publish_status()
+
+    def _srv_reload_config(self, _request, response):
+        with self._lock:
+            busy = self._busy
+        if busy:
+            response.success = False
+            response.message = ('a cycle is running; the sequence would '
+                                'change under it')
+            return response
+        self.load_config()
+        response.success = True
+        response.message = ' -> '.join(self._sequence)
+        if self._config_problems:
+            response.message += ' (' + '; '.join(self._config_problems) + ')'
+        return response
+
+    def _srv_save_config(self, _request, response):
+        why = self.save_config()
+        response.success = why is None
+        response.message = why or f'saved {self.config_path()}'
+        return response
+
+    # -- the saved config ----------------------------------------------------
+
+    def config_path(self):
+        """Where the sequence and the UI-settable parameters live, or None."""
+        name = self.get_parameter('pick_place_config').value
+        if not name:
+            return None
+        return name if os.path.isabs(name) else os.path.join(WS, name)
+
+    def load_config(self):
+        """Read the saved sequence and settings, and apply them.
+
+        Applied as ROS parameters, so everything downstream reads them the way
+        it always has -- there is no second source of truth for the torque cap
+        or the grasp height, just a file that sets the same parameters a
+        launch argument would.
+
+        A launch argument still wins where the two disagree *and* the file has
+        no opinion; where the file has one, the file wins, because it is the
+        thing the operator edited most recently. Anything unreadable falls
+        back to the defaults and is reported rather than fatal: the robot
+        coming up matters more than the last setting being honoured.
+        """
+        path = self.config_path()
+        if path is None:
+            self.get_logger().info('pick_place_config is empty; using the built-in '
+                                   'sequence and the launch parameters')
+            return
+        config, problems = sequence_model.load_config(path)
+        self._config_problems = problems
+        for complaint in problems:
+            self.get_logger().warn(f'{os.path.basename(path)}: {complaint}')
+        self._sequence = list(config['sequence'])
+        # Before anything is applied, and on real hardware *instead* of
+        # applying it. A warning is not a guard: this warned exactly as
+        # designed on run 1789014831 and the run went ahead with the grasp
+        # check off, because grasp_finger_min=-1.0 had been saved by a
+        # --fake rehearsal. The jaws then stalled at 1.08 mm and 0.50 Nm --
+        # empty -- and the cycle called it a hold, carried nothing to the
+        # drop point and finished DONE.
+        settings = dict(config.get('settings') or {})
+        fake = self.get_parameter('fake_hardware').value
+        for warning in sequence_model.check_disabling_settings(settings):
+            self._config_problems.append(warning)
+            if fake:
+                self.get_logger().warn(
+                    f'{os.path.basename(path)} switches a check off -- '
+                    f'{warning} This is a fake-hardware run, so it stands.')
+                continue
+            name = warning.split('=', 1)[0]
+            settings.pop(name, None)
+            self.get_logger().error(
+                f'{os.path.basename(path)} SWITCHES A CHECK OFF -- {warning} '
+                f'These are the arms, not a rehearsal, so {name} is being '
+                f'ignored and the built-in default used instead. Save the '
+                f'settings again from the panel to clear it out of the file.')
+        applied = self.apply_settings(settings)
+        self.get_logger().info(
+            f'sequence ({len(self._sequence)} steps): '
+            f'{" -> ".join(self._sequence)}')
+        if applied:
+            self.get_logger().info(
+                f'settings from {os.path.basename(path)}: '
+                + ', '.join(f'{k}={v}' for k, v in sorted(applied.items())))
+
+    def apply_settings(self, settings):
+        """Set the UI-settable parameters. Returns what was actually applied."""
+        applied = {}
+        for name, value in (settings or {}).items():
+            entry = sequence_model.SETTINGS_BY_NAME.get(name)
+            if entry is None:
+                continue
+            coerced, complaint = sequence_model.coerce_setting(entry, value)
+            if complaint:
+                self.get_logger().warn(complaint)
+            if coerced is None:
+                continue
+            try:
+                self.set_parameters([rclpy.parameter.Parameter(
+                    name,
+                    rclpy.Parameter.Type.BOOL if entry['type'] == 'bool'
+                    else rclpy.Parameter.Type.DOUBLE,
+                    coerced)])
+            except Exception as exc:                 # noqa: BLE001 - reported
+                self.get_logger().warn(f'could not set {name}: {exc}')
+                continue
+            applied[name] = coerced
+        return applied
+
+    def current_settings(self):
+        """What the settable parameters are right now, for the UI to show."""
+        values = {}
+        for entry in sequence_model.SETTINGS:
+            try:
+                values[entry['name']] = self.get_parameter(
+                    entry['name']).value
+            except Exception:                        # noqa: BLE001
+                continue
+        return values
+
+    def save_config(self, sequence=None, settings=None, prompt=None):
+        """Persist the sequence and settings. Returns None or a reason.
+
+        Applies before it writes, so a saved file and a running robot cannot
+        disagree: if the parameters will not take, nothing is written.
+        """
+        path = self.config_path()
+        if path is None:
+            return 'pick_place_config is empty, so there is nowhere to save'
+        if sequence is not None:
+            cleaned, problems = sequence_model.validate_sequence(sequence)
+            self._sequence = cleaned
+            self._config_problems = problems
+            for complaint in problems:
+                self.get_logger().warn(f'sequence: {complaint}')
+        if settings:
+            self.apply_settings(settings)
+        if prompt is not None:
+            self.prompt = to_detection_prompt(prompt) or self.prompt
+        body = {
+            'prompt': self.prompt,
+            'arm': self.arm,
+            'sequence': list(self._sequence),
+            'settings': self.current_settings(),
+        }
+        why = sequence_model.save_config(path, body)
+        if why:
+            self.get_logger().error(why)
+        else:
+            self.get_logger().info(f'saved {os.path.basename(path)}')
+        self.publish_status()
+        return why
+
+    def publish_status(self):
+        """Everything the UI needs to draw one frame, as JSON.
+
+        Separate from the human-readable state string because the flow chart
+        highlights a *step*, and 'PRE_PICK: on the way back, cycle complete'
+        cannot be matched against a step name without parsing prose.
+        """
+        try:
+            self.status_pub.publish(String(data=json.dumps({
+                'state': self.state,
+                'step': self._step,
+                'arm': self.arm,
+                'cycle': self._cycle_count,
+                'holding': self._holding,
+                'busy': self._busy,
+                'prompt': self.prompt,
+                'sequence': list(self._sequence),
+                'problems': list(self._config_problems),
+                'stamp': round(
+                    self.get_clock().now().nanoseconds * 1e-9, 3),
+            })))
+        except Exception as exc:                     # noqa: BLE001 - reported
+            self.get_logger().warn(f'could not publish status: {exc}')
 
     def _await(self, future, timeout):
         """Block a worker thread on an rclpy future.
@@ -1286,6 +1951,12 @@ class PickPlaceOrchestrator(Node):
         with self._lock:
             self._latest_detections = payload
 
+    def measured_joints(self):
+        """This arm's measured positions in joint order, or None."""
+        with self._lock:
+            values = [self._arm_positions.get(j) for j in self.arm_joints]
+        return None if any(v is None for v in values) else values
+
     def joint_snapshot(self):
         """Positions, velocities and efforts of this arm plus the gripper.
 
@@ -1317,6 +1988,11 @@ class PickPlaceOrchestrator(Node):
         swings 3.7 cm sideways on the way -- and that difference is exactly
         what breaks things here. Returns a stop function that hands back the
         samples.
+
+        Efforts are sampled too, and they are the only way to answer "is it
+        pressing on the table": the endpoints alone cannot separate an arm
+        leaning on something from an arm holding itself out at full stretch.
+        They are also what the torque guard watches -- see watch_torque.
         """
         period = self.get_parameter('motion_sample_period').value
         if not self._motion_log or period <= 0.0:
@@ -1335,6 +2011,12 @@ class PickPlaceOrchestrator(Node):
                 entry = {'t': round(now - started, 3)}
                 if all(v is not None for v in joints):
                     entry['joints'] = [round(v, 5) for v in joints]
+                with self._lock:
+                    efforts = [self._arm_efforts.get(j)
+                               for j in self.arm_joints]
+                if any(v is not None for v in efforts):
+                    entry['efforts'] = [None if v is None else round(v, 3)
+                                        for v in efforts]
                 tcp = self.tcp_position()
                 if tcp is not None:
                     entry['tcp'] = [round(v, 5) for v in tcp]
@@ -1558,6 +2240,7 @@ class PickPlaceOrchestrator(Node):
           the approach is a much larger set to choose from and, on most
           objects, the same grasp.
         * Both together.
+        * Turning the grasp about vertical, last of all -- see below.
 
         Ordered so that nothing is given up that does not have to be: exactly
         vertical first, then vertical flipped, then the smallest tilt in each
@@ -1580,6 +2263,36 @@ class PickPlaceOrchestrator(Node):
                     azimuth = 2.0 * math.pi * index / azimuths
                     for base in flips:
                         options.append(tilt_quat(base, tilt, azimuth))
+        # Turning the grasp about vertical, and deliberately last.
+        #
+        # The yaw comes from the detector's axis estimate over a 2D box, and
+        # for a round object that estimate means nothing. Measured on the
+        # robot, a roll of tape at (0.323, 0.070) that the pre-flight had just
+        # refused outright:
+        #
+        #     yaw   0 deg   approach  26%   descent   0%   <- the only one tried
+        #     yaw  45 deg   approach 100%   descent  76%
+        #     yaw  90 deg   approach 100%   descent 100%   <- flies
+        #     yaw 135 deg   approach  26%   descent   0%
+        #
+        # So a pickable object was reported unreachable because one number
+        # nobody measured was taken as fixed.
+        #
+        # Last, though, because turning the grasp is not free on every object:
+        # on a screwdriver it is the difference between gripping across the
+        # shaft and gripping along it, and the detector's axis is right about
+        # that. A tilt is a compromise that still grips the correct faces; a
+        # yaw change is a *different* grasp. So every tilt is tried first, and
+        # yaw is only reached when nothing that respects the measured axis
+        # flies at all. Half a turn is the flip, which is already covered, so
+        # the alternatives are spread over 180 degrees.
+        turns = int(self.get_parameter('grasp_yaw_options').value)
+        if turns > 0:
+            for index in range(1, turns + 1):
+                yaw = math.pi * index / (turns + 1)
+                spin = (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+                for base in flips:
+                    options.append(quat_mul(spin, base))
         # `limit` is for callers that pay per orientation and only need a
         # representative few -- the reach probe sends a planning request each.
         return options[:limit] if limit else options
@@ -1738,6 +2451,21 @@ class PickPlaceOrchestrator(Node):
                 and abs(approach[2] - pregrasp[2]) > 1e-6:
             wanted_legs.append(('pre-grasp', tuple(pregrasp)))
         wanted_legs.append(('grasp', tuple(grasp)))
+        # And back up again, chained from the grasp posture, because the way
+        # out is part of the path and was not being checked at all.
+        #
+        # Measured: a cycle whose descent and grasp both passed the
+        # pre-flight, and whose LIFT was then refused twice for 2.97 and 3.01
+        # rad of joint travel -- with the object already in the jaws, at the
+        # bottom of the column, which is the worst place to discover it. It
+        # settled for a 50 mm lift and the carry started from there.
+        #
+        # Checked to the pre-grasp height rather than the full retreat:
+        # lift_column asks for retreat_height and falls back to pregrasp, so
+        # pregrasp is what it actually needs. Demanding the full 200 mm here
+        # would reject candidates that fly perfectly well.
+        if self.get_parameter('preflight_lift').value:
+            wanted_legs.append(('lift', (grasp[0], grasp[1], pregrasp[2])))
         # Ask exactly the way the descent will, or the pre-flight is answering
         # a different question than the one that matters.
         checked_first = not (
@@ -1864,6 +2592,18 @@ class PickPlaceOrchestrator(Node):
                 best = entry
             detail = ', '.join(f'{name} {value * 100:.0f}%'
                                for name, value in legs)
+            if worst >= wanted and not self.posture_is_gettable(
+                    entry, label, index):
+                # Proving the descent from a posture is only half the
+                # question; the other half is whether the arm can get into it.
+                # Measured, run 1788945589: the pre-flight passed a posture
+                # candidate with 2.151 rad of travel, and TRANSIT -- the joint
+                # goal that puts the arm in it -- came back -2. A pre-flight
+                # that approves a posture the arm cannot reach has checked the
+                # wrong thing.
+                worst = 0.0
+                entry['worst_leg'] = worst
+                entry['unreachable_posture'] = True
             if worst >= wanted:
                 self.get_logger().info(
                     f'{label}: pre-flight passed on candidate {index + 1} of '
@@ -1886,18 +2626,44 @@ class PickPlaceOrchestrator(Node):
 
         detail = ', '.join(f'{name} {value * 100:.0f}%'
                            for name, value in (best or {}).get('legs', []))
+        # Say what actually refused it. All the legs can read 100% and the
+        # candidate still be rejected -- because the arm cannot be planned
+        # into the posture that flies them. Reporting that as "no descent
+        # exists" alongside "grasp 100%, lift 100%" is a contradiction the
+        # reader has to untangle, and it points at the object's position when
+        # the problem is the approach.
+        stuck = sum(1 for c in candidates if c.get('unreachable_posture'))
+        costly = sum(1 for c in candidates if c.get('costly'))
+        if stuck == len(candidates) and stuck:
+            blame = ('every posture that can fly the descent is one the arm '
+                     'cannot be planned into')
+            advice = ('The column is fine; getting into position for it is '
+                      'not. Something is in the way between the staging pose '
+                      'and the object -- check the octomap, and try clearing '
+                      'it: ros2 service call /clear_octomap '
+                      'std_srvs/srv/Empty')
+            why = 'posture-unreachable'
+        elif costly:
+            blame = 'no descent worth flying exists'
+            advice = (f'{costly} of {len(candidates)} solved the line but '
+                      f'would have swung the arm across the workspace to do '
+                      f'it. Bring the object closer to the base.')
+            why = 'joint-travel'
+        else:
+            blame = 'no straight-line descent exists'
+            advice = ('This is the arm running out of travel along the '
+                      'descent, not an obstacle -- bring the object closer '
+                      'to the base, or try the other arm.')
+            why = 'no-line'
         self._preflight_reason = (
-            f'no straight-line descent exists from any of the '
-            f'{len(candidates)} postures that reach '
+            f'{blame} from any of the {len(candidates)} postures that reach '
             f'({approach[0]:.3f}, {approach[1]:.3f}, {approach[2]:.3f}). '
-            f'The best managed {detail}. Nothing moved. This is the arm '
-            f'running out of travel along the descent, not an obstacle -- '
-            f'bring the object closer to the base, or try the other arm.')
+            f'The best managed {detail}. Nothing moved. {advice}')
         self.log_motion(label, 'preflight', 'refused',
                         secs=round(self.get_clock().now().nanoseconds * 1e-9
                                    - preflight_from, 2),
                         target=[round(v, 5) for v in approach],
-                        of=len(candidates),
+                        of=len(candidates), why=why,
                         legs={n: round(v, 4)
                               for n, v in (best or {}).get('legs', [])})
         return None
@@ -2178,8 +2944,24 @@ class PickPlaceOrchestrator(Node):
         misses roughly one goal in seven, and the same goal sent again normally
         succeeds. Without this a cycle inherits that rate eight times over.
         """
-        if not self.move_client.wait_for_server(timeout_sec=10.0):
-            self.get_logger().error('/move_action unavailable -- is move_group running?')
+        # A planner that answered earlier in this run and has now vanished
+        # is not going to come back inside a cycle, and every goal after it
+        # costs the full wait. Measured, run 1789012345: three refuges, ten
+        # seconds each, all of them hopeless.
+        patience = 2.0 if self._planner_stalled else 10.0
+        if not self.move_client.wait_for_server(timeout_sec=patience):
+            if self._planner_answered:
+                self.get_logger().error(
+                    f'{label}: /move_action has stopped being served. '
+                    f'move_group answered earlier in this run, so the node '
+                    f'has jammed rather than never started -- it does that '
+                    f'after rejecting a path as invalid. Nothing that needs '
+                    f'a planner will work until it is restarted; the arm can '
+                    f'still be driven out with record_states.py --play.')
+            else:
+                self.get_logger().error(
+                    '/move_action unavailable -- is move_group running?')
+            self._planner_stalled = self.get_clock().now().nanoseconds * 1e-9
             return False
 
         attempts = max(1, int(self.get_parameter('plan_attempts').value))
@@ -2258,9 +3040,11 @@ class PickPlaceOrchestrator(Node):
                              self.get_parameter('motion_timeout').value)
         if result is None:
             self.get_logger().error(f'{label}: timed out waiting for execution')
+            self._planner_stalled = self.get_clock().now().nanoseconds * 1e-9
             # A goal that never came back may still be executing; resending
             # would race with it.
             return MoveItErrorCodes.FAILURE
+        self._planner_answered = True
         return result.result.error_code.val
 
     def pose_constraints(self, position, quat, link):
@@ -3305,8 +4089,24 @@ class PickPlaceOrchestrator(Node):
             return None
         return solution
 
-    def reachable(self, position, quat, arm=None):
+    def reachable(self, position, quat, arm=None, orientations=None,
+                  cheap=False):
         """Can this arm put its tool there? True, False, or None for unknown.
+
+        cheap stops after KDL. Its "yes" is conclusive and costs milliseconds;
+        everything after it is there to second-guess a "no", and that is
+        where the time goes -- the local solver runs 48 seeded
+        damped-least-squares solves and takes 2.9 seconds whether it finds
+        anything or not. Multiplied by three orientations, three heights and
+        two arms, that was 52 seconds before the robot moved at all, measured
+        as an 85-second gap between the first look and the second.
+
+        For choosing *between* two arms an inconclusive answer is not a
+        problem: it means "use the half of the frame the object is in", which
+        is what arm_candidates already says. The pre-flight then settles
+        whether the pick is possible, properly, for whichever arm was
+        chosen -- so paying 52 seconds for a worse version of that answer
+        beforehand buys nothing.
 
         Two solvers get asked, in cheapness order, and this is the whole point:
 
@@ -3353,6 +4153,11 @@ class PickPlaceOrchestrator(Node):
                                  joints=joints) is not None:
                     return True
 
+        if cheap:
+            # KDL could not confirm it, and confirming is all this mode is
+            # for. Unknown, not False.
+            return None
+
         # Solved here, for either arm.
         #
         # This is the only authority that works for the arm cuMotion is not
@@ -3368,9 +4173,10 @@ class PickPlaceOrchestrator(Node):
         # it works from the description rather than from a service.
         solver = self.kinematics(arm)
         if solver is not None:
+            wanted = orientations if orientations is not None else \
+                self.get_parameter('reach_orientations').value
             for candidate in self.grasp_quat_options(
-                    quat, limit=max(1, int(self.get_parameter(
-                        'reach_orientations').value))):
+                    quat, limit=max(1, int(wanted))):
                 joints_found, _margin, _solved, _tried = solver.tool_posture(
                     position, candidate,
                     seeds=int(self.get_parameter('posture_seeds').value))
@@ -3703,6 +4509,78 @@ class PickPlaceOrchestrator(Node):
             f'{len(names) - touched - 1} entries in the matrix are untouched')
         return True
 
+    def posture_is_gettable(self, entry, label, index):
+        """Can the arm actually get into this posture? True unless told no.
+
+        The pre-flight proves the column *from* a posture with an explicit
+        start state, which says nothing about reaching the posture in the
+        first place. TRANSIT is the joint goal that does that, and it is a
+        free-space plan through the octomap -- a different question with a
+        different answer. Measured, run 1788945589: a candidate passed the
+        column check and TRANSIT then returned -2, after the arm had already
+        driven to the staging pose.
+
+        Asked with a plan-only goal, so nothing moves. Unknown counts as yes:
+        a planner that will not answer is not evidence the posture is
+        unreachable, and refusing on it would turn a stack that is merely
+        busy into a workspace problem.
+        """
+        if not self.get_parameter('preflight_posture_reachable').value:
+            return True
+        joints = list(entry['joints'])
+        if entry.get('tilt') is not None:
+            joints[6] = entry['tilt']
+        verdict = self.planner_can_hold(joints, f'{label} candidate {index + 1}')
+        if verdict is False:
+            self.get_logger().info(
+                f'{label}: candidate {index + 1} proves the column, but the '
+                f'arm cannot be planned into the posture it proves it from '
+                f'-- which is what TRANSIT would have discovered after '
+                f'driving to the staging pose. Trying the next.')
+            self.log_motion(label, 'preflight', 'posture-unreachable',
+                            target=[round(v, 5) for v in joints],
+                            candidate=index + 1)
+            return False
+        return True
+
+    def planner_can_hold(self, joints, label):
+        """Plan-only joint goal: can the planner put the arm here? T/F/None.
+
+        The same shape of question planner_is_planning asks, aimed at a
+        posture the arm is not in rather than the one it is. Nothing moves.
+        """
+        if not self.move_client.wait_for_server(timeout_sec=2.0):
+            return None
+        request = self._base_request()
+        constraints = Constraints()
+        for name, value in zip(self.arm_joints, joints):
+            jc = JointConstraint()
+            jc.joint_name = name
+            jc.position = float(value)
+            jc.tolerance_above = jc.tolerance_below = 0.05
+            jc.weight = 1.0
+            constraints.joint_constraints.append(jc)
+        request.goal_constraints = [constraints]
+        goal = MoveGroup.Goal()
+        goal.request = request
+        goal.planning_options.plan_only = True          # nothing moves
+        goal.planning_options.replan = False
+        goal.planning_options.planning_scene_diff.is_diff = True
+        goal.planning_options.planning_scene_diff.robot_state.is_diff = True
+
+        handle = self._await(self.move_client.send_goal_async(goal), 10.0)
+        if handle is None or not handle.accepted:
+            return None
+        result = self._await(handle.get_result_async(),
+                             self.get_parameter('motion_timeout').value)
+        if result is None:
+            return None
+        code = result.result.error_code.val
+        if code == MOVEIT_SUCCESS:
+            return True
+        self.get_logger().info(f'{label}: plan-only came back {code}')
+        return False
+
     def probe_cartesian(self, start_joints, position, quat,
                         avoid_collisions=True):
         """Would a straight line to `position` solve from `start_joints`?
@@ -4001,8 +4879,20 @@ class PickPlaceOrchestrator(Node):
         if handle is None or not handle.accepted:
             self.get_logger().error(f'{label}: trajectory rejected')
             return False
-        result = self._await(handle.get_result_async(),
-                             self.get_parameter('motion_timeout').value)
+
+        # Watch the motors while it flies. Nothing else in the cycle notices
+        # the arm leaning on something: the controller has no goal tolerance
+        # and reports SUCCESS whatever it hit, and the collision world only
+        # knows what the octomap saw.
+        watch = self.watch_torque(label, handle, trajectory)
+        try:
+            result = self._await(handle.get_result_async(),
+                                 self.get_parameter('motion_timeout').value)
+        finally:
+            hit = watch()
+        if hit is not None:
+            self.retreat_from_contact(label, hit)
+            return False
         if result is None:
             self.get_logger().error(f'{label}: trajectory timed out')
             return False
@@ -4011,6 +4901,255 @@ class PickPlaceOrchestrator(Node):
             self.get_logger().error(f'{label}: execution failed, code {code}')
             return False
         return True
+
+    def trajectory_plan(self, trajectory):
+        """A trajectory as [(seconds, joints in this arm's order)].
+
+        None when it is not this arm's trajectory, which drops the contact
+        guard's motion test rather than comparing against the wrong joints.
+        """
+        if trajectory is None:
+            return None
+        names = list(trajectory.joint_trajectory.joint_names)
+        try:
+            order = [names.index(joint) for joint in self.arm_joints]
+        except ValueError:
+            return None
+        plan = []
+        for point in trajectory.joint_trajectory.points:
+            if len(point.positions) < len(names):
+                continue
+            seconds = (point.time_from_start.sec
+                       + point.time_from_start.nanosec * 1e-9)
+            plan.append((seconds, [point.positions[i] for i in order]))
+        return plan or None
+
+    def watch_torque(self, label, handle, trajectory=None):
+        """Stop the move if the arm starts leaning on something.
+
+        Returns a stop function, which hands back what tripped -- including
+        the postures the arm held over the last contact_rewind_seconds, so
+        the caller can retrace them instead of planning a way out.
+
+        The rule lives in ContactMonitor; this is the thread that feeds it
+        and the cancel that acts on it. The cancel goes out from *here*, the
+        moment the verdict comes back. It used to be sent by the stop
+        function, which does not run until the wait for the result returns
+        -- so the arm finished the move it was supposed to be stopped in the
+        middle of, every time, and the first anyone knew of the "contact"
+        was a completed motion being reported as a crash.
+
+        On fake hardware there are no efforts at all, so this never fires.
+        """
+        margin = self.get_parameter('contact_torque_margin').value
+        if margin <= 0.0:
+            return lambda: None
+
+        with self._lock:
+            reported = {joint: self._arm_efforts.get(joint)
+                        for joint in self.arm_joints}
+        if not any(v is not None for v in reported.values()):
+            return lambda: None            # nothing reports effort here
+
+        plan = self.trajectory_plan(trajectory)
+        if not plan:
+            # Nothing to measure against, so nothing to measure. Said out
+            # loud because a guard that is quietly not guarding is worse
+            # than one that is not there.
+            self.get_logger().warn(
+                f'{label}: no trajectory to compare against, so the contact '
+                f'guard is not watching this move',
+                throttle_duration_sec=30.0)
+            return lambda: None
+
+        monitor = ContactMonitor(
+            self.arm_joints,
+            margin=margin,
+            window=self.get_parameter('contact_torque_window').value,
+            hold=self.get_parameter('contact_torque_hold').value,
+            rewind=self.get_parameter('contact_rewind_seconds').value,
+            lag_limit=self.get_parameter('contact_lag_rad').value,
+            plan=plan)
+
+        stop = threading.Event()
+        tripped = {}
+
+        def poll():
+            while not stop.is_set():
+                now = self.get_clock().now().nanoseconds * 1e-9
+                with self._lock:
+                    positions = [self._arm_positions.get(joint)
+                                 for joint in self.arm_joints]
+                    efforts = {joint: self._arm_efforts.get(joint)
+                               for joint in self.arm_joints}
+                verdict = monitor.add(now, positions, efforts)
+                if verdict is not None:
+                    tripped.update(verdict)
+                    stop.set()
+                    self.cancel_move(handle, label)
+                    return
+                stop.wait(0.02)
+
+        thread = threading.Thread(target=poll, daemon=True)
+        thread.start()
+
+        def finish():
+            was_set = stop.is_set()
+            stop.set()
+            thread.join(timeout=2.0)
+            if not (was_set and tripped):
+                return None
+            lag = tripped.get('lag')
+            # Which of the two motion tests caught it, in words: they mean
+            # different things. 'lag' is a long move stopped early, 'stall'
+            # is an arm going nowhere while its plan carries on -- which is
+            # what a descent onto a table looks like, where there is never
+            # enough plan left to build up a lag.
+            how = ('fell '
+                   + ('behind its trajectory' if lag is None
+                      else f'{lag:.3f} rad behind its trajectory')
+                   if tripped.get('why') == 'lag' else
+                   'stopped moving while its trajectory carried on')
+            self.get_logger().error(
+                f'{label}: {tripped["joint"]} went from '
+                f'{tripped["baseline"]:.2f} to {tripped["effort"]:.2f} Nm '
+                f'while the arm {how}. That is the arm pushing on something '
+                f'rather than carrying itself, so the move was cancelled.')
+            self.log_motion(label, 'joint', 'contact',
+                            joint=tripped['joint'],
+                            torque=round(tripped['effort'], 3),
+                            baseline=round(tripped['baseline'], 3),
+                            why=tripped.get('why'),
+                            lag_rad=None if lag is None else round(lag, 4))
+            return tripped
+
+        return finish
+
+    def cancel_move(self, handle, label):
+        """Ask for a running trajectory to stop. Never raises."""
+        try:
+            handle.cancel_goal_async()
+        except Exception as exc:                     # noqa: BLE001
+            self.get_logger().warn(f'{label}: could not cancel the move: {exc}')
+
+    def retreat_from_contact(self, label, hit):
+        """Retrace the last contact_rewind_seconds, without planning.
+
+        Driven straight at the joint trajectory controller. Two reasons it
+        does not ask a planner:
+
+          - the arm is leaning on something, so its own start state is very
+            likely in collision and every plan from it comes back -2;
+          - move_group is as often as not the thing being escaped from.
+
+        Measured, run 1789012345: the back-off asked cuMotion, which planned
+        it; move_group rejected the path for the gripper being inside the
+        octomap; the resend was planned again and never answered. Two
+        60-second timeouts later /move_action was no longer in the graph at
+        all, /check_state_validity had stopped being served, and neither
+        refuge could be checked or reached. The arm sat over the table for
+        two minutes because the way out went through the thing that had
+        jammed.
+
+        The postures being retraced were measured on the way in, seconds
+        ago, so this path is known good without asking anyone.
+        """
+        retrace = [list(p) for p in (hit.get('retrace') or [])]
+        if not retrace:
+            self.get_logger().error(
+                f'{label}: stopped on contact, but no earlier posture was '
+                f'recorded to back off to. The arm is holding where it '
+                f'stopped.')
+            self.log_motion(label, 'joint', 'stuck-on-contact')
+            return False
+
+        self._set_state('CONTACT', f'{hit["joint"]} loaded up during {label}')
+        rewind = self.get_parameter('contact_rewind_seconds').value
+        self.get_logger().warn(
+            f'backing off along the way it came, to where the arm was '
+            f'{rewind:.1f} s before the contact')
+        # Newest first: out of the contact, then back along the path.
+        path = thin(list(reversed(retrace)), 12)
+        ok = self.drive_joint_path(path, f'{label} back-off')
+        if not ok:
+            # The controller would not take it. A plan is a poor second --
+            # see above -- but standing on the obstruction is worse.
+            ok = self._move_to_joints(path[-1], f'{label} back-off',
+                                      skip_if_there=True)
+        self.log_motion(label, 'joint',
+                        'backed-off' if ok else 'stuck-on-contact',
+                        target=[round(v, 5) for v in path[-1]],
+                        waypoints=len(path))
+        return ok
+
+    def drive_joint_path(self, path, label, speed=None):
+        """Send a joint path straight to the controller. No planning.
+
+        The one place in the cycle that moves the arm without a collision
+        check, and deliberately so: it exists for the case where the planner
+        cannot be reached or cannot be trusted, and it is only safe because
+        every waypoint is a posture the arm measured itself in moments ago.
+        Do not use it for anywhere the arm has not just been.
+        """
+        client = getattr(self, 'traj_client', None)
+        if client is None or not client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().error(
+                f'{label}: {self.arm}_joint_trajectory_controller is not '
+                f'taking trajectories, so the arm cannot be driven back '
+                f'without a planner')
+            return False
+        if speed is None:
+            speed = self.get_parameter('contact_retreat_speed').value
+        speed = max(0.05, speed)
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = list(self.arm_joints)
+        # Left at zero: the controller starts from wherever the arm is and
+        # interpolates to the first waypoint over its time_from_start, which
+        # is what makes it safe to send a path beginning next to the arm
+        # rather than exactly on it.
+        previous = self.measured_joints()
+        elapsed = 0.0
+        for target in path:
+            step = (max(abs(a - b) for a, b in zip(target, previous))
+                    if previous and len(previous) == len(target) else 0.5)
+            elapsed += max(0.15, step / speed)
+            point = JointTrajectoryPoint()
+            point.positions = [float(v) for v in target]
+            point.time_from_start.sec = int(elapsed)
+            point.time_from_start.nanosec = int((elapsed % 1.0) * 1e9)
+            goal.trajectory.points.append(point)
+            previous = list(target)
+
+        handle = self._await(client.send_goal_async(goal), 5.0)
+        if handle is None or not handle.accepted:
+            self.get_logger().error(f'{label}: the controller refused it')
+            return False
+        result = self._await(handle.get_result_async(), elapsed + 10.0)
+        if result is None:
+            self.get_logger().error(f'{label}: the controller never answered')
+            return False
+        code = result.result.error_code
+        if code == FollowJointTrajectory.Result.SUCCESSFUL:
+            self.get_logger().info(
+                f'{label}: retraced {len(path)} posture(s) in about '
+                f'{elapsed:.1f} s')
+            return True
+        # A tolerance violation still moved the arm, and moved is the point.
+        # What matters is where it ended up, not what the controller made of
+        # the journey.
+        worst = self.joint_error(path[-1], fresh=True)
+        settled = self.get_parameter('at_goal_tolerance').value * 3.0
+        if worst is not None and worst <= settled:
+            self.get_logger().warn(
+                f'{label}: the controller reported {code}, but the arm is '
+                f'{worst:.4f} rad from where it was asked to go, so it went')
+            return True
+        self.get_logger().error(
+            f'{label}: the controller reported {code} and the arm is '
+            f'{"unknown" if worst is None else f"{worst:.4f} rad"} from the '
+            f'posture it was sent to')
+        return False
 
     def column_heights(self, from_z, to_z):
         """The z values to visit, from just below from_z down to exactly to_z.
@@ -4559,53 +5698,98 @@ class PickPlaceOrchestrator(Node):
     # -- verification --------------------------------------------------------
 
     def verify_grasp(self, pick_point):
-        """Two independent checks, because either alone has a blind spot.
+        """Did the object actually leave the spot it was picked from?
 
-        The finger check misses the case where a fingertip stalls on the
-        object's edge without capturing it; the re-detection check misses when
-        the object is occluded by the gripper. Requiring the finger check and
-        no-object-left-behind together is the combination that actually
-        distinguishes "held" from "closed on air".
+        The detector decides. The fingers only get a veto: jaws shut on
+        nothing is proof of failure, but jaws holding *something* is not
+        proof of success -- a fingertip on an edge reads the same.
+
+        Both halves of that used to be wrong at once, and run 1789014831
+        cycle 1 is what it looks like. The jaws closed 15.1 mm off target,
+        stalled at 1.08 mm with 0.50 Nm -- empty by any reading -- and the
+        cycle went on to "place" nothing and finish DONE. Two holes:
+
+          - grasp_finger_min was -1.0, saved into pick_place_config.json by
+            a --fake rehearsal, so the finger check passed whatever was
+            between the jaws. load_config now refuses that value on the
+            arms and save_config no longer writes it;
+          - the detector found *nothing at all*, and nothing was read as
+            "the object is gone, so we must have it". It is not. The arm is
+            hovering directly over the object it just failed to pick, which
+            is the one place guaranteed to hide it from the camera.
+
+        So nothing seen is not confirmation. The object has to be seen
+        somewhere other than where it was.
         """
+        floor = self.get_parameter('grasp_finger_min').value
+        ceiling = self.get_parameter('grasp_finger_max').value
         finger = self.finger_position()
-        lo = self.get_parameter('grasp_finger_min').value
-        hi = self.get_parameter('grasp_finger_max').value
-        if finger is None:
-            self.get_logger().warn('no finger feedback on /joint_states')
-            finger_ok = False
-        else:
-            finger_ok = lo < finger < hi
-            self.get_logger().info(
-                f'finger {finger:.4f} in ({lo:.4f}, {hi:.4f}) -> '
-                f'{"holding" if finger_ok else "empty"}')
-        if not finger_ok:
+        if floor < 0.0:
+            self.get_logger().error(
+                'grasp_finger_min is negative, so the finger check is off '
+                'and the detector is the only thing deciding this. That is '
+                'the fake-hardware value.')
+        elif finger is None:
+            self.get_logger().warn(
+                'no finger feedback on /joint_states, so the detector is '
+                'deciding this on its own')
+        elif not floor < finger < ceiling:
+            self.get_logger().warn(
+                f'finger {finger:.4f} m is outside ({floor:.4f}, '
+                f'{ceiling:.4f}) -- the jaws are shut on nothing')
             return False
 
-        payload = self.detect(min_count=0)
-        if payload is None:
-            self.get_logger().warn('no detection for grasp check; trusting fingers')
-            return True
+        tries = max(1, int(self.get_parameter('verify_detect_tries').value))
+        detections, answered = [], False
+        for attempt in range(1, tries + 1):
+            payload = self.detect(min_count=0)
+            if payload is None:
+                self.get_logger().warn(
+                    f'the detector did not answer the grasp check '
+                    f'({attempt} of {tries})')
+                continue
+            answered = True
+            detections = payload.get('detections') or []
+            if detections:
+                break
+            self.get_logger().warn(
+                f'the detector sees nothing at all ({attempt} of {tries})')
 
-        detections = payload.get('detections', [])
         eps = self.get_parameter('object_moved_eps').value
-        left_behind = [d for d in detections if dist(d['point'], pick_point) < eps]
+        left_behind = [d for d in detections
+                       if dist(d['point'], pick_point) < eps]
         if left_behind:
             self.get_logger().warn(
                 f'object still at the pick point '
                 f'({dist(left_behind[0]["point"], pick_point):.3f} m) '
-                '-- grasp failed')
+                f'-- grasp failed')
+            return False
+
+        if not detections:
+            self.get_logger().error(
+                'not confirming this grasp: the detector '
+                + ('sees the object nowhere' if answered
+                   else 'never answered')
+                + f' after {tries} attempt(s), so there is nothing saying it '
+                f'left {pick_point[0]:.3f}, {pick_point[1]:.3f}. An empty '
+                f'frame is not evidence -- the arm is directly over the pick '
+                f'point, which is exactly where it would hide an object it '
+                f'failed to pick.')
             return False
 
         tcp = self.tcp_position()
-        if tcp is not None and detections:
+        if tcp is not None:
             radius = self.get_parameter('object_hold_radius').value
             nearest = min(dist(d['point'], tcp) for d in detections)
             if nearest < radius:
-                self.get_logger().info(f'object {nearest:.3f} m from the tool: held')
+                self.get_logger().info(
+                    f'object {nearest:.3f} m from the tool: held')
                 return True
             self.get_logger().info(
-                f'nearest detection {nearest:.3f} m from the tool; the gripper is '
-                'probably occluding it -- trusting fingers')
+                f'the nearest of {len(detections)} detection(s) is '
+                f'{nearest:.3f} m from the tool and none is within '
+                f'{eps:.3f} m of the pick point, so the object is not where '
+                f'it was: held')
         return True
 
     def verify_place(self, reference=None):
@@ -4641,13 +5825,20 @@ class PickPlaceOrchestrator(Node):
             # A crash mid-descent leaves the arm down at the object as surely
             # as a failure does, and the next cycle starts by going home.
             try:
-                self.clear_the_surface('after the cycle crashed')
+                self.safe_shutdown(self.load_states(),
+                                   'after the cycle crashed')
             except Exception as lift_exc:
                 self.get_logger().error(
-                    f'could not lift clear after the crash: {lift_exc}')
+                    f'could not park the arm after the crash: {lift_exc}')
         finally:
             with self._lock:
                 self._busy = False
+            # Say so. Every status the UI has is published from _set_state,
+            # and the terminal state -- DONE, FAILED, ABORTED -- is set
+            # *before* this runs, so the last thing the browser heard was
+            # busy=true and its Pick button stayed disabled for ever. One
+            # more publish, after the flag is actually down.
+            self.publish_status()
 
     def _cycle(self):
         self._failures = []
@@ -4799,39 +5990,253 @@ class PickPlaceOrchestrator(Node):
                     'the descent was checked and the posture chosen before '
                     'moving, so this is a real fault rather than something a '
                     f'different yaw recovers -- {self._failure_summary()}')
-                self._retreat_to_home(states, 'after a failed pick')
+                self.safe_shutdown(states, 'after a failed pick')
                 return
         else:
             self._set_state(
                 'FAILED',
                 f'every pick strategy was exhausted -- {self._failure_summary()}')
-            self._retreat_to_home(states, 'after a failed pick')
+            self.safe_shutdown(states, 'after a failed pick')
             return
 
-        # Straight from the lift to the drop, carrying. No detour home:
-        # capture_octomap refuses while holding -- the payload would be mapped
-        # as an obstacle that then travels with the tool -- so going home would
-        # clear the map, fail to replace it, and leave the drop planning
-        # against nothing.
-        #
-        # attach_object() has already put the payload in the planning scene, so
-        # these moves are planned with the object on the tool rather than with
-        # an invisible thing swinging through the octomap.
-        if not self._place(states):
-            # Retreat anyway. A failed place used to return here and leave the
-            # arm wherever it stopped -- extended over the work surface, often
-            # still holding the object -- which is both the worst place to
-            # leave it and the hardest place to start the next cycle from.
-            # The same way out as a successful place: staging pose, then home.
-            self._retreat_to_home(states, 'after a failed place')
+        # The rest of the sequence, carrying. No detour home in the middle
+        # of it: capture_octomap refuses while holding -- the payload would be
+        # mapped as an obstacle that then travels with the tool -- so a trip
+        # home would clear the map, fail to replace it, and leave the drop
+        # planning against nothing. attach_object() has already put the
+        # payload in the planning scene, so these moves are planned with the
+        # object on the tool rather than with an invisible thing swinging
+        # through the octomap.
+        _pick_steps, place_steps = self.sequence_split()
+        ctx = dict(self._ctx or {}, states=states, why='cycle complete')
+        if self.run_sequence(place_steps, ctx) is None:
+            # Which half failed decides what to say and what to do.
+            #
+            # A place that never happened leaves the arm somewhere unplanned
+            # and usually still holding the object: safe_shutdown checks a
+            # refuge against the collision world, parks it, and takes the
+            # motors off.
+            #
+            # A place that *did* happen and then could not be walked back from
+            # is a different thing entirely. The object is where it was asked
+            # to go and the job is done; only the trip home is unfinished.
+            # Calling that "place failed" and disengaging the motors -- which
+            # is what this did, on a cycle that had just picked and placed a
+            # roll of tape -- is a worse answer than the truth.
+            done = ctx.get('done') or []
+            if 'release' in done:
+                self.get_logger().error(
+                    'the object was placed, but the arm could not be walked '
+                    'back afterwards. The cycle did its job; what is left is '
+                    'an arm short of home. Parking it where it stands.')
+                self.safe_shutdown(states, 'after placing, before parking')
+                self._set_state(
+                    'DONE',
+                    'placed, but the arm is parked short of home -- clear '
+                    'whatever is blocking the way back before the next cycle')
+                return
+            self.safe_shutdown(states, 'after a failed place')
             self._set_state('FAILED', 'place failed')
             return
-
-        # Back the way it came: the staging pose, then home. PRE_PICK is a
-        # posture the arm is known to be able to reach from both the drop and
-        # from home, which is what makes it a safe waypoint out.
-        self._retreat_to_home(states, 'cycle complete')
         self._set_state('DONE')
+
+    # -- getting out of trouble ----------------------------------------------
+
+    def posture_is_clear(self, joints, label):
+        """Would the arm be in collision standing here? True / False / None.
+
+        Asks /check_state_validity, which answers against the *current*
+        planning scene -- octomap included -- without planning anything. That
+        is the difference between checking a refuge and discovering it by
+        arriving: a joint goal into an occupied posture comes back
+        INVALID_MOTION_PLAN with nothing said about what is in the way, and
+        that is what a failed cycle was doing twice in a row before giving up
+        and driving home anyway.
+
+        None means nothing could answer, which is deliberately not False: a
+        service that is down is not a reason to call a posture occupied.
+        """
+        if not self.validity_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn(
+                '/check_state_validity is not being served, so a refuge '
+                'cannot be checked before moving to it')
+            return None
+        request = GetStateValidity.Request()
+        request.group_name = self.group
+        request.robot_state.is_diff = True
+        request.robot_state.joint_state.name = list(self.arm_joints)
+        request.robot_state.joint_state.position = [float(v) for v in joints]
+        result = self._await(self.validity_client.call_async(request), 5.0)
+        if result is None:
+            self.get_logger().warn(f'{label}: the validity check did not answer')
+            return None
+        if result.valid:
+            return True
+        contacts = sorted({f'{c.contact_body_1}/{c.contact_body_2}'
+                           for c in result.contacts})
+        self.get_logger().warn(
+            f'{label} is not a refuge: the arm would be in collision there'
+            + (f' -- {", ".join(contacts[:4])}' if contacts else '')
+            + '. Not driving into it.')
+        self.log_motion(label, 'validity', 'occupied',
+                        target=[round(v, 5) for v in joints],
+                        contacts=contacts[:8])
+        return False
+
+    def disengage_motors(self, why):
+        """Take the motors off, by deactivating the hardware components.
+
+        openarm_hardware's on_deactivate calls disable_all(), so this is what
+        "disengage" means on this robot: the joints stop being driven.
+
+        **The arm is then held up by nothing.** These are direct-drive motors
+        with no brakes, so a limp arm sags, and an extended one falls. That is
+        why this is the last thing the failure path does and only once a
+        refuge has been reached -- see safe_shutdown. Bringing it back needs
+        the components reactivated, which in practice means restarting the
+        bringup.
+        """
+        if not self.hardware_client.wait_for_service(timeout_sec=3.0):
+            self.get_logger().error(
+                'the controller manager is not offering '
+                'set_hardware_component_state, so the motors cannot be taken '
+                'off from here. Stop the bringup instead.')
+            return False
+        done = []
+        for component in ('openarm_left_hardware_interface',
+                          'openarm_right_hardware_interface'):
+            request = SetHardwareComponentState.Request()
+            request.name = component
+            request.target_state.id = LifecycleState.PRIMARY_STATE_INACTIVE
+            request.target_state.label = 'inactive'
+            result = self._await(
+                self.hardware_client.call_async(request), 10.0)
+            if result is None or not result.ok:
+                self.get_logger().error(
+                    f'could not deactivate {component}; its motors are still '
+                    f'driven')
+                continue
+            done.append(component)
+        if done:
+            self.get_logger().warn(
+                f'motors disengaged {why}: {", ".join(done)}. The arm is not '
+                f'being held up any more -- support it before moving it, and '
+                f'restart the bringup to drive it again.')
+            self.log_motion('DISENGAGE', 'hardware', 'off', components=done)
+        return bool(done)
+
+    def safe_shutdown(self, states, why):
+        """Park the arm somewhere checked, then take the motors off.
+
+        The failure path, and deliberately not _retreat_to_home. A cycle that
+        failed has an arm somewhere unplanned -- often still holding the
+        object, often with its start state already in collision -- and the
+        old answer was a joint goal at HOME, which is a folded posture on the
+        far side of the workspace. Measured, run 1788933180: PRE_PICK and DROP
+        both came back -2 with the gripper in the octomap, and home was then
+        driven to anyway, carrying the object.
+
+        So: up off the surface, then the nearest refuge whose posture the
+        collision world says is actually free, and only then the motors.
+
+        A refuge that cannot be reached is not replaced by driving somewhere
+        else and hoping. If none can be reached the arm stays where it is,
+        still driven, and says so -- an arm stranded over the table is bad,
+        an arm going limp while stranded over the table falls onto it.
+        """
+        self._set_state('RECOVER', why)
+        self.clear_the_surface(why)
+
+        # Hold the gripper out of the octomap for the whole escape, not for
+        # one leg of it.
+        #
+        # Getting stuck is what happens otherwise, and it is the map that
+        # does it. Measured, run 1788948709: the descent was refused, so the
+        # tool was still at transit height with the jaws open right above the
+        # object; clear_the_surface saw it as already clear and released the
+        # column, which handed the gripper back to collision checking against
+        # the very voxels it was standing in. Both refuges then came back -2
+        # in under a second -- not because they were unreachable, but because
+        # the arm's own start state had just been declared invalid.
+        #
+        # The exemption is for the gripper alone and the refuges are still
+        # checked against everything else, so this does not blind the escape;
+        # it stops the escape being blocked by the thing it is escaping.
+        exempt = False
+        if self.get_parameter('gripper_octomap_exemption').value:
+            exempt = self.allow_gripper_in_octomap(True)
+            self._octomap_exempt = exempt
+        try:
+            reached = self._reach_a_refuge(states, why)
+        finally:
+            if exempt:
+                self.allow_gripper_in_octomap(False)
+                self._octomap_exempt = False
+
+        if reached is None:
+            # Which of the two it is matters: one is cleared with a service
+            # call and the other needs the stack restarted, and a single
+            # line about refuges tells the operator neither.
+            jammed = self._planner_stalled is not None and self._planner_answered
+            self._set_state(
+                'STOPPED',
+                'move_group has stopped answering, so nothing can be planned '
+                'and the arm is parked where it stands with the motors on'
+                if jammed else
+                'no refuge could be reached, so the arm is parked where it '
+                'stands and the motors are left on')
+            if jammed:
+                self.get_logger().error(
+                    'the motors are staying on because there is no planner '
+                    'left to plan the way out: move_group answered earlier in '
+                    'this run and has since stopped serving /move_action. '
+                    'Restart the stack. Until then the arm can be driven out '
+                    'with record_states.py --play, which talks to the '
+                    'controller directly.')
+            else:
+                self.get_logger().error(
+                    'nothing safe could be reached, so the motors are staying '
+                    'on: a limp arm holds itself up with nothing, and letting '
+                    'go here would drop it onto whatever it is over. Clear the '
+                    'obstruction (the octomap usually: ros2 service call '
+                    '/clear_octomap std_srvs/srv/Empty) and drive it out with '
+                    'record_states.py --play.')
+            self.log_motion('RECOVER', 'joint', 'no-refuge',
+                            planner='jammed' if jammed else 'answering')
+            return False
+
+        if self.get_parameter('disengage_on_failure').value:
+            self.disengage_motors(f'at {reached}, {why}')
+        return True
+
+    def _reach_a_refuge(self, states, why):
+        """The nearest posture the collision world calls free, or None."""
+        reached = None
+        for name in (PRE_PICK_STATE, None):
+            if name is None:
+                target = self.home_positions()
+                label = 'HOME'
+            else:
+                entry = (states or {}).get(name) or {}
+                target = entry.get('joints')
+                label = name.upper()
+                if not target:
+                    continue
+            if self.posture_is_clear(target, label) is False:
+                continue
+            self._set_state(label, f'refuge, {why}')
+            if name is None:
+                if self.move_to_home():
+                    reached = label
+                    break
+            elif self.move_to_state(name, states):
+                reached = label
+                break
+            self.get_logger().warn(
+                f'{label} is clear but could not be reached; trying the next '
+                f'refuge')
+
+        return reached
 
     def _retreat_to_home(self, states, why):
         """Back the way it came: the staging pose, then home.
@@ -4896,6 +6301,37 @@ class PickPlaceOrchestrator(Node):
         self.log_motion('HOME', 'joint', 'refused-no-pre-pick')
         return False
 
+    def _arm_that_reaches(self, candidates, targets, quat, where, states):
+        """KDL alone: the first arm it confirms can reach every target.
+
+        Returns (decided, states). decided is False only when nothing was
+        confirmed, which means "ask again properly" rather than "no arm can"
+        -- KDL's yes is conclusive and its no is not. A switch that finds no
+        recorded states is decided *and* fatal, so the two are reported
+        separately: collapsing them would send a fatal case round the slow
+        path and overwrite the FAILED state on the way.
+        """
+        orientations = int(
+            self.get_parameter('arm_choice_orientations').value)
+        for arm in candidates:
+            verdicts = [self.reachable(point, quat, arm=arm,
+                                       orientations=orientations, cheap=True)
+                        for _, point in targets]
+            if not all(v is True for v in verdicts):
+                continue
+            if arm == self.arm:
+                self.get_logger().info(f'the {arm} arm can reach it')
+                return True, states
+            self._set_state('SWITCH_ARM', f'{self.arm} -> {arm} ({where})')
+            self.configure_arm(arm)
+            switched = self.load_states()
+            if not self.check_states(switched):
+                self._set_state(
+                    'FAILED', f'no recorded states for the {arm} arm')
+                return True, None
+            return True, switched
+        return False, states
+
     def arm_candidates(self, detection, payload):
         """The arms to consider, best first.
 
@@ -4953,6 +6389,32 @@ class PickPlaceOrchestrator(Node):
         self.get_logger().info(
             f'object {where}; trying {" then ".join(candidates)}')
 
+        # by_side: the half of the frame the object is in, and get on with
+        # it. The camera half gets this right nearly every time -- an object
+        # on the left is picked by the left arm -- and asking the solvers
+        # instead cost 87 seconds between the first look and the second,
+        # measured, for the same answer.
+        #
+        # Nothing is given up by not asking. The pre-flight settles whether
+        # the pick is actually possible, properly, for the arm chosen, and it
+        # runs before anything moves -- so a wrong guess costs a pre-flight,
+        # not a motion. by_reach restores the old behaviour for the cases
+        # where the camera half really is not the right signal.
+        if self.arm_selection != 'by_reach':
+            arm = candidates[0]
+            if arm == self.arm:
+                self.get_logger().info(
+                    f'{where}, so the {arm} arm takes it')
+                return states
+            self._set_state('SWITCH_ARM', f'{self.arm} -> {arm} ({where})')
+            self.configure_arm(arm)
+            switched = self.load_states()
+            if not self.check_states(switched):
+                self._set_state(
+                    'FAILED', f'no recorded states for the {arm} arm')
+                return None
+            return switched
+
         grasp, pregrasp, quat, _ = self.grasp_from_detection(
             detection, STRATEGIES[0])
         transit = (grasp[0], grasp[1],
@@ -4960,10 +6422,34 @@ class PickPlaceOrchestrator(Node):
         targets = [('grasp', grasp), ('pre-grasp', pregrasp),
                    ('transit height', transit)]
 
+        # Cheap first, thorough only if that settles nothing.
+        #
+        # KDL confirms the common case in milliseconds -- the object is in
+        # front of an arm that can plainly reach it -- and the solvers behind
+        # it cost 2.9 seconds per orientation per height per arm whether they
+        # find anything or not, which was 52 seconds before the robot moved.
+        #
+        # But cheap alone loses the case this method exists for: an object
+        # only the *far* arm can reach, where KDL's "cannot tell" would leave
+        # the near arm selected and the pick refused. So when no arm is
+        # confirmed cheaply, the expensive question gets asked after all. The
+        # cost lands on the hard case, which is where it is worth paying.
+        if self.get_parameter('arm_choice_cheap').value:
+            decided, chosen = self._arm_that_reaches(
+                candidates, targets, quat, where, states)
+            if decided:
+                return chosen
+            self.get_logger().info(
+                'no arm could be confirmed the quick way, so the object is '
+                'somewhere awkward; asking the slow solvers')
+
         unreachable = []
         for arm in candidates:
-            verdicts = [self.reachable(point, quat, arm=arm)
-                        for _, point in targets]
+            verdicts = [
+                self.reachable(point, quat, arm=arm,
+                               orientations=int(self.get_parameter(
+                                   'arm_choice_orientations').value))
+                for _, point in targets]
             if any(v is None for v in verdicts):
                 # Nothing could answer. Refusing on that would turn a stack
                 # that is merely not up into a workspace problem, so carry on
@@ -5010,9 +6496,106 @@ class PickPlaceOrchestrator(Node):
             f'actually reachable at this height with:  python3 '
             f'native/tests/check_reachability.py --arm {candidates[0]} '
             f'--sweep --z {grasp[2]:.3f}')
+        # Same reasoning as the per-attempt check: this samples a few
+        # orientations and asks whether a posture exists, while the pre-flight
+        # samples the lot and asks whether the line actually flies from the
+        # staging pose. When the thorough one is going to run anyway, the
+        # cheap one does not get to veto it -- it was wrong about a roll of
+        # tape the left arm had picked eleven minutes earlier.
+        #
+        # Which arm, then? The one arm_candidates preferred, which is the half
+        # of the frame the object is in. The pre-flight will refuse properly
+        # if it really cannot be done, and OUT_OF_REACH will mean it.
+        if self.get_parameter('preflight_descent').value:
+            self.get_logger().warn(
+                f'no arm passed the reach check, but the pre-flight asks a '
+                f'better question and nothing has moved yet, so the '
+                f'{candidates[0]} arm gets its turn -- {message}')
+            self._note_failure('REACH', f'(advisory) {message}')
+            if candidates[0] != self.arm:
+                self._set_state(
+                    'SWITCH_ARM',
+                    f'{self.arm} -> {candidates[0]} ({where}), on the '
+                    f'pre-flight rather than the reach check')
+                self.configure_arm(candidates[0])
+                states = self.load_states()
+                if not self.check_states(states):
+                    self._set_state(
+                        'FAILED',
+                        f'no recorded states for the {candidates[0]} arm')
+                    return None
+            return states
         self._note_failure('REACH', message)
         self._set_state('OUT_OF_REACH', message)
         return OUT_OF_REACH
+
+    def _on_grasp_candidates(self, msg):
+        try:
+            payload = json.loads(msg.data)
+        except ValueError:
+            self.get_logger().warn('unreadable /grasp/candidates payload')
+            return
+        with self._lock:
+            self._grasps = payload
+        found = payload.get('grasps') or []
+        self.get_logger().info(
+            f'grasp server proposed {len(found)} candidate(s)'
+            + (f', best score {found[0]["score"]:.2f} at '
+               f'{found[0]["width"] * 1000:.0f} mm' if found else ''))
+
+    def model_proposals(self, detection, strategy):
+        """The model's grasps for this object, best first, or [].
+
+        Each comes back in the same shape the synthesised one has --
+        (grasp, pregrasp, quat) -- so the pre-flight cannot tell where a
+        proposal came from and does not need to.
+
+        Filtered on age and on distance from the object actually being
+        picked: the server publishes for whatever it was last asked about,
+        and using yesterday's tape to pick today's screwdriver would be worse
+        than not using it at all.
+        """
+        if not self.get_parameter('use_grasp_model').value:
+            return []
+        with self._lock:
+            payload = self._grasps
+        if not payload:
+            return []
+        age = self.get_clock().now().nanoseconds * 1e-9 - payload.get(
+            'stamp', 0.0)
+        if age > self.get_parameter('grasp_model_max_age').value:
+            self.get_logger().info(
+                f'the grasp server\'s candidates are {age:.0f} s old, so '
+                f'they are about some earlier look; synthesising instead')
+            return []
+        point = detection.get('point') or []
+        about = payload.get('about') or []
+        if len(about) == 3 and len(point) == 3:
+            offset = math.dist(about, point)
+            if offset > self.get_parameter('grasp_model_max_offset').value:
+                self.get_logger().info(
+                    f'the candidates are about a point {offset * 1000:.0f} mm '
+                    f'from this object, so they are for something else')
+                return []
+
+        approach = self.get_parameter('approach_height').value
+        drop = strategy['z_offset']
+        out = []
+        for entry in payload.get('grasps') or []:
+            position = entry.get('position')
+            quat = entry.get('quat')
+            if not position or not quat or len(position) != 3:
+                continue
+            grasp = (position[0], position[1], position[2] + drop)
+            out.append({
+                'grasp': grasp,
+                'pregrasp': (grasp[0], grasp[1], grasp[2] + approach),
+                'quat': tuple(quat),
+                'source': 'model',
+                'score': entry.get('score'),
+                'width': entry.get('width'),
+            })
+        return out
 
     def _detection_age(self):
         """Seconds since the detection in hand was published, or None."""
@@ -5091,7 +6674,19 @@ class PickPlaceOrchestrator(Node):
         # a grasp the arm can touch but not approach from above is no use.
         transit = (grasp[0], grasp[1],
                    grasp[2] + self.get_parameter('transit_height').value)
-        if self.get_parameter('check_reach').value:
+        # Skipped entirely when the pre-flight is going to run, and that is
+        # not an optimisation so much as removing work nobody reads.
+        #
+        # This check samples orientations and asks whether a *posture*
+        # exists; the pre-flight samples the same set and asks whether the
+        # actual straight line flies from the actual staging pose. The second
+        # is strictly more informative, so the first was made advisory -- and
+        # an advisory answer still cost a planning request per orientation
+        # per target. Measured after reach_orientations went 3 -> 10: LOCATE
+        # to PREFLIGHT took 162 seconds, most of it spent producing a verdict
+        # that was then logged and ignored.
+        if (self.get_parameter('check_reach').value
+                and not self.get_parameter('preflight_descent').value):
             refusal = self.out_of_reach(
                 [('grasp', grasp), ('pre-grasp', pregrasp),
                  ('transit height', transit)], quat)
@@ -5117,8 +6712,63 @@ class PickPlaceOrchestrator(Node):
         # to be standing while the pre-flight runs, which is HOME.
         staging = (states.get(PRE_PICK_STATE) or {}).get('joints')
         self._approach_from = list(staging) if staging else None
-        self._preflight_choice = self.preflight_column(
-            grasp, pregrasp, approach_point, quat, 'PREFLIGHT')
+
+        # What to try, best first: whatever the grasp model proposed, then
+        # the synthesised top-down pose as the last resort. The pre-flight
+        # decides between them -- it is the only thing here that knows
+        # whether a grasp can actually be flown to -- and it takes the first
+        # whose whole column works.
+        #
+        # The synthesised one stays on the end rather than being replaced.
+        # GraspNet was trained for a 100 mm gripper against this one's 44 mm,
+        # so on a wide object every proposal it makes can be one the robot
+        # cannot close on, and the fallback is then the only way to pick at
+        # all. Measured on a roll of tape: three candidates, needing 55, 66
+        # and 98 mm.
+        proposals = self.model_proposals(detection, strategy)
+        proposals.append({'grasp': grasp, 'pregrasp': pregrasp, 'quat': quat,
+                          'source': 'top-down', 'score': None, 'width': None})
+        if len(proposals) > 1:
+            self.get_logger().info(
+                f'{len(proposals) - 1} grasp(s) from the model to try before '
+                f'falling back to the synthesised top-down pose')
+
+        self._preflight_choice = None
+        for index, proposal in enumerate(proposals):
+            if self._abort.is_set():
+                self._set_state('ABORTED')
+                return None
+            grasp = tuple(proposal['grasp'])
+            pregrasp = tuple(proposal['pregrasp'])
+            quat = tuple(proposal['quat'])
+            approach_point = ((grasp[0], grasp[1], grasp[2] + transit_height)
+                              if staged else tuple(pregrasp))
+            if proposal['source'] == 'model':
+                self._set_state(
+                    'PREFLIGHT',
+                    f'model grasp {index + 1}, score {proposal["score"]}, '
+                    f'{proposal["width"] * 1000:.0f} mm')
+            self._preflight_choice = self.preflight_column(
+                grasp, pregrasp, approach_point, quat, 'PREFLIGHT')
+            if self._preflight_choice is not None:
+                if proposal['source'] == 'model':
+                    self.get_logger().info(
+                        f'flying the model\'s grasp {index + 1} of '
+                        f'{len(proposals) - 1}: score {proposal["score"]}, '
+                        f'{proposal["width"] * 1000:.0f} mm opening at '
+                        f'{[round(v, 4) for v in grasp]}')
+                self.log_motion('PREFLIGHT', 'proposal', 'chosen',
+                                source=proposal['source'],
+                                candidate=index + 1, of=len(proposals),
+                                score=proposal['score'],
+                                width=proposal['width'],
+                                target=[round(v, 5) for v in grasp])
+                break
+            if proposal['source'] == 'model':
+                self.get_logger().info(
+                    f'the model\'s grasp {index + 1} does not fly from here; '
+                    f'trying the next')
+
         if self._preflight_choice is None and self._preflight_reason:
             self._note_failure('PREFLIGHT', self._preflight_reason)
             self._set_state('OUT_OF_REACH', self._preflight_reason)
@@ -5203,22 +6853,99 @@ class PickPlaceOrchestrator(Node):
                 return None
             from_z = pregrasp[2]
 
-        # Before the descent, not between two of them: with the tool above the
-        # object at transit height there is nothing for open fingers to catch
-        # on, and a gripper that fails to open then costs no motion at all.
-        self._set_state('OPEN_GRIPPER')
-        if not self.open_gripper():
-            return None
+        # From here the cycle is data. pick_place_sequence.DEFAULT_SEQUENCE
+        # is the order, the web UI edits it, and the steps below are what the
+        # names resolve to. The approach above is deliberately not in it: the
+        # pre-flight proves the whole column from the staging posture as one
+        # unit, so reordering what it depends on would not give a different
+        # cycle, it would give an unchecked one.
+        ctx = {
+            'grasp': grasp, 'pregrasp': pregrasp, 'quat': quat,
+            'point': point, 'states': states, 'from_z': from_z,
+            'strategy': strategy,
+        }
+        self._ctx = ctx
+        pick_steps, _place_steps = self.sequence_split()
+        return self.run_sequence(pick_steps, ctx, default=point)
 
+    # -- the cycle, as data --------------------------------------------------
+
+    def sequence_split(self):
+        """(pick steps, place steps) -- where the retry ladder stops.
+
+        The ladder retries the pick: locate, descend, grasp. It does not retry
+        the place, because by then the object is held and starting over would
+        mean putting it back. The boundary is the point the grasp is secured
+        -- after verify_grasp if the sequence has one, after the grasp itself
+        if it does not -- and the UI draws it, because "which of these get
+        retried" is a fair thing to want to know before reordering them.
+        """
+        sequence = list(self._sequence)
+        for anchor in ('verify_grasp', 'grasp'):
+            if anchor in sequence:
+                cut = sequence.index(anchor) + 1
+                return sequence[:cut], sequence[cut:]
+        return sequence, []
+
+    def run_sequence(self, steps, ctx, default=True):
+        """Run named steps in order. Returns `default`, None, or GRASP_MISSED.
+
+        A step returns True to carry on, False to end the cycle, or
+        GRASP_MISSED to send the ladder to its next rung. Anything a step
+        raises ends the cycle rather than the process: the sequence is edited
+        by hand from a browser, and a bad edit must not be able to take the
+        orchestrator down with it.
+        """
+        for name in steps:
+            if self._abort.is_set():
+                self._set_state('ABORTED')
+                return None
+            handler = self.STEP_HANDLERS.get(name)
+            if handler is None:
+                self.get_logger().error(
+                    f'{name!r} is in the sequence but nothing implements it; '
+                    f'skipping. This should have been caught when the '
+                    f'sequence was loaded.')
+                continue
+            self._step = name
+            try:
+                outcome = handler(self, ctx)
+            except Exception as exc:                 # noqa: BLE001 - reported
+                self.get_logger().error(f'step {name!r} raised: {exc}')
+                self._note_failure(name.upper(), f'the step raised: {exc}')
+                return None
+            if outcome is GRASP_MISSED:
+                return GRASP_MISSED
+            if not outcome:
+                return None
+            # What has actually happened, so a caller can tell a cycle that
+            # failed before doing its job from one that failed after.
+            if isinstance(ctx, dict):
+                ctx.setdefault('done', []).append(name)
+        return default
+
+    # -- the steps -------------------------------------------------------
+    #
+    # Each is the body that used to sit inline in _attempt_pick or _place, in
+    # the same order and with the same reasoning; what changed is that the
+    # order now comes from a file. Every one takes the cycle context and
+    # returns True to carry on.
+
+    def _step_open_gripper(self, ctx):
+        """Before the descent, not between two of them: with the tool above
+        the object at transit height there is nothing for open fingers to
+        catch on, and a gripper that fails to open then costs no motion."""
+        self._set_state('OPEN_GRIPPER')
+        return self.open_gripper()
+
+    def _step_descend(self, ctx):
+        grasp, quat = ctx['grasp'], ctx['quat']
         # What the pre-flight promised was a line from the posture it chose.
         # The arm does not always hold that posture: measured at TRANSIT,
-        # joint1 settled 70 mrad (4 degrees) from its commanded value, which
-        # is ~35 mm at the tool -- and from *there* the same descent solved
-        # 48.6% instead of 100%. Report the gap, so a descent that fails after
+        # joint1 settled 70 mrad from its commanded value, ~35 mm at the tool,
+        # and from there the same descent solved 48.6% instead of 100%. Let it
+        # finish arriving, then report the gap, so a descent that fails after
         # a pre-flight that passed is not a mystery.
-        # Let it finish arriving first. Without this the drift below is
-        # measured mid-convergence and the descent is planned from a posture
-        # the arm is still leaving.
         entry = self._preflight_choice
         if entry and not entry.get('linear'):
             settling = list(entry['joints'])
@@ -5227,12 +6954,29 @@ class PickPlaceOrchestrator(Node):
             self.settle_joints(settling, 'DESCEND')
         self._report_posture_drift('DESCEND')
 
+        # Ask the question again, from where the arm actually is.
+        #
+        # The pre-flight proved this column from the posture it *predicted*
+        # the approach would end in. The arm does not land there: measured,
+        # run 1788948709, TRANSIT arrived 32.6 mm off and the descent the
+        # pre-flight had just passed then cost 6.42 rad against a 1.5 rad
+        # budget and was refused -- after the arm had flown the whole
+        # approach. A check made from a posture the arm is not in has checked
+        # a descent that is not the one about to be flown.
+        better = self.descend_orientation(grasp, quat)
+        if better is not None and better is not quat:
+            self.get_logger().info(
+                'the descent the pre-flight proved does not fly from where '
+                'the arm actually landed; using an orientation that does')
+            quat = better
+            ctx['quat'] = quat
+
         # From here until the tool is clear again the arm is on a vertical
         # line over the object, and every way out has to go back up it first.
-        self._column = (list(grasp), list(pregrasp), list(quat))
+        self._column = (list(grasp), list(ctx['pregrasp']), list(quat))
         self._set_state('DESCEND')
         if not self.descend_column(
-                grasp, from_z, grasp[2], quat, 'DESCEND',
+                grasp, ctx['from_z'], grasp[2], quat, 'DESCEND',
                 uncheck_collisions=self.get_parameter(
                     'approach_ignores_octomap').value,
                 linear_only=self.get_parameter('descend_linear_only').value):
@@ -5241,9 +6985,7 @@ class PickPlaceOrchestrator(Node):
                              'descend_ignores_octomap').value)
             # Say what actually refused it. A refusal for joint travel and a
             # refusal for reach look identical from here and have opposite
-            # fixes, and this message used to assert the second whatever the
-            # cause -- so a descent whose line solved 100% was reported as
-            # the arm running out of reach.
+            # fixes.
             blame = self._column_refusal or (
                 'the collision world may hold the object itself, or the '
                 'grasp is below the work surface'
@@ -5257,22 +6999,19 @@ class PickPlaceOrchestrator(Node):
                 f'arrived above the object but could not descend to '
                 f'z={grasp[2]:.3f} -- {blame}'))
             self.clear_the_surface('after a failed descent')
-            return None
-
-        # Where the jaws actually are, before they close on whatever is
-        # there. The descent reports its own error, but the number that
-        # decides whether the grip works is this one: the plan ended exactly
-        # at the commanded point (plan_error_mm 0.0) and the arm stopped
-        # 29 mm above it, so the jaws closed on air 29 mm over the object and
-        # the only symptom was 'closed-on-nothing' at 1.9 Nm. Say it plainly
-        # instead, because no gripper setting fixes a gripper in the wrong
-        # place.
+            return False
         self.close_descent_gap(grasp, quat)
+        return True
 
+    def _step_grasp(self, ctx):
+        grasp = ctx['grasp']
+        # Where the jaws actually are, before they close on whatever is
+        # there. The number that decides whether the grip works is this one:
+        # the plan ended exactly at the commanded point and the arm stopped
+        # 29 mm above it, so the jaws closed on air over the object and the
+        # only symptom was 'closed-on-nothing'. Say it plainly instead.
         self._set_state('CLOSE_GRIPPER')
         at_jaws = self.tcp_position()
-        # Recorded before the close, so the failure below can quote it.
-        self._grasp_commanded = list(grasp)
         if at_jaws is not None:
             short = at_jaws[2] - grasp[2]
             sideways = math.hypot(at_jaws[0] - grasp[0],
@@ -5283,18 +7022,14 @@ class PickPlaceOrchestrator(Node):
                     f'closing at [{at_jaws[0]:.4f}, {at_jaws[1]:.4f}, '
                     f'{at_jaws[2]:.4f}] but the grasp was commanded at '
                     f'[{grasp[0]:.4f}, {grasp[1]:.4f}, {grasp[2]:.4f}] -- '
-                    f'{short * 1000:+.0f} mm in height and {sideways * 1000:.0f} '
-                    f'mm sideways. The descent plan ended on the point; the '
-                    f'arm did not follow it there. If this grip fails it '
-                    f'failed here, not at the fingers.')
+                    f'{short * 1000:+.0f} mm in height and '
+                    f'{sideways * 1000:.0f} mm sideways. The descent plan '
+                    f'ended on the point; the arm did not follow it there. '
+                    f'If this grip fails it failed here, not at the fingers.')
                 self.log_motion('CLOSE_GRIPPER', 'gripper', 'off-target',
                                 target=list(grasp), tcp=list(at_jaws),
                                 error_mm=round(miss * 1000.0, 1))
         if not self.close_gripper_to_cap():
-            # Note it. This used to return without recording anything, so
-            # _failure_summary found an empty list and reported 'no attempt
-            # ran' -- to an operator who had just watched the arm descend and
-            # close. Measured, run 1788869179 cycle 2.
             landed = at_jaws[2] if at_jaws else None
             self._note_failure('CLOSE_GRIPPER', (
                 'the descent arrived'
@@ -5308,40 +7043,341 @@ class PickPlaceOrchestrator(Node):
             # slimmest thing to lift back through whatever is down there.
             self.clear_the_surface('the grip closed on nothing')
             return GRASP_MISSED
+        return True
 
-        # Straight back up, and well clear -- not just back to the pre-grasp.
-        # The next move carries the object to the drop pose as a free-space
-        # plan, and starting that 5 cm off the surface is what dragged the
-        # gripper across the table. retreat_height defaults to transit_height,
-        # so the object leaves at the same altitude the approach arrived at.
+    def _step_lift(self, ctx):
+        """Straight back up, and well clear -- not just to the pre-grasp.
+
+        The next move carries the object to the drop as a free-space plan, and
+        starting that 5 cm off the surface is what dragged the gripper across
+        the table.
+        """
         self._set_state('LIFT')
-        if not self.lift_column(grasp, pregrasp, quat, 'LIFT'):
+        if not self.lift_column(ctx['grasp'], ctx['pregrasp'], ctx['quat'],
+                                'LIFT'):
             self._note_failure('LIFT', (
                 'the object was gripped but the arm could not lift it '
                 'straight up, at any height. It is still holding it, at the '
                 'grasp.'))
-            return None
-        # Off the column and clear. Everything after this -- the carry, the
-        # drop, the retreat -- is above the surface and has its own way out,
-        # so leaving the column set would have the retreat fly one more line
-        # straight up from wherever the drop left the tool, for nothing. It
-        # also hands the gripper back to the octomap, which is safe now and
-        # was not while the jaws were down among the voxels.
+            return False
+        # Off the column and clear. Everything after this is above the
+        # surface and has its own way out, and this also hands the gripper
+        # back to the octomap -- safe now, and not while the jaws were down
+        # among the voxels.
         self.release_column()
+        return True
 
-        self._set_state('VERIFY_GRASP')
-        if not self.verify_grasp(point):
-            self._note_failure('VERIFY_GRASP', (
-                'the gripper closed but nothing was held -- check '
-                'grasp_finger_min against your object, and the grasp height'))
-            self._set_state('VERIFY_GRASP', 'failed, retrying')
-            self.open_gripper()
-            return None
+    def _step_verify_grasp(self, ctx):
+        """Ask the detector whether the object actually left, and try again
+        if it did not.
 
-        self.attach_object()
-        self._holding = True
-        self._set_state('VERIFY_GRASP', 'confirmed')
-        return point
+        The fingers alone cannot tell a grip from a fingertip resting on an
+        edge, so the object being *gone from where it was* is the check that
+        matters. When it is still sitting there, nothing was picked -- and
+        the useful answer is not to abandon the cycle but to have another go
+        at the same grasp: open, come back down the column, close, lift.
+
+        Bounded, because the same grasp failing the same way three times is
+        not going to work on the fourth, and each go costs a descent. After
+        that it gives up cleanly and the retreat takes the arm to pre_pick
+        and home.
+        """
+        tries = max(1, int(self.get_parameter('regrasp_attempts').value))
+        for attempt in range(1, tries + 1):
+            self._set_state(
+                'VERIFY_GRASP',
+                '' if attempt == 1 else f'try {attempt} of {tries}')
+            if self.verify_grasp(ctx['point']):
+                self.attach_object()
+                self._holding = True
+                self._set_state('VERIFY_GRASP', 'confirmed')
+                return True
+            if attempt >= tries:
+                break
+            self._set_state(
+                'REGRASP',
+                f'the object has not moved, so nothing was picked '
+                f'({attempt} of {tries})')
+            self.get_logger().warn(
+                f'the detector still sees the object where it was, so the '
+                f'grasp did not take. Going back down for another try '
+                f'({attempt} of {tries}).')
+            if not self._regrasp(ctx):
+                break
+
+        self._note_failure('VERIFY_GRASP', (
+            f'unable to pick it in {tries} tries -- the object is still '
+            f'where it was after each one. The jaws are closing somewhere '
+            f'the object is not: check the grasp height against this object, '
+            f'and grasp_finger_min against how thin it is'))
+        self._set_state('VERIFY_GRASP', f'unable to pick after {tries} tries')
+        self.open_gripper()
+        return False
+
+    def _regrasp(self, ctx):
+        """Open, back down the column, close, lift. True if it got that far.
+
+        The same column the descent already proved, so this is a repeat of a
+        motion known to fly rather than a fresh plan -- and the arm is at the
+        top of it, which is exactly where a retry should start from.
+        """
+        grasp = tuple(ctx['grasp'])
+        pregrasp = tuple(ctx['pregrasp'])
+        quat = tuple(ctx['quat'])
+        # Back on the column, so the gripper is exempt from the octomap for
+        # the descent and every way out goes back up it.
+        self._column = (list(grasp), list(pregrasp), list(quat))
+
+        self._set_state('OPEN_GRIPPER', 'before another try')
+        if not self.open_gripper():
+            return False
+        here = self.fresh_tcp()
+        from_z = here[2] if here else pregrasp[2]
+        if not self.descend_column(
+                grasp, from_z, grasp[2], quat, 'REGRASP_DESCEND',
+                uncheck_collisions=self.get_parameter(
+                    'approach_ignores_octomap').value,
+                linear_only=self.get_parameter('descend_linear_only').value):
+            self.get_logger().warn(
+                'could not get back down the column for another try')
+            self.clear_the_surface('after a failed re-descent')
+            return False
+        self._set_state('CLOSE_GRIPPER', 'another try')
+        if not self.close_gripper_to_cap():
+            self.clear_the_surface('the retry also closed on nothing')
+            return False
+        self._set_state('LIFT', 'after another try')
+        if not self.lift_column(grasp, pregrasp, quat, 'REGRASP_LIFT'):
+            self.get_logger().warn('picked it up but could not lift it again')
+            return False
+        self.release_column()
+        return True
+
+    def request_grasps(self, point, why):
+        """Ask the grasp server what it makes of the object from here.
+
+        From the staging pose, not from home. The arm is where the descent
+        will start, so the point cloud is the one the descent has to work in,
+        and anything the server proposes can be checked from the posture the
+        pre-flight measures from.
+
+        Fire and forget: the server answers on /grasp/candidates when it has
+        something, and nothing in the cycle waits on it.
+        """
+        if not self.get_parameter('request_grasps').value or not point:
+            return
+        self.grasp_request_pub.publish(String(data=json.dumps({
+            'point': [round(float(v), 5) for v in point],
+            'prompt': self.prompt,
+            'why': why,
+        })))
+
+    def _step_pre_pick(self, ctx):
+        """The staging posture. Above the work surface and reachable from
+        both ends, which is what makes it the safe waypoint -- a direct joint
+        goal from the lift to the drop came back INVALID_MOTION_PLAN three
+        times, which is what a swing through the octomap looks like.
+
+        Not fatal on its own: the step reports and the cycle carries on, and
+        the retreat is where an unreachable pre_pick becomes a refusal to fly
+        home. See _retreat_to_home.
+        """
+        self._set_state('PRE_PICK', 'staging')
+        # Clear of the surface first, if the arm is still on a column: a joint
+        # goal from down there is what sweeps it across the table.
+        self.clear_the_surface('before the staging pose')
+        if not self.move_to_state(PRE_PICK_STATE, ctx['states']):
+            self.get_logger().warn(
+                'could not reach pre_pick; carrying on without staging, '
+                'which may sweep low across the work surface')
+        # Standing where the descent starts: a good moment to ask what the
+        # object looks like from here. Only on the way in -- the pre_pick on
+        # the way out has the object in the gripper and nothing to grasp.
+        if not self._holding:
+            self.request_grasps(ctx.get('point'), 'at the staging pose')
+        return True
+
+    def _step_drop(self, ctx):
+        """Where the object is released -- whichever place_mode says."""
+        mode = self.place_mode
+        if mode == 'home':
+            self._set_state('HOME', 'carrying the object back')
+            if not self.move_to_home():
+                self._note_failure('DROP', 'could not carry the object home')
+                return False
+        elif mode == 'position':
+            place = list(self.get_parameter('place_position').value)
+            quat = top_down_quat(self.get_parameter('place_yaw').value)
+            above = (place[0], place[1],
+                     place[2] + self.get_parameter(
+                         'place_approach_height').value)
+            self._set_state('OVER_BOX')
+            if not self.move_to_pose(above, quat, 'OVER_BOX'):
+                return False
+            if not self.move_to_pose(tuple(place), quat, 'PLACE'):
+                return False
+        else:
+            self._set_state('DROP', 'moving to the recorded drop pose')
+            if not self.move_to_state(DROP_STATE, ctx['states']):
+                self._note_failure('DROP', 'could not reach the drop pose')
+                return False
+        ctx['release_point'] = self.tcp_position()
+        return True
+
+    def _step_release(self, ctx):
+        self._set_state('RELEASE', f'at the {self.place_mode} drop')
+        if not self.open_gripper():
+            return False
+        self.detach_object()
+        self._holding = False
+        if self.place_mode == 'position':
+            place = list(self.get_parameter('place_position').value)
+            quat = top_down_quat(self.get_parameter('place_yaw').value)
+            above = (place[0], place[1],
+                     place[2] + self.get_parameter(
+                         'place_approach_height').value)
+            self._set_state('RETREAT')
+            if not self.move_to_pose(above, quat, 'RETREAT'):
+                return False
+        return True
+
+    def _step_verify_place(self, ctx):
+        """Advisory: the box usually occludes the object, so a negative here
+        is not a reason to call the cycle failed."""
+        self._set_state('VERIFY_PLACE')
+        release_point = ctx.get('release_point')
+        if release_point is None:
+            self.get_logger().warn(
+                f'no {self.tcp_frame} transform at release; skipping the '
+                f'check')
+        else:
+            self.verify_place(release_point)
+        return True
+
+    def _step_shut_jaws(self, ctx):
+        """The trip back is made with the jaws shut rather than with 44 mm of
+        open fingers hunting for something to catch on."""
+        self._set_state('CLOSE_GRIPPER', 'shutting the jaws')
+        if not self.close_gripper('CLOSE_AT_DROP'):
+            # Not fatal. The object is placed and the cycle has done its job;
+            # an open gripper on the way home is untidy, not unsafe.
+            self.get_logger().warn(
+                'could not shut the jaws; going on with the gripper open')
+        return True
+
+    def _step_home(self, ctx):
+        """Home, and only ever from the staging pose.
+
+        A joint goal from a low, extended posture is the one move that drags
+        the arm across the table, so HOME is reached from pre_pick or not at
+        all -- see _retreat_to_home.
+
+        But when the sequence has *just* run its own pre_pick step, going
+        through the retreat asks for it a second time, and the second ask is
+        a fresh planning problem that can fail on its own. Measured, run at
+        14:07: a completed pick and place, then PRE_PICK_STATE twice with -2,
+        the cycle declared failed and the motors taken off -- and
+        safe_shutdown then reached pre_pick on its very next attempt. The
+        planner is stochastic here; the codebase carries plan_attempts for
+        exactly that. Asking twice as often is asking to be unlucky twice.
+        """
+        if self.at_state(PRE_PICK_STATE, ctx['states']):
+            self._set_state('HOME', ctx.get('why', 'cycle complete'))
+            return self.move_to_home()
+        return self._retreat_to_home(ctx['states'], ctx.get('why', 'the '
+                                                            'sequence says so'))
+
+    def at_state(self, name, states):
+        """Is the arm already standing at a recorded posture?"""
+        entry = (states or {}).get(name) or {}
+        wanted = entry.get('joints')
+        if not wanted:
+            return False
+        error = self.joint_error(list(wanted))
+        if error is None:
+            return False
+        return error <= self.get_parameter('at_goal_tolerance').value
+
+    STEP_HANDLERS = {
+        'open_gripper': _step_open_gripper,
+        'descend': _step_descend,
+        'grasp': _step_grasp,
+        'lift': _step_lift,
+        'verify_grasp': _step_verify_grasp,
+        'pre_pick': _step_pre_pick,
+        'drop': _step_drop,
+        'release': _step_release,
+        'verify_place': _step_verify_place,
+        'shut_jaws': _step_shut_jaws,
+        'home': _step_home,
+    }
+
+    def descend_orientation(self, grasp, quat, label='DESCEND'):
+        """The orientation whose descent flies from here, or None.
+
+        Probed from the arm's *measured* posture with an explicit start
+        state, so it answers about the descent that is actually about to
+        happen rather than the one the pre-flight modelled from the staging
+        pose. Costs one service call per orientation and no motion.
+
+        Returns the pre-flight's own choice untouched when that still works,
+        which is the common case -- this is a correction for the landing
+        error, not a second opinion on the grasp.
+        """
+        if not self.get_parameter('descend_recheck').value:
+            return quat
+        if not self.await_joint_states():
+            return quat
+        with self._lock:
+            here = [self._arm_positions.get(j) for j in self.arm_joints]
+        if any(v is None for v in here):
+            return quat
+
+        budget = self.get_parameter('column_max_joint_travel').value
+        wanted = self.get_parameter('cartesian_min_fraction').value
+        may_uncheck = self.get_parameter('descend_ignores_octomap').value
+        options = [quat] + [q for q in self.grasp_quat_options(quat)
+                            if tuple(q) != tuple(quat)]
+
+        def flies(candidate):
+            """Would the descent take this orientation, asked its way?
+
+            Checked first and unchecked only as a fallback, because that is
+            exactly what _descend_column does -- a probe that asks a
+            different question from the leg it precedes is not a prediction
+            of anything. The object being reached for is often in the
+            octomap, which is why the unchecked retry exists at all.
+            """
+            for checked in ((True, False) if may_uncheck else (True,)):
+                fraction, _end, cost = self.probe_cartesian(
+                    here, grasp, candidate, avoid_collisions=checked)
+                if fraction is None:
+                    return None        # nothing could answer
+                if fraction >= wanted and (budget <= 0.0 or cost is None
+                                           or cost <= budget):
+                    return (fraction, cost)
+            return False
+
+        for index, candidate in enumerate(options):
+            verdict = flies(candidate)
+            if verdict is None:
+                return quat            # nothing could answer; carry on as was
+            if verdict:
+                fraction, cost = verdict
+                if index:
+                    self.log_motion(label, 'recheck', 'reoriented',
+                                    candidate=index + 1, of=len(options),
+                                    fraction=round(fraction, 4),
+                                    travel_rad=(None if cost is None
+                                                else round(cost, 3)))
+                return candidate
+        self.get_logger().warn(
+            f'{label}: no orientation descends from where the arm actually '
+            f'landed -- {len(options)} tried. The descent below will fail, '
+            f'and the reason is the landing error rather than the grasp: '
+            f'compare the commanded and measured joints at TRANSIT.')
+        self.log_motion(label, 'recheck', 'none-fly', of=len(options))
+        return quat
 
     def close_descent_gap(self, grasp, quat):
         """Fly whatever height the descent did not.
@@ -5517,120 +7553,6 @@ class PickPlaceOrchestrator(Node):
                 f'record_states.py --play, before restarting.')
         self.release_column()
         return lifted
-
-    def _place(self, states):
-        if self.place_mode == 'state':
-            return self._place_at_state(states)
-        if self.place_mode == 'home':
-            return self._place_at_home()
-        place = list(self.get_parameter('place_position').value)
-        quat = top_down_quat(self.get_parameter('place_yaw').value)
-        above = (place[0], place[1],
-                 place[2] + self.get_parameter('place_approach_height').value)
-
-        self._set_state('OVER_BOX')
-        if not self.move_to_pose(above, quat, 'OVER_BOX'):
-            return False
-        if not self.move_to_pose(tuple(place), quat, 'PLACE'):
-            return False
-
-        self._set_state('RELEASE')
-        if not self.open_gripper():
-            return False
-        self.detach_object()
-
-        self._set_state('RETREAT')
-        if not self.move_to_pose(above, quat, 'RETREAT'):
-            return False
-
-        self._set_state('VERIFY_PLACE')
-        self.verify_place(place)     # advisory: the box usually occludes the object
-        return True
-
-    def _place_at_state(self, states):
-        """Carry to the recorded drop_state and release there.
-
-        Staged through the pre-pick pose on the way, because the carry starts
-        low over the work surface and the drop pose is on the other side of
-        it. Measured: a direct joint goal from the lift to drop_state came
-        back INVALID_MOTION_PLAN (-2) three times -- the path was computed and
-        then rejected, which is what a swing through the octomap looks like.
-        pre_pick is above the table by construction, is a posture both ends
-        are known to reach, and is already the waypoint used on the way back.
-
-        Not fatal if the staging move fails: the direct carry is still tried,
-        and it may well be fine for a drop pose on the same side.
-        """
-        if self.get_parameter('stage_drop_through_pre_pick').value:
-            self._set_state('PRE_PICK', 'staging the carry over the table')
-            if not self.move_to_state(PRE_PICK_STATE, states):
-                self.get_logger().warn(
-                    'could not stage the carry through pre_pick; going '
-                    'straight to the drop pose, which may sweep low across '
-                    'the work surface')
-
-        self._set_state('DROP', 'moving to the recorded drop pose')
-        if not self.move_to_state(DROP_STATE, states):
-            return False
-
-        release_point = self.tcp_position()
-        self._set_state('RELEASE', 'at drop_state')
-        if not self.open_gripper():
-            return False
-        self.detach_object()
-
-        self._set_state('VERIFY_PLACE')
-        if release_point is None:
-            self.get_logger().warn(
-                f'no {self.tcp_frame} transform at release; skipping the check')
-        else:
-            self.verify_place(release_point)
-
-        # Shut the jaws before leaving, at the drop pose itself. The trip back
-        # through pre_pick to home is then made with a closed gripper rather
-        # than 44 mm of open fingers hunting for something to catch on, and
-        # the arm ends the cycle in the shape it started it. After
-        # verify_place, not before: that check looks for the object at the
-        # release point and should see the scene as the release left it.
-        self._set_state('CLOSE_GRIPPER', 'shutting the jaws at the drop')
-        if not self.close_gripper('CLOSE_AT_DROP'):
-            # Not fatal. The object is placed and the cycle has done its job;
-            # an open gripper on the way home is untidy, not unsafe.
-            self.get_logger().warn(
-                'could not shut the jaws at the drop pose; going home with '
-                'the gripper open')
-        return True
-
-    def _place_at_home(self):
-        """Carry back to HOME and release there.
-
-        No approach or retreat move: the pose is the drop point, so the object
-        falls the distance between the tool and whatever is below it.
-        """
-        self._set_state('HOME', 'carrying the object back')
-        if not self.move_to_home():
-            return False
-        release_point = self.tcp_position()
-
-        self._set_state('RELEASE', 'at home')
-        if not self.open_gripper():
-            return False
-        self.detach_object()
-
-        self._set_state('VERIFY_PLACE')
-        if release_point is None:
-            self.get_logger().warn(
-                f'no {self.tcp_frame} transform at release; skipping the check')
-        else:
-            self.verify_place(release_point)
-
-        # Same as the drop pose: the arm does not sit at rest with its fingers
-        # wide open.
-        self._set_state('CLOSE_GRIPPER', 'shutting the jaws after the release')
-        if not self.close_gripper('CLOSE_AT_DROP'):
-            self.get_logger().warn(
-                'could not shut the jaws after releasing; leaving them open')
-        return True
 
 
 def main():

@@ -74,7 +74,21 @@ def clamp_box(box, shape):
     return max(0, x1), max(0, y1), min(w, x2), min(h, y2)
 
 
-def axis_from_mask(mask, origin, min_area=30):
+# How much longer the long side has to be before the angle means anything.
+#
+# A round object's minAreaRect is square to within noise, and its angle is
+# then whatever the contour happened to do that frame. Measured on one roll
+# of tape, run 1789014831, four detections of the same object on the same
+# table: world yaw -169, -86, 0 and 0 degrees. The attempt that got -86 put
+# the jaws across a diameter they cannot span and closed on nothing.
+#
+# 1.15 is deliberately low. It is not trying to judge shape -- anything
+# genuinely elongated clears it easily (a screwdriver crop is 4:1 or more)
+# and anything near square has no long axis to report.
+MIN_AXIS_ASPECT = 1.15
+
+
+def axis_from_mask(mask, origin, min_area=30, min_aspect=MIN_AXIS_ASPECT):
     """Long axis of the biggest blob in `mask`, in degrees, plus its corners.
 
     The angle is such that the axis direction is (cos a, sin a) in pixel
@@ -83,6 +97,12 @@ def axis_from_mask(mask, origin, min_area=30):
     long axis. Verified against OpenCV 5, whose rect angles run in [-90, 0):
     every orientation comes back correct modulo 180 degrees, which is all an
     undirected grasp axis needs.
+
+    Three outcomes, and the caller needs to tell them apart:
+
+      (angle, corners)  an elongated blob, and which way it lies
+      (None, corners)   a blob too square for its angle to mean anything
+      (None, None)      no blob worth measuring
     """
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -93,9 +113,13 @@ def axis_from_mask(mask, origin, min_area=30):
 
     rect = cv2.minAreaRect(largest)
     (rw, rh), angle = rect[1], rect[2]
+    corners = np.intp(cv2.boxPoints(rect)) + list(origin)
+    longer, shorter = max(rw, rh), min(rw, rh)
+    if shorter <= 0.0 or longer / shorter < min_aspect:
+        return None, corners
     if rw < rh:
         angle += 90.0
-    return angle, np.intp(cv2.boxPoints(rect)) + list(origin)
+    return angle, corners
 
 
 def object_axis_angle(image, depth, box, z_ref, depth_scale, depth_tol=0.03):
@@ -121,6 +145,13 @@ def object_axis_angle(image, depth, box, z_ref, depth_scale, depth_tol=0.03):
     angle, corners = axis_from_mask(mask, (x1, y1))
     if angle is not None:
         return angle, corners, 'depth'
+    if corners is not None:
+        # The depth blob is there and it is round. Falling through to
+        # intensity would just find another arbitrary angle on the same
+        # round thing, and the bbox fallback below would invent one from
+        # the box. No axis is the honest answer, and the orchestrator
+        # already reads "no axis" as yaw 0 rather than guessing.
+        return None, corners, 'round'
 
     gray = cv2.cvtColor(image[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -348,7 +379,9 @@ def render_debug(color, depth, items, prompt, hud=(), dashboard=False,
             f'#{index} {label}  d={record["depth_m"]:.3f}m',
             f'xyz {wx:+.3f} {wy:+.3f} {wz:+.3f}',
             (f'yaw {math.degrees(yaw):+.1f}deg' if yaw is not None
-             else 'yaw unavailable') + f'  img {record["image_angle_deg"]:+.0f}',
+             else 'no axis')
+            + ('' if record['image_angle_deg'] is None
+               else f'  img {record["image_angle_deg"]:+.0f}'),
             f'axis={record["axis_source"]}  depth_px={record["depth_px"]}',
         ]
         # Below the box when there is room, above it otherwise.

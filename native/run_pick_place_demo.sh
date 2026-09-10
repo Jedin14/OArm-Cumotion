@@ -3,9 +3,19 @@
 # The whole thing in one command: robot, MoveIt, cuMotion, camera, the PaliGemma
 # detector, the pick-and-place orchestrator, and the panel you type into.
 #
-#   native/run_pick_place_demo.sh
-#   native/run_pick_place_demo.sh --fake                     # rehearsal
+#   native/run_pick_place_demo.sh                # everything, incl. the web UI
+#   native/run_pick_place_demo.sh --fake         # rehearsal, no arms, no CAN
+#   native/run_pick_place_demo.sh --no-can       # do not touch the interfaces
 #   native/run_pick_place_demo.sh arm:=left
+#
+# The web UI comes up on http://<this machine>:8088 -- open it from wherever
+# you are sitting. web:=false leaves it out, ui:=true brings back the old Tk
+# panel as well.
+#
+# grasp_model:=true also starts the GraspNet server, which publishes ranked
+# 6-DoF grasps on /grasp/candidates. It only publishes; nothing acts on them
+# unless use_grasp_model is on too. Fetch it first with
+# grasp/fetch_graspnet.sh.
 #
 # Any pick_place_demo.launch.py argument can be appended; --show-args lists them.
 #
@@ -22,18 +32,17 @@
 # and object_moved_eps:=0.0 for that reason and no other -- never pass those on
 # real hardware, they are exactly what makes the retries work.
 #
-# Bring the CAN interfaces up first -- still the one part that needs root,
-# because it configures kernel network devices:
+# The CAN interfaces are brought up here, which needs root -- configuring a
+# kernel network device does. Expect one sudo prompt on a cold boot and none
+# afterwards, because an interface already up at the right bitrate is left
+# alone. --no-can skips it, --fake does not need it.
 #
-#   sudo ip link set can0 down
-#   sudo ip link set can0 type can bitrate 1000000 dbitrate 5000000 fd on
-#   sudo ip link set can0 up
-#   sudo ip link set can1 down
-#   sudo ip link set can1 type can bitrate 1000000 dbitrate 5000000 fd on
-#   sudo ip link set can1 up
+# Run this on the machine the arms are wired to. Over a remote mount the sudo
+# would authenticate on the wrong host and the CAN devices would not be there
+# to configure.
 #
-# Everything below is a check that turns a confusing downstream failure into one
-# line of text. None of it starts anything.
+# Everything else below is a check that turns a confusing downstream failure
+# into one line of text. None of it starts anything.
 set -eo pipefail
 
 NATIVE_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -66,9 +75,13 @@ fi
 # caller writes after --fake still wins: a repeated launch argument takes its
 # last value.
 FAKE_HARDWARE=false
+BRING_CAN_UP=true
 ARGS=()
 for arg in "$@"; do
     case "${arg}" in
+        --no-can)
+            BRING_CAN_UP=false
+            ;;
         --fake|--sim)
             FAKE_HARDWARE=true
             ARGS+=(use_fake_hardware:=true
@@ -85,6 +98,27 @@ for arg in "$@"; do
     esac
 done
 
+# The bitrates the arms run at. Both interfaces, both arms, every time --
+# these are a property of the hardware, not a choice.
+CAN_BITRATE=1000000
+CAN_DBITRATE=5000000
+
+can_is_up() {
+    ip link show "$1" 2>/dev/null | grep -q "state UP"
+}
+
+bring_can_up() {
+    local iface="$1"
+    echo "bringing ${iface} up at ${CAN_BITRATE}/${CAN_DBITRATE} (needs sudo)"
+    # Down first: the bitrate of a running interface cannot be changed, and
+    # setting it on one that is already up fails with a bare "Device or
+    # resource busy". Down on an already-down interface is harmless.
+    sudo ip link set "${iface}" down \
+        && sudo ip link set "${iface}" type can \
+               bitrate "${CAN_BITRATE}" dbitrate "${CAN_DBITRATE}" fd on \
+        && sudo ip link set "${iface}" up
+}
+
 if [[ "${FAKE_HARDWARE}" == false ]]; then
     for iface in can0 can1; do
         if ! ip link show "${iface}" &> /dev/null; then
@@ -93,14 +127,31 @@ if [[ "${FAKE_HARDWARE}" == false ]]; then
             echo "  native/run_pick_place_demo.sh --fake" >&2
             exit 1
         fi
-        if ! ip link show "${iface}" | grep -q "state UP"; then
-            echo "error: ${iface} is down. Bring it up with:" >&2
+        if can_is_up "${iface}"; then
+            continue
+        fi
+        if [[ "${BRING_CAN_UP}" == false ]]; then
+            echo "error: ${iface} is down and --no-can was given. Either drop" >&2
+            echo "--no-can, or bring it up yourself with:" >&2
             echo >&2
             echo "  sudo ip link set ${iface} down" >&2
-            echo "  sudo ip link set ${iface} type can bitrate 1000000 dbitrate 5000000 fd on" >&2
+            echo "  sudo ip link set ${iface} type can bitrate ${CAN_BITRATE} dbitrate ${CAN_DBITRATE} fd on" >&2
             echo "  sudo ip link set ${iface} up" >&2
             exit 1
         fi
+        if ! bring_can_up "${iface}"; then
+            echo "error: could not bring ${iface} up." >&2
+            echo "If sudo asked for a password and did not get one, run the" >&2
+            echo "three commands by hand -- they are in the README -- or add" >&2
+            echo "an /etc/sudoers.d rule for 'ip link set can*'." >&2
+            exit 1
+        fi
+        if ! can_is_up "${iface}"; then
+            echo "error: ${iface} still reports down after being brought up." >&2
+            echo "Usually the adapter: check 'dmesg | tail' and the cabling." >&2
+            exit 1
+        fi
+        echo "  ${iface} is up"
     done
 fi
 

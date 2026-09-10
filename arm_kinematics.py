@@ -84,6 +84,37 @@ def axis_matrix(axis, angle):
     return np.eye(3) + math.sin(angle) * K + (1.0 - math.cos(angle)) * (K @ K)
 
 
+def principal_rotation(kind, angle):
+    """Rotation about +x (0), +y (1) or +z (2), filled directly.
+
+    The general Rodrigues form in axis_matrix costs about ten numpy calls;
+    this costs one array build. Worth having because every joint on this arm
+    turns about a principal axis of its own frame, and the rotation is
+    rebuilt inside pose() -- which the numerical Jacobian calls eight times
+    per iteration, eighty iterations per seed, forty-eight seeds per
+    orientation probed.
+    """
+    np = _need_numpy()
+    c, s = math.cos(angle), math.sin(angle)
+    if kind == 0:
+        return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+    if kind == 1:
+        return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def principal_axis(axis):
+    """(which principal axis this is, whether it points backwards) or None.
+
+    None for a genuinely oblique axis, which then takes the general path.
+    """
+    for index in range(3):
+        others = [abs(axis[other]) for other in range(3) if other != index]
+        if abs(abs(axis[index]) - 1.0) < 1e-9 and max(others) < 1e-9:
+            return index, axis[index] < 0.0
+    return None
+
+
 def quat_matrix(quat):
     """Rotation matrix from (x, y, z, w)."""
     np = _need_numpy()
@@ -171,6 +202,9 @@ class ArmChain:
         self._chains = {link: self._chain_to(link)
                         for link in (self.tool_link, self.wrist_link,
                                      self.forearm_link)}
+        # Filled on first use by pose(), which is where the shape of a chain
+        # actually costs anything.
+        self._compiled = {}
         self.wrist_lever = self._measure_lever()
 
     def _chain_to(self, link):
@@ -192,26 +226,68 @@ class ArmChain:
 
     # -- kinematics -------------------------------------------------------
 
-    def pose(self, link, q):
-        """World 4x4 of `link` at joint vector `q` (joint1..joint7)."""
+    def compiled(self, link):
+        """The chain to `link` as fixed transforms with joints between them.
+
+        T = F0 . R(qa) . F1 . R(qb) . ... . Fn, with every fixed piece built
+        once here and runs of them multiplied together. A 28-entry chain
+        with seven joints in it then costs seven rotations and eight matrix
+        multiplies per pose instead of twenty-eight of each.
+
+        Worth the machinery because pose() is the innermost function of the
+        whole reach check: the numerical Jacobian calls it eight times per
+        iteration, up to eighty iterations per seed, forty-eight seeds per
+        orientation, ten orientations per pre-flight. Measured on this
+        description, compiling took a pose from 89 to 24 us.
+        """
         np = _need_numpy()
-        angles = dict(zip(self.joint_names, [float(v) for v in q]))
-        chain = self._chains.get(link) or self._chain_to(link)
-        T = np.eye(4)
-        for entry in chain:
+        steps, fixed = [], np.eye(4)
+        for entry in (self._chains.get(link) or self._chain_to(link)):
             L = np.eye(4)
             L[:3, :3] = rpy_matrix(*entry['rpy'])
             L[:3, 3] = entry['xyz']
-            value = angles.get(entry['name'], 0.0)
-            if entry['type'] in ('revolute', 'continuous'):
-                R = np.eye(4)
-                R[:3, :3] = axis_matrix(entry['axis'], value)
-                L = L @ R
-            elif entry['type'] == 'prismatic':
-                R = np.eye(4)
-                R[:3, 3] = [v * value for v in entry['axis']]
-                L = L @ R
-            T = T @ L
+            fixed = fixed @ L
+            if entry['type'] in ('revolute', 'continuous', 'prismatic'):
+                index = (self.joint_names.index(entry['name'])
+                         if entry['name'] in self.joint_names else None)
+                steps.append({
+                    'fixed': fixed,
+                    'type': entry['type'],
+                    'axis': np.asarray(entry['axis'], dtype=float),
+                    'index': index,
+                    'principal': principal_axis(entry['axis']),
+                })
+                fixed = np.eye(4)
+        steps.append({'fixed': fixed, 'type': None})
+        return steps
+
+    def pose(self, link, q):
+        """World 4x4 of `link` at joint vector `q` (joint1..joint7)."""
+        steps = self._compiled.get(link)
+        if steps is None:
+            steps = self._compiled[link] = self.compiled(link)
+        T = steps[0]['fixed'].copy()
+        for i in range(len(steps) - 1):
+            step = steps[i]
+            index = step['index']
+            value = float(q[index]) if index is not None else 0.0
+            if step['type'] == 'prismatic':
+                # A pure translation along the joint axis, expressed in the
+                # frame the arm has reached: the rotation is untouched.
+                T[:3, 3] = T[:3, 3] + T[:3, :3] @ (step['axis'] * value)
+            else:
+                principal = step['principal']
+                if principal is None:
+                    R = axis_matrix(step['axis'], value)
+                else:
+                    kind, flip = principal
+                    R = principal_rotation(kind, -value if flip else value)
+                # T @ [[R, 0], [0, 1]] touches the rotation block alone, so
+                # this is a 3x3 multiply rather than a 4x4 one.
+                T[:3, :3] = T[:3, :3] @ R
+            # The next fixed piece, which is already one matrix however
+            # many links it was built from.
+            T = T @ steps[i + 1]['fixed']
         return T
 
     def _joint_frames(self, q):

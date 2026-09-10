@@ -17,7 +17,8 @@ sys.path.insert(0, WS)
 
 import numpy as np                                              # noqa: E402
 
-from arm_kinematics import (ArmChain, chain_from_urdf,           # noqa: E402
+from arm_kinematics import (ArmChain, axis_matrix,               # noqa: E402
+                            chain_from_urdf, principal_axis,
                             quat_matrix, rpy_matrix)
 
 FAILURES = []
@@ -328,6 +329,56 @@ def main():
           float(np.abs(quat_matrix((0.0, 2.0, 0.0, 0.0))
                        - quat_matrix((0.0, 1.0, 0.0, 0.0))).max()), 0.0,
           tol=1e-12)
+
+    # -- the compiled chain ------------------------------------------------
+    #
+    # pose() no longer walks the URDF chain: it walks a compiled form where
+    # runs of fixed links are pre-multiplied and each joint is a principal
+    # rotation applied to the rotation block alone. Four times faster, and
+    # worth nothing at all if it is not the same answer -- so it is checked
+    # against the straightforward walk rather than against itself.
+    def plain_pose(chain_, link, q):
+        angles = dict(zip(chain_.joint_names, [float(v) for v in q]))
+        entries = chain_._chains.get(link) or chain_._chain_to(link)
+        T = np.eye(4)
+        for entry in entries:
+            L = np.eye(4)
+            L[:3, :3] = rpy_matrix(*entry['rpy'])
+            L[:3, 3] = entry['xyz']
+            value = angles.get(entry['name'], 0.0)
+            if entry['type'] in ('revolute', 'continuous'):
+                R = np.eye(4)
+                R[:3, :3] = axis_matrix(entry['axis'], value)
+                L = L @ R
+            elif entry['type'] == 'prismatic':
+                R = np.eye(4)
+                R[:3, 3] = [v * value for v in entry['axis']]
+                L = L @ R
+            T = T @ L
+        return T
+
+    rng = np.random.default_rng(7)
+    worst = 0.0
+    for arm_chain in (chain, left):
+        links = [arm_chain.tool_link, arm_chain.wrist_link,
+                 arm_chain.forearm_link, f'openarm_{arm_chain.arm}_link3']
+        for _ in range(60):
+            q = rng.uniform(arm_chain.limits[:, 0], arm_chain.limits[:, 1])
+            for link in links:
+                worst = max(worst, float(np.abs(
+                    plain_pose(arm_chain, link, q)
+                    - arm_chain.pose(link, q)).max()))
+    check('the compiled chain agrees with walking the URDF', worst, 0.0,
+          tol=1e-12)
+    steps = [s for s in chain.compiled(chain.tool_link) if s['type']]
+    check('with one step per joint', len(steps), 7)
+    check('and every one of them on a principal axis, which is what the '
+          'fast rotation needs',
+          [s['principal'] is None for s in steps], [False] * 7)
+    check('a backwards axis is spotted as such',
+          principal_axis([-1.0, 0.0, 0.0]), (0, True))
+    check('and an oblique one is left to the general path',
+          principal_axis([0.6, 0.8, 0.0]), None)
 
     # -- graceful failure --------------------------------------------------
     check('a description without this arm gives None, not an exception',

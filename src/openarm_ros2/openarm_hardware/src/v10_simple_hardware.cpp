@@ -251,8 +251,21 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_activate(
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   openarm_->recv_all();
 
-  // Return to zero position
-  return_to_zero();
+  // Hold the arm where it is, rather than driving it anywhere.
+  //
+  // This used to call return_to_zero(), which interpolates every joint to
+  // zero over 2.4 seconds -- unplanned, uncollision-checked, and from
+  // wherever the arm happens to be standing. On a cold bringup that is a
+  // surprise. After a disengage it is worse: these are direct-drive motors
+  // with no brakes, so the arm has sagged under its own weight, and
+  // activating it made the arm jump. Measured on the robot; it jumped.
+  //
+  // Seeding the command with the measured state means the very first write()
+  // asks for the position the arm is already in, so enabling is only
+  // enabling -- red light to green light and nothing else. Moving it
+  // somewhere afterwards is then a planned motion like any other, which is
+  // what /pick_place/engage does once this returns.
+  hold_current_position();
 
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"), "OpenArm V10 activated");
   return CallbackReturn::SUCCESS;
@@ -361,6 +374,39 @@ hardware_interface::return_type OpenArm_v10HW::write(
   return hardware_interface::return_type::OK;
 }
 
+void OpenArm_v10HW::hold_current_position() {
+  // Read where the motors actually are, and make that the command. Nothing
+  // moves: the position error the controller sees is zero, so the MIT
+  // command is the arm's own weight and nothing more.
+  //
+  // Both buffers, because a command left at its resize() default of 0.0 is
+  // the jump this exists to prevent -- the first write() after activation
+  // would ask for zero on every joint.
+  openarm_->refresh_all();
+  openarm_->recv_all();
+
+  const auto& arm_motors = openarm_->get_arm().get_motors();
+  for (size_t i = 0; i < ARM_DOF && i < arm_motors.size(); ++i) {
+    pos_states_[i] = arm_motors[i].get_position();
+    pos_commands_[i] = pos_states_[i];
+  }
+
+  if (hand_ && joint_names_.size() > ARM_DOF) {
+    const auto& gripper_motors = openarm_->get_gripper().get_motors();
+    if (!gripper_motors.empty()) {
+      pos_states_[ARM_DOF] =
+          motor_radians_to_joint(gripper_motors[0].get_position());
+      pos_commands_[ARM_DOF] = pos_states_[ARM_DOF];
+    }
+  }
+
+  RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+              "Holding the posture the arm was already in");
+}
+
+// Kept, and deliberately not called from on_activate any more -- see there.
+// Still the right thing for anything that genuinely wants the arm folded up
+// and can guarantee the path is clear.
 void OpenArm_v10HW::return_to_zero() {
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
               "Returning to zero position...");

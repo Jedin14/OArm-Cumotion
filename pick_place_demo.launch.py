@@ -46,11 +46,13 @@ WS = os.path.dirname(os.path.realpath(__file__))
 
 # Passed straight through to pick_place.launch.py, which declares the rest.
 FORWARDED = ['arm', 'arm_selection', 'prompt', 'states_file', 'place_mode',
+             'pick_place_config',
              'approach_height',
              'velocity_scaling', 'acceleration_scaling', 'gripper_max_effort',
              'detection_reuse_age', 'grasp_finger_min', 'object_moved_eps',
              'grasp_z_offset', 'grasp_max_depth', 'descend_close_gap',
              'descend_gap_max', 'home_requires_pre_pick',
+             'disengage_on_failure',
              'refresh_octomap_at_home', 'use_table_collision', 'table_z']
 
 
@@ -63,9 +65,10 @@ def generate_launch_description():
             description='Which arm picks. Also decides cuMotion\'s tool_frame.'),
         DeclareLaunchArgument(
             'arm_selection', default_value='by_side',
-            description='"by_side" chooses the arm before moving -- the half '
-                        'of the camera frame the object is in, and whichever '
-                        'arm can reach it. "fixed" always uses arm.'),
+            description='"by_side" takes the half of the camera frame the '
+                        'object is in -- fast, and right nearly every time. '
+                        '"by_reach" asks the solvers which arm can reach '
+                        'first, which is slow. "fixed" always uses arm.'),
         DeclareLaunchArgument(
             'prompt', default_value='detect screwdriver',
             description='Initial detector prompt. The panel overrides it.'),
@@ -121,8 +124,31 @@ def generate_launch_description():
             'left_can_interface', default_value='can1',
             description='CAN interface for the left arm.'),
         DeclareLaunchArgument(
-            'ui', default_value='true',
-            description='Start the panel. false leaves the service interface.'),
+            'ui', default_value='false',
+            description='Start the old Tk panel as well. The web UI '
+                        'supersedes it; this is here for a machine with no '
+                        'browser to hand.'),
+        DeclareLaunchArgument(
+            'grasp_model', default_value='false',
+            description='Start the GraspNet server, which publishes ranked '
+                        '6-DoF grasps on /grasp/candidates. Off by default: '
+                        'it is third-party, noncommercial-licensed, and has '
+                        'to be fetched with grasp/fetch_graspnet.sh first. '
+                        'Publishing is harmless -- nothing acts on it unless '
+                        'use_grasp_model is also on.'),
+        DeclareLaunchArgument(
+            'web', default_value='true',
+            description='Start the web UI. Reachable from any machine on the '
+                        'network, which is the point -- the workspace lives '
+                        'on the robot and is driven from elsewhere.'),
+        DeclareLaunchArgument(
+            'web_port', default_value='8088',
+            description='Port the web UI listens on.'),
+        DeclareLaunchArgument(
+            'pick_place_config', default_value='pick_place_config.json',
+            description='Where the editable sequence and the UI-settable '
+                        'parameters are saved. Read at bringup, so a run '
+                        'starts where the last one left off.'),
         DeclareLaunchArgument(
             'detection_reuse_age', default_value='10.0',
             description='How old a detection may be and still be picked from '
@@ -149,11 +175,19 @@ def generate_launch_description():
                         'tool may be commanded, metres. The floor '
                         'min_grasp_z is not.'),
         DeclareLaunchArgument(
-            'descend_close_gap', default_value='false',
+            'descend_close_gap', default_value='true',
             description='Fly the remainder when the descent stops short of '
                         'the grasp -- straight down the same line, as a '
-                        'continuation of the one descent. Off by default; '
-                        'no measured grasp has needed it.'),
+                        'continuation of the one descent. On since run '
+                        '1789014831, where the two descents that missed '
+                        'stopped 18 mm out with 15 mm of it height and the '
+                        'jaws closed on air; the two that gripped stopped '
+                        'within 4 mm.'),
+        DeclareLaunchArgument(
+            'disengage_on_failure', default_value='true',
+            description='Take the motors off after a failed cycle has parked '
+                        'the arm somewhere checked. No brakes on these '
+                        'motors, so the arm is then held up by nothing.'),
         DeclareLaunchArgument(
             'home_requires_pre_pick', default_value='true',
             description='Refuse HOME when pre_pick could not be reached on '
@@ -185,9 +219,37 @@ def generate_launch_description():
 
     pick_place = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(WS, 'pick_place.launch.py')),
-        launch_arguments={
-            name: LaunchConfiguration(name) for name in FORWARDED
-        }.items(),
+        launch_arguments=dict(
+            {name: LaunchConfiguration(name) for name in FORWARDED},
+            # Under a different name at each end, so it cannot be forwarded
+            # by the list above: the robot layer calls it use_fake_hardware
+            # and the orchestrator calls it fake_hardware. It has to get
+            # there, though -- it is what stops a rehearsal's saved
+            # grasp_finger_min=-1.0 being honoured on the arms.
+            fake_hardware=LaunchConfiguration('use_fake_hardware'),
+        ).items(),
+    )
+
+    # Its own process and its own environment, like the detector: the torch
+    # the CUDA extensions were compiled against is not cuRobo's.
+    grasp = ExecuteProcess(
+        cmd=[os.path.join(WS, 'grasp', 'run_grasp_server.sh')],
+        name='grasp_server',
+        output='screen',
+        additional_env={'PYTHONUNBUFFERED': '1'},
+        condition=IfCondition(LaunchConfiguration('grasp_model')),
+    )
+
+    web = ExecuteProcess(
+        cmd=['python3', os.path.join(WS, 'pick_place_web.py'),
+             '--port', LaunchConfiguration('web_port')],
+        name='pick_place_web',
+        output='screen',
+        additional_env={
+            'PICK_PLACE_CONFIG': LaunchConfiguration('pick_place_config'),
+            'PYTHONUNBUFFERED': '1',
+        },
+        condition=IfCondition(LaunchConfiguration('web')),
     )
 
     ui = ExecuteProcess(
@@ -201,4 +263,5 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('ui')),
     )
 
-    return LaunchDescription(declarations + [robot, pick_place, ui])
+    return LaunchDescription(
+        declarations + [robot, pick_place, grasp, web, ui])
