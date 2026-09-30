@@ -360,11 +360,29 @@ class VlmDetectorNode(Node):
             self.depth_scale, self.min_depth, self.max_depth,
             self.get_parameter('axis_depth_tolerance').value)
 
+        # Why a box did not become a detection. The model always answers
+        # something, so "nothing detected" is nearly always "something was
+        # found and thrown away" -- and which of the reasons it was decides
+        # what to do about it. Without this the orchestrator reports an
+        # empty frame and there is nothing to act on.
+        rejected = []
+        for _corners, record in corners_by_index:
+            if record.get('point') is not None:
+                continue
+            rejected.append({
+                'bbox_px': record.get('bbox_px'),
+                'why': record.get('rejected') or 'no usable depth in the box',
+            })
+
         now = self.get_clock().now()
         payload = {
             'stamp': now.nanoseconds * 1e-9,
             'frame_id': self.target_frame,
             'prompt': prompt,
+            # What the model returned, and what happened to the boxes that
+            # did not survive.
+            'raw': len(raw),
+            'rejected': rejected,
             # Needed to say which half of the camera view a detection is in,
             # which is how the orchestrator picks an arm. center_px on its own
             # cannot answer that without knowing the frame width.

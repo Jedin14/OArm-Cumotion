@@ -64,10 +64,221 @@ ORCHESTRATOR_ARGS = [
      'YAML of poses recorded by record_states.py; "auto" means '
      'pick_place_states_<arm>.yaml. pre_pick_state is always needed; '
      'drop_state is needed when place_mode is "state".'),
-    ('place_mode', 'state',
-     '"state" releases at the recorded drop_state; "ready" releases at the '
-     'observation pose; "position" moves over place_position and releases '
-     'there.'),
+    ('place_mode', 'detected',
+     'Where the object is put down. "detected", the default, looks for '
+     'place_prompt and puts it on top of whatever it finds -- a sheet of '
+     'paper on the table is then a drop point that can be moved by moving '
+     'the sheet. "state" releases at the recorded drop_state; "home" '
+     'releases at the observation pose; "position" moves over '
+     'place_position and releases there.'),
+    ('place_prompt', 'piece of paper',
+     'place_mode "detected": what the drop surface is called. Asked of the '
+     'same detector the pick uses, so a sheet of paper on the table is a '
+     'drop point that can be moved by moving the sheet. Measured on this '
+     'camera: the model answers "piece of paper" where it answers neither '
+     '"paper" nor "white paper".'),
+    ('place_max_drop', '0.010',
+     'The most the object\'s own base may be above the sheet when the jaws '
+     'open, metres. Not a tolerance on the descent -- the height of the '
+     'thing being put down, which is what "do not drop it" means. '
+     'place_clearance is the deliberate part of this budget; whatever the '
+     'descent falls short by comes out of the same one, and the place '
+     'refuses rather than letting go from higher.'),
+    ('place_clearance', '0.005',
+     'The gap left *under the object* when it is let go, metres. How far '
+     'the object hangs below the tool is not a guess: the pick measured it '
+     '-- the tool gripped at a known height above the surface the object '
+     'was standing on -- so the tool goes that much plus this above the '
+     'sheet. Without that measurement it falls back to being clearance for '
+     'the tool, which is what it used to mean.'),
+    ('place_edge_margin', '0.04',
+     'How far inside the sheet\'s own edge a fallback drop point sits, '
+     'metres. Only used when the middle of the sheet cannot be reached: '
+     'anywhere on the paper will do, but the object has to land on it and '
+     'its own width is not known, so the point is pulled well in.'),
+    ('place_speed', '0.2',
+     'Speed cap for the descent onto the drop surface and the retreat off '
+     'it, as a share of the joint limits. A cap and not a factor -- a cycle '
+     'already slower than this keeps its own speed.'),
+    ('place_ignores_octomap', 'true',
+     'Skip collision checking on the straight vertical leg onto the drop '
+     'surface. That surface is in the octomap exactly as the object being '
+     'picked up is, so a checked line onto it stalls a centimetre short for '
+     'the same reason -- see descend_ignores_octomap.'),
+    ('place_after_pick', 'false',
+     'Whether one press of Pick also places. Off: pick and place are two '
+     'operator actions, and between them the arm stands at the staging pose '
+     'holding the object, which is what the Place button then puts down. On '
+     'restores the single uninterrupted cycle.'),
+    ('boot_walk', 'true',
+     'At bringup, walk both arms to boot_pose and wait there. That is where '
+     'an arm should be waiting -- the alternative is the posture the last '
+     'run left it in, which after a failure is somewhere over the table, '
+     'held up by nothing. Slow, to a recorded posture, as a joint goal, '
+     'skipped for an arm with no recording, and refused if anything else '
+     'is running.'),
+    ('boot_pose', 'pre_pick',
+     'Where they wait: "pre_pick" or "home". The staging pose is the '
+     'default because it is where the approach starts, so a Pick pressed '
+     'from there begins with the transit. The boot walk goes via HOME and '
+     'maps the work area on the way through, because HOME is the one pose '
+     'the map can be captured from without the robot in it.'),
+    ('boot_via_home', 'false',
+     'Whether the boot walk folds down to HOME to capture the map before '
+     'going to where the arms wait. On, because on this robot the '
+     'self-filter does not remove the grippers: measured, a map captured '
+     'at the staging pose left all four fingers in it as obstacles, and '
+     '/check_state_validity then called both arms invalid -- after which '
+     'nothing plans, not even a goal to the arm\'s own posture. That is '
+     'now handled by gripper_never_in_map instead of by moving the robot '
+     'out of the way, so this is off; capture_octomap still drops a map '
+     'that caught anything other than the grippers.'),
+    ('cartesian_boost_max', '3.0',
+     'How much faster than /compute_cartesian_path timed it a straight '
+     'line may be flown. 1.0 flies it exactly as timed, which is what it '
+     'used to do. It exists because the two halves of a cycle are timed by '
+     'different things: cuMotion times the joint goals from its own '
+     'limits, MoveIt times the straight lines from joint_limits.yaml, and '
+     'that file sets has_acceleration_limits false for every joint on this '
+     'robot. Measured, run 1789640514: four TRANSIT legs at 11.2-11.6 s '
+     'and a peak of 0.8 rad/s^2, against joint goals in the same run '
+     'peaking at 3.4-5.4 rad/s^2 and finishing inside 3.5 s.'),
+    ('cartesian_vel_max', '2.5',
+     'Speed ceiling for a sped-up straight line, rad/s. Set against what '
+     'the joint goals already reach on this arm -- a measured 1.73 rad/s '
+     '-- so a straight line works about as hard as a free-space move '
+     'already does and no harder.'),
+    ('cartesian_accel_max', '4.0',
+     'Acceleration ceiling for the same, rad/s^2, against a measured 5.4 '
+     'on the joint goals. Lower both if the contact guard starts tripping '
+     'on the robot\'s own moves: it watches torque, and torque follows '
+     'acceleration.'),
+    ('motion_start_timeout', '12.0',
+     'How long a goal move_group has accepted may sit without the arm '
+     'moving before it is cancelled and retried. 0 waits out the whole of '
+     'motion_timeout, which is what it used to do -- measured, run '
+     '1789640514: a staging goal sat 59.9 s with every joint inside 0.01 '
+     'rad of where it started and then reported a failure that is not '
+     'retryable, so the cycle gave up on a goal that was never tried.'),
+    ('place_retreat_speed', '0.5',
+     'Speed for the leg that comes back up off the drop surface, once the '
+     'object is down and the jaws are open around it. It was flown at '
+     'place_speed, which is the speed for lowering something and the wrong '
+     'answer here: what the retreat has to be is vertical, and that is the '
+     'column it flies rather than its speed. Measured 7.2 s at 0.14 rad/s '
+     'on a leg carrying nothing.'),
+    ('carry_side_refuse', '0.25',
+     'How far into the other arm\'s half a carry may cross before the '
+     'guard refuses instead of preferring. Under it, the best of the '
+     'plans is flown and the crossing is reported; over it, the arm stops '
+     'and says so. A guard that vetoes leaves the arm stranded over the '
+     'table holding something, which is worse than the swing it avoided.'),
+    ('use_home', 'false',
+     'Whether HOME may be commanded at all. Off -- the default -- makes '
+     'the staging pose the rest pose, the observation pose and the place '
+     'a cycle returns to, and nothing drives to HOME. HOME is a folded '
+     'posture on the far side of the workspace and every trip to it is a '
+     'long swing that buys nothing left to buy: the map is captured from '
+     'wherever the arms stand (gripper_never_in_map covers the gripper, '
+     'robot_in_map throws away a map that caught anything else), the '
+     'detector looks from staging, and a cycle already starts and ends '
+     'there. It is also a posture this robot cannot reach -- joint4\'s '
+     'HOME value sits against its lower limit and the elbow stops short '
+     'of it, which is why the arrival check needed slack of its own to '
+     'pass. On restores it for a stack that wants the fold-away.'),
+    ('carry_guard', 'true',
+     'Carrying something back to the staging pose, keep the tool out of '
+     'the other arm\'s half of the workspace. The goal cannot say this -- '
+     'the staging pose is on this arm\'s own side whichever way round the '
+     'arm reaches it -- and the planner takes no path constraints, so the '
+     'plan is asked for, measured with the arm\'s own kinematics and flown '
+     'only if it stays put. It matters because the other arm is parked '
+     'over there, in the air, and the octomap is of the table.'),
+    ('carry_guard_tries', '3',
+     'How many plans to ask for before giving up on finding one that '
+     'stays on this arm\'s own side. Worth more than one because '
+     'cuMotion\'s optimiser is stochastic: the same goal gives a '
+     'different path.'),
+    ('carry_side_slack', '0.02',
+     'How far over the line still counts as staying on this side, metres. '
+     'Slack for the tool\'s own width and for the difference between the '
+     'plan and what the arm tracks, not a licence to cross.'),
+    ('place_above_tolerance', '0.12',
+     'How far off the point above the drop surface the tool may land and '
+     'still count as having got there, metres. Coarse on purpose: the leg '
+     'straight after it measures where the tool actually is and closes '
+     'the gap horizontally before anything descends. What it is really '
+     'for is the arm that has not moved at all.'),
+    ('arrival_progress', '0.05',
+     'Past that tolerance, how much of the distance a move had to cover '
+     'it must have covered to count, metres. The failure worth stopping '
+     'for is an arm that has not gone anywhere, not one that has gone '
+     'nearly all the way: measured, the miss this guard exists for closed '
+     '0 mm of 300, and the three places it wrongly threw away closed 198.'),
+    ('gripper_never_in_map', 'true',
+     'Exempt the three gripper links from colliding with the octomap for '
+     'the whole session, not just during the descent. The gripper stands '
+     'in the camera view at the staging pose, so it lands in any map '
+     'captured from there -- and an arm inside its own map cannot plan at '
+     'all. Its own geometry is never an obstacle worth planning around: it '
+     'is the part doing the grasping, the SRDF checks it against the rest '
+     'of the robot, and what it runs into is what the contact guard is '
+     'for. The forearm and upper arm stay checked against the map.'),
+    ('recover_after_contact', 'true',
+     'After a torque trip: take the motors off, let the arm settle off '
+     'whatever it hit, put them back on, and glide slowly to the staging '
+     'pose so the next cycle is a press away. Off leaves the arm limp '
+     'where it settled, which needs a bringup restart.'),
+    ('contact_relax_seconds', '3.0',
+     'How long the motors stay off during that recovery. The point of '
+     'letting go is to come off what the arm is leaning on, and that takes '
+     'a moment of gravity. It is held up by nothing for this long.'),
+    ('boot_other_arm', 'pre_pick',
+     'Where the arm that is not picking waits: "pre_pick", "home" or '
+     '"leave". Both at the staging pose by default -- the two staging '
+     'poses are mirror images about 35 cm apart, and an arm carrying '
+     'something to its own staging pose passes the other one -- measured, '
+     'the staging goal came back INVALID_MOTION_PLAN three times with the '
+     'object in the jaws. That is the planner doing its job: the other arm '
+     'is a real robot link, not a voxel, and no self-filtering makes it '
+     'go away. If it recurs, re-record the two staging poses further '
+     'apart, or use "home" here.'),
+    ('grasp_table_clearance', '0.005',
+     'How close to the surface the object is standing on the jaws may '
+     'close, metres. This is the floor that stops a deeper grasp pressing '
+     'into the table, and the surface is measured per detection -- the '
+     'depth of the ring around the object -- rather than configured. With '
+     'it, a negative grasp_z_offset reaches down the side of the object '
+     'for a firmer grip instead of closing on its top face.'),
+    ('locate_from_staging', 'true',
+     'Whether a cycle that starts with the arm already at the staging pose '
+     'looks from there instead of folding down to HOME and back -- about '
+     'ten seconds each way. What it gives up: the map is not refreshed, '
+     'and the arm is in the picture. A detection that lands on the gripper '
+     'is refused (self_detect_radius) and the look is taken again from '
+     'HOME, so the failure costs one inference rather than a bad grasp.'),
+    ('self_detect_radius', '0.15',
+     'How close to the tool a detection has to be before it is the robot '
+     'rather than the object, metres. The jaws span 44 mm and the hand is '
+     'about 150 mm long, so anything inside that of the tool centre is the '
+     'camera looking at the gripper. 0 turns the check off.'),
+    ('boot_speed', '0.15',
+     'Speed cap for the boot walk, as a share of the joint limits. Nobody '
+     'pressed anything to start this move, so it is the slowest one the '
+     'robot makes.'),
+    ('boot_delay', '8.0',
+     'Seconds after bringup before the boot walk starts looking for the '
+     'planner. Not a correctness requirement -- nothing is sent until a '
+     'plan-only probe comes back -- it just keeps the log quiet for the '
+     'first few seconds.'),
+    ('boot_planner_wait', '180.0',
+     'How long the boot walk waits for the planner to become usable before '
+     'giving up and leaving the arms where they are. move_group being in '
+     'the graph is not the same as move_group being able to take a goal: '
+     'measured on a cold bringup, the first goal it accepted came 77 s '
+     'after the node started, and goals sent before that were refused and '
+     'then executed a minute later -- an arm moving while the panel says '
+     'IDLE.'),
     ('place_position', '[0.35, 0.30, 0.25]',
      'Where to drop the object, xyz in the world frame. Only used when '
      'place_mode is "position". Measure this in RViz.'),
@@ -154,21 +365,32 @@ ORCHESTRATOR_ARGS = [
      'Not called config_file: realsense2_camera declares one of those and '
      'opens it as YAML, and launch configurations reach into included '
      'launch files.'),
-    ('grasp_z_offset', '0.010',
-     'Added to the detected top of the object to get the grasp height. '
-     'Positive: the tool stops above it. Measured grips came in at 14.7 mm '
-     'and 25 mm above the detected top, both with the arm stopping short of '
-     'its command, so there is real tolerance here -- what the jaws do not '
-     'tolerate is being sent below the object. A negative value was what '
-     'pressed the tool into the table once the arm started tracking its '
-     'trajectory properly.'),
-    ('disengage_on_failure', 'true',
+    ('grasp_z_offset', '-0.030',
+     'Added to the *top* of the object to get the grasp height, metres. '
+     'Negative reaches down the side of it: the jaws close 30 mm below the '
+     'top, or as far down as the surface the object is standing on allows '
+     '-- grasp_table_clearance is the floor and it is measured per '
+     'detection, so this cannot reach through the table. It was +10 mm, '
+     'which put the fingertips above the top face; that is a grip on the '
+     'corner of a thing, and it is why a screwdriver came back "closed on '
+     'nothing" twice with the orientation right.'),
+    ('disengage_on_failure', 'false',
      'Take the motors off once a failed cycle has parked the arm somewhere '
-     'the collision world says is free. openarm_hardware disables the motors '
-     'when its component is deactivated, and these are direct-drive with no '
-     'brakes -- so the arm is held up by nothing afterwards. Only ever done '
-     'after a refuge is reached, never with the arm stranded over the '
-     'table.'),
+     'the collision world says is free. Off: an ordinary failure -- nothing '
+     'detected, a plan that would not go, a grip that closed on air -- '
+     'leaves a perfectly healthy arm, and taking the motors off it means '
+     'the next run starts with a restart of the whole stack. The two cases '
+     'where letting go is right have their own switches: '
+     'disengage_on_contact, and the Stop button. Wherever it does fire, it '
+     'is only after a refuge is reached: openarm_hardware disables the '
+     'motors when its component is deactivated, and these are direct-drive '
+     'with no brakes, so the arm is held up by nothing afterwards.'),
+    ('disengage_on_contact', 'true',
+     'The exception. The contact guard fires when a joint loads up *and* '
+     'the arm stops following its trajectory -- it has run into something '
+     'and is leaning on it. Holding position against an obstruction is how '
+     'a motor cooks itself, and the arm is by then resting on the thing it '
+     'hit, so letting go is the safe answer rather than the drastic one.'),
     ('home_requires_pre_pick', 'true',
      'Whether HOME may be commanded when pre_pick could not be reached on '
      'the way back. HOME is a joint goal to a folded posture, and from a low '
@@ -311,6 +533,21 @@ ORCHESTRATOR_ARGS = [
      'Set to -1.0 to rehearse on fake hardware, where mock_components '
      'reports the finger exactly where it was commanded and the check can '
      'never pass. native/run_pick_place_demo.sh --fake does that for you.'),
+    ('grasp_hold_torque_min', '1.0',
+     'What the jaws must be pressing with, in Nm at the gripper motor, to '
+     'count as holding something when the detector cannot see. Shut on '
+     'nothing measures 0.5-1.2 Nm on this robot and holding measures '
+     '1.8-2.5 Nm; 1.0 sits low in that gap on purpose, because it only has '
+     'to catch a jaw that is clearly slack and throwing away a real grasp '
+     'costs more than missing an empty one. 0 turns the torque half of the '
+     'check off.'),
+    ('grasp_width_drop', '0.002',
+     'How much narrower than the close the jaws may sit and still count as '
+     'holding the same thing, metres. It is the reading that catches an '
+     'object that slipped out after the close, which the width band alone '
+     'cannot: 6 mm of finger is a grip if the close ended at 6 mm and an '
+     'empty jaw if it ended at 14. The close steps 2 mm, so anything under '
+     'that is the step. 0 turns it off.'),
     ('object_moved_eps', '0.05',
      'How far the object must have moved for a place to count, metres. Set '
      'to 0.0 on fake hardware, where the object never physically moves so '
@@ -332,6 +569,14 @@ ORCHESTRATOR_ARGS = [
      'Refresh the octomap at HOME, and nowhere else. HOME is out of the '
      'camera view; anywhere the arm can be seen from, it gets captured as an '
      'obstacle sitting exactly where it is about to plan from.'),
+    ('map_before_pick', 'true',
+     'Drop the octomap and retake it at the top of every pick. Without this '
+     'a cycle that looks from the staging pose never refreshes the map at '
+     'all -- it plans against whatever the boot walk captured, so anything '
+     'moved on the table since is invisible. The clear is the point: a '
+     'refresh only ever adds voxels, so without it the scene keeps every '
+     'object that has ever been on the table, including the one just '
+     'carried away.'),
     ('home_pose_tolerance', '0.05',
      'How close the measured joints must be to HOME, radians, before the map '
      'may be captured.'),
@@ -400,12 +645,40 @@ ORCHESTRATOR_ARGS = [
      'proposed, which is common: GraspNet was trained for a 100 mm gripper '
      'and this one spans 44 mm. Needs grasp_model:=true to have anything to '
      'listen to.'),
-    ('grasp_model_max_age', '30.0',
-     'How old a candidate list may be, seconds, before it is treated as '
-     'being about some earlier look.'),
+    ('grasp_model_max_age', '0.0',
+     'How old the grasp model\'s candidate list may be before it is ignored, '
+     'seconds. 0 means no age limit, which is the default and is safe '
+     'because the list is dropped at the start of every cycle -- so "no '
+     'limit" means "no limit within this cycle". The clock was the wrong '
+     'bound: the grasps are requested at the staging pose and the '
+     'pre-flight that uses them runs on the next attempt, so 30 s expired '
+     'them before anything could act on them and every pick fell back to '
+     'the synthesised top-down pose. What still rejects them is '
+     'grasp_model_max_offset -- candidates about something 20 cm away are '
+     'for something else whatever their age.'),
     ('grasp_model_max_offset', '0.08',
      'How far a candidate list\'s object may be from the one being picked, '
      'metres, before it is treated as being about something else.'),
+    ('use_grasp_recipes', 'true',
+     'Ask the detector for the part of the object worth gripping rather '
+     'than for the object -- "detect handle of the screwdriver" instead of '
+     '"detect screwdriver". This is the prompt and nothing else: the '
+     'detector answers referring expressions, and the reported point is the '
+     'centre of whatever it found, which for a roll of tape is the hole. '
+     'Always a first try, with the plain object as an immediate fallback. '
+     'See grasp_recipes.py.'),
+    ('grasp_recipes', 'grasp_recipes.json',
+     'A JSON file of recipes, whose entries come before the built-in ones '
+     'so any of them can be overridden without touching code. Absent is '
+     'fine and is the default state; malformed is reported and ignored.'),
+    ('grasp_model_max_tilt', '0.6',
+     'How far off vertical one of the model\'s own grasps may be, rad, and '
+     'still be flown. GraspNet proposes full 6-DoF grasps and some come in '
+     'from the side, which is the point of asking it -- but the approach '
+     'and retreat here are a *vertical* column, so a tilted tool is fine '
+     'and a tilted path is not. Past this a grasp is skipped and said out '
+     'loud rather than driven down across the object. Flying the column '
+     'along the grasp\'s own approach axis is what would lift this.'),
     ('request_grasps', 'true',
      'Ask the grasp server for candidates on reaching the staging pose. Only '
      'a topic publish -- nothing acts on the answer yet -- so it is free to '
@@ -453,6 +726,13 @@ ORCHESTRATOR_ARGS = [
      'reasons about the target -- which is the difference between "the '
      'planner is not planning" and a report blaming the recorded pre-pick '
      'pose.'),
+    ('planner_probe_timeout', '10.0',
+     'How long the pre-flight planner probe waits for move_group to answer, '
+     'seconds. Its own budget rather than motion_timeout, because nothing '
+     'is moving: measured, cuMotion planned the probe in 116 ms and logged '
+     'success while move_group never returned the result, and the cycle sat '
+     'silent for 46 s on the 60 s motion budget before it was killed by '
+     'hand.'),
     ('linear_transit', 'true',
      'Fly the long move above the object as a straight line as well -- the '
      'same motion as dragging the end-effector arrow in RViz. Pre-flighted '

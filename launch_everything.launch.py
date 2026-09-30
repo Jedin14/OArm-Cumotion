@@ -37,6 +37,13 @@ def generate_launch_description():
         default_value='live',
         description='Octomap mode: live or static'
     )
+    declare_use_rviz = DeclareLaunchArgument(
+        'use_rviz',
+        default_value='true',
+        description='Start RViz. false on a headless or VNC session: without '
+                    'hardware GL it hangs at start-up with its window never '
+                    'mapped, and nothing else needs it.'
+    )
     declare_4d = DeclareLaunchArgument(
         '4d',
         default_value='false',
@@ -76,6 +83,7 @@ def generate_launch_description():
             'use_fake_hardware': use_fake_hardware,
             'right_can_interface': right_can,
             'left_can_interface': left_can,
+            'use_rviz': LaunchConfiguration('use_rviz'),
         }.items()
     )
     
@@ -119,6 +127,7 @@ def generate_launch_description():
         declare_right_can,
         declare_left_can,
         declare_octomap,
+        declare_use_rviz,
         declare_4d,
         declare_tool_frame,
         declare_collision_distance,

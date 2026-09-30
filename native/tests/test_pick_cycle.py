@@ -60,7 +60,8 @@ from trajectory_msgs.msg import (                                 # noqa: E402
     JointTrajectoryPoint)
 from rcl_interfaces.msg import ParameterType, ParameterValue      # noqa: E402
 from rcl_interfaces.srv import GetParameters                      # noqa: E402
-from rclpy.action import ActionServer                             # noqa: E402
+from rclpy.action import ActionServer                              # noqa: E402
+from rclpy.action.server import GoalResponse                      # noqa: E402
 from rclpy.callback_groups import ReentrantCallbackGroup          # noqa: E402
 from rclpy.executors import MultiThreadedExecutor                 # noqa: E402
 from rclpy.node import Node                                       # noqa: E402
@@ -81,6 +82,10 @@ import arm_kinematics                                            # noqa: E402
 
 ARM = 'right'
 OBJECT_POINT = [0.35, -0.18, 0.05]
+# How far the object stands above the surface under it. The detector
+# reports both, and the grasp is measured from the top and floored on the
+# surface -- a roll of tape is about this tall.
+OBJECT_HEIGHT = 0.025
 OBJECT_YAW = 0.4
 APPROACH_HEIGHT = 0.05
 # The shipped default, and deliberately positive: the tool stops 10 mm above
@@ -128,6 +133,10 @@ JOINT1_UPPER = 3.490659
 
 OPEN_FINGER = 0.044
 HOLDING_FINGER = 0.02          # inside (grasp_finger_min, grasp_finger_max)
+# What the jaws press with while holding, measured on the robot: run
+# 1789022566 held a screwdriver handle at 14.0 mm and 2.28 Nm, against
+# 0.50 Nm on the close that gripped nothing.
+HOLDING_TORQUE = 2.28
 
 # The gripper's real force law, from
 # openarm_hardware/include/openarm_hardware/v10_simple_hardware.hpp:
@@ -230,16 +239,33 @@ class FakeRobot(Node):
         # The detector sees nothing at all -- an occluded object, or a model
         # that missed it. Not the same as "the object is gone".
         self.object_hidden = False
+        # The detector process not running at all, which is a different
+        # thing from it looking and finding nothing: the topic has no
+        # publisher, so no payload ever arrives.
+        self.detector_silent = False
         # How far apart the jaws physically stop when nothing_to_grip is set.
         # 0.0 is air. A thin object -- a roll of tape measured at ~4 mm --
         # stalls them above that while the torque still never reaches the
         # cap, and that is the case the empty check kept calling empty.
         self.finger_floor = 0.0
+        # Whether /move_action takes goals at all.
+        self.move_available = True
+        # The arm the suite is not testing. It stands at home and stays
+        # there: nothing here models its motion, and the one thing the
+        # orchestrator does with it -- park it at boot -- is a no-op from
+        # there, which is exactly what the arms do too.
+        self.other_joints = list(HOME_JOINTS)
         # Published in /joint_states. Non-zero means "still moving".
         self.joint_speed = 0.011
         # Reply for plan-only goals, when the planner is to be modelled as
         # up but unable to plan. None means answer normally.
         self.plan_only_code = None
+        # What a plan-only joint goal hands back as its path. None is the
+        # old behaviour -- SUCCESS and an empty trajectory -- which is what
+        # every section that does not care about the path wants. A list of
+        # joint vectors models a planner that answers with the route it
+        # would take, which is the only thing the carry guard can judge.
+        self.plan_path = None
         # A code returned for every executing (non-plan-only) goal, for as
         # long as it is set. move_fail_codes pops one entry per goal, which
         # cannot model "this posture is simply unreachable from here" -- the
@@ -276,9 +302,17 @@ class FakeRobot(Node):
         self.create_subscription(String, '/vlm/prompt', self._on_prompt, 10,
                                  callback_group=cb)
         self.prompt = 'detect screwdriver'
+        # The second thing in the scene: the sheet the place puts the object
+        # down onto. Answered only when it is what was asked for, exactly as
+        # the detector behaves -- detect() matches the prompt on the payload
+        # before believing a word of it, so a place cannot be aimed by an
+        # answer to the pick's question.
+        self.place_prompt = 'detect piece of paper'
+        self.place_point = [0.36, -0.12, 0.05]
+        self.place_hidden = False
 
         ActionServer(self, MoveGroup, '/move_action', self._on_move,
-                     callback_group=cb)
+                     goal_callback=self._accept_move, callback_group=cb)
         ActionServer(self, GripperCommand,
                      f'/{ARM}_gripper_controller/gripper_cmd', self._on_gripper,
                      callback_group=cb)
@@ -315,16 +349,26 @@ class FakeRobot(Node):
 
         js = JointState()
         js.header.stamp = stamp
+        # Both arms, because the robot publishes both and the orchestrator
+        # reads whichever one it is configured for. The boot walk
+        # configures the other arm to park it, and with only one arm on
+        # the topic every reading for the other one came back empty --
+        # which is not a thing that can happen on the arms.
+        other = 'left' if ARM == 'right' else 'right'
         js.name = ([f'openarm_{ARM}_joint{i}' for i in range(1, 8)]
-                   + [f'openarm_{ARM}_finger_joint1'])
+                   + [f'openarm_{ARM}_finger_joint1']
+                   + [f'openarm_{other}_joint{i}' for i in range(1, 8)]
+                   + [f'openarm_{other}_finger_joint1'])
         with self.lock:
-            js.position = list(self.joints) + [self.finger]
-            js.effort = [0.0] * len(self.joints) + [self.torque]
+            js.position = (list(self.joints) + [self.finger]
+                           + list(self.other_joints) + [0.0])
+            js.effort = ([0.0] * len(self.joints) + [self.torque]
+                         + [0.0] * len(self.other_joints) + [0.0])
             # The real robot publishes velocities, and at_home_pose() needs
             # them to tell "as close as this hardware gets" from "still on
             # its way". A standing joint reads +/-0.011 rad/s of noise.
-            js.velocity = ([self.joint_speed] * len(self.joints)
-                           + [0.0])
+            js.velocity = ([self.joint_speed] * len(self.joints) + [0.0]
+                           + [0.0] * len(self.other_joints) + [0.0])
         self.joint_pub.publish(js)
 
         t = TransformStamped()
@@ -349,27 +393,69 @@ class FakeRobot(Node):
         # after a good lift), and an empty frame there means the gripper is
         # occluding the object it just failed to pick.
         with self.lock:
+            if self.detector_silent:
+                return
             holding = self.holding
             hidden = self.object_hidden
-        payload = {
-            'stamp': now.nanoseconds * 1e-9,
-            'prompt': self.prompt,
-            'image_size': list(IMAGE_SIZE),
-            'detections': [] if hidden else [{
-                'point': list(tcp) if holding else list(OBJECT_POINT),
+        with self.lock:
+            asked = self.prompt
+            place_point = list(self.place_point)
+            place_hidden = self.place_hidden
+        if asked == self.place_prompt:
+            found = [] if place_hidden else [{
+                'point': place_point,
+                'center_px': [320, 240],
+                'axis_yaw': 0.0,
+                'depth_m': 0.72,
+                'depth_px': 6832,
+                'axis_source': 'depth',
+                # A sheet is flat: its top is its own surface.
+                'top': place_point,
+                'surface': place_point,
+                'height_m': 0.0,
+                'footprint': [place_point[0] - 0.14, place_point[1] - 0.10,
+                              place_point[0] + 0.14, place_point[1] + 0.10],
+            }]
+        else:
+            here = list(tcp) if holding else list(OBJECT_POINT)
+            found = [] if hidden else [{
+                'point': here,
                 'center_px': list(self.object_px),
                 'axis_yaw': OBJECT_YAW,
                 'depth_m': 0.62,
                 'depth_px': 812,
                 'axis_source': 'depth',
-            }],
+                # The detector reports the top of the object and the
+                # surface it stands on; the grasp is measured from the
+                # first and floored on the second.
+                'top': [here[0], here[1], here[2] + OBJECT_HEIGHT],
+                'surface': [here[0], here[1], here[2]],
+                'height_m': OBJECT_HEIGHT,
+                'footprint': [here[0] - 0.03, here[1] - 0.03,
+                              here[0] + 0.03, here[1] + 0.03],
+            }]
+        payload = {
+            'stamp': now.nanoseconds * 1e-9,
+            'prompt': asked,
+            'image_size': list(IMAGE_SIZE),
+            'detections': found,
         }
         self.detections_pub.publish(String(data=json.dumps(payload)))
 
     def _on_prompt(self, msg):
-        self.prompt = msg.data
+        with self.lock:
+            self.prompt = msg.data
 
     # -- served interfaces -------------------------------------------------
+
+    def _accept_move(self, _goal):
+        """In the graph but not answering, which is what a cold move_group
+        looks like: the action name resolves, the node is up, and a goal
+        sent to it is not taken. Measured on a real bringup -- the first
+        goal it accepted came 77 s in."""
+        with self.lock:
+            available = self.move_available
+        return GoalResponse.ACCEPT if available else GoalResponse.REJECT
 
     def _on_move(self, goal_handle):
         request = goal_handle.request.request
@@ -435,6 +521,18 @@ class FakeRobot(Node):
         goal_handle.succeed()
         result = MoveGroup.Result()
         result.error_code.val = code
+        with self.lock:
+            path = self.plan_path
+        if (entry['plan_only'] and code == MoveItErrorCodes.SUCCESS
+                and entry['kind'] == 'joint' and path):
+            planned = RobotTrajectory()
+            planned.joint_trajectory.joint_names = list(entry['names'])
+            for index, values in enumerate(path):
+                point = JointTrajectoryPoint()
+                point.positions = [float(v) for v in values]
+                point.time_from_start.sec = index
+                planned.joint_trajectory.points.append(point)
+            result.planned_trajectory = planned
         return result
 
     def _on_gripper(self, goal_handle):
@@ -805,6 +903,20 @@ def main():
         # directly further down instead, where the goals themselves are what
         # is being checked.
         '-p', 'approach_frame:=planner',
+        # The long cycle below is the *whole* thing -- pick, carry, drop,
+        # home -- which is what place_after_pick restores. The default is
+        # off, because pick and place are two operator actions now; the
+        # split is checked on its own further down, and this keeps the
+        # place half's coverage in one continuous run.
+        '-p', 'place_after_pick:=true',
+        # No boot walk under test: the suite drives the arm itself from the
+        # first line, and a background thread moving it to pre_pick would
+        # race every check. The walk has its own section.
+        '-p', 'boot_walk:=false',
+        # The documented state order starts at HOME, and the suite drives
+        # the arm to wherever each section needs it. The staging shortcut
+        # is checked on its own, with the arm deliberately parked there.
+        '-p', 'locate_from_staging:=false',
     ])
     module = load_orchestrator()
 
@@ -854,11 +966,14 @@ def main():
         # The second CLOSE_GRIPPER is the one at the drop pose: the arm goes
         # back through pre_pick to home with the jaws shut rather than with
         # 44 mm of open fingers hunting for something to catch on.
+        # Ends at the staging pose, not at HOME: a cycle ends where the
+        # next one starts, so a Pick pressed afterwards begins with the
+        # transit rather than by folding out of HOME and back.
         wanted = ['HOME', 'LOCATE', 'PRE_PICK', 'TRANSIT',
                   'OPEN_GRIPPER', 'DESCEND', 'CLOSE_GRIPPER', 'LIFT',
                   'VERIFY_GRASP', 'PRE_PICK', 'DROP', 'RELEASE',
                   'VERIFY_PLACE', 'CLOSE_GRIPPER',
-                  'PRE_PICK', 'HOME', 'DONE']
+                  'PRE_PICK', 'DONE']
         index, missing = 0, []
         for step in wanted:
             while index < len(steps) and steps[index] != step:
@@ -880,10 +995,10 @@ def main():
                      if g >= orchestrator.get_parameter('gripper_open').value)
         check('and it comes after the release, not before it',
               len(grip_order) - 1 > opened, True)
-        check('the close at the drop is between VERIFY_PLACE and the way home',
+        check('the close at the drop is between VERIFY_PLACE and the way back',
               steps.index('VERIFY_PLACE')
               < len(steps) - 1 - steps[::-1].index('CLOSE_GRIPPER')
-              < len(steps) - 1 - steps[::-1].index('HOME'), True)
+              < len(steps) - 1 - steps[::-1].index('PRE_PICK'), True)
 
         with robot.lock:
             goals = [g for g in robot.goals if not g['plan_only']]
@@ -892,7 +1007,10 @@ def main():
         kinds = [g['kind'] for g in goals]
         poses = [g for g in goals if g['kind'] == 'pose']
         transit_height = orchestrator.get_parameter('transit_height').value
-        grasp_z_expected = OBJECT_POINT[2] + GRASP_Z_OFFSET
+        # From the top of the object, which is what the detector reports
+        # and what a top-down grasp has to stop above -- not from the box
+        # centre, which for anything that stands up is down its side.
+        grasp_z_expected = OBJECT_POINT[2] + OBJECT_HEIGHT + GRASP_Z_OFFSET
         transit_z = grasp_z_expected + transit_height
 
         with robot.lock:
@@ -912,14 +1030,18 @@ def main():
         check('the default takes the camera half rather than probing',
               orchestrator.get_parameter('arm_selection').value, 'by_side')
 
-        # Two joint goals in (home, pre_pick) and four out: pre_pick again to
-        # stage the carry over the table, then drop, pre_pick, home. Only the
-        # transit is a pose goal; everything below it is a Cartesian path
-        # executed as a trajectory, so it does not appear as a MoveGroup goal
-        # at all.
+        # One joint goal in, not two, and four out. With use_home off the
+        # rest and observation pose *is* the staging pose, so what used to
+        # be HOME then pre_pick is a single move -- and the pre_pick step
+        # that follows it is then skipped outright, because the arm is
+        # already standing there. A whole leg of every cycle, gone.
+        #
+        # Only the transit is a pose goal; everything below it is a
+        # Cartesian path executed as a trajectory, so it does not appear as
+        # a MoveGroup goal at all.
         check('joint goals bracket the middle',
-              (kinds[:2], kinds[-4:]),
-              (['joint', 'joint'], ['joint', 'joint', 'joint', 'joint']))
+              (kinds[:2], kinds[-3:]),
+              (['joint', 'pose'], ['joint', 'joint', 'joint']))
         check('the transit is the only pose goal', len(poses), 1)
         check('nothing else goes as a MoveGroup goal', kinds[3:-4], [])
 
@@ -929,13 +1051,21 @@ def main():
               sorted({g['link'] for g in goals if g['kind'] == 'pose'}),
               [f'openarm_{ARM}_hand_tcp'])
 
-        # HOME first: the map is built and the object observed from there,
-        # with the arm out of the camera's frame.
-        check('goal 1 is HOME, so the map and the look happen there',
-              goals[0]['joints'], HOME_JOINTS, 1e-5)
-        check('goal 2 replays pre_pick_state', goals[1]['joints'], PRE_PICK_JOINTS)
-        check('pre_pick goal names the arm joints', goals[1]['names'],
+        # The staging pose first: the map is built and the object observed
+        # from there. HOME is a folded posture on the far side of the
+        # workspace that this arm cannot actually reach -- joint4's HOME
+        # value sits against its lower limit -- and nothing needs it: the
+        # gripper is exempt from the map by ACM and robot_in_map drops a
+        # map that caught anything else.
+        check('goal 1 is the staging pose, where the map and the look '
+              'happen now', goals[0]['joints'], PRE_PICK_JOINTS, 1e-5)
+        check('and it names the arm joints', goals[0]['names'],
               [f'openarm_{ARM}_joint{i}' for i in range(1, 8)])
+        check('and nothing in the cycle is ever sent to HOME',
+              [g for g in goals
+               if g['kind'] == 'joint' and len(g['joints']) == len(HOME_JOINTS)
+               and max(abs(a - b) for a, b in zip(g['joints'], HOME_JOINTS))
+               < 1e-5], [])
 
         grasp_z = grasp_z_expected
         above = grasp_z + APPROACH_HEIGHT
@@ -1013,9 +1143,19 @@ def main():
         # not.
         # Two legs now, not three: straight down to the grasp, and straight
         # back up to the retreat height. The stop at `above` is gone.
+        # A subset, not the whole set: a tool that lands off the column is
+        # brought onto it with a horizontal leg first, and that leg is a
+        # line too -- at whatever height the tool was already at.
+        heights = {round(r['xyz'][2], 6) for r in lines}
         check('both legs of the column ask for a line',
-              sorted({round(r['xyz'][2], 6) for r in lines}),
+              sorted(heights & {round(grasp_z, 6),
+                                round(grasp_z + retreat, 6)}),
               sorted({round(grasp_z, 6), round(grasp_z + retreat, 6)}))
+        check('and any other line is the sideways correction, well above '
+              'the surface',
+              [z for z in heights
+               if z not in (round(grasp_z, 6), round(grasp_z + retreat, 6))
+               and z < grasp_z + retreat], [])
         check('and each is exempt from checking if the checked one fails',
               orchestrator.get_parameter('approach_ignores_octomap').value, True)
 
@@ -1094,26 +1234,31 @@ def main():
         with robot.lock:
             retreat = [g['joints'] for g in robot.goals[before:]
                        if not g['plan_only'] and g['kind'] == 'joint']
-        check('and the retreat still runs, ending at home',
-              [round(v, 5) for v in retreat[-1]] if retreat else None,
-              [round(v, 5) for v in HOME_JOINTS])
-        check('via the staging pose',
-              any(max(abs(a - b) for a, b in zip(j, PRE_PICK_JOINTS)) < 1e-3
-                  for j in retreat), True)
+        # It ends at the staging pose, which is the rest pose now. Checked
+        # against where the arm actually ends up rather than against the
+        # last goal sent: the final move is skipped outright when the arm
+        # is already standing there, and "no goal" is the right answer
+        # then, not a missing one.
+        with robot.lock:
+            parked = list(robot.joints)
+        check('and the retreat still runs, ending at the staging pose',
+              [round(v, 5) for v in parked],
+              [round(v, 5) for v in PRE_PICK_JOINTS])
+        check('without ever being sent to HOME',
+              [j for j in retreat
+               if max(abs(a - b) for a, b in zip(j, HOME_JOINTS)) < 1e-3], [])
 
-        check('the last three joint goals are drop, pre_pick, home',
-              len(joint_goals) >= 5, True)
-        check('carries straight to drop_state', joint_goals[-3]['joints'],
+        check('the last two joint goals are drop then pre_pick',
+              len(joint_goals) >= 4, True)
+        check('carries straight to drop_state', joint_goals[-2]['joints'],
               DROP_JOINTS)
-        check('then stages back through pre_pick',
-              joint_goals[-2]['joints'], PRE_PICK_JOINTS)
-        check('and finishes at home', joint_goals[-1]['joints'],
-              HOME_JOINTS, 1e-5)
+        check('and finishes at the staging pose, where the next cycle starts',
+              joint_goals[-1]['joints'], PRE_PICK_JOINTS)
         # Carrying must not detour home: capture_octomap refuses while holding,
         # so the trip would clear the map and leave nothing to plan the drop
         # against.
         check('no trip home between the lift and the release',
-              [g for g in joint_goals[-3:-2]
+              [g for g in joint_goals[-2:-1]
                if max(abs(a - b) for a, b in zip(g['joints'], HOME_JOINTS)) < 1e-3],
               [])
 
@@ -1150,13 +1295,15 @@ def main():
         with robot.lock:
             refreshes = list(robot.refreshes)
         # A capture recorded as v happened straight after goals[v - 1], and
-        # that goal must be the HOME one. This is the check that pins the bug:
-        # a capture after the READY goal put the arm in the map.
+        # that goal must be the one that puts the arm at the pose the map
+        # is built from -- the staging pose, with use_home off. This is the
+        # check that pins the bug it was written for: a capture taken after
+        # the old READY goal put the arm itself in the map.
         check('the octomap was captured at all', len(refreshes) > 0, True)
         captured_after = [goals[v - 1]['joints'] for v in refreshes if v > 0]
-        check('every capture followed a goal to HOME, never READY',
+        check('every capture followed a goal to the pose it is built from',
               [j for j in captured_after
-               if max(abs(a - b) for a, b in zip(j, HOME_JOINTS)) > 1e-3],
+               if max(abs(a - b) for a, b in zip(j, PRE_PICK_JOINTS)) > 1e-3],
               [])
         check('and the map was cleared before being rebuilt',
               len(robot.clears) > 0, True)
@@ -1166,10 +1313,678 @@ def main():
         # transit_height and descend_step, so hard indices here quietly stopped
         # describing "while carrying" the moment the column grew.
         joint_indices = [i for i, g in enumerate(goals) if g['kind'] == 'joint']
-        carrying_ready, final_ready = joint_indices[2], joint_indices[4]
+        # One fewer joint goal at the front than there used to be: the trip
+        # to HOME is gone and the pre_pick that followed it is skipped,
+        # because the arm is already standing at the pose both were for.
+        carrying_ready, final_ready = joint_indices[1], joint_indices[3]
         check('no capture between picking the object up and releasing it',
               [v for v in refreshes
                if carrying_ready + 1 <= v <= final_ready], [])
+
+        # -- pick and place are two presses --------------------------------
+        #
+        # The cycle above ran with place_after_pick on, which is the old
+        # single cycle. Off is the default: Pick ends holding, standing at
+        # the staging pose, and nothing else happens until somebody presses
+        # Place. Run for real rather than asserted at the seams -- what is
+        # being checked is where a whole cycle *stops*.
+        keep_after = orchestrator.get_parameter('place_after_pick').value
+        keep_mode = orchestrator.place_mode
+        # Put the published state back at the end of the section. The
+        # gripper-service checks further down set _busy without publishing
+        # anything, so whatever state this section leaves behind is what
+        # their heartbeat records show -- and "IDLE while busy" is what the
+        # motion log is asserted never to contain.
+        keep_state = orchestrator.state
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'place_after_pick', value=False)])
+        with robot.lock:
+            # The fake shuts its jaws on the object whenever it is commanded
+            # closed, so the cycle above left it "holding" and the detector
+            # would report the object up at the tool. Put the world back.
+            robot.holding = False
+            robot.object_hidden = False
+            robot.place_hidden = False
+            robot.nothing_to_grip = False
+            robot.finger = OPEN_FINGER
+            robot.torque = 0.0
+            robot.goals.clear()
+            robot.gripper_commands.clear()
+            robot.cartesian_requests.clear()
+            robot.executed.clear()
+        orchestrator._forget_grasp()
+        # Marked rather than cleared: states[] is the whole run's record and
+        # later sections read the first cycle out of it.
+        mark = len(states)
+        time.sleep(0.3)
+
+        started, _ = orchestrator._start_cycle()
+        check('a second cycle starts', started, True)
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            if len(states) > mark and states[-1].split(':')[0].strip() in (
+                    'HOLDING', 'DONE', 'FAILED', 'ABORTED'):
+                break
+            time.sleep(0.2)
+        pick_only = [line.split(':')[0].strip() for line in states[mark:]]
+        print('\npick only:', ' -> '.join(pick_only), '\n')
+        check('the pick ends holding rather than placed',
+              pick_only[-1] if pick_only else None, 'HOLDING')
+        check('and HOLDING is terminal, so the buttons come back',
+              'HOLDING' in module.TERMINAL_STATES, True)
+        check('the object is still in the jaws', orchestrator.holding(ARM), True)
+        check('named, so the panel can say what is in the hand',
+              orchestrator.held_object(ARM), 'wrench')
+        # Captured here, while the object is still held: the place releases
+        # it, and the fake then reports the object at the tool, which moves
+        # the surface the next grasp would measure from.
+        picked_hold = orchestrator.hold_offset(ARM)
+        check('the pick measured how the object is held',
+              round(picked_hold or 0.0, 4),
+              round(OBJECT_HEIGHT + GRASP_Z_OFFSET, 4))
+        check('nothing was released', [s for s in pick_only if s == 'RELEASE'],
+              [])
+        check('and no drop pose was visited',
+              [s for s in pick_only if s == 'DROP'], [])
+        with robot.lock:
+            waiting = [g for g in robot.goals
+                       if not g['plan_only'] and g['kind'] == 'joint']
+        check('the arm waits at the staging pose, where the place starts',
+              waiting[-1]['joints'] if waiting else None, PRE_PICK_JOINTS)
+
+        # -- Place only puts down what is actually held ---------------------
+        status = orchestrator.status_payload()
+        check('the status names what is in the hand',
+              (status.get('holding'), status.get('held_object')),
+              (True, 'wrench'))
+
+        # -- and it aims at whatever the place prompt finds -----------------
+        orchestrator.place_mode = 'detected'
+        with robot.lock:
+            robot.goals.clear()
+            robot.cartesian_requests.clear()
+            robot.gripper_commands.clear()
+        mark = len(states)
+        target, why = orchestrator.place_target()
+        check('the drop surface is found by asking for it',
+              [round(v, 4) for v in target['point']] if target else None,
+              [round(v, 4) for v in robot.place_point])
+        check('and it is a different question from the pick\'s', why, '')
+        with robot.lock:
+            robot.place_hidden = True
+        time.sleep(0.3)
+        missing, why = orchestrator.place_target()
+        check('a sheet that cannot be seen is a refusal, not a guess',
+              missing, None)
+        check('that says so', 'in view' in why, True)
+        with robot.lock:
+            robot.place_hidden = False
+        time.sleep(0.3)
+
+        started, message = orchestrator._start_place()
+        check('place starts while something is held', started, True)
+        check('and says what it is placing', 'wrench' in message, True)
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            if len(states) > mark and states[-1].split(':')[0].strip() in (
+                    'DONE', 'FAILED', 'ABORTED'):
+                break
+            time.sleep(0.2)
+        placed_states = [line.split(':')[0].strip() for line in states[mark:]]
+        print('\nplace:', ' -> '.join(placed_states), '\n')
+        check('the place runs to DONE', placed_states[-1], 'DONE')
+        check('over the target first, then down onto it',
+              ('OVER_DROP' in placed_states and 'PLACE' in placed_states
+               and placed_states.index('OVER_DROP')
+               < placed_states.index('PLACE')), True)
+
+        # The tool goes high enough that the *object* sits a clearance
+        # above the sheet, not the tool: the pick measured how far the tool
+        # is above the bottom of what it is holding, and that is the number
+        # the place needs.
+        clearance = orchestrator.get_parameter('place_clearance').value
+        hold = picked_hold
+        release_z = robot.place_point[2] + (hold or 0.0) + clearance
+        with robot.lock:
+            place_lines = list(robot.cartesian_requests)
+            place_grips = list(robot.gripper_commands)
+        check('the descent onto the sheet is a straight vertical line',
+              bool(place_lines), True)
+        # Over the sheet, not necessarily at its exact middle: the tool
+        # lands tens of millimetres from where a joint goal aimed it, and
+        # anywhere on the paper will do -- sliding across to the centre
+        # costs a move and drags the held object.
+        sheet_box = [robot.place_point[0] - 0.14, robot.place_point[1] - 0.10,
+                     robot.place_point[0] + 0.14, robot.place_point[1] + 0.10]
+        off_sheet = [(r['xyz'][0], r['xyz'][1]) for r in place_lines
+                     if not (sheet_box[0] <= r['xyz'][0] <= sheet_box[2]
+                             and sheet_box[1] <= r['xyz'][1] <= sheet_box[3])]
+        check('every leg of the place stays over the sheet', off_sheet, [])
+        check('and they all share one vertical line',
+              len({(round(r['xyz'][0], 4), round(r['xyz'][1], 4))
+                   for r in place_lines}), 1)
+        check('and it stops a clearance above it rather than on it',
+              min(r['xyz'][2] for r in place_lines), release_z, 1e-6)
+        check('nothing goes below the release height',
+              min(r['xyz'][2] for r in place_lines) >= release_z - 1e-9, True)
+        # Anywhere on the paper will do. The centre first, because it is
+        # the most forgiving place to put something down, but a sheet near
+        # the edge of the envelope can have an unreachable middle and a
+        # perfectly reachable corner.
+        sheet = {'point': list(robot.place_point),
+                 'top': list(robot.place_point),
+                 'footprint': [robot.place_point[0] - 0.14,
+                               robot.place_point[1] - 0.10,
+                               robot.place_point[0] + 0.14,
+                               robot.place_point[1] + 0.10]}
+        flat = list(module.top_down_quat(0.0))
+        aimed = orchestrator.drop_point(sheet, release_z, flat)
+        check('the middle of the sheet is where it aims',
+              [round(v, 4) for v in aimed[:2]],
+              [round(v, 4) for v in robot.place_point[:2]])
+        margin = orchestrator.get_parameter('place_edge_margin').value
+        # The planner is the authority, so that is what is made to refuse.
+        # KDL cannot: its cheap mode answers True or unknown, never False.
+        with robot.lock:
+            robot.plan_only_code = MoveItErrorCodes.PLANNING_FAILED
+        time.sleep(0.3)
+        check('a sheet no part of which can be reached is refused',
+              orchestrator.drop_point(sheet, release_z, flat), None)
+        with robot.lock:
+            robot.plan_only_code = None
+        time.sleep(0.3)
+        check('and the fallback points stay inside the sheet',
+              margin > 0.0, True)
+
+        check('the jaws opened to let it go',
+              max(place_grips) >= orchestrator.get_parameter(
+                  'gripper_open').value - 1e-9, True)
+        check('and the hand is empty afterwards', orchestrator.holding(ARM), False)
+        check('with nothing left to name', orchestrator.held_object(ARM), None)
+
+        # -- the best spot across the sheet, not the first corner ----------
+        #
+        # A grid, ordered from the middle outwards, so the first one that
+        # works is the most central spot the arm can actually get down to.
+        grid = orchestrator.get_parameter('place_grid').value
+        edge = orchestrator.get_parameter('place_edge_margin').value
+        wide = {'point': [0.40, -0.20, 0.05],
+                'footprint': [0.25, -0.35, 0.55, -0.05]}
+        spots = orchestrator.sheet_candidates(wide)
+        check('it searches a grid across the sheet',
+              len(spots) >= grid * grid - 1, True)
+        check('starting at the detected middle',
+              (round(spots[0][0], 4), round(spots[0][1], 4)), (0.40, -0.20))
+        centre_first = [round(math.hypot(x - 0.40, y + 0.20), 6)
+                        for x, y in spots]
+        check('and working outwards from it',
+              centre_first == sorted(centre_first), True)
+        check('every spot inside the sheet, clear of its edge',
+              [(x, y) for x, y in spots
+               if not (0.25 + edge - 1e-9 <= x <= 0.55 - edge + 1e-9
+                       and -0.35 + edge - 1e-9 <= y <= -0.05 + edge + 1e-9)],
+              [])
+        check('with no two spots on top of each other',
+              min(math.hypot(a[0] - b[0], a[1] - b[1])
+                  for i, a in enumerate(spots) for b in spots[i + 1:]) > 0.01,
+              True)
+        # A sheet too small to be choosy about is aimed at in the middle.
+        tiny = {'point': [0.40, -0.20, 0.05],
+                'footprint': [0.39, -0.21, 0.41, -0.19]}
+        check('a sheet smaller than the margins is aimed at in the middle',
+              orchestrator.sheet_candidates(tiny), [(0.40, -0.20)])
+        check('and so is one with no footprint at all',
+              orchestrator.sheet_candidates({'point': [0.4, -0.2, 0.05]}),
+              [(0.40, -0.20)])
+
+        # -- anywhere on the paper will do ----------------------------------
+        #
+        # The tool lands tens of millimetres from where a joint goal aimed
+        # it. Sliding sideways to the exact middle costs a move and drags
+        # the held object; if the tool is already over the paper, straight
+        # down is simpler and safer.
+        sheet = {'point': [0.40, -0.20, 0.05],
+                 'footprint': [0.34, -0.26, 0.46, -0.14]}
+        margin = orchestrator.get_parameter('place_edge_margin').value
+        check('a tool over the middle of the sheet is over the sheet',
+              orchestrator.on_the_sheet(sheet, [0.40, -0.20, 0.5]), True)
+        check('and one a couple of centimetres off it still is',
+              orchestrator.on_the_sheet(sheet, [0.41, -0.19, 0.5]), True)
+        check('but not one outside the footprint',
+              orchestrator.on_the_sheet(sheet, [0.50, -0.20, 0.5]), False)
+        check('nor one inside the edge margin',
+              orchestrator.on_the_sheet(
+                  sheet, [0.46 - margin * 0.5, -0.20, 0.5]), False)
+        check('and with no footprint reported it aims at the middle',
+              orchestrator.on_the_sheet({'point': [0.4, -0.2, 0.05]},
+                                        [0.40, -0.20, 0.5]), False)
+
+        # -- a sheet the arm is standing in front of ------------------------
+        #
+        # The staging pose is above the work surface, so the arm in it is a
+        # plausible thing to be between the camera and the sheet. HOME is
+        # out of frame by definition -- it is where the object was located
+        # from -- so the look is worth one more try from there before
+        # giving up. And giving up is what happens if it still sees
+        # nothing: no motion towards a target nobody has.
+        orchestrator._held[ARM] = {'object': 'wrench', 'offset': 0.02}
+        with robot.lock:
+            robot.finger = HOLDING_FINGER
+            robot.torque = HOLDING_TORQUE
+            robot.place_hidden = True
+            # Standing at the staging pose, which is where a place starts
+            # and the posture that might be in the way. Left at HOME the
+            # move is skipped as "already there" and the retry proves
+            # nothing.
+            robot.joints = list(PRE_PICK_JOINTS)
+            robot.goals.clear()
+        orchestrator._forget_grasp()
+        time.sleep(0.4)
+        hidden_ctx = {'states': {'pre_pick_state': {'joints': PRE_PICK_JOINTS},
+                                 'drop_state': {'joints': DROP_JOINTS}}}
+        check('a place with nothing to place onto is refused',
+              orchestrator._drop_on_detected(hidden_ctx), False)
+        with robot.lock:
+            looked = [g for g in robot.goals
+                      if not g['plan_only'] and g['kind'] == 'joint']
+            approached = [g for g in robot.goals
+                          if not g['plan_only'] and g['kind'] == 'pose']
+        # It used to fold down to HOME and look again. With use_home off
+        # the staging pose is the only pose there is, so a second look
+        # would be the same look -- it is refused rather than driven for.
+        check('and it did not drive to HOME to look again, because there '
+              'is no HOME to drive to',
+              [g for g in looked
+               if max(abs(a - b) for a, b in zip(g['joints'], HOME_JOINTS))
+               < 1e-3], [])
+        check('and never approached a target it did not have',
+              approached, [])
+        with robot.lock:
+            robot.place_hidden = False
+            robot.goals.clear()
+        orchestrator._held.pop(ARM, None)
+        orchestrator.release_column()
+        time.sleep(0.3)
+
+        # -- an empty frame is an answer, not a reason to look again --------
+        #
+        # Two 15 s waits and a fold down to HOME and back, to report what
+        # the first look already knew. Run at 14:51: LOCATE from the
+        # staging pose, HOME, LOCATE again, FAILED.
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'locate_from_staging', value=True)])
+        with robot.lock:
+            robot.joints = list(PRE_PICK_JOINTS)
+            robot.tcp = [0.30, -0.20, 0.50]
+            robot.object_hidden = True
+            robot.goals.clear()
+        time.sleep(0.5)
+        staged = {'pre_pick_state': {'joints': PRE_PICK_JOINTS},
+                  'drop_state': {'joints': DROP_JOINTS}}
+        check('nothing in the frame is reported as nothing',
+              orchestrator.take_up_the_view(staged), module.NOTHING_SEEN)
+        # And a detector that is not there at all is a different answer.
+        # Measured, run at 11:12: the log said "no fresh /vlm/detections --
+        # is run_vlm_detector.sh running?" and then, next line, "the
+        # detector answered, and it answered that the frame is empty". It
+        # had not answered; nothing was publishing on the topic. Anyone
+        # reading that goes looking for the object instead of starting the
+        # detector.
+        with robot.lock:
+            robot.detector_silent = True
+            robot.goals.clear()
+        check('a detector that never answers is not an empty table',
+              orchestrator.take_up_the_view(staged), module.NO_DETECTOR)
+        with robot.lock:
+            check('and that is not worth a trip home either',
+                  [g for g in robot.goals if not g['plan_only']], [])
+            robot.detector_silent = False
+        time.sleep(0.3)
+        with robot.lock:
+            check('without driving home to look again',
+                  [g for g in robot.goals if not g['plan_only']], [])
+            robot.object_hidden = False
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'locate_from_staging', value=False)])
+        time.sleep(0.4)
+
+        # -- the motors come off for two reasons and no others --------------
+        check('an ordinary failure leaves the motors on',
+              orchestrator.get_parameter('disengage_on_failure').value, False)
+        check('a contact is the exception',
+              orchestrator.get_parameter('disengage_on_contact').value, True)
+        check('and a fresh cycle starts with no contact recorded',
+              orchestrator._contact_fired, False)
+        # A torque trip means the arm is pressing on something and the
+        # motor is holding it there. Letting go, settling, taking hold
+        # again and gliding back is what makes the next cycle a press
+        # away rather than a bringup restart.
+        check('and after one it recovers rather than going limp',
+              orchestrator.get_parameter('recover_after_contact').value, True)
+        source_text = open(os.path.join(
+            WS, 'pick_place_orchestrator.py')).read()
+        recover = source_text.split(
+            'def recover_from_contact(')[1].split('\n    def ')[0]
+        # Qualified, because "engage_motors" is a substring of
+        # "disengage_motors" and an unqualified index finds the wrong one.
+        check('letting go comes before taking hold again',
+              recover.index('self.disengage_motors(')
+              < recover.index('self.engage_motors('), True)
+        check('with a settle between them',
+              recover.index('self.engage_motors(')
+              > recover.index("get_parameter('contact_relax_seconds')"), True)
+        check('and it ends at the staging pose',
+              '_walk_to_boot_pose' in recover, True)
+
+        # -- a pick needs a free hand, not an empty robot -------------------
+        #
+        # One hand full is a pick for the *other* hand: choose_arm is told
+        # to skip the occupied ones. Only with both full is there nowhere
+        # to put anything, and then it refuses rather than opening a full
+        # gripper on the way down.
+        other = module.other_arm(ARM)
+        orchestrator._held[ARM] = {'object': 'wrench', 'offset': 0.02}
+        check('one full hand still leaves an arm to pick with',
+              orchestrator.free_arms(), [other])
+        check('and the occupied one is not a candidate',
+              orchestrator.arm_candidates(
+                  {'point': list(OBJECT_POINT),
+                   'center_px': list(robot.object_px)},
+                  {'image_size': list(IMAGE_SIZE)}), [other])
+        with robot.lock:
+            before_full = moved(robot)
+        orchestrator._held[other] = {'object': 'tape', 'offset': 0.02}
+        started, message = orchestrator._start_cycle()
+        check('pick is refused only when both hands are full', started, False)
+        check('and it names what is in the way',
+              'wrench' in message and 'tape' in message, True)
+        with robot.lock:
+            check('nothing moved for it', moved(robot), before_full)
+        # Two full hands means two things to put down, so the ambiguous
+        # Place refuses and says to pick one.
+        started, message = orchestrator._start_place()
+        check('an unqualified Place refuses with both hands full',
+              started, False)
+        check('asking which to put down', 'say which' in message, True)
+        orchestrator._held.pop(other, None)
+        orchestrator._held.pop(ARM, None)
+
+        # -- Place with nothing in the hand does not fly the approach -------
+        #
+        # It would go all the way to the drop surface and open on nothing,
+        # and report a successful place. That is the false success the grasp
+        # check exists to stop, arriving through the other door.
+        with robot.lock:
+            before_empty = moved(robot)
+        started, message = orchestrator._start_place()
+        check('place is refused with an empty hand', started, False)
+        check('saying so rather than "busy"', 'nothing has been picked' in
+              message, True)
+        check('and naming a hand that is not holding is refused too',
+              orchestrator._start_place(ARM)[0], False)
+        with robot.lock:
+            check('and nothing moved', moved(robot), before_empty)
+
+        # Held according to the cycle, but the jaws say otherwise -- an
+        # object dropped between the pick and the press.
+        orchestrator._held[ARM] = {'object': 'wrench', 'offset': 0.02}
+        orchestrator._forget_grasp()
+        with robot.lock:
+            robot.finger = 0.0011          # 1789014831: empty, 0.50 Nm
+            robot.torque = 0.5
+        time.sleep(0.4)
+        started, message = orchestrator._start_place()
+        check('place is refused when the jaws disagree', started, False)
+        check('the gripper reading is what it says, and which hand',
+              f'the {ARM} gripper is empty' in message, True)
+        check('and the panel stops claiming to hold something',
+              orchestrator.holding(ARM), False)
+        with robot.lock:
+            check('still nothing moved', moved(robot), before_empty)
+        with robot.lock:
+            robot.finger = OPEN_FINGER
+            robot.torque = 0.0
+            robot.holding = False
+        orchestrator.place_mode = keep_mode
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'place_after_pick', value=keep_after)])
+        time.sleep(0.3)
+
+        # -- gently: one lever, and it is put back --------------------------
+        was_speed = orchestrator.get_parameter('velocity_scaling').value
+        with orchestrator.at_speed(0.05, 'a test'):
+            check('inside the block every plan is capped',
+                  orchestrator.get_parameter('velocity_scaling').value, 0.05)
+        check('and the cycle speed comes back afterwards',
+              orchestrator.get_parameter('velocity_scaling').value, was_speed)
+        with orchestrator.at_speed(1.0, 'a test'):
+            check('a cap above the configured speed does not speed it up',
+                  orchestrator.get_parameter('velocity_scaling').value,
+                  was_speed)
+        try:
+            with orchestrator.at_speed(0.05, 'a test'):
+                raise RuntimeError('a move that failed')
+        except RuntimeError:
+            pass
+        check('a move that raises still gives the speed back',
+              orchestrator.get_parameter('velocity_scaling').value, was_speed)
+
+        # -- the pose the robot waits in ------------------------------------
+        #
+        # Nothing is sent until the planner proves it can plan. On a cold
+        # bringup move_group is in the graph long before it will take a
+        # goal: measured, the first accept came 77 s in, and the three the
+        # walk had already sent were refused at 15 s each and then
+        # executed a minute later -- an arm moving while the panel says
+        # IDLE.
+        check('the planner is asked before anything is sent',
+              orchestrator.wait_for_planner(5.0), True)
+        with robot.lock:
+            robot.move_available = False
+            robot.goals.clear()
+        check('and a planner that never answers moves nothing',
+              orchestrator.wait_for_planner(2.0), False)
+        with robot.lock:
+            robot.move_available = True
+            check('nothing was sent while it was down',
+                  [g for g in robot.goals if not g['plan_only']], [])
+        time.sleep(0.5)
+
+        #
+        # Nobody presses anything to start this, so it is the most
+        # conservative move the robot makes: slow, to a recorded posture, as
+        # a joint goal, and skipped for an arm that has no recording rather
+        # than computed for it.
+        with robot.lock:
+            robot.joints = list(HOME_JOINTS)
+            robot.goals.clear()
+        time.sleep(0.3)
+        keep_boot = orchestrator.get_parameter('boot_pose').value
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'boot_pose', value='pre_pick')])
+        detail = orchestrator._walk_to_boot_pose()
+        check('and it says which arms it moved',
+              orchestrator.launch_arm in (detail or ''), True)
+        with robot.lock:
+            walked = [g for g in robot.goals
+                      if not g['plan_only'] and g['kind'] == 'joint']
+        check('the boot walk goes to the staging pose',
+              walked[-1]['joints'] if walked else None, PRE_PICK_JOINTS)
+        check('as a joint goal -- the one kind that is repeatable',
+              sorted({g['kind'] for g in walked}), ['joint'])
+        check('for this arm, and not for the one with no recording',
+              sorted({g['group'] for g in walked}), [f'{ARM}_arm'])
+        check('and it leaves the node configured for the launch arm',
+              orchestrator.arm, orchestrator.launch_arm)
+        with robot.lock:
+            robot.goals.clear()
+        with orchestrator._lock:
+            orchestrator._busy = True
+        orchestrator._boot_walk()
+        with orchestrator._lock:
+            orchestrator._busy = False
+        # HOME is the default, because that is the pose a cycle starts
+        # from: the look and the map both need the arm out of the camera
+        # frame, so waiting anywhere else costs a trip on the first Pick.
+        # The staging pose is where they wait, because that is where the
+        # approach starts -- and the walk goes via HOME so the map can be
+        # taken with the robot out of the frame.
+        check('the staging pose is where they wait unless told otherwise',
+              keep_boot, 'pre_pick')
+        # The other arm waits out of the way. Both at pre_pick puts one
+        # across the other's path: run at 15:10, INVALID_MOTION_PLAN three
+        # times at the staging goal with the tape in the jaws.
+        check('and so does the arm that is not picking',
+              orchestrator.get_parameter('boot_other_arm').value, 'pre_pick')
+        check('which is what it is sent to',
+              orchestrator.boot_destination(module.other_arm(ARM)),
+              'pre_pick')
+        check('while the picking arm gets it from boot_pose',
+              orchestrator.boot_destination(ARM), 'pre_pick')
+        # The idle arm can be folded away instead. The two staging poses
+        # are mirror images about 35 cm apart and a carried object passes
+        # between them -- and the other arm is a real robot link in the
+        # planning scene, not a voxel, so no self-filtering makes it go
+        # away.
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'boot_other_arm', value='home')])
+        check('or folded down at its own side',
+              orchestrator.boot_destination(module.other_arm(ARM)), 'home')
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'boot_other_arm', value='leave')])
+        left_alone, why = orchestrator.boot_joints(module.other_arm(ARM))
+        check('or left exactly where it is',
+              (left_alone, 'boot_other_arm' in (why or '')), (None, True))
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'boot_other_arm', value='pre_pick')])
+        with robot.lock:
+            boot_tcp = list(robot.tcp)
+            boot_joints = list(robot.joints)
+            # Somewhere that is neither home nor the staging pose, so both
+            # legs of the walk are real moves rather than skips.
+            robot.joints = list(DROP_JOINTS)
+            robot.goals.clear()
+            refreshed = len(robot.refreshes)
+        time.sleep(0.4)
+        orchestrator._walk_to_boot_pose()
+        with robot.lock:
+            walked = [g['joints'] for g in robot.goals
+                      if not g['plan_only'] and g['kind'] == 'joint']
+            mapped = len(robot.refreshes) - refreshed
+        # Straight to where they wait, and the map is taken from there:
+        # the grippers being in it is handled by exempting them, not by
+        # moving the robot out of the way.
+        check('the walk goes straight to the staging pose',
+              walked[-1], PRE_PICK_JOINTS)
+        check('with no fold down to home on the way',
+              [j for j in walked
+               if max(abs(a - b) for a, b in zip(j, HOME_JOINTS)) < 1e-3], [])
+        check('and the map is captured from where they stand',
+              mapped > 0, True)
+        # The detour is still there for a stack that wants it.
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'boot_via_home', value=True)])
+        with robot.lock:
+            robot.joints = list(DROP_JOINTS)
+            robot.goals.clear()
+        time.sleep(0.4)
+        orchestrator._walk_to_boot_pose()
+        with robot.lock:
+            detoured = [g['joints'] for g in robot.goals
+                        if not g['plan_only'] and g['kind'] == 'joint']
+        check('boot_via_home puts the fold down to home back',
+              any(max(abs(a - b) for a, b in zip(j, HOME_JOINTS)) < 1e-3
+                  for j in detoured[:-1]), True)
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'boot_via_home', value=False)])
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'boot_pose', value='home')])
+        home_joints, problem = orchestrator.boot_joints(ARM)
+        check('HOME always has somewhere to go, recorded or not',
+              (problem, [round(v, 5) for v in home_joints]),
+              (None, [round(v, 5) for v in orchestrator.home_positions()]))
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'boot_pose', value=keep_boot)])
+
+        # -- a Pick pressed at the staging pose starts there ---------------
+        #
+        # The trip to HOME and back is about ten seconds each way, and the
+        # boot walk has just left the arm standing where the approach
+        # begins.
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'locate_from_staging', value=True)])
+        with robot.lock:
+            robot.joints = list(PRE_PICK_JOINTS)
+            robot.tcp = [0.30, -0.20, 0.50]
+            robot.object_hidden = False
+            robot.holding = False
+            robot.goals.clear()
+        time.sleep(0.5)
+        staged_states = {'pre_pick_state': {'joints': PRE_PICK_JOINTS},
+                         'drop_state': {'joints': DROP_JOINTS}}
+        check('it looks from where it stands',
+              orchestrator.take_up_the_view(staged_states), True)
+        with robot.lock:
+            went = [g for g in robot.goals if not g['plan_only']]
+        check('without going home for it', went, [])
+        check('and the answer is kept, so the attempt pays for one look',
+              orchestrator._last_detection is not None, True)
+
+        # The robot looking at itself. The staging pose is over the work
+        # surface, so the arm is in the picture -- and the detector always
+        # answers something.
+        with robot.lock:
+            robot.tcp = list(OBJECT_POINT)
+            robot.goals.clear()
+        time.sleep(0.5)
+        near = orchestrator.get_parameter('self_detect_radius').value
+        refused = orchestrator.implausible_detection(
+            {'point': list(OBJECT_POINT), 'depth_m': 0.6, 'depth_px': 800})
+        check('a detection on the gripper is refused',
+              'from the tool' in (refused or ''), True)
+        check('and the tool is what it was measured against',
+              near > 0.0, True)
+        # With HOME off there is nowhere out of frame to look from, so the
+        # honest answer is to say so rather than drive to the pose the arm
+        # is already standing in and find the same gripper again.
+        check('and with no HOME to fold down to, that is reported',
+              orchestrator.take_up_the_view(staged_states),
+              module.NOTHING_SEEN)
+        with robot.lock:
+            recovered = [g['joints'] for g in robot.goals
+                         if not g['plan_only'] and g['kind'] == 'joint']
+        check('rather than driven for',
+              [j for j in recovered
+               if max(abs(a - b) for a, b in zip(j, HOME_JOINTS)) < 1e-3], [])
+
+        # And the trip is still there for a stack that wants it.
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'use_home', value=True)])
+        with robot.lock:
+            robot.goals.clear()
+        check('use_home:=true folds out of frame and looks once more',
+              orchestrator.take_up_the_view(staged_states), True)
+        with robot.lock:
+            recovered = [g['joints'] for g in robot.goals
+                         if not g['plan_only'] and g['kind'] == 'joint']
+        check('which means it actually went there',
+              any(max(abs(a - b) for a, b in zip(j, HOME_JOINTS)) < 1e-3
+                  for j in recovered), True)
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'use_home', value=False)])
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'locate_from_staging', value=False)])
+        with robot.lock:
+            robot.tcp = list(boot_tcp)
+            robot.joints = list(boot_joints)
+            robot.goals.clear()
+        orchestrator._last_detection = None
+        orchestrator._last_payload = None
+        time.sleep(0.3)
+        with robot.lock:
+            check('a boot walk is refused while something is running',
+                  [g for g in robot.goals if not g['plan_only']], [])
+        orchestrator._set_state(keep_state, 'after the boot-walk checks')
 
         # Guards. These are what stand between an unrecorded pose and the arm
         # moving somewhere nobody chose.
@@ -1218,6 +2033,19 @@ def main():
         check('torque never ran away past the cap',
               final_torque <= TORQUE_CAP_NM + GRIPPER_KP * step / GRIPPER_R + 1e-6,
               True)
+        # What the close ended at is latched, because every later question
+        # about the grip is a question about a change since this moment.
+        latched = orchestrator.grasp_close_reading()
+        check('a good close is remembered', latched is not None, True)
+        if latched is not None:
+            with robot.lock:
+                check('with the width the jaws actually settled at',
+                      round(latched['width'], 5), round(robot.finger, 5))
+            check('and the torque they settled at', latched['torque'] > 0.0,
+                  True)
+        orchestrator.open_gripper('TEST-OPEN')
+        check('and forgotten the moment they open',
+              orchestrator.grasp_close_reading(), None)
 
         # The gripper on its own, so the cap can be tested with an object placed
         # in the fingers by hand and no arm motion at all.
@@ -1350,15 +2178,29 @@ def main():
             order.append(st['name'])
             shapes.add(shape)
         check('a ladder where every rung misses skips only the duplicate',
-              order, ['nominal', 'yaw+90', 'lower-8mm', 'yaw+90-lower',
+              order, ['nominal', 'lower-8mm', 'yaw+90', 'yaw+90-lower',
                       'remap-from-home'])
+        # Height before yaw. The yaw comes from the detector's measured
+        # object axis and is usually right; the height is what has been
+        # wrong, and a rung spent turning the wrist is a whole approach.
+        check('the first thing it varies is the height, not the wrist',
+              order[1], 'lower-8mm')
         check('and it does reach a rung that goes lower',
               any(module.STRATEGIES[[s['name'] for s in module.STRATEGIES]
                                     .index(n)]['z_offset'] < 0.0
                   for n in order), True)
 
-        check('the shipped grasp offset stops above the object, not below it',
-              orchestrator.get_parameter('grasp_z_offset').value > 0.0, True)
+        # Down the side of the object, not above its top face. The floor
+        # is the measured surface, so this reaches as far down as the
+        # table allows and no further.
+        # Read from the source, because this suite pins its own value at
+        # init -- what is being checked is what ships.
+        shipped = float(re.search(
+            r"declare_parameter\('grasp_z_offset', (-?[0-9.]+)\)",
+            open(os.path.join(WS, 'pick_place_orchestrator.py')).read()
+        ).group(1))
+        check('the shipped grasp offset reaches down the object, not over it',
+              shipped < 0.0, True)
         nominal = next(st for st in module.STRATEGIES
                        if st['name'] == 'nominal')
         deeper = dict(nominal, z_offset=-0.050)
@@ -1379,6 +2221,138 @@ def main():
             check(f'and {name} really does aim lower than nominal',
                   low[2] < point[2]
                   + orchestrator.get_parameter('grasp_z_offset').value, True)
+
+        # -- the grasp is measured from the top of the object ---------------
+        #
+        # `point` is the median depth over the inner half of the box, which
+        # for anything that stands up sits somewhere down its side. A grasp
+        # computed from that is aimed inside the object.
+        tall = dict(good, point=[0.35, -0.18, 0.30],
+                    top=[0.35, -0.18, 0.34], height_m=0.04)
+        offset = orchestrator.get_parameter('grasp_z_offset').value
+        high, _pg, _q, _p = orchestrator.grasp_from_detection(tall, nominal)
+        check('the grasp is taken from the reported top, not the centre',
+              round(high[2], 6), round(0.34 + offset, 6))
+        check('which is above what the centre depth would have given',
+              high[2] > 0.30 + offset, True)
+        # The floor is the measured surface, not the object's own top
+        # face. A grasp at the top face of a roll of tape is a grasp on
+        # 10 mm of air, and the grip that results is the one that lets go.
+        deep = dict(tall, surface=[0.35, -0.18, 0.30])
+        clearance = orchestrator.get_parameter('grasp_table_clearance').value
+        digs = dict(nominal, z_offset=-0.030)
+        down, _pg, _q, _p = orchestrator.grasp_from_detection(deep, digs)
+        check('a negative offset now reaches down the side of the object',
+              down[2] < 0.34, True)
+        check('but never below the surface it is standing on',
+              round(down[2], 6) >= round(0.30 + clearance, 6), True)
+        sunk = dict(nominal, z_offset=-0.500)
+        check('however deep it is asked to go',
+              round(orchestrator.grasp_from_detection(deep, sunk)[0][2], 6),
+              round(0.30 + clearance, 6))
+        # "Do not drop it from a height" is one number: how far the tool
+        # was above the surface the object stood on when the jaws closed.
+        # Put the tool that far above the paper and the object is set down.
+        # Taken from where the tool actually was -- this arm lands 10-25 mm
+        # from what it was commanded.
+        orchestrator._pick_surface_z = None
+        orchestrator._pick_hold_offset = None
+        orchestrator.grasp_from_detection(deep, nominal)
+        check('the surface the object stood on is kept for the place',
+              round(orchestrator._pick_surface_z, 4), 0.30)
+        check('with a provisional hold height from the commanded grasp',
+              orchestrator._pick_hold_offset is not None, True)
+        source_at_grasp = open(os.path.join(
+            WS, 'pick_place_orchestrator.py')).read()
+        grasp_step = source_at_grasp.split(
+            'def _step_grasp(')[1].split('\n    def ')[0]
+        check('and the jaws closing replaces it with the measured height',
+              '_pick_hold_offset = float(\n                at_jaws[2] - self._pick_surface_z)'
+              in grasp_step, True)
+        check('before the close is attempted, so a missed grip still has it',
+              grasp_step.index('_pick_hold_offset')
+              < grasp_step.index('close_gripper_to_cap'), True)
+
+        top_z, why = orchestrator.object_top(tall)
+        check('and it says which number it used', (round(top_z, 4), 'measured' in why),
+              (0.34, True))
+        # A detector that reports no top at all still works, on the old
+        # number and with a warning.
+        older = {k: v for k, v in tall.items() if k not in ('top', 'height_m')}
+        fell_back, note = orchestrator.object_top(older)
+        check('an older detector falls back to the centre depth',
+              (round(fell_back, 4), 'box-centre' in note), (0.30, True))
+        check('and the clamp follows the top too',
+              round(orchestrator.grasp_from_detection(tall, deeper)[0][2], 6),
+              round(0.34, 6))
+
+        # -- the descent is vertical, so the tool gets on the column first --
+        #
+        # compute_cartesian_path interpolates from where the tool *is*, so
+        # a tool off the column does not descend, it slants -- and closes
+        # the lateral gap on the way down, through whatever is standing
+        # there. Run 1789111587: TRANSIT landed 21.4 mm short in x, the
+        # descent ended 22.8 mm past, 44 mm of sideways travel while
+        # dropping 43 mm. The jaws then closed on nothing 22 mm off.
+        column = (0.40, -0.20, 0.30)
+        aligned_quat = list(module.top_down_quat(0.0))
+        # The transit height over the grasp: that is the height the
+        # approach ends at, chosen to be well clear of anything on the
+        # surface, and it is where a descent starts from.
+        transit = orchestrator.get_parameter('transit_height').value
+        high = column[2] + transit
+        # The guard has to admit the height the descent actually starts
+        # from. It did not -- it wanted the retreat height, which is
+        # higher -- so the correction never ran and every descent went
+        # back to being a slant.
+        check('the correction is allowed at the height a descent starts',
+              transit <= orchestrator.get_parameter('retreat_height').value,
+              True)
+        with robot.lock:
+            robot.cartesian_requests.clear()
+            robot.tcp = [column[0] - 0.0214, column[1] + 0.001, high]
+        time.sleep(0.5)
+        check('an off-column tool is brought onto it first',
+              orchestrator.align_over_column(column, aligned_quat, 'TEST'),
+              True)
+        with robot.lock:
+            legs = list(robot.cartesian_requests)
+            after = list(robot.tcp)
+        check('with a leg of its own', bool(legs), True)
+        check('horizontal -- at the height it was already at, not lower',
+              [round(r['xyz'][2], 4) for r in legs],
+              [round(high, 4)] * len(legs))
+        check('aimed at the column', (round(legs[-1]['xyz'][0], 4),
+                                      round(legs[-1]['xyz'][1], 4)),
+              (round(column[0], 4), round(column[1], 4)))
+        check('and the tool ends on it',
+              math.hypot(after[0] - column[0], after[1] - column[1]) < 0.002,
+              True)
+
+        # Under the tolerance it is not worth a move.
+        with robot.lock:
+            robot.cartesian_requests.clear()
+            robot.tcp = [column[0] + 0.001, column[1], high]
+        time.sleep(0.5)
+        check('a tool already on the column is left alone',
+              orchestrator.align_over_column(column, aligned_quat, 'TEST'),
+              True)
+        with robot.lock:
+            check('with no leg at all', len(robot.cartesian_requests), 0)
+
+        # And never sideways down among whatever is on the table: a
+        # correction made a centimetre above the object is the move that
+        # knocks it over.
+        with robot.lock:
+            robot.cartesian_requests.clear()
+            robot.tcp = [column[0] - 0.0214, column[1], column[2] + 0.01]
+        time.sleep(0.5)
+        check('an off-column tool low down is not dragged sideways',
+              orchestrator.align_over_column(column, aligned_quat, 'TEST'),
+              True)
+        with robot.lock:
+            check('so no leg is flown down there',
+                  len(robot.cartesian_requests), 0)
 
         # Seeded IK, on its own. This is the mechanism that stops a 5 cm
         # descent from flipping the arm, so its failure modes matter.
@@ -1679,13 +2653,36 @@ def main():
         check('and the column is forgotten, so the next exit is a no-op',
               orchestrator._column, None)
 
-        # A no-op once the tool is clear. The successful path has already
-        # lifted, and a second lift there would be a wasted leg -- or, if the
-        # object is being carried, a leg planned with the payload attached for
-        # no reason.
+        # "Clear" means retreat_height above the grasp, not merely back at
+        # the pre-grasp. Settling for the pre-grasp is what handed the
+        # gripper back to the octomap 50 mm above the object it had just
+        # picked up, with its own voxels still there: run 1789103548, three
+        # INVALID_MOTION_PLANs at the staging goal and a pick that finished
+        # 150 mm low.
+        retreat = orchestrator.get_parameter('retreat_height').value
         with robot.lock:
             robot.cartesian_requests.clear()
             robot.tcp = [column_xy[0], column_xy[1], 0.46]
+        time.sleep(0.6)
+        orchestrator._column = ([column_xy[0], column_xy[1], 0.30],
+                                [column_xy[0], column_xy[1], 0.45], quat)
+        check('a tool at the pre-grasp height is not clear yet',
+              orchestrator.clear_the_surface('a test'), True)
+        with robot.lock:
+            # At least to the retreat height above the grasp. Higher is
+            # fine and is what happens: the lift is asked for from where
+            # the tool actually is, not from the grasp.
+            check('so it keeps rising, past the retreat height',
+                  max(line['xyz'][2] for line in robot.cartesian_requests
+                      if line['xyz']) >= 0.30 + retreat - 1e-6, True)
+
+        # A no-op once the tool really is clear. The successful path has
+        # already lifted, and a second lift there would be a wasted leg --
+        # or, if the object is being carried, a leg planned with the payload
+        # attached for no reason.
+        with robot.lock:
+            robot.cartesian_requests.clear()
+            robot.tcp = [column_xy[0], column_xy[1], 0.30 + retreat + 0.01]
             before = moved(robot)
         time.sleep(0.6)
         orchestrator._column = ([column_xy[0], column_xy[1], 0.30],
@@ -1702,6 +2699,62 @@ def main():
         orchestrator._column = None
         check('and with no column it is a no-op',
               orchestrator.clear_the_surface('a test'), True)
+
+        # -- the lift climbs what it cannot fly in one line ----------------
+        #
+        # Bracketed: this flies four lines and executes four trajectories,
+        # and the sections after it read the arm's posture and the request
+        # lists as they were.
+        with robot.lock:
+            was_joints = list(robot.joints)
+            was_tcp = list(robot.tcp)
+        #
+        # The joint-travel budget is per line, which is the whole reason
+        # this works. Run 1789103548: 200 mm straight up was refused at
+        # 3.582 rad against a 1.5 rad budget, the lift settled for the
+        # pre-grasp height, and the gripper stayed inside the voxels of the
+        # roll it had just picked up -- three INVALID_MOTION_PLANs and a
+        # pick that finished 150 mm low.
+        step = orchestrator.get_parameter('descend_step').value
+        with robot.lock:
+            robot.cartesian_requests.clear()
+            robot.tcp = [column_xy[0], column_xy[1], 0.30]
+        time.sleep(0.6)
+        orchestrator.climb_in_steps(0.30 + 4 * step, quat, 'TEST')
+        with robot.lock:
+            climbed = [line['xyz'][2] for line in robot.cartesian_requests
+                       if line['xyz']]
+            ended = list(robot.tcp)
+        check('it climbs in more than one line', len(climbed) > 1, True)
+        check('no line longer than a step',
+              max(b - a for a, b in zip([0.30] + climbed, climbed))
+              <= step + 1e-6, True)
+        check('and it arrives at the top', ended[2], 0.30 + 4 * step, 1e-6)
+        check('without wandering off the column',
+              (round(ended[0], 6), round(ended[1], 6)),
+              (round(column_xy[0], 6), round(column_xy[1], 6)))
+
+        # A line that will not go ends the climb where it is. This is a
+        # best-effort improvement on a height already reached, never a
+        # reason to fail a lift that has otherwise worked.
+        with robot.lock:
+            robot.cartesian_requests.clear()
+            robot.tcp = [column_xy[0], column_xy[1], 0.30]
+            robot.cartesian_fraction = 0.0
+        time.sleep(0.6)
+        orchestrator.climb_in_steps(0.30 + 4 * step, quat, 'TEST')
+        with robot.lock:
+            robot.cartesian_fraction = 1.0
+            stuck = list(robot.tcp)
+        check('a refused step stops the climb rather than looping',
+              stuck[2] < 0.30 + step + 1e-6, True)
+        with robot.lock:
+            robot.joints = list(was_joints)
+            robot.tcp = list(was_tcp)
+            robot.cartesian_requests.clear()
+            robot.ik_requests.clear()
+        orchestrator._column = None
+        time.sleep(0.4)
 
         # The structural half: every exit from a pick has to go through it.
         # The lift is only worth having if it is on all of the paths, and the
@@ -1853,8 +2906,8 @@ def main():
         # pinning the two lines adjacent broke the moment a _note_failure
         # call was added between them, which is a change to neither.
         missed_branch = orch_src.split(
-            'if not self.close_gripper_to_cap():')[1].split(
-                '\n        self._set_state')[0]
+            'if not self.close_gripper_to_cap() and not self.close_lower('
+            )[1].split('\n    def ')[0]
         # Anchored on the statement, not the word: the branch's own comment
         # contains "return without recording anything", and matching that
         # compared the lift against a comment.
@@ -1968,11 +3021,35 @@ def main():
             gripper = index[orchestrator.gripper_links()[0]]
             check('the gripper is allowed to touch the octomap',
                   bool(sent['acm_values'][gripper][octomap]), True)
-            check('and the exemption is withdrawn again afterwards',
-                  any(not sc['acm_values'][octomap][gripper]
-                      for sc in acm[1:]
-                      if len(sc['acm_values']) > max(octomap, gripper))
-                  if len(acm) > 1 else False, True)
+            # Not withdrawn afterwards, and deliberately: the gripper
+            # stands in the camera's view at the staging pose, so it lands
+            # in any map captured from there -- and an arm inside its own
+            # map cannot plan at all, not even to its own posture.
+            # Measured at 13:37, all four finger links in the octomap and
+            # both arms invalid. Only the gripper is exempt; the forearm
+            # and upper arm stay checked against the map.
+            check('the exemption stands for the session, not just the leg',
+                  orchestrator.get_parameter('gripper_never_in_map').value,
+                  True)
+            check('so nothing withdraws it',
+                  [sc for sc in acm[1:]
+                   if len(sc['acm_values']) > max(octomap, gripper)
+                   and not sc['acm_values'][octomap][gripper]], [])
+            orchestrator.set_parameters([rclpy.parameter.Parameter(
+                'gripper_never_in_map', value=False)])
+            with robot.lock:
+                robot.scene_requests.clear()
+            orchestrator.allow_gripper_in_octomap(False)
+            with robot.lock:
+                back = [sc for sc in robot.scene_requests
+                        if sc.get('acm_names')]
+            check('unless it is turned off, and then it can be withdrawn',
+                  bool(back) and not back[-1]['acm_values'][
+                      back[-1]['acm_names'].index('<octomap>')][
+                      back[-1]['acm_names'].index(
+                          orchestrator.gripper_links()[0])], True)
+            orchestrator.set_parameters([rclpy.parameter.Parameter(
+                'gripper_never_in_map', value=True)])
 
         # With the exemption unavailable, the old blunt fallback still works.
         orchestrator.set_parameters([rclpy.parameter.Parameter(
@@ -2307,8 +3384,11 @@ def main():
         check('the log has heartbeat records', len(beats) > 0, True)
         check('and they carry the same measured values',
               all(len(b['measured']['joints']) == 7 for b in beats), True)
+        # Named rather than counted, so a failure says which state was
+        # published while a run was supposedly in progress.
         check('they are only written while a cycle runs',
-              all(b['state'] not in ('IDLE', 'INIT') for b in beats), True)
+              sorted({b['state'] for b in beats
+                      if b['state'] in ('IDLE', 'INIT')}), [])
         print(f'        {len(beats)} heartbeats at '
               f"{orchestrator.get_parameter('motion_log_heartbeat').value}s")
 
@@ -3444,14 +4524,14 @@ def main():
                   refresh_before + 1)
 
         # Holding something must also block it, wherever the arm is.
-        orchestrator._holding = True
+        orchestrator._held[ARM] = {'object': 'wrench', 'offset': 0.02}
         with robot.lock:
             held_refresh = len(robot.refreshes)
         check('carrying blocks the octomap too',
               orchestrator.capture_octomap(), False)
         with robot.lock:
             check('and let no frames through', len(robot.refreshes), held_refresh)
-        orchestrator._holding = False
+        orchestrator._held.pop(ARM, None)
 
         # A dead planner must stop the cycle, not warn and walk the whole retry
         # ladder: with nothing planning, "every pick strategy was exhausted"
@@ -3808,6 +4888,7 @@ def main():
         hit = {'joint': joints[0], 'effort': -9.0, 'baseline': -3.0,
                'lag': 0.4, 'at': 0.0, 'back_to': list(retrace[0]),
                'retrace': [list(p) for p in retrace]}
+        orchestrator._contact_fired = False
         backed = orchestrator.retreat_from_contact('TEST', hit)
         check('the back-off goes', backed, True)
         with robot.lock:
@@ -3828,6 +4909,16 @@ def main():
                   sent[0]['seconds'][-1] >= 0.5, True)
         check('and the arm is there', round(landed[0], 3),
               round(retrace[0][0], 3))
+        # A back-off that worked means the arm is off what it hit, so
+        # safe_shutdown's disengage-on-contact path -- meant for an arm
+        # that is *still* leaning on something -- has nothing left to act
+        # on. Run at 17:45: this flag stayed set 18 s and four successful
+        # legs past a clean back-off, so an unrelated failure at the end
+        # of the cycle still triggered a full disengage/settle/re-engage,
+        # and the arm sagged 32 cm in the 3 s it spent with no torque at
+        # all before either side could plan back to the staging pose.
+        check('a successful back-off clears the contact flag',
+              orchestrator._contact_fired, False)
 
         # A controller that will not take it must not leave the arm leaning.
         # Put the arm back first: the destination is where it now stands, and
@@ -3838,6 +4929,7 @@ def main():
             robot.controller_refuse = True
             robot.trajectories.clear()
             planner_goals = len(robot.goals)
+        orchestrator._contact_fired = True
         backed = orchestrator.retreat_from_contact('TEST', hit)
         with robot.lock:
             robot.controller_refuse = False
@@ -3846,6 +4938,22 @@ def main():
         check('a controller that refuses falls back to the planner',
               fell_back > 0, True)
         check('and the arm still gets out', backed, True)
+        check('and the flag is cleared here too -- the fallback got the '
+              'arm off the obstruction just as well as the direct drive '
+              'did', orchestrator._contact_fired, False)
+
+        # And the one case where it has to stay set: no retrace at all, so
+        # nothing was done about the contact and the arm may genuinely
+        # still be resting on what it hit.
+        orchestrator._contact_fired = True
+        stuck = orchestrator.retreat_from_contact(
+            'TEST', {'joint': joints[0], 'effort': -9.0, 'baseline': -3.0,
+                     'retrace': []})
+        check('with nowhere to retreat to, the back-off is refused',
+              stuck, False)
+        check('and the flag stays set -- this is the genuine case',
+              orchestrator._contact_fired, True)
+        orchestrator._contact_fired = False
 
         # -- the grasp check: the detector decides -------------------------
         #
@@ -3859,9 +4967,14 @@ def main():
             keep_holding = robot.holding
             keep_hidden = robot.object_hidden
             keep_finger = robot.finger
+            keep_torque = robot.torque
             robot.holding = False
             robot.object_hidden = False
             robot.finger = HOLDING_FINGER
+            robot.torque = HOLDING_TORQUE
+        # No latched close: the drift reading gets its own checks below, and
+        # a leftover from the gripper tests further up would decide these.
+        orchestrator._forget_grasp()
         time.sleep(0.3)
         check('an object still lying at the pick point fails the check',
               orchestrator.verify_grasp(list(OBJECT_POINT)), False)
@@ -3873,20 +4986,407 @@ def main():
         with robot.lock:
             robot.object_hidden = True
         time.sleep(0.3)
-        check('an empty frame is not a pass: that is what a failed pick '
-              'looks like with the arm parked over the object',
+        # An empty frame decides nothing, so the fingers do. Run
+        # 1789022566: the jaws held a screwdriver handle at 14.0 mm and
+        # 2.28 Nm, the detector saw nothing twice, and reading that as a
+        # failure opened the jaws and dropped it.
+        check('an empty frame with the jaws full is held, not dropped',
+              orchestrator.verify_grasp(list(OBJECT_POINT)), True)
+        with robot.lock:
+            robot.finger = 0.0011         # 1789014831: empty, 0.50 Nm
+        time.sleep(0.3)
+        check('an empty frame with the jaws empty is a failure',
               orchestrator.verify_grasp(list(OBJECT_POINT)), False)
         with robot.lock:
             robot.object_hidden = False
-            robot.finger = 0.0011         # the measured value from that run
         time.sleep(0.3)
         check('and jaws shut on nothing fail whatever the detector says',
               orchestrator.verify_grasp(list(OBJECT_POINT)), False)
         with robot.lock:
+            robot.finger = HOLDING_FINGER
+        time.sleep(0.3)
+
+        # -- the grasp check: what the gripper itself says -----------------
+        #
+        # Width is not the only thing the jaws know. The grip force is
+        # position error times a fixed Kp, so an object that leaves lets
+        # the fingers travel in and the torque goes with it -- and both of
+        # those are readable while the detector is looking at an occluded
+        # object and saying nothing.
+        with robot.lock:
+            robot.object_hidden = True
+            robot.torque = 0.5            # 1789014831: shut on nothing
+        time.sleep(0.3)
+        check('jaws the right width but slack are not holding',
+              orchestrator.verify_grasp(list(OBJECT_POINT)), False)
+        # Slack jaws are a hint, not a proof: seeing the object up at the
+        # tool after the lift is the stronger evidence and still wins.
+        with robot.lock:
+            robot.object_hidden = False
+            robot.holding = True
+        time.sleep(0.3)
+        check('but a sighting at the tool overrules them',
+              orchestrator.verify_grasp(list(OBJECT_POINT)), True)
+        with robot.lock:
+            robot.object_hidden = True
+            robot.torque = HOLDING_TORQUE
+        time.sleep(0.3)
+
+        # Drift: the same width means opposite things depending on where
+        # the close ended. 5 mm is a grip if the jaws closed at 5 mm and an
+        # empty jaw if they closed at 14 and have travelled in since.
+        drop = orchestrator.get_parameter('grasp_width_drop').value
+        with robot.lock:
+            robot.finger = HOLDING_FINGER
+        time.sleep(0.3)
+        orchestrator._latch_grasp('test')
+        check('the close is remembered to compare against',
+              round(orchestrator.grasp_close_reading()['width'], 4),
+              round(HOLDING_FINGER, 4))
+        check('and jaws that have not moved since are still holding',
+              orchestrator.verify_grasp(list(OBJECT_POINT)), True)
+        with robot.lock:
+            robot.finger = HOLDING_FINGER - drop * 4
+        time.sleep(0.3)
+        check('jaws that travelled in since the close have let go',
+              orchestrator.verify_grasp(list(OBJECT_POINT)), False)
+        orchestrator._forget_grasp()
+        time.sleep(0.1)
+        check('with nothing to compare against, that same width holds',
+              orchestrator.verify_grasp(list(OBJECT_POINT)), True)
+        with robot.lock:
+            robot.object_hidden = False
+            robot.finger = HOLDING_FINGER
+        time.sleep(0.3)
+
+        # Both halves can be switched off, for a gripper whose driver
+        # reports no torque or a run that wants the width alone.
+        orchestrator.set_parameters([
+            rclpy.parameter.Parameter('grasp_hold_torque_min', value=0.0),
+            rclpy.parameter.Parameter('grasp_width_drop', value=0.0)])
+        with robot.lock:
+            robot.torque = 0.5
+        time.sleep(0.3)
+        check('a zero torque threshold leaves the width in charge',
+              orchestrator.finger_verdict()['held'], True)
+        orchestrator.set_parameters([
+            rclpy.parameter.Parameter('grasp_hold_torque_min', value=1.0),
+            rclpy.parameter.Parameter('grasp_width_drop', value=0.002)])
+        with robot.lock:
+            robot.torque = HOLDING_TORQUE
+        time.sleep(0.3)
+
+        # The position test only means something if the arm carried the
+        # object somewhere. That run's lift was refused for joint travel
+        # and fell back to 38 mm, under the 50 mm that separates "moved"
+        # from "did not" -- so the object in the jaws and the object still
+        # on the table are the same point, and the test must not be run.
+        eps = orchestrator.get_parameter('object_moved_eps').value
+        with robot.lock:
+            keep_tcp = list(robot.tcp)
+            robot.tcp = [OBJECT_POINT[0], OBJECT_POINT[1],
+                         OBJECT_POINT[2] + eps * 0.75]
+            robot.holding = False         # object still lying where it was
+        time.sleep(0.4)
+        check('a lift shorter than object_moved_eps does not fail the grasp',
+              orchestrator.verify_grasp(list(OBJECT_POINT)), True)
+        with robot.lock:
+            robot.tcp = list(keep_tcp)
+            robot.holding = True
+        time.sleep(0.4)
+        with robot.lock:
             robot.holding = keep_holding
             robot.object_hidden = keep_hidden
             robot.finger = keep_finger
+            robot.torque = keep_torque
         time.sleep(0.3)
+
+        # -- a straight line is flown as fast as the ceilings allow -------
+        #
+        # The two halves of a cycle are timed by different things. cuMotion
+        # times the joint goals from its own limits; MoveIt times the
+        # Cartesian paths from joint_limits.yaml, which on this robot
+        # declares has_acceleration_limits false for every joint. Measured
+        # in run 1789640514: the four TRANSIT legs took 11.2-11.6 s at a
+        # peak of 0.8 rad/s^2 while the same run's joint goals peaked at
+        # 3.4-5.4 and finished inside 3.5 s.
+        def ramp(*positions):
+            """A trajectory with one joint on the given path, 1 s apart."""
+            traj = RobotTrajectory()
+            traj.joint_trajectory.joint_names = [
+                f'openarm_{ARM}_joint{i}' for i in range(1, 8)]
+            for index, value in enumerate(positions):
+                point = JointTrajectoryPoint()
+                point.positions = [float(value)] + [0.0] * 6
+                point.velocities = [0.0] * 7
+                point.accelerations = [0.0] * 7
+                point.time_from_start.sec = index
+                traj.joint_trajectory.points.append(point)
+            return traj
+
+        def seconds(traj):
+            last = traj.joint_trajectory.points[-1].time_from_start
+            return last.sec + last.nanosec * 1e-9
+
+        # 0.1, 0.2, 0.3, 0.4 rad/s one second apart: 0.1 rad/s^2 throughout.
+        fastest, hardest = orchestrator.trajectory_peaks(
+            ramp(0.0, 0.1, 0.3, 0.6, 1.0))
+        check('the peak speed a path asks for is read off the path itself',
+              round(fastest, 4), 0.4)
+        check('and so is the peak acceleration', round(hardest, 4), 0.1)
+        check('a path too short to difference twice says so',
+              orchestrator.trajectory_peaks(ramp(0.0, 0.1))[0], None)
+
+        keep_speed = orchestrator.get_parameter('velocity_scaling').value
+        keep_boost = orchestrator.get_parameter('cartesian_boost_max').value
+        keep_vmax = orchestrator.get_parameter('cartesian_vel_max').value
+        orchestrator.set_parameters([
+            rclpy.parameter.Parameter('velocity_scaling', value=0.8),
+            rclpy.parameter.Parameter('cartesian_boost_max', value=1.0)])
+        check('with the boost off, a line is only ever slowed to the '
+              'operator speed',
+              round(seconds(orchestrator._retime(
+                  ramp(0.0, 0.1, 0.3, 0.6, 1.0))), 3), 5.0)
+
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'cartesian_boost_max', value=3.0)])
+        flown = orchestrator._retime(ramp(0.0, 0.1, 0.3, 0.6, 1.0))
+        check('with headroom under both ceilings it takes the whole boost',
+              round(seconds(flown), 3), round(4.0 / (0.8 * 3.0), 3))
+        after = orchestrator.trajectory_peaks(flown)
+        check('and the sped-up path still sits under the speed ceiling',
+              after[0] <= orchestrator.get_parameter(
+                  'cartesian_vel_max').value + 1e-9, True)
+
+        # The ceiling, not the cap, is what usually decides.
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'cartesian_vel_max', value=0.8)])
+        check('a low speed ceiling bounds the boost before the cap does',
+              round(seconds(orchestrator._retime(
+                  ramp(0.0, 0.1, 0.3, 0.6, 1.0))), 3),
+              round(4.0 / (0.8 * 2.0), 3))
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'cartesian_vel_max', value=keep_vmax)])
+
+        # And a leg the operator asked to be gentle stays exactly as gentle
+        # as it was: the boost corrects a base timing, and place_speed was
+        # measured against that base with an object in the jaws.
+        with orchestrator.at_speed(0.2, 'test'):
+            check('a gentle block is not sped up',
+                  round(seconds(orchestrator._retime(
+                      ramp(0.0, 0.1, 0.3, 0.6, 1.0))), 3), 20.0)
+        check('and the block puts the speed back',
+              orchestrator.get_parameter('velocity_scaling').value, 0.8)
+        check('along with the boost',
+              round(seconds(orchestrator._retime(
+                  ramp(0.0, 0.1, 0.3, 0.6, 1.0))), 3),
+              round(4.0 / (0.8 * 3.0), 3))
+        orchestrator.set_parameters([
+            rclpy.parameter.Parameter('velocity_scaling', value=keep_speed),
+            rclpy.parameter.Parameter('cartesian_boost_max', value=keep_boost)])
+
+        # -- arriving is about the distance closed, not the distance left --
+        #
+        # This robot does not land on a joint goal. The failure worth
+        # stopping for is the one measured at 13:5x -- the goal reported
+        # SUCCESS and the tool never left the staging pose -- and that is
+        # not the same as the 102 mm the arm was routinely settling off by,
+        # which the leg below closes horizontally before descending.
+        keep_arrival_tcp = list(robot.tcp)
+        aim = [0.40, -0.05, 0.55]
+        from_here = [0.18, -0.18, 0.50]
+        with robot.lock:
+            robot.tcp = list(from_here)
+        time.sleep(0.3)
+        check('a tool that never left where it started has not arrived',
+              orchestrator.arrived(aim, 'OVER_DROP', tolerance=0.12,
+                                   start=list(from_here)), False)
+        with robot.lock:
+            robot.tcp = [0.355, -0.052, 0.514]
+        time.sleep(0.3)
+        check('nor has one judged with no start to compare against',
+              orchestrator.arrived(aim, 'OVER_DROP', tolerance=0.05), False)
+        check('but one that closed most of the gap has, even outside the '
+              'tolerance, because the leg below closes the rest',
+              orchestrator.arrived(aim, 'OVER_DROP', tolerance=0.05,
+                                   start=list(from_here)), True)
+        with robot.lock:
+            robot.tcp = [0.40, -0.05, 0.53]
+        time.sleep(0.3)
+        check('and one inside the tolerance needs no start at all',
+              orchestrator.arrived(aim, 'OVER_DROP', tolerance=0.05), True)
+        with robot.lock:
+            robot.tcp = keep_arrival_tcp
+
+        # -- carrying back stays on this arm's own side --------------------
+        #
+        # The other arm is parked on its side of the middle, in the air,
+        # and the octomap is of the table -- nothing in the collision world
+        # says it is there. The goal cannot express the constraint either:
+        # the staging pose is on this arm's own side whichever way round
+        # the arm gets to it. So the plan is asked for, measured with the
+        # arm's own kinematics, and only then flown.
+        # The arm-choice block above left the *other* arm's recording in
+        # the states file, and the refusal test at the end of the suite
+        # depends on it being there. This needs this arm's, because which
+        # half an arm works in is read off its own recorded staging pose.
+        with open(states_path) as handle:
+            borrowed_states = handle.read()
+        write_states(states_path)
+        import arm_kinematics as kin
+        chain = kin.chain_from_urdf(ARM_URDF, ARM)
+        with orchestrator._lock:
+            orchestrator._own_side.clear()     # read it, do not recall it
+        side = orchestrator.own_side()
+        staging_y = float(chain.pose(chain.tool_link, PRE_PICK_JOINTS)[1, 3])
+        check('the arm works in the half its recorded staging pose is in',
+              side, -1.0 if staging_y < 0.0 else 1.0)
+        check('which for the right arm is the -y half', side, -1.0)
+
+        # joint3 is the one that swings this arm's tool across the middle:
+        # at -1.5 rad from the staging posture the tool stands at y=+0.121,
+        # which is the other arm's half however the guard is written.
+        across = list(PRE_PICK_JOINTS)
+        across[2] -= 1.5
+        across_y = float(chain.pose(chain.tool_link, across)[1, 3])
+        check('a posture across the middle to test against',
+              side * across_y < -0.1, True)
+
+        def plan_of(*postures):
+            traj = RobotTrajectory()
+            traj.joint_trajectory.joint_names = [
+                f'openarm_{ARM}_joint{i}' for i in range(1, 8)]
+            for index, values in enumerate(postures):
+                point = JointTrajectoryPoint()
+                point.positions = [float(v) for v in values]
+                point.time_from_start.sec = index
+                traj.joint_trajectory.points.append(point)
+            return traj
+
+        path = orchestrator.tool_path(plan_of(PRE_PICK_JOINTS, across))
+        check('a plan is turned into where the tool would go', len(path), 2)
+        check('and it is the same kinematics the rest of the file uses',
+              path[1][1][1], across_y, tol=1e-9)
+        over, where = orchestrator.worst_crossing(
+            plan_of(PRE_PICK_JOINTS, across), side, 0.0)
+        check('a plan that swings across the middle is measured, in metres',
+              over, abs(across_y), tol=1e-6)
+        check('and says where it happens', where[1], across_y, tol=1e-9)
+        clean, _ = orchestrator.worst_crossing(
+            plan_of(PRE_PICK_JOINTS, PRE_PICK_JOINTS), side, 0.0)
+        check('a plan that stays on this side measures zero', clean, 0.0)
+        check('a trajectory with no points cannot be judged',
+              orchestrator.worst_crossing(plan_of(), side, 0.0)[0], None)
+
+        # Park the arm away from the goal: fly_on_own_side answers a goal
+        # the arm is already at without planning, which is right and is not
+        # what is under test here.
+        keep_joints = list(robot.joints)
+        keep_tcp = list(robot.tcp)
+        with robot.lock:
+            robot.joints = [v + 0.4 for v in PRE_PICK_JOINTS]
+            # On this arm's own side, which is where the guard reads the
+            # line it holds the path to from. Set rather than inherited:
+            # earlier sections leave the tool wherever they needed it.
+            robot.tcp = [0.30, -0.20, 0.50]
+        time.sleep(0.4)
+
+        # A crossing the guard dislikes but will still fly. It prefers a
+        # clear plan and asks again to get one, but a guard that vetoes
+        # leaves the arm stranded over the table holding something --
+        # measured, run at 15:52: the goal was refused, the lift the retry
+        # depends on solved 2.4% of its line, and the cycle ended at
+        # z=0.357 with the controller reporting CONTROL_FAILED.
+        keep_refuse = orchestrator.get_parameter('carry_side_refuse').value
+        with robot.lock:
+            robot.plan_path = [PRE_PICK_JOINTS, across, PRE_PICK_JOINTS]
+            executed_before = len(robot.executed)
+        flown = orchestrator.fly_on_own_side(
+            list(PRE_PICK_JOINTS), 'PRE_PICK_STATE', tries=2)
+        check('a crossing under the refusal threshold is flown anyway, '
+              'because stopping out there is worse', flown, True)
+        with robot.lock:
+            check('the planner was asked again before settling for it, '
+                  'because cuMotion answers the same goal differently',
+                  sum(1 for g in robot.goals[-6:]
+                      if g['plan_only'] and g['kind'] == 'joint') >= 2, True)
+            check('and it is one of the measured plans that flies',
+                  len(robot.executed), executed_before + 1)
+
+        # Past the threshold it is not a clip of the middle any more, it is
+        # a swing through where the other arm is parked.
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'carry_side_refuse', value=0.05)])
+        with robot.lock:
+            robot.joints = [v + 0.4 for v in PRE_PICK_JOINTS]
+            executed_before = len(robot.executed)
+        time.sleep(0.4)
+        flown = orchestrator.fly_on_own_side(
+            list(PRE_PICK_JOINTS), 'PRE_PICK_STATE', tries=2)
+        check('a crossing past the refusal threshold is refused', flown, False)
+        with robot.lock:
+            check('and nothing is flown', len(robot.executed), executed_before)
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'carry_side_refuse', value=keep_refuse)])
+        with robot.lock:
+            robot.joints = [v + 0.4 for v in PRE_PICK_JOINTS]
+        time.sleep(0.4)
+
+        # The same goal, by a route that stays put: flown, and flown as the
+        # measured plan rather than re-planned from scratch.
+        halfway = [(a + b) / 2.0 for a, b in
+                   zip(PRE_PICK_JOINTS, [v + 0.4 for v in PRE_PICK_JOINTS])]
+        with robot.lock:
+            robot.plan_path = [halfway, PRE_PICK_JOINTS]
+            executed_before = len(robot.executed)
+        flown = orchestrator.fly_on_own_side(
+            list(PRE_PICK_JOINTS), 'PRE_PICK_STATE', tries=2)
+        check('a plan that stays on this side is flown', flown, True)
+        with robot.lock:
+            check('and it is the plan that was measured that flies',
+                  len(robot.executed), executed_before + 1)
+            check('ending at the posture that was asked for',
+                  [round(v, 6) for v in
+                   robot.executed[-1]['points'][-1]['positions']],
+                  [round(v, 6) for v in PRE_PICK_JOINTS])
+
+        # Off, it is the ordinary goal again -- one move_action goal, no
+        # /execute_trajectory, whatever the plan would have done.
+        with robot.lock:
+            robot.joints = [v + 0.4 for v in PRE_PICK_JOINTS]
+            robot.plan_path = [PRE_PICK_JOINTS, across, PRE_PICK_JOINTS]
+            executed_before = len(robot.executed)
+        time.sleep(0.4)
+        keep_guard = orchestrator.get_parameter('carry_guard').value
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'carry_guard', value=False)])
+        check('the guard is off for this check', orchestrator.get_parameter(
+            'carry_guard').value, False)
+        states_now = orchestrator.load_states()
+        check('and the staging pose is still on file to fly to',
+              bool((states_now.get('pre_pick_state') or {}).get('joints')),
+              True)
+        with robot.lock:
+            goals_before = len(robot.goals)
+        flown = orchestrator.move_to_state('pre_pick_state', states_now,
+                                           on_own_side=True)
+        with robot.lock:
+            sent = [g for g in robot.goals[goals_before:]
+                    if not g['plan_only'] and g['kind'] == 'joint']
+            after = len(robot.executed)
+        check('carry_guard off sends the goal the ordinary way',
+              len(sent), 1)
+        check('and it flies', flown, True)
+        check('which is a move_action goal, not an executed plan',
+              after, executed_before)
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'carry_guard', value=keep_guard)])
+        with robot.lock:
+            robot.plan_path = None
+            robot.joints = keep_joints
+            robot.tcp = keep_tcp
+        with open(states_path, 'w') as handle:
+            handle.write(borrowed_states)
 
         # -- a rehearsal value must not reach the arms ---------------------
         import pick_place_sequence as seq_model

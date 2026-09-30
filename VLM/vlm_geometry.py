@@ -208,6 +208,101 @@ def sample_depth(depth, box, depth_scale, min_depth, max_depth):
     return float(np.median(valid)), int(valid.size)
 
 
+# How far into the depth distribution "the top of it" is, and over which
+# part of the box.
+#
+# The whole box at the tenth percentile was too eager: a box is bigger than
+# the thing in it, and whatever is *nearest* in it need not be the object at
+# all. Measured, run at 15:10 -- the arm was in the frame at the staging
+# pose, the nearest tenth of the box was the gripper, and the top came back
+# 45 mm high. The grasp was then computed above the object entirely and the
+# jaws closed on air.
+#
+# So: the inner half, which is where the object actually is (the same region
+# sample_depth uses for the centre), and a fifth rather than a tenth, which
+# is past the dropouts and the edge pixels without being past the object.
+TOP_PERCENTILE = 20.0
+TOP_INNER = 0.25          # half-width as a fraction of the box, per side
+# The ring outside the box that the object is standing on. A tenth of the
+# box on each side, so a small object still gets a reading and a large one
+# does not sample half the table.
+SURFACE_MARGIN = 0.10
+MIN_SURFACE_POINTS = 20
+
+
+def box_depths(depth, box, depth_scale, min_depth, max_depth, grow=0.0):
+    """Valid depths, in metres, over a box optionally grown by `grow` of its
+    own size. Returns a flat array, empty when there is nothing usable."""
+    x1, y1, x2, y2 = box
+    h, w = depth.shape
+    pad_x = (x2 - x1) * grow
+    pad_y = (y2 - y1) * grow
+    ix1 = max(0, int(x1 - pad_x))
+    ix2 = min(w, int(x2 + pad_x) + 1)
+    iy1 = max(0, int(y1 - pad_y))
+    iy2 = min(h, int(y2 + pad_y) + 1)
+    patch = depth[iy1:iy2, ix1:ix2].astype(np.float32) * depth_scale
+    return patch[(patch > min_depth) & (patch < max_depth)]
+
+
+def object_top(depth, box, depth_scale, min_depth, max_depth):
+    """(nearest depth on the object, depth of the surface around it).
+
+    Either may be None. The first is what the tool has to stop above; the
+    second is what the object is standing on, and the difference between
+    them is how tall it is.
+
+    Worth separating from sample_depth, which takes the median over the
+    inner half of the box. That is the right number for "where is it" and
+    the wrong one for "how high is it": for anything that stands up, the
+    median of the box is somewhere down the side of the object, and a
+    grasp computed from it is a grasp aimed *inside* the object. Measured,
+    run 1789111587: the descent was commanded to a z the tool then had to
+    be clamped away from, and the jaws closed 10.7 mm above it anyway.
+    """
+    x1, y1, x2, y2 = box
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    half_w = max(2.0, (x2 - x1) * TOP_INNER)
+    half_h = max(2.0, (y2 - y1) * TOP_INNER)
+    inner = (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+    inside = box_depths(depth, inner, depth_scale, min_depth, max_depth)
+    top = (float(np.percentile(inside, TOP_PERCENTILE))
+           if inside.size else None)
+
+    # The ring around the box: everything in the grown box, minus what is
+    # near enough to the object's own depth to be the object.
+    grown = box_depths(depth, box, depth_scale, min_depth, max_depth,
+                       grow=SURFACE_MARGIN)
+    surface = None
+    if grown.size >= MIN_SURFACE_POINTS:
+        # The far half of the grown box is the surface: the object is the
+        # near part by construction, since it stands on it.
+        far = grown[grown > np.median(grown)]
+        if far.size >= MIN_SURFACE_POINTS:
+            surface = float(np.median(far))
+    return top, surface
+
+
+def footprint_world(intrinsics, box, z, rot, trans):
+    """[xmin, ymin, xmax, ymax] in world, from the box corners at depth z.
+
+    An approximation, and a deliberate one: the camera looks down at an
+    angle, so four corners deprojected at one depth are a quadrilateral
+    rather than a rectangle, and this takes their bounds. For "is this
+    point on the sheet of paper" that is enough, and the alternative --
+    segmenting the sheet out of the depth image -- is a great deal of work
+    for a number that only has to be right to a centimetre.
+    """
+    x1, y1, x2, y2 = box
+    corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+    points = [rot @ deproject(intrinsics, u, v, z) + trans
+              for u, v in corners]
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+    return [round(min(xs), 4), round(min(ys), 4),
+            round(max(xs), 4), round(max(ys), 4)]
+
+
 def deproject(intrinsics, u, v, z):
     return np.array([(u - intrinsics.cx) * z / intrinsics.fx,
                      (v - intrinsics.cy) * z / intrinsics.fy,
@@ -291,6 +386,25 @@ def build_detections(color, depth, raw, intrinsics, rot, trans, depth_scale,
         point_cam = deproject(intrinsics, center[0], center[1], z)
         point_world = rot @ point_cam + trans
 
+        # Where the top of it is, and how far it stands above what it is
+        # on. Both along the ray through the box centre, so they are the
+        # top and the base of the same column of the object rather than
+        # two unrelated points, and both taken to world coordinates before
+        # the difference is read -- the camera looks down at an angle, so
+        # a depth difference is not a height.
+        top_depth, surface_depth = object_top(
+            depth, box, depth_scale, min_depth, max_depth)
+        top_world = height_m = None
+        if top_depth is not None:
+            top_world = rot @ deproject(
+                intrinsics, center[0], center[1], top_depth) + trans
+        surface_world = None
+        if surface_depth is not None:
+            surface_world = rot @ deproject(
+                intrinsics, center[0], center[1], surface_depth) + trans
+            if top_world is not None:
+                height_m = float(top_world[2] - surface_world[2])
+
         angle, corners, axis_source = object_axis_angle(
             color, depth, box, z, depth_scale, axis_depth_tolerance)
         yaw = (axis_yaw_world(angle, intrinsics, rot, z)
@@ -302,6 +416,27 @@ def build_detections(color, depth, raw, intrinsics, rot, trans, depth_scale,
             'depth_m': round(z, 4),
             'point_cam': [round(float(v), 4) for v in point_cam],
             'point': [round(float(v), 4) for v in point_world],
+            # The top of the object, which is what a top-down grasp has to
+            # stop above -- `point` is the median over the inner half of
+            # the box and sits somewhere down the side of anything that
+            # stands up.
+            'top': (None if top_world is None
+                    else [round(float(v), 4) for v in top_world]),
+            'height_m': (None if height_m is None
+                         else round(float(height_m), 4)),
+            # What the object is standing on, along the same ray. This is
+            # the table, measured rather than configured, and it is what a
+            # grasp has to stay above.
+            'surface': (None if surface_world is None
+                        else [round(float(v), 4) for v in surface_world]),
+            # Where it sits on the table, in world x-y: the four box
+            # corners deprojected at the object's own depth, as axis-
+            # aligned bounds. Enough to answer "is this point on the
+            # sheet", which is what a drop needs -- anywhere on the paper
+            # will do, and the centre of it may not be the part this arm
+            # can reach.
+            'footprint': footprint_world(
+                intrinsics, box, z, rot, trans),
             'axis_yaw': None if yaw is None else round(yaw, 4),
             'image_angle_deg': None if angle is None else round(float(angle), 2),
             'axis_source': axis_source,

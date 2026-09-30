@@ -112,6 +112,10 @@ class UiNode(Node):
             callback_group=cb)
         self.start_client = self.create_client(Trigger, '/pick_place/start',
                                                callback_group=cb)
+        self.place_client = self.create_client(Trigger, '/pick_place/place',
+                                               callback_group=cb)
+        self.stop_client = self.create_client(Trigger, '/pick_place/stop_arm',
+                                              callback_group=cb)
         self.abort_client = self.create_client(Trigger, '/pick_place/abort',
                                                callback_group=cb)
         self.open_client = self.create_client(Trigger, '/pick_place/open_gripper',
@@ -182,6 +186,12 @@ class UiNode(Node):
         # that makes one button do both.
         self._call(self.start_client, 'start')
 
+    def place(self):
+        self._call(self.place_client, 'place')
+
+    def stop_arm(self):
+        self._call(self.stop_client, 'stop', reenable=True)
+
     def abort(self):
         self._call(self.abort_client, 'abort')
 
@@ -240,6 +250,13 @@ class Panel:
         self.pick_button = tk.Button(buttons, text='Pick', width=12,
                                      command=self.on_pick)
         self.pick_button.pack(side='left')
+        # Place is its own press. The orchestrator refuses it unless the
+        # jaws are actually holding something, so this stays enabled and
+        # the refusal comes back as a message rather than as a dead button
+        # -- the panel has no status feed to grey it out from.
+        self.place_button = tk.Button(buttons, text='Place', width=12,
+                                      command=self.on_place)
+        self.place_button.pack(side='left', padx=6)
         self.abort_button = tk.Button(buttons, text='Abort', width=12,
                                       state='disabled', command=self.on_abort)
         self.abort_button.pack(side='left', padx=6)
@@ -321,6 +338,7 @@ class Panel:
     def busy(self, is_busy):
         state = 'disabled' if is_busy else 'normal'
         self.pick_button.configure(state=state)
+        self.place_button.configure(state=state)
         self.open_button.configure(state=state)
         self.grip_button.configure(state=state)
         self.abort_button.configure(state='normal' if is_busy else 'disabled')
@@ -351,6 +369,11 @@ class Panel:
         self.busy(True)
         self.state_label.configure(text='starting...')
         self.node.start(prompt)
+
+    def on_place(self):
+        self.busy(True)
+        self.state_label.configure(text='placing...')
+        self.node.place()
 
     def on_open(self):
         self.write('opening the gripper')

@@ -34,6 +34,10 @@ CANPacket CanPacketEncoder::create_set_zero_command(const Motor& motor) {
     return {motor.get_send_can_id(), pack_command_data(0xFE)};
 }
 
+CANPacket CanPacketEncoder::create_clear_error_command(const Motor& motor) {
+    return {motor.get_send_can_id(), pack_command_data(0xFB)};
+}
+
 CANPacket CanPacketEncoder::create_mit_control_command(const Motor& motor,
                                                        const MITParam& mit_param) {
     return {motor.get_send_can_id(), pack_mit_control_data(motor.get_motor_type(), mit_param)};
@@ -61,7 +65,18 @@ StateResult CanPacketDecoder::parse_motor_state_data(const Motor& motor,
                                                      const std::vector<uint8_t>& data) {
     if (data.size() < 8) {
         std::cerr << "Warning: Skipping motor state data less than 8 bytes" << std::endl;
-        return {0, 0, 0, 0, 0, false};
+        return {0, 0, 0, 0, 0, false, -1};
+    }
+
+    // Byte 0 is (status << 4) | controller id, and it was being thrown
+    // away -- which is why nothing upstream could answer "is this motor
+    // actually driving". It is only trusted when the low nibble agrees
+    // with the id this motor was configured with: that makes the frame
+    // layout self-evident rather than assumed, and a mismatch reports
+    // "unknown" instead of a plausible-looking wrong answer.
+    int status = -1;
+    if ((data[0] & 0x0F) == static_cast<uint8_t>(motor.get_send_can_id() & 0x0F)) {
+        status = (data[0] >> 4) & 0x0F;
     }
 
     // Parse state data
@@ -78,7 +93,7 @@ StateResult CanPacketDecoder::parse_motor_state_data(const Motor& motor,
     double recv_dq = CanPacketDecoder::uint_to_double(dq_uint, -limits.vMax, limits.vMax, 12);
     double recv_tau = CanPacketDecoder::uint_to_double(tau_uint, -limits.tMax, limits.tMax, 12);
 
-    return {recv_q, recv_dq, recv_tau, t_mos, t_rotor, true};
+    return {recv_q, recv_dq, recv_tau, t_mos, t_rotor, true, status};
 }
 
 ParamResult CanPacketDecoder::parse_motor_param_data(const std::vector<uint8_t>& data) {

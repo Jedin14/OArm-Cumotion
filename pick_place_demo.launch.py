@@ -50,10 +50,19 @@ FORWARDED = ['arm', 'arm_selection', 'prompt', 'states_file', 'place_mode',
              'approach_height',
              'velocity_scaling', 'acceleration_scaling', 'gripper_max_effort',
              'detection_reuse_age', 'grasp_finger_min', 'object_moved_eps',
+             'grasp_hold_torque_min', 'grasp_width_drop',
+             'place_prompt', 'place_clearance', 'place_max_drop',
+             'place_speed',
+             'place_after_pick', 'boot_walk', 'boot_pose', 'boot_speed',
+             'locate_from_staging', 'boot_other_arm', 'grasp_table_clearance',
+             'boot_via_home', 'recover_after_contact', 'carry_guard',
+             'use_home',
              'grasp_z_offset', 'grasp_max_depth', 'descend_close_gap',
              'descend_gap_max', 'home_requires_pre_pick',
-             'disengage_on_failure',
-             'refresh_octomap_at_home', 'use_table_collision', 'table_z']
+             'disengage_on_failure', 'disengage_on_contact',
+             'refresh_octomap_at_home', 'map_before_pick',
+             'planner_probe_timeout',
+             'use_table_collision', 'table_z']
 
 
 def generate_launch_description():
@@ -77,8 +86,88 @@ def generate_launch_description():
             description='Poses recorded by record_states.py. "auto" resolves '
                         'to pick_place_states_<arm>.yaml.'),
         DeclareLaunchArgument(
-            'place_mode', default_value='state',
-            description='Where the object is released: state, home or position.'),
+            'place_mode', default_value='detected',
+            description='Where the object is released: state, home, position '
+                        'or detected.'),
+        DeclareLaunchArgument(
+            'place_prompt', default_value='piece of paper',
+            description='place_mode "detected": what the drop surface is '
+                        'called. The object is put down on top of whatever '
+                        'the detector finds for this.'),
+        DeclareLaunchArgument(
+            'place_max_drop', default_value='0.010',
+            description='The most the object may be above the sheet when '
+                        'the jaws open, metres. The place refuses rather '
+                        'than dropping from higher.'),
+        DeclareLaunchArgument(
+            'place_clearance', default_value='0.005',
+            description='The gap left under the object when it is let go, '
+                        'metres. How far it hangs below the tool comes '
+                        'from what the pick measured.'),
+        DeclareLaunchArgument(
+            'place_speed', default_value='0.2',
+            description='Speed cap for the descent onto the drop surface '
+                        'and the retreat off it.'),
+        DeclareLaunchArgument(
+            'use_home', default_value='false',
+            description='Whether HOME may be commanded at all. Off: the '
+                        'staging pose is the rest pose, the observation '
+                        'pose and where a cycle returns to, and nothing '
+                        'drives to HOME.'),
+        DeclareLaunchArgument(
+            'carry_guard', default_value='true',
+            description='Carrying something back to the staging pose, keep '
+                        'the tool out of the other arm\'s half. The plan is '
+                        'measured before it is flown, because the planner '
+                        'takes no path constraints and the other arm is '
+                        'parked over there with nothing in the map to say '
+                        'so.'),
+        DeclareLaunchArgument(
+            'place_after_pick', default_value='false',
+            description='Whether one press of Pick also places. Off: Pick '
+                        'ends holding at the staging pose and Place puts it '
+                        'down.'),
+        DeclareLaunchArgument(
+            'boot_walk', default_value='true',
+            description='At bringup, walk both arms to boot_pose and wait '
+                        'there.'),
+        DeclareLaunchArgument(
+            'boot_pose', default_value='pre_pick',
+            description='Where they wait: "pre_pick", the staging pose, or '
+                        '"home". The boot walk maps the work area from '
+                        'HOME on its way either way.'),
+        DeclareLaunchArgument(
+            'use_rviz', default_value='true',
+            description='Start RViz. false on a headless or VNC session: '
+                        'without hardware GL it hangs at start-up with its '
+                        'window never mapped, and nothing else needs it.'),
+        DeclareLaunchArgument(
+            'boot_via_home', default_value='false',
+            description='Whether the boot walk folds down to HOME to map '
+                        'before going to where the arms wait. Off: '
+                        'straight there, and the map is taken from there.'),
+        DeclareLaunchArgument(
+            'recover_after_contact', default_value='true',
+            description='After a torque trip: motors off, let it settle, '
+                        'motors on, glide to the staging pose.'),
+        DeclareLaunchArgument(
+            'boot_other_arm', default_value='pre_pick',
+            description='Where the arm that is not picking waits: "home", '
+                        '"pre_pick" or "leave". HOME keeps it out of the '
+                        'picking arm\'s way.'),
+        DeclareLaunchArgument(
+            'grasp_table_clearance', default_value='0.005',
+            description='How close to the measured surface the jaws may '
+                        'close. The floor that stops a deeper grasp '
+                        'pressing into the table.'),
+        DeclareLaunchArgument(
+            'locate_from_staging', default_value='true',
+            description='Whether a cycle starting at the staging pose looks '
+                        'from there rather than going to HOME first.'),
+        DeclareLaunchArgument(
+            'boot_speed', default_value='0.15',
+            description='Speed cap for the boot walk, as a share of the '
+                        'joint limits.'),
         DeclareLaunchArgument(
             'approach_height', default_value='0.05',
             description='Pre-grasp height above the object, metres.'),
@@ -100,6 +189,15 @@ def generate_launch_description():
             'refresh_octomap_at_home', default_value='true',
             description='Capture the octomap only at HOME, never at READY -- '
                         'the arm is in the camera frame at READY.'),
+        DeclareLaunchArgument(
+            'map_before_pick', default_value='true',
+            description='Clear the octomap and retake it at the start of '
+                        'every pick, so the plan is made against the table '
+                        'as it is now rather than as the boot walk left it.'),
+        DeclareLaunchArgument(
+            'planner_probe_timeout', default_value='10.0',
+            description='Seconds the pre-flight planner probe waits for '
+                        'move_group before reporting it wedged.'),
         DeclareLaunchArgument(
             'use_table_collision', default_value='false',
             description='Explicit collision box for the work surface.'),
@@ -160,15 +258,25 @@ def generate_launch_description():
                         'holding something. -1.0 to rehearse on fake '
                         'hardware.'),
         DeclareLaunchArgument(
+            'grasp_hold_torque_min', default_value='1.0',
+            description='Torque at the gripper motor, Nm, below which the '
+                        'jaws count as slack rather than gripping. 0 turns '
+                        'the torque half of the grasp check off.'),
+        DeclareLaunchArgument(
+            'grasp_width_drop', default_value='0.002',
+            description='How much narrower than the close the jaws may sit '
+                        'and still count as holding the same thing, metres. '
+                        'Catches an object that slipped out afterwards.'),
+        DeclareLaunchArgument(
             'object_moved_eps', default_value='0.05',
             description='How far the object must have moved for a place to '
                         'count, metres. 0.0 to rehearse on fake hardware.'),
         DeclareLaunchArgument(
-            'grasp_z_offset', default_value='0.010',
-            description='Added to the detected top of the object to get the '
-                        'grasp height. Positive: the tool stops above it. '
-                        'Raise it if the arm presses into the surface, lower '
-                        'it if the jaws close above the object.'),
+            'grasp_z_offset', default_value='-0.030',
+            description='Added to the *top* of the object to get the grasp '
+                        'height. Negative reaches down the side of it; '
+                        'grasp_table_clearance is the floor, so it cannot '
+                        'reach through the surface.'),
         DeclareLaunchArgument(
             'grasp_max_depth', default_value='0.0',
             description='How far below the detected top of the object the '
@@ -184,10 +292,17 @@ def generate_launch_description():
                         'jaws closed on air; the two that gripped stopped '
                         'within 4 mm.'),
         DeclareLaunchArgument(
-            'disengage_on_failure', default_value='true',
+            'disengage_on_failure', default_value='false',
             description='Take the motors off after a failed cycle has parked '
-                        'the arm somewhere checked. No brakes on these '
-                        'motors, so the arm is then held up by nothing.'),
+                        'the arm somewhere checked. Off: an ordinary failure '
+                        'leaves a healthy arm, and releasing it costs a '
+                        'restart of the stack. See disengage_on_contact and '
+                        'the Stop button.'),
+        DeclareLaunchArgument(
+            'disengage_on_contact', default_value='true',
+            description='Take the motors off after the contact guard fires '
+                        '-- the arm has run into something and is leaning '
+                        'on it.'),
         DeclareLaunchArgument(
             'home_requires_pre_pick', default_value='true',
             description='Refuse HOME when pre_pick could not be reached on '
@@ -212,6 +327,7 @@ def generate_launch_description():
             'collision_activation_distance':
                 LaunchConfiguration('collision_activation_distance'),
             'use_fake_hardware': LaunchConfiguration('use_fake_hardware'),
+            'use_rviz': LaunchConfiguration('use_rviz'),
             'right_can_interface': LaunchConfiguration('right_can_interface'),
             'left_can_interface': LaunchConfiguration('left_can_interface'),
         }.items(),

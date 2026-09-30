@@ -148,6 +148,8 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_init(
   pos_states_.resize(total_joints, 0.0);
   vel_states_.resize(total_joints, 0.0);
   tau_states_.resize(total_joints, 0.0);
+  // -1 until a frame has been read: "not known", not "not enabled".
+  status_states_.resize(total_joints, -1.0);
 
   // Initialize KDL for gravity compensation
   KDL::Tree kdl_tree;
@@ -220,6 +222,13 @@ OpenArm_v10HW::export_state_interfaces() {
         joint_names_[i], hardware_interface::HW_IF_VELOCITY, &vel_states_[i]));
     state_interfaces.emplace_back(hardware_interface::StateInterface(
         joint_names_[i], hardware_interface::HW_IF_EFFORT, &tau_states_[i]));
+    // Not one of the standard hardware_interface names, deliberately:
+    // there is no standard one for "the motor's own status", and
+    // joint_state_broadcaster publishes whatever it is given on
+    // /dynamic_joint_states, which is where anything wanting to know
+    // whether a motor is driving can read it.
+    state_interfaces.emplace_back(hardware_interface::StateInterface(
+        joint_names_[i], "status", &status_states_[i]));
   }
 
   return state_interfaces;
@@ -250,6 +259,17 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_activate(
   openarm_->enable_all();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   openarm_->recv_all();
+  // Then check that they actually came up, and do something about the ones
+  // that did not.
+  //
+  // enable_all() sends seven commands back to back and reads nothing back.
+  // A motor that misses its own, or that is sitting in a latched fault and
+  // will not accept it, stays limp -- and since its encoder keeps reporting
+  // perfectly, nothing downstream notices: the joint reads a plausible
+  // position, near-zero torque, and moves freely by hand. Measured on this
+  // robot: the left wrist roll did exactly that while every other joint on
+  // the same bus, including the gripper past it, was driving.
+  verify_enabled();
 
   // Hold the arm where it is, rather than driving it anywhere.
   //
@@ -297,6 +317,7 @@ hardware_interface::return_type OpenArm_v10HW::read(
     pos_states_[i] = arm_motors[i].get_position();
     vel_states_[i] = arm_motors[i].get_velocity();
     tau_states_[i] = arm_motors[i].get_torque();
+    status_states_[i] = static_cast<double>(arm_motors[i].get_status());
   }
 
   // Read gripper state if enabled
@@ -318,6 +339,8 @@ hardware_interface::return_type OpenArm_v10HW::read(
       // up in /joint_states for whoever enforces the cap.
       vel_states_[ARM_DOF] = 0;  // gripper_motors[0].get_velocity();
       tau_states_[ARM_DOF] = gripper_motors[0].get_torque();
+      status_states_[ARM_DOF] =
+          static_cast<double>(gripper_motors[0].get_status());
     }
   }
 
@@ -372,6 +395,58 @@ hardware_interface::return_type OpenArm_v10HW::write(
   }
   openarm_->recv_all(1000);
   return hardware_interface::return_type::OK;
+}
+
+void OpenArm_v10HW::verify_enabled() {
+  // Up to three rounds: read what the motors say, retry the ones that are
+  // not enabled, and clear a latched fault first where there is one, since
+  // a faulted motor will not take an enable until it is cleared.
+  const auto& logger = rclcpp::get_logger("OpenArm_v10HW");
+  for (int round = 0; round < 3; ++round) {
+    openarm_->refresh_all();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    openarm_->recv_all();
+
+    std::vector<size_t> limp;
+    const auto& motors = openarm_->get_arm().get_motors();
+    for (size_t i = 0; i < ARM_DOF && i < motors.size(); ++i) {
+      if (motors[i].get_status() != 1) limp.push_back(i);
+    }
+    if (limp.empty()) {
+      if (round > 0) {
+        RCLCPP_INFO(logger, "all %zu arm motors are enabled", ARM_DOF);
+      }
+      return;
+    }
+    if (round == 2) {
+      for (size_t i : limp) {
+        RCLCPP_ERROR(
+            logger,
+            "%s did NOT enable: the motor reports status %d. It will report "
+            "position and torque like any other joint and hold nothing -- it "
+            "moves freely by hand. Check its CAN link and its power.",
+            joint_names_[i].c_str(), motors[i].get_status());
+      }
+      return;
+    }
+    for (size_t i : limp) {
+      int status = motors[i].get_status();
+      if (status >= 8) {
+        // A latched fault. It has to be cleared before an enable will take.
+        RCLCPP_WARN(logger, "%s is in fault state %d; clearing it",
+                    joint_names_[i].c_str(), status);
+        openarm_->get_arm().clear_error_one(static_cast<int>(i));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      } else {
+        RCLCPP_WARN(logger, "%s did not enable (status %d); asking again",
+                    joint_names_[i].c_str(), status);
+      }
+      openarm_->get_arm().enable_one(static_cast<int>(i));
+      // Paced. Seven enables sent back to back is how one gets missed.
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    openarm_->recv_all();
+  }
 }
 
 void OpenArm_v10HW::hold_current_position() {

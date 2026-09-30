@@ -135,15 +135,61 @@ A PaliGemma detector finds the object, cuMotion plans to it, and the same
 detector checks whether each step actually worked — a failed grasp is retried
 with an escalating strategy rather than repeated.
 
+**Two presses, not one.** Pick ends with the object in the jaws, standing at
+the staging pose; Place puts it down. Between them the robot waits, which is
+the moment a person uses to decide where the object should go — and to move
+the sheet of paper it goes onto.
+
 ```
-HOME ─► LOCATE ─► PREFLIGHT ─► PRE_PICK ─► TRANSIT ─► OPEN ─► DESCEND ─► CLOSE
-  ▲                                                                       │
-  └────── PRE_PICK ◄── CLEAR ◄── failed ──────────── VERIFY_GRASP ◄── LIFT
-                                                           │
-  HOME ◄── PRE_PICK ◄── CLOSE ◄── VERIFY_PLACE ◄── RELEASE ◄── DROP ◄── PRE_PICK
-                                                                          ▲
-                                                                          └── LIFT
+   Pick  (waiting at PRE_PICK) ─► LOCATE ─► PREFLIGHT ─► TRANSIT ─► OPEN
+           │                        ┊                                 │
+           │            HOME, only if the look has to be              │
+           │            taken from out of the camera frame            ▼
+           │                                                      DESCEND
+           └── PRE_PICK ◄── CLEAR ◄── failed ── VERIFY_GRASP ◄── LIFT ◄┘
+                                            │
+                                            └─► PRE_PICK ─► HOLDING ┈ waits
+
+  Place  HOLDING ─► PRE_PICK ─► OVER_DROP ─► PLACE ─► RELEASE ─► RETREAT
+                                                                     │
+                         HOME ◄── PRE_PICK ◄── CLOSE ◄── VERIFY_PLACE ◄┘
 ```
+
+`place_after_pick:=true` restores the single uninterrupted cycle, and the two
+halves are the same code either way — the sequence editor's boundary, drawn
+after `verify_grasp`, is exactly where Pick stops and Place starts.
+
+**On bringup, both arms walk straight to `boot_pose` and wait there, and the
+work area is mapped from where they stand.** Nobody presses anything to start that move, so it is
+the most conservative one the robot makes: slow (`boot_speed`, 15% of the
+joint limits), to a *recorded* posture, as a joint goal — the one kind that
+is repeatable on a 7-DOF arm — skipped for an arm that has nowhere recorded
+to go, and refused outright if anything else is running. Both arms, because
+nothing else parks the other one: it is left wherever the last run put it,
+and these are direct-drive motors with no brakes. `boot_walk:=false` turns it
+off.
+
+**They wait at the staging pose, and a Pick starts from there.** That is
+where the approach begins, so pressing Pick goes straight to the transit
+instead of folding down to HOME and coming back — about ten seconds each
+way. Two things make that safe rather than merely quicker:
+
+- **The boot walk goes via HOME and maps the work area on the way through.**
+  HOME is out of the camera's frame, which is the only condition under which
+  a map can be captured without the robot in it. So the arms pass through
+  HOME, the map is taken, and they carry on to the staging pose.
+- **A detection that lands on the gripper is refused.** The staging pose is
+  over the work surface, so the arm *is* in the picture, and PaliGemma always
+  answers something — "the gripper" is exactly the answer it gives when what
+  you asked for is behind the arm. Any point within `self_detect_radius`
+  (150 mm, about the length of the hand) of the tool is thrown out, and the
+  look is taken again from HOME. One inference, not a bad grasp.
+
+What it does give up is the map refresh: a cycle that looks from the staging
+pose plans against the map from the last time the arm was out of frame. After
+a place the arm ends at HOME anyway, so the map is refreshed on the next
+cycle. `locate_from_staging:=false` always goes home first;
+`boot_pose:=home` parks them there instead.
 
 **HOME is the only pose the arm rests, observes and maps from.** There used to
 be a separate READY as well, and having two was the whole problem: the octomap
@@ -1708,10 +1754,11 @@ ros2 service call /pick_place/capture_ready std_srvs/srv/Trigger
 It returns a paste-ready list, which beats the Joints tab — that only shows whole
 degrees.
 
-**With the default `place_mode:=ready` the object is released at this pose**, so it
-falls the distance between the tool and whatever is under it. Check what is
-underneath before the first run. `place_mode:=position` restores the older
-behaviour of moving over a separate `place_position` and releasing there.
+`place_mode:=home` releases the object at this pose, so it falls the distance
+between the tool and whatever is under it — check what is underneath before
+using it. The default is `detected`, which puts the object down on the sheet
+the detector finds; `place_mode:=position` moves over a separate
+`place_position` and releases there.
 
 ### Which Python runs what
 
@@ -1815,13 +1862,47 @@ Orchestrator — all exposed as launch arguments, `--show-args` lists the rest:
 | `arm` | `right` | must match the `tool_frame` the robot was launched with |
 | `ready_joint_positions` | elbow-up pose | the observation pose, `joint1..joint7` in radians |
 | `states_file` | `auto` | the poses `record_states.py` writes; `auto` is `pick_place_states_<arm>.yaml`, re-read every cycle |
-| `place_mode` | `state` | `state` drops at `drop_state`; `ready` at the observation pose; `position` uses `place_position` |
+| `place_mode` | `detected` | `detected` puts the object on top of whatever `place_prompt` finds; `state` drops at `drop_state`; `home` at the observation pose; `position` uses `place_position` |
+| `place_prompt` | `piece of paper` | `place_mode:=detected`: what the drop surface is called. The phrasing matters — see [Where it gets put down](#where-it-gets-put-down) |
+| `place_max_drop` | `0.010` | the most the object's own base may be above the sheet when the jaws open. **Not** a tolerance on the descent — the height of the thing being put down, which is what "do not drop it" means. `place_clearance` is the deliberate part of this budget; whatever the descent falls short by comes out of the same one, and the place **refuses** rather than letting go from higher |
+| `place_clearance` | `0.005` | the gap left **under the object** when it is let go. How far it hangs below the tool is not a guess — the pick measured it: the tool gripped at a known height above the surface the object was standing on, so the tool goes that much plus this above the sheet. Without that measurement it falls back to being clearance for the tool |
+| `place_edge_margin` | `0.04` | how far inside the sheet's own edge a fallback drop point sits. Only used when the middle of the sheet cannot be reached — anywhere on the paper will do, but the object has to land *on* it |
+| `place_speed` | `0.2` | speed cap for the descent onto the drop surface and the retreat off it. A cap, not a factor: a cycle already slower keeps its own speed |
+| `disengage_on_contact` | `true` | the exception to the above, and only while it stays true. The contact guard fires when a joint loads up **and** the arm stops following its trajectory — it has run into something and is leaning on it, and holding position against an obstruction is how a motor cooks itself. But the back-off (`retreat_from_contact`) exists precisely to get the arm off that obstruction, and once it succeeds the premise is gone: the flag it sets is **cleared again the moment the back-off works**, and only stays set if the back-off itself failed and the arm may genuinely still be resting on what it hit. Measured, run at 17:45: without this, one contact backed off cleanly, the cycle flew four more legs without incident, then failed later for an unrelated reason — and the stale flag still triggered a full disengage/settle/re-engage at the end, dropping the arm 32 cm in the 3 s it spent with no torque before either side could plan back |
+| `place_look_from_home` | `true` | if the drop target is not visible from the staging pose, go to HOME — out of the camera frame by definition — and look once more before refusing |
+| `place_ignores_octomap` | `true` | skip collision checking on the vertical leg onto the drop surface. That surface is in the octomap exactly as the object being picked up is, so a checked line onto it stalls a centimetre short for the same reason |
+| `place_after_pick` | `false` | whether one press of Pick also places. Off: Pick ends holding at the staging pose and Place is a second press |
+| `boot_walk` | `true` | at bringup, walk **both** arms to `boot_pose` and wait there |
+| `boot_pose` | `pre_pick` | where they wait. The staging pose is where the approach starts, so a Pick from there begins with the transit. The boot walk goes **via HOME** either way and maps the work area on the way through — HOME is the one pose a map can be taken from without the robot in it |
+| `locate_from_staging` | `true` | whether a cycle that starts at the staging pose looks from there rather than folding down to HOME and back. A detection landing on the gripper is refused and re-taken from HOME. It used to give up the map refresh as well; `map_before_pick` now retakes the map from the staging pose instead |
+| `self_detect_radius` | `0.15` | how close to the tool a detection has to be before it is the robot rather than the object. The hand is about 150 mm long. `0` turns the check off |
+| `boot_speed` | `0.15` | speed cap for that walk. Nobody pressed anything to start it, so it is the slowest move the robot makes |
+| `boot_delay` | `8.0` | seconds after bringup before the walk starts looking for the planner |
+| `boot_planner_wait` | `180.0` | how long the walk waits for the planner to become usable before giving up and moving nothing. **move_group being in the graph is not the same as move_group being able to take a goal** — measured on a cold bringup, the first goal it accepted came **77 s** after the node started, and the three the walk had already sent were refused at 15 s each and then executed a minute later, which is an arm moving while the panel says IDLE. Nothing is sent now until a plan-only probe comes back |
 | `place_position` | `[0.35, 0.30, 0.25]` | `place_mode:=position` only — **placeholder, measure yours** |
 | `grasp_finger_min` | `0.003` | finger position above which the gripper counts as holding something — measure it on your object |
+| `grasp_table_clearance` | `0.005` | how close to **the surface the object is standing on** the jaws may close. The floor a deeper grasp is clamped to, and the surface is measured per detection — the depth of the ring around the object — rather than configured. With it, a **negative `grasp_z_offset`** reaches down the side of the object for a firmer grip instead of closing on its top face |
+| `boot_via_home` | `false` | whether the boot walk folds down to HOME to capture the map before going to where the arms wait. Off: straight there. Keeping the robot out of its own map is the **self-filter's** job — a detour on every bringup is a poor substitute for one. On restores it for a stack whose self-filter is missing |
+| `recover_after_contact` | `true` | after a torque trip: motors off, let the arm settle off whatever it hit, motors back on, then a slow glide to the staging pose — so the next cycle is a press away rather than a bringup restart |
+| `contact_relax_seconds` | `3.0` | how long the motors stay off during that. The arm is held up by nothing for this long |
+| `boot_other_arm` | `pre_pick` | where the arm that is *not* picking waits. The two staging poses are mirror images about 35 cm apart, and an arm carrying something to its own staging pose has to pass the other one — measured, with both parked at `pre_pick` the staging goal came back `INVALID_MOTION_PLAN` three times with the object in the jaws. `pre_pick` parks it alongside anyway; `leave` does not move it |
+| `cartesian_boost_max` | `3.0` | how much faster than `/compute_cartesian_path` timed it a straight line may be flown. `1.0` flies it exactly as timed, which is what it used to do. **The two halves of a cycle are timed by different things** — cuMotion times the joint goals from its own limits, MoveIt times the straight lines from `joint_limits.yaml`, and that file sets `has_acceleration_limits: false` for every joint on this robot, so its parameterisation has no acceleration limit to work with. Measured, run `1789640514`: the four `TRANSIT` legs took **11.2–11.6 s** each at a peak of **0.8 rad/s²**, while the joint goals in the same run peaked at **3.4–5.4 rad/s²** and finished inside 3.5 s. Same arm, same run, a fifth of the acceleration. The ceilings below are what actually bounds the speed-up; this only caps how much correction is allowed at once |
+| `cartesian_vel_max` | `2.5` | speed ceiling for a sped-up straight line, rad/s, against a measured **1.73 rad/s** on this arm's own joint goals |
+| `cartesian_accel_max` | `4.0` | acceleration ceiling for the same, rad/s², against a measured **5.4**. Between them these are what decide: a leg that is already brisk barely changes — the grasp descent has the headroom for about 1.2× — and the slow free-space legs take the rest. Lower both if the contact guard starts tripping on the robot's own moves: it watches torque, and torque follows acceleration. **A leg inside an `at_speed` block is never sped up at all** — `place_speed` was measured against the old timing, with an object in the jaws and a surface underneath, and quietly changing what it means is not something a speed-up should do behind your back |
+| `place_retreat_speed` | `0.5` | the leg that comes back up off the drop surface, once the object is down and the jaws are open around it. It used to fly at `place_speed`, which is the speed for *lowering* something: what the retreat actually has to be is **vertical**, so the open jaws rise off the object rather than sweeping it along, and that is the column it flies rather than its speed. Measured at 7.2 s and 0.14 rad/s on a leg carrying nothing |
+| `motion_start_timeout` | `12.0` | how long a goal move_group has **accepted** may sit without the arm moving before it is cancelled and retried. `0` waits out the whole of `motion_timeout`, which is what it used to do. `motion_timeout` is the budget for a *flight*; spending it on a goal that never started is a minute of a cycle spent on nothing. Measured, run `1789640514`: a staging goal sat **59.9 s** with every joint inside 0.01 rad of where it began, then reported `FAILURE` — which is **not** retryable, so the cycle gave up on a goal that had never been tried once. Cancelling first is what makes the retry safe |
+| `carry_side_refuse` | `0.25` | how far into the other arm's half a carry may cross before the guard **refuses** instead of **preferring**. Under it, the best of the plans is flown and the crossing is reported; over it — a swing right through where the other arm is parked, rather than a clip of the middle — the arm stops and says so. Measured, run at 15:52: every plan crossed by 85 mm, the goal was refused, the lift the retry depends on then solved 2.4% of its line, and the cycle ended with the arm out at z = 0.357 and the controller reporting `CONTROL_FAILED`. **Nothing about that was better than having flown the 85 mm** |
+| `carry_guard` | `true` | carrying something back to the staging pose, keep the tool **out of the other arm's half**. The goal cannot say this — the staging pose is on the arm's own side whichever way round it gets there — and cuMotion's MoveIt plugin takes no path constraints, so the plan is asked for with `plan_only`, measured with the arm's own forward kinematics, and flown with `/execute_trajectory` only if it stays put. It matters because the other arm is parked over there **in the air**, and the octomap is of the table: nothing in the collision world says an arm is standing there. The guard drops itself, rather than guessing, when there is no kinematic chain or the planner will not answer plan-only |
+| `carry_guard_tries` | `3` | how many plans to ask for before giving up on one that stays on this side. Worth more than one because cuMotion's optimiser is **stochastic** — the same goal gives a different path. If every one of them crosses, the arm **stays where it is**, still holding, and says so rather than flying the least bad one |
+| `carry_side_slack` | `0.02` | how far over the line still counts as staying on this side. Slack for the tool's own width and for the difference between the plan and what the arm tracks, not a licence to cross. A pick near the middle can legitimately leave the arm reaching across it, so the rule is that the way back does not go **further** over than it starts, not that it starts on the right side |
+| `place_above_tolerance` | `0.12` | how far off the point above the drop surface the tool may land and still count as having got there. Coarse on purpose: the leg straight after it measures where the tool actually is and closes the gap **horizontally, at height** before anything descends |
+| `arrival_progress` | `0.05` | past that tolerance, how much of the distance a move had to cover it must have **closed** to count. The failure worth stopping for is an arm that has not gone anywhere, not one that has gone nearly all the way — measured, the miss this guard exists for closed 0 mm of 300, and the three places it wrongly threw away closed 198 mm of 300 |
+| `grasp_hold_torque_min` | `1.0` | Nm at the gripper motor below which the jaws count as slack rather than gripping, when the detector cannot see whether the object moved. Empty measures 0.5–1.2 Nm on this robot and holding 1.8–2.5 Nm; 1.0 sits low in that gap deliberately — it only has to catch a jaw that is clearly slack, because the width catches the rest, and throwing away a real grasp costs more than missing an empty one. `0` uses the width alone |
+| `grasp_width_drop` | `0.002` | how much narrower than the close the jaws may sit and still count as holding the same thing. Catches an object that slipped out *after* the close, which the width band alone cannot. The close steps 2 mm coarse and 0.5 mm fine, so anything under 2 mm is the step and not a drop. `0` turns it off |
 | `grasp_miss_warn` | `0.010` | how far the jaws may sit from the commanded grasp before `CLOSE_GRIPPER` logs `off-target`. Reporting only; nothing refuses on it |
-| `grasp_z_offset` | `0.010` | added to the object's detected *top* surface. **Positive: the tool stops above it.** Measured grips came in at 14.7 mm and 25 mm above the detected top, both with the arm stopping short of its command, so there is real tolerance here — what the jaws do not tolerate is being sent *below* the object. `-0.005` only ever worked because the arm stopped 36 mm short of what it was told (`error_mm 40.6`, `plan_error_mm 0.0`); once it tracked better the same command pressed into the table. Raise it if the arm presses down, lower it if the jaws close above the object |
+| `grasp_z_offset` | `-0.030` | added to the object's measured **top**. Negative reaches *down the side of it*: the jaws close 30 mm below the top, or as far down as `grasp_table_clearance` above the surface allows, whichever comes first. It was `+0.010`, which put the fingertips above the top face — a grip on the corner of a thing, and why a screwdriver came back `closed-on-nothing` twice with the orientation visibly right. That only made sense while the floor *was* the object's own top; the floor is the measured surface now, so this can reach down and cannot reach through. **Old note, kept because the measurements still hold:** added to the object's detected *top* surface. **Positive: the tool stops above it.** Measured grips came in at 14.7 mm and 25 mm above the detected top, both with the arm stopping short of its command, so there is real tolerance here — what the jaws do not tolerate is being sent *below* the object. `-0.005` only ever worked because the arm stopped 36 mm short of what it was told (`error_mm 40.6`, `plan_error_mm 0.0`); once it tracked better the same command pressed into the table. Raise it if the arm presses down, lower it if the jaws close above the object |
 | `pick_place_config` | `pick_place_config.json` | where the editable sequence and the UI-settable parameters live. Read at bringup, written by the web UI. Empty uses the built-in order and the launch arguments. **Not** `config_file`: `realsense2_camera` declares one of those and opens it as YAML, and a launch configuration set at the top reaches every included launch file — naming it that took the whole bringup down with `FileNotFoundError` on our own JSON path |
-| `disengage_on_failure` | `true` | once a failed cycle has parked the arm somewhere the collision world says is free, take the motors off. `openarm_hardware` disables them when its component is deactivated. **These are direct-drive motors with no brakes** — afterwards the arm is held up by nothing, so it is only ever done *after* a refuge is reached, never with the arm stranded over the table, where letting go would drop it onto whatever it is over. To put them back on, support the arm and reactivate the components — `ros2 control set_hardware_component_state openarm_left_hardware_interface active` (and `..._right_...`), or just restart the bringup. `on_activate` seeds its command buffers from the measured state, so activating holds the posture the arm is in rather than driving it anywhere. There is deliberately **no Engage button**: putting the motors back on is a power operation, and hanging a trip home off it made a button that moved the arm |
+| `disengage_on_failure` | `false` | once a failed cycle has parked the arm somewhere the collision world says is free, take the motors off. `openarm_hardware` disables them when its component is deactivated. **These are direct-drive motors with no brakes** — afterwards the arm is held up by nothing, so it is only ever done *after* a refuge is reached, never with the arm stranded over the table, where letting go would drop it onto whatever it is over. To put them back on, support the arm and reactivate the components — `ros2 control set_hardware_component_state openarm_left_hardware_interface active` (and `..._right_...`), or just restart the bringup. `on_activate` seeds its command buffers from the measured state, so activating holds the posture the arm is in rather than driving it anywhere. There is deliberately **no Engage button**: putting the motors back on is a power operation, and hanging a trip home off it made a button that moved the arm |
 | `home_requires_pre_pick` | `true` | whether HOME may be commanded when `pre_pick` could not be reached on the way back. HOME is a **joint** goal to a folded posture, and from a low, extended one the short path in joint space goes through the work surface. Measured, run `1788869179` cycle 2: `CLEAR` got the tool to z = 0.4286, `PRE_PICK_STATE` came back exhausted, and HOME was sent anyway — the arm swept out to x = 0.44 and *down* to z = 0.358, across the object it had just failed to pick. With this on, the retreat lifts higher and tries pre_pick once more, then **stops and reports** rather than sweeping. Leaving the arm over the table is bad; dragging it across the table is worse |
 | `descend_close_gap` | `true` | fly the remainder when the descent stops short of the grasp. The descent's plan ends on the point and the arm does not — measured **15.5, 29 and 36 mm** above it across three runs, `plan_error_mm 0.0` every time. That varies by 20 mm, so `grasp_z_offset` cannot dial it out: the offset that grips one run closes on air or presses the table the next, and both have happened. A **continuation of the one descent** — same vertical line, straight down from where the tool actually is, same collision settings and travel budget. x and y are left alone: the jaws span 40 mm and grips have worked 17 mm off laterally. **On by default since run `1789014831`**, which is the run the old comment asked for. Four right-arm descents: the two that gripped stopped **3.2 and 4.0 mm** from the commanded grasp, the two that missed stopped **18.1 and 18.9 mm** out with 15 mm of it height, and the jaws closed on air above the object. All of it tracking error and none of it calibration — at the end of those moves the joints were still **29 mrad** from the last point of their own trajectory, against 9–11 mrad on the two that worked. The risk it was off for, pressing into the table, is what the contact guard now watches |
 | `descend_gap_max` | `0.06` | largest gap, m, treated as tracking error and flown. Beyond it something else is wrong, and it is reported rather than flown blind |
@@ -1872,6 +1953,7 @@ Orchestrator — all exposed as launch arguments, `--show-args` lists the rest:
 | `gripper_torque_cap` | `2.5` | grip torque cap in **Nm at the motor** (≈59.5 N at the finger, 5.25 mm of finger overshoot); enforced by stepping the close and stopping at the cap |
 | `gripper_close_step` | `0.002` | coarse close step, m; quarter steps are used near the cap |
 | `refresh_octomap_at_home` | `true` | capture the octomap only at HOME |
+| `map_before_pick` | `true` | clear the octomap and retake it at the top of every pick, including cycles that never pass through HOME. The clear is the point: a refresh only ever *adds* voxels, so without it the scene keeps every object that has ever stood on the table — including the one just picked up and carried away. Measured, run `1790054584`: the boot walk mapped the area at 10:53 and the cycle eleven minutes later planned against that same map. The cost is that the arm is in frame here, so the capture leans on the self-filter in `sensors_3d.yaml` and is thrown away if `robot_in_map` finds the robot in it |
 | `home_joint_positions` | `[0, 0, 0, 0.20, 0, 0, 0]` | HOME, joint1..7 in rad. The SRDF `home` group state except for joint4 — `0.0` there is exactly that joint's URDF lower limit and the elbow stops 8.9° short of it |
 | `home_pose_tolerance` | `0.05` | rad; how close the measured joints must be to HOME before the map may be captured |
 | `home_settle_tolerance` | `0.20` | rad; how far a **stopped** joint may stand off HOME and still count as arrived |
@@ -1888,6 +1970,7 @@ Orchestrator — all exposed as launch arguments, `--show-args` lists the rest:
 | `posture_seeds` | `48` | random restarts per posture solve. Measured on this description, 48 seeds take **0.80 s** — it was 2.76 s until `pose()` was compiled (see below), which is most of what the pre-flight spends |
 | `single_descent` | `true` | one line from the approach height straight to the grasp, with the gripper opened before it. `false` restores the stop at the pre-grasp |
 | `check_planner_ready` | `true` | before the cycle, ask the planner to plan a goal to the arm's *own current posture*. Plan-only, no motion, and it cannot fail for reasons about the target |
+| `planner_probe_timeout` | `10.0` | seconds that probe waits for move_group to answer. Its own budget rather than `motion_timeout`, because nothing is moving. Measured, run `1790054584` cycle 2: cuMotion planned the probe in 116 ms and logged success, move_group never returned the result and stopped logging altogether, and the cycle sat in `STARTING` for 46 s on the 60 s motion budget — saying nothing — until it was killed by hand |
 | `linear_transit` | `true` | fly the long move above the object as a straight line too, when one solves from the staging pose and the descent still flies from where it ends |
 | `preflight_descent` | `true` | prove the descent from the intended posture, before the arm leaves its rest pose. A refusal here costs no motion at all |
 | `preflight_candidates` | `6` | postures the pre-flight may probe. Each costs up to four `/compute_cartesian_path` calls and no motion |
@@ -2092,6 +2175,180 @@ expect it around 8–10 s. The remaining lever is vectorising the seeds — the
 forty-eight are independent and solved one at a time — which is a real rewrite
 and has not been done.
 
+### Where on the object to grab
+
+The detector answers **referring expressions**, not just nouns. `detect
+handle of the screwdriver` localises the handle, for the same cost as
+`detect screwdriver`, and that has always gone straight through — the
+prompt is passed to the model as written.
+
+It matters because **the reported point is the centre of whatever was
+found**, and the centre is not always somewhere to put the jaws. The centre
+of a roll of tape is the hole. Measured, run `1789014831`: four detections
+of one roll gave world yaws of −169°, −86°, 0° and 0°, and the attempt that
+got −86° closed on nothing.
+
+So [grasp_recipes.py](grasp_recipes.py) maps a name to the part worth
+gripping:
+
+| typed | asked | why |
+|---|---|---|
+| `tape` | `edge of the tape` | a roll is a ring, and the centre of a ring is the hole |
+| `screwdriver`, `wrench`, `hammer`, … | `handle of the …` | the part shaped to be held, and the part whose width the jaws can span |
+| `mug`, `cup` | `rim of the …` | a wall the jaws can close on; the body is wider than they open |
+| `bottle`, `can`, `jar` | `middle of the …` | **side approach — not flown, see below** |
+
+Three things keep it from making anything worse:
+
+- **It is always only a first try.** A part prompt that finds nothing falls
+  back to the plain object immediately, and says so. Asked with
+  `min_count=0`, so a miss costs one inference rather than the whole
+  `detect_timeout`.
+- **Whole-word matching**, so `cellotape` does not inherit `tape`'s recipe,
+  and a prompt that already names a part is left alone — you said what you
+  wanted.
+- **The grasp check asks for the object, not the part.** This is the one
+  place the two questions must differ: if the pick aimed at a handle, the
+  handle is precisely the bit now inside the jaws, and asking for it again
+  finds nothing. Run `1789022566` did exactly that and dropped a good
+  grasp.
+
+Override or extend the table with a `grasp_recipes.json` of the same shape;
+a malformed one is reported and ignored rather than stopping the bringup.
+And check what the model does with a phrase before trusting it — PaliGemma
+is a *pretrained* checkpoint and always answers something:
+
+```bash
+VLM/run_vlm_detect.sh --prompt "detect handle of the screwdriver"
+```
+
+**The `side` approach is not flown.** The cycle's approach and retreat are a
+vertical column — `descend_column` and `lift_column` interpolate in z and
+hold x and y — so a tilted *tool* is fine and a tilted *path* is not. A
+recipe whose approach cannot be honoured is **not half-applied**: aiming a
+top-down grasp at the middle of a standing bottle is worse than aiming it at
+the object's own centre, so the recipe is skipped and the reason logged. The
+same limit bounds the model's own grasps, via `grasp_model_max_tilt`.
+Flying the column along the grasp's own approach axis is what would lift
+this, and it has not been done.
+
+### Where it gets put down
+
+`place_mode` decides, and the default is **`detected`**: the drop point is
+whatever `place_prompt` finds, and the object is let go `place_clearance`
+(5 mm) above it, with `place_max_drop` (10 mm) capping how high it may
+actually be when the jaws open
+(30 mm) above it. A sheet of paper on the table is then a drop point that
+can be moved by moving the sheet — no re-recording, no measuring anything in
+RViz.
+
+| `place_mode` | where the object goes |
+|---|---|
+| **`detected`** (default) | on top of whatever `place_prompt` finds. Nothing in view is a **refusal**, not a guess — the arm does not move |
+| `state` | the recorded `drop_state` posture |
+| `home` | released at the observation pose, from whatever height that holds the tool at |
+| `position` | over `place_position`, in world coordinates |
+
+Write the words on the sheet if you like — the model is not reading them. It
+is finding the sheet, and `piece of paper` is the phrasing it answers to:
+measured on this camera against one frame, `white paper`, `paper`, `sheet of
+paper`, `note`, `card` and `white rectangle` all returned nothing, and
+`piece of paper` boxed the whole sheet (159 × 169 px, its centre 1 cm from
+the sheet's true middle). Check any phrase before trusting it:
+
+```bash
+VLM/run_in_vlm_env.sh vlm_detect.py "piece of paper" --once --source realsense
+```
+
+The approach has the same shape as the pick's, for the same reason: a
+free-space move to a point above the target (`OVER_DROP`), then a **straight
+vertical line** down (`PLACE`). One pose goal for the whole thing is what
+swings a held object across whatever is between here and there. Both legs run
+capped at `place_speed` (20% of the joint limits) — this is the leg that
+lowers something held onto something else, and there is nothing to be gained
+by arriving fast. The retreat goes back up the same line before anything else
+plans, because the jaws are open around an object standing on the surface and
+any move that is not vertical takes it with them.
+
+**If the sheet cannot be seen from the staging pose, it looks again from
+HOME.** The staging pose is above the work surface, which makes the arm
+standing in it a plausible thing to be between the camera and a sheet of
+paper; HOME is out of frame by definition — it is where the object was
+located from in the first place. One move, one inference, and only when the
+first look found nothing. It then returns to the staging pose before
+approaching, because a free-space plan from the folded HOME posture out over
+the table is the move that sweeps across it. `place_look_from_home:=false`
+turns it off.
+
+**The motors come off for two reasons and no others.** An ordinary failure —
+nothing detected, a plan that would not go, a grip that closed on air —
+leaves a perfectly healthy arm, and taking the motors off it means the next
+run starts with a restart of the whole stack. So `disengage_on_failure` is
+**off**. What does release the arm is `disengage_on_contact` (it ran into
+something and is leaning on it) and the **Stop** button, which parks at home
+first and only then lets go — these motors have no brakes, and an arm
+released anywhere but a resting posture falls. Stop takes two presses,
+because putting the motors back on is a power operation and needs the
+bringup restarted.
+
+**Place is refused unless something is actually held**, and that is asked
+twice: `_holding`, which is verify_grasp's answer, and a *fresh* gripper
+reading, which is what catches an object dropped between the pick and the
+press. A place with empty jaws would fly the entire approach, open on
+nothing, and report success — the same false success the grasp check exists
+to stop, arriving through the other door.
+
+### Is it actually in the jaws
+
+Three sources answer that, and each is trusted only where it can tell:
+
+| seen | means |
+|---|---|
+| the object at the pick point | it never left. Certain failure |
+| the object away from it, up at the tool | it came along. Certain success |
+| nothing at all | says nothing either way |
+
+The third row is the common one — the gripper occludes what it is holding —
+and it has been read wrong in **both** directions, at a cost each time.
+Reading it as success let run `1789014831` "place" nothing and report DONE
+with jaws that had stalled at 1.08 mm and 0.50 Nm. Reading it as failure
+threw away run `1789022566`: a screwdriver handle held at 14.0 mm and
+2.28 Nm, unseen twice, opened and dropped.
+
+So an empty frame decides nothing, and the **gripper** is asked instead.
+Three readings, kept apart because each goes blind where the others do not:
+
+| reading | says | blind to |
+|---|---|---|
+| **width** — `grasp_finger_min`/`_max` | where the jaws stopped: 4–18 mm holding, 1.1–2.5 mm empty, measured across every close on this robot with nothing in between | a jaw that stopped inside the band on nothing — friction, backlash, a fingertip on an edge |
+| **torque** — `grasp_hold_torque_min` | what they are pressing with. Grip force is position error × a fixed Kp, so an object that leaves lets the fingers travel in and the torque goes with it. 1.8–2.5 Nm holding, 0.5–1.2 Nm empty | how wide they are; and absent entirely on a build from before the driver read `gripper_motors[0].get_torque()` |
+| **drift** — `grasp_width_drop` | the width now against the width the close ended at. 6 mm is a grip if the close ended at 6 mm and an empty jaw if it ended at 14 | anything, until a close has been latched — after a restart, or an uncapped fallback close, it says nothing |
+
+The close latches its width and torque the moment it passes its own checks
+(`gripped under the cap: 14.0 mm at 2.28 Nm`), and opening the jaws forgets
+it. That latch is the only reason drift can be asked at all.
+
+**Only the width ends the check on its own.** A jaw at 1.1 mm is empty and
+there is nothing to discuss. A jaw the right width but slack, or narrower
+than it closed, is a strong hint and not a proof, so it goes to the detector
+first and decides only if the detector cannot. Believing the fingers over a
+clear sighting is exactly how the good pick was thrown away — and where the
+two disagree, the sighting wins *and the log says which reading was
+overruled*, so a cycle that then places nothing tells you which one was
+right.
+
+None of the three can say *what* is held: a jaw shut on a cable reads like a
+jaw shut on the object. That is why they are the tie-break and never the
+test, and why a grasp confirmed this way is logged as **confirmed on the
+gripper alone**.
+
+One more thing that run showed: the position test only means anything if the
+arm actually carried the object somewhere. That lift was refused for joint
+travel and fell back to 38 mm, under the 50 mm `object_moved_eps` that
+separates "moved" from "did not" — so the object in the jaws and the object
+on the table were the same point, and the test is skipped rather than run
+on a distance that cannot distinguish them.
+
 ### Reach: ask cuMotion, never `/compute_ik`
 
 **`/compute_ik` lies on this robot.** `config/kinematics.yaml` configures
@@ -2197,7 +2454,9 @@ Two tabs. **Run** is what you watch:
   the tape`. The detector is a pretrained PaliGemma checkpoint and answers
   `detect tape`; the field shows what it will actually be asked, live. A
   sentence still works, because `to_detection_prompt` strips the lead-in
-  either way, but asking for one invited one.
+  either way, but asking for one invited one. Where a **grasp recipe**
+  applies, the field shows the *part* it will ask for first and why —
+  `detect edge of the tape (falls back to detect tape)`.
 - **What it looked at** — one frame, captured when the detector finds the
   object, so it is the picture the arm decided from. Not a stream: the
   tabletop does not change during a cycle, and pushing it thirty times a
@@ -2206,8 +2465,68 @@ Two tabs. **Run** is what you watch:
 - **The arm**, either as a live 3D render from the URDF or as joint gauges
   with angle and torque per joint. The 3D view loads three.js from a CDN and
   degrades to the gauges if it cannot.
+- **Motors**, one light per motor, on the page the robot is driven from,
+  plus a count in the header. There is no health flag to read:
+  `openarm_hardware` exports position, velocity and effort per joint and
+  nothing else, so a motor that stops answering on the CAN bus raises
+  nothing — `read()` keeps copying the last frame it received, for ever, and
+  the topic carries on looking normal. What the panel watches instead is
+  whether the reading *changes*. These are direct-drive motors holding an
+  arm up against gravity and they are never perfectly still: measured at
+  rest in `motion_log.jsonl`, joint1's effort read 3.5473, 3.3099, 3.4418
+  and 3.9429 Nm on four consecutive stills. So:
+  **green** it is answering; **red** its reading has not moved for
+  `MOTOR_QUIET_SECONDS` (4 s) while the arm is powered, or it is not on
+  `/joint_states` at all; **amber** it is not moving *because the arm is
+  switched off* — which is a different thing and needs a different response.
+  The two are told apart by asking the controller manager for the hardware
+  components' lifecycle states, and when there is no controller manager to
+  ask the panel says so rather than guessing.
+
+  **The motor's own word comes first.** Every Damiao feedback frame carries
+  a status nibble in byte 0 — enabled, disabled, over-voltage,
+  under-voltage, over-current, driver or motor over-temperature, lost
+  communication, overloaded — and `openarm_can` was discarding that byte
+  entirely: it parsed bytes 1–7 and never looked at 0, so `Motor::is_enabled()`
+  existed but was set nowhere and always returned false. Nothing in the ROS
+  stack could tell a motor that was *driving* from one that was merely
+  *reporting*. It is parsed now (and only trusted when the frame's low
+  nibble matches the motor's own CAN id, so the layout is verified rather
+  than assumed), `openarm_hardware` exports it as each joint's `status`
+  state interface, and it reaches the panel on `/dynamic_joint_states`.
+  Both packages need a rebuild — `native/build_ws.sh --packages-select
+  openarm_can openarm_hardware` — and without it the panel falls back to
+  the inference below and says so.
+
+  Freshness alone is not enough, and the second half of the check is why.
+  **A motor with no torque still has an encoder.** It reports, and
+  its numbers move *more* than a driven joint's rather than less, because
+  gravity is moving it — so every freshness test in the world calls it
+  healthy. What it does not do is stay where it was put. So each joint's
+  distance from the position its controller told it to hold is read from
+  `/<arm>_joint_trajectory_controller/controller_state` and shown as
+  **not holding position**, but only once that joint has been asked to
+  stand still for a moment: during a move the error is the arm lagging its
+  own trajectory and says nothing about the motor. Measured on this robot
+  with both arms parked, 194 samples per controller: every joint sat within
+  **0.38 mrad** of its commanded position except two, at **2.86** and
+  **5.06** — and one of those two was showing a green light. `MOTOR_HOLD_ERROR`
+  (2 mrad, about an eighth of a degree) is the gap between those groups.
+
+  And where neither can answer — no status from the motor, and a joint
+  carrying so little load that it holds its place with the torque off just
+  as well as on — the light is **hollow, not green**. That is the case that
+  showed a limp left wrist as healthy: green was a claim the panel had no
+  basis for.
+
+  Left and right are **the robot's own**, the ones in the joint names;
+  standing in front of it they are the other way round, and the panel says
+  so under the heading. Hover a light for that motor's angle, torque, how
+  long it has been saying the same thing, and how far off its commanded
+  position it is.
 - **Log**, every state transition as it happens, and **Progress**, the
-  workflow with the running step lit up.
+  workflow with the running step lit up and a count of where the cycle has
+  got to.
 
 **Setup** is what you change: the settings on the left, the workflow editor on
 the right. Grip torque, grasp height, speed, the travel budget and the rest
@@ -2461,6 +2780,11 @@ ros2 topic echo /pick_place/state --once
 | It says | What to do |
 | --- | --- |
 | `the planner is unusable for this arm` | see below — usually cuMotion has died |
+| *LOCATE, then HOME, then LOCATE again, then `nothing matched`* | fixed. An empty frame is an **answer**: the detector looked and there was nothing there, and a second look from HOME finds the same nothing thirty seconds later. It now reports not-found on the first look. The trip home is still made when the detector finds *the gripper* — that means the view is blocked, not that the object is absent |
+| *the grip is weak, and the jaws close above the object* | the grasp is measured from the object's **top**, and `grasp_z_offset` (+10 mm) puts the jaws above that. The floor is now the **measured surface**, not the top, so a negative offset reaches down the side of the object — `grasp_z_offset:=-0.015` bites 15 mm down and `grasp_table_clearance` (5 mm) stops it pressing into the table |
+| *the top reads centimetres high* | fixed. The top was the nearest tenth of the **whole box**, and a box is bigger than the thing in it: with the arm in frame at the staging pose the nearest tenth was the gripper, and the top came back 45 mm high. It is now the **inner half** of the box at the 20th percentile — where the object actually is, past the dropouts and the edge pixels |
+| `OVER_DROP ... code 99999` *after 60 s* | an unreachable pose goal does not come back refused, it comes back **not at all**: cuMotion sits on it for the whole `motion_timeout` and move_group is wedged afterwards. The drop point is now reach-checked before it is commanded |
+| `the detection is N mm from the tool` | the camera found the gripper rather than the object — possible only when a cycle looks from the staging pose, which is over the work surface. It is refused and the look is retaken from HOME. If it happens every time, the arm is sitting in front of whatever you are picking: `locate_from_staging:=false`, or re-record `pre_pick_state` further back |
 | `nothing matched "detect X"` | the detector saw no such object. Check `/vlm/debug_image`, and that it has finished loading — a pick started during the PaliGemma load fails this way six times over |
 | `could not plan to the pre-grasp above (x, y, z)` | almost always **out of reach**. The line includes a ready-made `check_reachability.py` command; for the right arm keep objects around `x ≤ 0.40, y ≤ −0.10` |
 | `could not plan to pre_pick_state` | the recorded staging pose is not reachable from the observation pose; re-record it |
@@ -2468,11 +2792,22 @@ ros2 topic echo /pick_place/state --once
 | *the gripper turns red in RViz, then every move fails with −2* | the jaws are inside the octomap and the arm's own **start state** is in collision, so no plan from it is valid. The descent leaves them among the voxels of the object they came for, so the gripper's octomap exemption is held for the whole time the arm is on the column — descent, close and the way back up — and `release_column()` is the one place that ends it. If this recurs, check that nothing clears `self._column` without going through it |
 | `CONTACT: <joint> loaded up during TRANSIT` *on a move that was fine* | fixed. The guard compared each joint against what it was pulling **when the move started**, and gravity moves that a long way: measured over one transit, joint1 went from +3.42 Nm at the staging pose to −10.48 Nm at full stretch. It tripped 1.7 s in, on the shoulder *unloading*, and the cancel was then sent from the stop function — which does not run until the wait for the result returns, so the arm flew the whole move anyway and a successful transit was reported as a crash. Now the reference is taken from just before the arm **stopped following its trajectory**, contact needs both a torque climb and the arm failing to keep up, and the cancel goes out from the watching thread |
 | `STOPPED: move_group has stopped answering` | move_group jammed. It does this after rejecting a computed path as invalid: measured, run `1789012345`, the second identical goal was planned by cuMotion and never answered, and `/move_action` and `/check_state_validity` both went out of the graph while the process stayed alive. Nothing that needs a planner will work until the stack is restarted. The contact back-off deliberately does not go through move_group for this reason; `record_states.py --play` talks to the controller directly and can drive the arm out |
+| `PRE_PICK_STATE ... code=-2` *straight after a good grasp* | fixed. The lift is what went wrong, not the staging goal: 200 mm straight up was refused for **joint travel** (measured 3.582 rad against a 1.5 rad budget), the lift settled for the pre-grasp height — 50 mm — and the gripper was handed back to the octomap while still inside the voxels of the object it had just picked up, so the arm's own start state was in collision and every plan out of it was invalid. Three things changed: the lift now **climbs what is left in `descend_step` hops**, because the travel budget is per line; "clear" now means `retreat_height` rather than the pre-grasp; and the staging step retries from higher up the way the retreat always has |
+| `BOOT: ... code 99999` *and the arms move a minute later* | fixed. 99999 is `FAILURE`, and on this path it means move_group did not **accept** the goal within 15 s — a cold bringup, with cuMotion still warming up. The goals were then accepted and executed long after the walk had reported failure. The walk now waits for a plan-only probe to come back (`boot_planner_wait`) before it sends anything, and moves nothing at all if the planner never becomes usable |
 | `RECOVER` then `STOPPED: no refuge could be reached` | a failed cycle could not park the arm anywhere the collision world calls free, so it is left where it stands **with the motors still on** — a limp arm holds itself up with nothing, and letting go while stranded drops it. Clear the obstruction (`ros2 service call /clear_octomap std_srvs/srv/Empty`) and drive it out with `record_states.py --play` |
 | `STOPPED: cannot reach pre_pick` | deliberate. The arm is parked clear of the surface because HOME from where it stands would sweep across the table. Usually the octomap is blocking the plan — `ros2 service call /clear_octomap std_srvs/srv/Empty`, then drive it out with `record_states.py --play`. `home_requires_pre_pick:=false` accepts the sweep instead |
 | *the jaws shut on air after a descent that landed accurately* | the commanded height is wrong for **this object**, not the motion. Measured, run `1788869179` cycle 2: DESCEND landed 1.4 mm from its commanded z and the jaws closed 11 mm above a screwdriver. `grasp_z_offset` is measured from the detector's z, which is not reliably the graspable height — a tall roll of tape tolerates +10 mm, a screwdriver does not. The ladder's `lower-8mm` rungs are the automatic answer and now run on a missed grip; lower `grasp_z_offset` if it happens every time |
 | *the arm presses down into the work surface* | the descent is aiming below the object. `grasp_z_offset` is added to the detected **top** of the object, so a negative value asks the tool to go below it; `grasp_max_depth` (`0.0`) is the floor that stops it, and `min_grasp_z` is **not** — that one is measured from the base. Note the two mask each other: the arm has been stopping tens of millimetres short of what it was told, so a command that is too deep can look fine until tracking improves |
 | `closed-on-nothing` *while the arm is visibly holding the object* | fixed — the check compared the **commanded** finger position, which at the end of a full close is always 0.0, against `grasp_finger_min`. It now reads the measured position. Across 14 real closes the two cases separate cleanly: empty is 0.0025–0.0026 m at 1.14–1.24 Nm, holding is 0.0039–0.0175 m at 1.84–2.46 Nm, and `grasp_finger_min` (0.003) already sat in the gap. A thin object gripped below the torque cap now logs `held-under-cap` |
+| *there is no Place button* | reload the page. It is in the Pick card, under Pick/Abort, and it turns blue when something is held. A browser can keep serving a copy of the panel it already has — aiohttp sends only `Last-Modified` and the browser invents its own freshness — so the page now goes out `no-cache` |
+| *Place is greyed out* | nothing is held. Pick ends in `HOLDING` only when the grasp check passed; if it ended `FAILED`, there is nothing to put down. The pill next to the state says which object the robot thinks it has |
+| `nothing has been picked yet` *from Place* | the same thing, said by the service. Place never flies the approach on an empty hand: it would open on nothing at the drop surface and report a successful place |
+| `the gripper is empty -- the jaws are N mm apart...` *from Place* | the cycle thought it was holding something and the fingers disagree **now** — an object dropped between the pick and the press. The claim is dropped with it, so the panel stops saying "holding" |
+| `nothing matching "detect piece of paper" is in view` | the drop target. It has already looked twice — once from the staging pose and once from HOME — so either the sheet is out of frame, or the phrasing is one the model does not answer to. Check with `VLM/run_in_vlm_env.sh vlm_detect.py "piece of paper" --once --source realsense`, and see [Where it gets put down](#where-it-gets-put-down) for the phrasings that were measured |
+| `could not get above the place target` | the place stopped at `OVER_DROP`. `motion_log.jsonl` says which of the two it was: an `arrival` row with outcome `off-target` means a posture was found and the arm did not take it up — it closed less than `arrival_progress` of the distance, which in practice means it never left the staging pose. No such row means no posture reached the point at all, and the sheet is outside this arm's envelope. Measured at 14:24, three places in a row stopped here because the check was a flat 50 mm against an arm that settles 0.115 rad off in joint1 — about 100 mm at the tool — which is now judged on the distance closed instead |
+| `the tool could not be brought over the drop point` | the horizontal correction above the sheet did not fly, and the tool is neither on the column nor over the paper. Coming down from there is a diagonal across the work surface with the object in the jaws, so nothing is lowered — the object stays held and the arm stays put. The sheet is at the edge of this arm's envelope: move it closer, or put it where the other arm can reach it |
+| `every one of N plans crosses into the other arm's half` | the carry guard. The arm is holding something, the staging pose is the goal, and every plan the planner offered swung the tool across the middle where the other arm is parked. The arm stops where it is, still holding, rather than flying it. Press Place from there if the drop surface is in reach, or park the other arm out of the way — `boot_other_arm:=home` — and press Pick again. `carry_guard:=false` flies whatever the planner gives |
+| *the object is placed too high, and falls* | it cannot be more than `place_max_drop` (10 mm) above the sheet — over that the place **refuses**. The height is measured: the pick records how far the tool was above the surface the object stood on at the moment the jaws closed, so the tool goes that much plus `place_clearance` above the paper. If the place starts refusing for this, the descent is not reaching — that spot is at the edge of the arm's envelope |
 | `the gripper closed but nothing was held` | `grasp_finger_min` or the grasp height is wrong for this object — **read the `CLOSE_GRIPPER` line above it first**: if it says `off-target`, the jaws were not where they were sent and nothing about the detector or the fingers is wrong. Measured once at 29 mm high with the descent plan ending exactly on the point |
 
 The out-of-reach case is the one that looks most like a software fault and is

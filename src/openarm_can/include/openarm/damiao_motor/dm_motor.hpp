@@ -36,13 +36,18 @@ public:
     double get_torque() const { return state_tau_; }
     int get_state_tmos() const { return state_tmos_; }
     int get_state_trotor() const { return state_trotor_; }
+    // The motor's own status nibble from its last feedback frame, or -1 if
+    // it has not been read. See StateResult::status for the values.
+    int get_status() const { return state_status_; }
 
     // Motor property getters
     uint32_t get_send_can_id() const { return send_can_id_; }
     uint32_t get_recv_can_id() const { return recv_can_id_; }
     MotorType get_motor_type() const { return motor_type_; }
 
-    // Enable status getters
+    // Enable status getters. Driven by the status the motor reports, so
+    // this answers "is it driving" rather than "was it asked to" -- it
+    // used to be set nowhere at all and was therefore always false.
     bool is_enabled() const { return enabled_; }
 
     // Parameter methods
@@ -53,7 +58,8 @@ public:
 
 protected:
     // State update methods
-    void update_state(double q, double dq, double tau, int tmos, int trotor);
+    void update_state(double q, double dq, double tau, int tmos, int trotor,
+                      int status = -1);
     void set_state_tmos(int tmos);
     void set_state_trotor(int trotor);
     void set_enabled(bool enabled);
@@ -70,6 +76,7 @@ protected:
     // Current state
     double state_q_, state_dq_, state_tau_;
     int state_tmos_, state_trotor_;
+    int state_status_;
 
     // Parameter storage
     std::map<int, double> temp_param_dict_;

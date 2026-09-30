@@ -42,6 +42,16 @@ struct StateResult {
     int t_mos;
     int t_rotor;
     bool valid;
+    // The status nibble the motor sends in byte 0 of every feedback frame:
+    // 0 disabled, 1 enabled, 8 over-voltage, 9 under-voltage, 0xA
+    // over-current, 0xB MOS over-temperature, 0xC rotor over-temperature,
+    // 0xD lost communication, 0xE overload. -1 when it could not be read.
+    //
+    // Byte 0 was being skipped entirely, so nothing above this library
+    // could tell a motor that is driving from one that is merely
+    // reporting. See parse_motor_state_data for how it is validated
+    // rather than assumed.
+    int status = -1;
 };
 
 struct CANPacket {
@@ -62,6 +72,12 @@ public:
     static CANPacket create_enable_command(const Motor& motor);
     static CANPacket create_disable_command(const Motor& motor);
     static CANPacket create_set_zero_command(const Motor& motor);
+    // 0xFB, the same shape as the others. A Damiao motor latches a fault
+    // -- overload, over-current, either over-temperature -- and produces
+    // no torque until it is cleared, while its encoder keeps reporting
+    // normally. Without this there was no way to clear one short of
+    // power-cycling the arm.
+    static CANPacket create_clear_error_command(const Motor& motor);
     static CANPacket create_mit_control_command(const Motor& motor, const MITParam& mit_param);
     static CANPacket create_query_param_command(const Motor& motor, int RID);
     static CANPacket create_refresh_command(const Motor& motor);

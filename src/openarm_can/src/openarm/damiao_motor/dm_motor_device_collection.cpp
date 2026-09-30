@@ -34,6 +34,28 @@ void DMDeviceCollection::enable_all() {
     }
 }
 
+void DMDeviceCollection::enable_one(int i) {
+    auto dm_device = get_dm_devices().at(i);
+    auto& motor = dm_device->get_motor();
+    CANPacket enable_packet = CanPacketEncoder::create_enable_command(motor);
+    send_command_to_device(dm_device, enable_packet);
+}
+
+void DMDeviceCollection::clear_error_one(int i) {
+    auto dm_device = get_dm_devices().at(i);
+    auto& motor = dm_device->get_motor();
+    CANPacket clear_packet = CanPacketEncoder::create_clear_error_command(motor);
+    send_command_to_device(dm_device, clear_packet);
+}
+
+void DMDeviceCollection::clear_error_all() {
+    for (auto dm_device : get_dm_devices()) {
+        CANPacket clear_packet =
+            CanPacketEncoder::create_clear_error_command(dm_device->get_motor());
+        send_command_to_device(dm_device, clear_packet);
+    }
+}
+
 void DMDeviceCollection::disable_all() {
     for (auto dm_device : get_dm_devices()) {
         CANPacket disable_packet = CanPacketEncoder::create_disable_command(dm_device->get_motor());

@@ -12,11 +12,11 @@ states:
     tcp_xyz: [0.2017, 0.214, 0.4932]
     recorded: '2026-09-03T13:37:14'
   pre_pick_state:
-    joints: [1.080148, -0.002861, 0.001717, 2.178416, -0.00248, 0.002861, -0.480087]
+    joints: [1.3439, -0.680678, 0.610865, 1.91986, -0.593412, 0.680678, -1.44862]
     joint_names: [openarm_left_joint1, openarm_left_joint2, openarm_left_joint3, openarm_left_joint4,
       openarm_left_joint5, openarm_left_joint6, openarm_left_joint7]
-    tcp_xyz: [0.1784, 0.1735, 0.4974]
-    recorded: '2026-09-03T14:42:26'
+    tcp_xyz: [0.0354, 0.1734, 0.4969]
+    recorded: '2026-09-22T10:16:32'
     mirrored_from: right:pre_pick_state
   drop_state:
     joints: [0.396162, -0.185206, 0.310712, 2.180323, -0.141718, -0.536164, 0.663577]

@@ -154,12 +154,22 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   std::vector<double> pos_states_;
   std::vector<double> vel_states_;
   std::vector<double> tau_states_;
+  // What each motor says about itself, exported as the "status" state
+  // interface: 1 enabled, 0 disabled, 8..14 a fault, -1 not readable.
+  // Position, velocity and effort cannot answer "is this motor driving" --
+  // an encoder reports the same either way, and a joint carrying no load
+  // holds its place on friction alone -- so the motor's own word for it is
+  // the only honest source, and it is already in every feedback frame.
+  std::vector<double> status_states_;
 
   // Helper methods
   void return_to_zero();
   // Seed the command buffers from the measured state, so activating the
   // hardware does not move the arm. See the definition.
   void hold_current_position();
+  // Read back what the motors say after an enable, retry the ones that did
+  // not come up, and clear a latched fault first where there is one.
+  void verify_enabled();
   bool parse_config(const hardware_interface::HardwareInfo& info);
   void generate_joint_names();
 

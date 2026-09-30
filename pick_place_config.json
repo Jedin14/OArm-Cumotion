@@ -12,8 +12,7 @@
     "release",
     "verify_place",
     "shut_jaws",
-    "pre_pick",
-    "home"
+    "pre_pick"
   ],
   "settings": {
     "acceleration_scaling": 0.6,

@@ -294,7 +294,29 @@ def test_build_detections():
     check_equal('every field the orchestrator reads is present',
                 sorted(near.keys()),
                 ['axis_source', 'axis_yaw', 'bbox_px', 'center_px', 'depth_m',
-                 'depth_px', 'image_angle_deg', 'point', 'point_cam'])
+                 'depth_px', 'footprint', 'height_m', 'image_angle_deg',
+                 'point', 'point_cam', 'surface', 'top'])
+    # Where it sits on the table, in world x-y. Enough to answer "is this
+    # point on the sheet", which is what a drop needs.
+    check_equal('the footprint is reported', len(near['footprint']), 4)
+    x1, y1, x2, y2 = near['footprint']
+    check_equal('and it contains the point it was measured around',
+                x1 <= near['point'][0] <= x2 and y1 <= near['point'][1] <= y2,
+                True)
+    # `point` is the median over the inner half of the box, which for
+    # anything that stands up is somewhere down its side. `top` is the
+    # nearest surface in the box -- what a descent has to stop above.
+    check_equal('the top is reported as well as the centre',
+                near['top'] is not None, True)
+    check_equal('and it is at least as high as the centre point',
+                near['top'][2] >= near['point'][2] - 1e-9, True)
+    # The surface the object is standing on, measured from the ring around
+    # the box. It is the floor a grasp must stay above, and measuring it
+    # beats configuring one table height for a workspace that has a case
+    # lid on it.
+    if near['surface'] is not None:
+        check_equal('the surface under it is below its top',
+                    near['surface'][2] <= near['top'][2] + 1e-9, True)
 
     empty, empty_overlay = build_detections(
         np.zeros((480, 848, 3), np.uint8), depth, [], intrinsics, rot, trans,

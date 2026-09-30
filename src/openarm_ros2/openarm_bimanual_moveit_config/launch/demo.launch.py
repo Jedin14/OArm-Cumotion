@@ -23,6 +23,7 @@ from launch.actions import (
     TimerAction,
     OpaqueFunction,
 )
+from launch.conditions import IfCondition
 from launch.substitutions import (
     LaunchConfiguration,
     PathJoinSubstitution,
@@ -153,6 +154,13 @@ def generate_launch_description():
             "description_file",
             default_value="v10.urdf.xacro",
         ),
+        DeclareLaunchArgument(
+            "use_rviz",
+            default_value="true",
+            description="Start RViz. Set false on a headless or VNC session: "
+                        "without hardware GL, RViz hangs at start-up with "
+                        "its window never mapped, and nothing else needs it.",
+        ),
         DeclareLaunchArgument("arm_type", default_value="v10"),
         DeclareLaunchArgument("use_fake_hardware", default_value="false"),
         DeclareLaunchArgument(
@@ -257,6 +265,12 @@ def generate_launch_description():
             "openarm_bimanual_moveit_config"), "config", "moveit.rviz"
     )
 
+    # RViz is optional, and on a headless or remote-desktop session it is
+    # worse than optional. Over TigerVNC there is no hardware GL, and RViz
+    # hangs during start-up with its window created but never mapped --
+    # measured, window 0x1a00001 at 20x20, "Map State: IsUnMapped", the
+    # process alive and idle. Nothing else needs it: move_group plans
+    # without it and the pick-and-place panel is a web page.
     rviz_node = Node(
         package="rviz2",
         executable="rviz2",
@@ -264,6 +278,7 @@ def generate_launch_description():
         output="log",
         arguments=["-d", rviz_cfg],
         parameters=[moveit_params],
+        condition=IfCondition(LaunchConfiguration("use_rviz")),
     )
 
     return LaunchDescription(

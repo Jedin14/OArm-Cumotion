@@ -1,3 +1,15 @@
+# The updater below lives in moveit_ros_perception (installed here as
+# 2.5.10). It is what keeps the robot out of its own map: a mesh self-filter
+# renders the arm and the gripper from the URDF at the live TF and drops
+# those pixels from the depth image *before* they become voxels. The camera
+# image is untouched -- nothing is hidden or painted over, and the colour
+# stream the detector reads never passes through here at all.
+#
+# If move_group ever comes up without it, it logs a pluginlib failure and
+# runs with no map: every plan then checks against an empty world while
+# every log line says the map was captured. capture_octomap reports the
+# voxel count after each refresh for exactly that reason.
+#
 octomap_frame: world
 # Voxel edge length, metres. 0.05 was coarser than the things being picked up:
 # a screwdriver is a couple of centimetres across, so at 50 mm it and the
@@ -24,6 +36,31 @@ realsense_depth:
   # it ever becomes voxels.
   far_clipping_plane_distance: 1.5
   shadow_threshold: 0.2
-  padding_scale: 2.0
-  padding_offset: 0.20
+  # The self-filter. This updater renders the robot from the URDF at the
+  # current TF and removes those pixels from the depth image *before* they
+  # become voxels -- which is how the arm and the gripper are kept out of
+  # the map without touching the camera image. padding_scale multiplies the
+  # rendered depth and padding_offset adds metres to it, so the pair is how
+  # much margin the filter leaves around the robot's own surfaces.
+  #
+  # 2.0 and 0.20 m were far too generous: 20 cm of margin behind every
+  # robot surface erases the table under the gripper along with the
+  # gripper -- and an object being reached for is by then within 20 cm of
+  # the gripper, so it goes too.
+  #
+  # Measured by bisection on this robot, not chosen from a template:
+  #
+  #   0.20  the gripper is gone -- and so is the table under it, and the
+  #         object being reached for, which is within 20 cm of the gripper
+  #         by the time it matters
+  #   0.05  whole voxels sitting on the gripper, with the hand drawn red
+  #         in the planning scene because its own start state collides
+  #
+  # 0.12 is the next step between them. The filter can only remove the
+  # robot where it thinks the robot is, so the margin has to cover the
+  # camera mount being a centimetre or two out and the collision meshes
+  # being coarser than the real parts -- a margin this large is a
+  # *symptom*, and the cure is calibrating the camera mount, not padding.
+  padding_scale: 1.1
+  padding_offset: 0.12
   max_update_rate: 5.0

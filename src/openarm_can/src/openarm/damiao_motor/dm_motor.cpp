@@ -29,7 +29,8 @@ Motor::Motor(MotorType motor_type, uint32_t send_can_id, uint32_t recv_can_id)
       state_dq_(0.0),
       state_tau_(0.0),
       state_tmos_(0),
-      state_trotor_(0) {}
+      state_trotor_(0),
+      state_status_(-1) {}
 
 // Enable methods
 void Motor::set_enabled(bool enable) { this->enabled_ = enable; }
@@ -45,12 +46,18 @@ double Motor::get_param(int RID) const {
 void Motor::set_temp_param(int RID, int val) { temp_param_dict_[RID] = val; }
 
 // State update methods
-void Motor::update_state(double q, double dq, double tau, int tmos, int trotor) {
+void Motor::update_state(double q, double dq, double tau, int tmos, int trotor,
+                         int status) {
     state_q_ = q;
     state_dq_ = dq;
     state_tau_ = tau;
     state_tmos_ = tmos;
     state_trotor_ = trotor;
+    state_status_ = status;
+    // 1 is the motor reporting itself enabled. Anything else -- 0 for
+    // disabled, 8..0xE for a fault -- is not driving, and an unreadable
+    // status (-1) is not a claim that it is.
+    enabled_ = (status == 1);
 }
 
 void Motor::set_state_tmos(int tmos) { state_tmos_ = tmos; }

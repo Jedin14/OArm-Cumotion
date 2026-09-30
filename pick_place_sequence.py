@@ -109,16 +109,33 @@ STEPS = {
                  'posture, so it is only safe from the staging pose -- see '
                  'home_requires_pre_pick.',
         'needs': [], 'gives': [],
-        'required': True, 'repeatable': True,
+        'required': False, 'repeatable': True,
     },
 }
 
 # The approach, shown but not edited. See the module docstring.
+#
+# In the order it actually happens now. The arm waits at the staging pose
+# -- that is where the boot walk leaves it and where a Pick is pressed from
+# -- so a cycle begins by *looking*, with no move at all. HOME is still in
+# the list because it is still where a look has to be taken from when the
+# arm is in the picture, but it is a detour now rather than the first step.
 FIXED_PREFIX = [
-    {'step': 'home', 'label': 'Home',
-     'about': 'Rest, observe and capture the octomap, out of the camera frame.'},
+    {'step': 'pre_pick', 'label': 'Waiting at pre-pick',
+     'about': 'Where the boot walk leaves the arm, and where a Pick starts. '
+              'The approach begins here, so pressing Pick goes straight to '
+              'the look.'},
     {'step': 'locate', 'label': 'Locate',
-     'about': 'Ask the detector where the object is.'},
+     'about': 'Ask the detector where the object is -- from the staging pose '
+              'when the arm is already standing there. An empty frame stops '
+              'the cycle here: the detector answered, and it answered that '
+              'there is nothing to pick.'},
+    {'step': 'home', 'label': 'Home (only if needed)',
+     'about': 'The staging pose is over the work surface, so the arm is in '
+              'the picture. If the detector finds the gripper rather than '
+              'the object, the look is taken again from HOME, which is out '
+              'of frame by definition -- and that is also where the octomap '
+              'is captured.'},
     {'step': 'choose_arm', 'label': 'Choose arm',
      'about': 'Which arm can reach it, settled before anything moves.'},
     {'step': 'preflight', 'label': 'Pre-flight',
@@ -127,7 +144,8 @@ FIXED_PREFIX = [
               'why the approach is not reorderable: the steps below it are '
               'checked as one unit.'},
     {'step': 'pre_pick', 'label': 'Pre-pick pose',
-     'about': 'The staging posture the pre-flight measured from.'},
+     'about': 'Back to the staging posture the pre-flight measured from, '
+              'before the transit.'},
     {'step': 'transit', 'label': 'Transit',
      'about': 'A straight line to a point above the object.'},
 ]
@@ -144,7 +162,6 @@ DEFAULT_SEQUENCE = [
     'verify_place',
     'shut_jaws',
     'pre_pick',
-    'home',
 ]
 
 # Orchestrator parameters the UI is allowed to set, with the bounds it offers.
@@ -164,6 +181,12 @@ SETTINGS = [
      'type': 'double', 'min': -1.0, 'max': 0.02, 'step': 0.001,
      'about': 'Measured finger opening above which the jaws count as '
               'holding something. -1 disables the check, for fake hardware.'},
+    {'name': 'grasp_hold_torque_min', 'label': 'Holding torque', 'unit': 'Nm',
+     'type': 'double', 'min': 0.0, 'max': 3.0, 'step': 0.1,
+     'about': 'What the jaws must be pressing with to count as holding, '
+              'when the detector cannot see whether the object moved. '
+              'Empty measures 0.5-1.2 Nm on this robot and holding '
+              '1.8-2.5 Nm. 0 uses the width alone.'},
     {'name': 'velocity_scaling', 'label': 'Speed', 'unit': '',
      'type': 'double', 'min': 0.05, 'max': 1.0, 'step': 0.05,
      'about': 'A time dilation of the planned path, so it changes speed and '
@@ -171,6 +194,22 @@ SETTINGS = [
     {'name': 'acceleration_scaling', 'label': 'Acceleration', 'unit': '',
      'type': 'double', 'min': 0.05, 'max': 1.0, 'step': 0.05,
      'about': 'The planner applies the lower of this and the speed.'},
+    {'name': 'cartesian_boost_max', 'label': 'Straight-line speed-up',
+     'unit': 'x', 'type': 'double', 'min': 1.0, 'max': 3.0, 'step': 0.1,
+     'about': 'How much faster than MoveIt timed it a straight line may be '
+              'flown. The joint goals are timed by cuMotion and the '
+              'straight lines by MoveIt, which has no acceleration limits '
+              'to work with on this robot -- measured, transit legs took '
+              '11 s at a fifth of the acceleration the joint goals used. '
+              '1 flies them exactly as timed. The speed and acceleration '
+              'ceilings bound it either way, and a leg asked to be gentle '
+              'is never sped up.'},
+    {'name': 'place_retreat_speed', 'label': 'Retreat speed', 'unit': '',
+     'type': 'double', 'min': 0.05, 'max': 1.0, 'step': 0.05,
+     'about': 'Coming back up off the drop surface, once the object is '
+              'down. What matters there is that it is vertical, so the '
+              'open jaws rise off the object rather than sweeping it '
+              'along; that is the column it flies, not its speed.'},
     {'name': 'approach_height', 'label': 'Pre-grasp height', 'unit': 'm',
      'type': 'double', 'min': 0.01, 'max': 0.20, 'step': 0.005,
      'about': 'How far above the grasp the gripper opens.'},
@@ -214,6 +253,15 @@ SETTINGS = [
               'direct-drive with no brakes, so the arm is held up by nothing '
               'afterwards -- it is never done with the arm stranded, where '
               'letting go would drop it onto whatever it is over.'},
+    {'name': 'carry_guard', 'label': 'Keep the carry on its own side',
+     'unit': '', 'type': 'bool',
+     'about': 'Carrying something back to the staging pose, keep the tool '
+              'out of the other arm\'s half. The plan is measured before it '
+              'is flown, because the planner takes no path constraints and '
+              'the other arm is parked over there in the air, with nothing '
+              'in the octomap to say so. If no plan stays put, the arm '
+              'stops where it is, still holding, rather than swinging '
+              'across.'},
     {'name': 'descend_close_gap', 'label': 'Close the descent gap',
      'unit': '', 'type': 'bool',
      'about': 'Fly the remainder when the descent stops short of the grasp. '
@@ -453,6 +501,27 @@ def save_config(path, config):
     return None
 
 
+# Where Pick stops and Place starts, and the one place that rule is
+# written down. The orchestrator's sequence_split reads the same anchors --
+# after verify_grasp if there is one, after the grasp itself if there is
+# not -- and the panel has to draw the same line, or the operator is
+# editing one thing and pressing another.
+PLACE_ANCHORS = ('verify_grasp', 'grasp')
+
+
+def place_from(sequence):
+    """Index of the first step the Place button runs.
+
+    len(sequence) when there is nothing after the grasp, which is a
+    sequence that cannot place at all -- the orchestrator refuses rather
+    than reporting a place that did not happen.
+    """
+    for anchor in PLACE_ANCHORS:
+        if anchor in sequence:
+            return sequence.index(anchor) + 1
+    return len(sequence)
+
+
 def describe(sequence):
     """The sequence as the UI wants it: the fixed approach, then the steps."""
     return {
@@ -460,4 +529,5 @@ def describe(sequence):
         'steps': [dict(STEPS[name], step=name) for name in sequence
                   if name in STEPS],
         'available': [dict(meta, step=name) for name, meta in STEPS.items()],
+        'place_from': place_from(list(sequence)),
     }

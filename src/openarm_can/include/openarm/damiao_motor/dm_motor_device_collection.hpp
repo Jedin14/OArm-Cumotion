@@ -31,6 +31,13 @@ public:
 
     // Common motor operations
     void enable_all();
+    // One motor. enable_all sends seven commands back to back and checks
+    // nothing, so a motor that misses its own -- or that is sitting in a
+    // latched fault and will not take it -- comes up limp with no
+    // complaint from anywhere. Retrying that one needs this.
+    void enable_one(int i);
+    void clear_error_one(int i);
+    void clear_error_all();
     void disable_all();
     void set_callback_mode_all(CallbackMode callback_mode);
 

@@ -54,6 +54,18 @@ WS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASPNET = os.path.join(WS, 'third_party', 'graspnet-baseline')
 
 
+# graspnet-baseline's own finger geometry, from
+# utils/collision_detector.py -- the space between the jaws runs from
+# depth - FINGER_LENGTH to depth along the approach axis. Taken from there
+# rather than guessed so that what is measured is the volume its own
+# collision check reasons about.
+FINGER_LENGTH = 0.06
+
+# Below this, the "object" between the jaws is depth noise and its extent
+# means nothing.
+MIN_SPAN_POINTS = 10
+
+
 def quat_to_rot(x, y, z, w):
     """Rotation matrix from a quaternion, as three columns."""
     n = (x * x + y * y + z * z + w * w) ** 0.5
@@ -354,7 +366,9 @@ class GraspServer(Node):
         floor = self.get_parameter('min_score').value
         widest = (self.get_parameter('gripper_open').value
                   - self.get_parameter('width_margin').value)
+        margin = self.get_parameter('width_margin').value
         keep, too_wide, too_far, too_weak = [], 0, 0, 0
+        rescued, near_widths = 0, []
         for row in grasps:
             entry = self._to_world(row, rot, trans)
             if entry['score'] < floor:
@@ -363,20 +377,39 @@ class GraspServer(Node):
             if np.linalg.norm(np.array(entry['position']) - wanted) > radius:
                 too_far += 1
                 continue
+            near_widths.append(entry['width'])
             if entry['width'] > widest:
-                too_wide += 1
-                continue
+                # The model wants more opening than there is. Before
+                # refusing, ask the cloud how much object is actually
+                # between the jaws here -- that is the number the hardware
+                # has to satisfy, and it is often smaller.
+                span = self._span_between_jaws(row, cloud)
+                if span is None or span + margin > widest:
+                    too_wide += 1
+                    continue
+                entry['model_width'] = entry['width']
+                entry['width'] = round(span + margin, 4)
+                entry['width_source'] = 'measured'
+                rescued += 1
             keep.append(entry)
-        if not keep and too_wide:
-            # Worth saying rather than reporting an empty list: "the model
-            # found grasps and this gripper cannot make any of them" is a
-            # different problem from "the model found nothing".
+        if rescued:
+            self.get_logger().info(
+                f'{rescued} grasp(s) the model called too wide are makeable: '
+                f'the cloud says the object between the jaws is narrower '
+                f'than the opening it asked for')
+        if not keep:
+            # "The model found grasps and this gripper cannot make any of
+            # them" is a different problem from "the model found nothing",
+            # and from "they were all somewhere else". Say which.
+            spread = ('' if not near_widths else
+                      f' Near-object widths ran '
+                      f'{min(near_widths) * 1000:.0f}-'
+                      f'{max(near_widths) * 1000:.0f} mm.')
             self.get_logger().warn(
-                f'{too_wide} grasp(s) needed more than the '
-                f'{widest * 1000:.0f} mm this gripper can span. GraspNet was '
-                f'trained for a 100 mm one, so a wide object gets proposals '
-                f'that are right for its gripper and impossible for this. '
-                f'Raise gripper_open if the jaws really open further.')
+                f'nothing usable from {len(grasps)} raw grasp(s): '
+                f'{too_weak} below score {floor:.2f}, {too_far} further than '
+                f'{radius * 1000:.0f} mm from the object, {too_wide} wider '
+                f'than the {widest * 1000:.0f} mm these jaws span.{spread}')
         keep.sort(key=lambda g: -g['score'])
         keep = keep[:self.get_parameter('max_candidates').value]
         self._publish(keep, request, self.target_frame)
@@ -454,6 +487,44 @@ class GraspServer(Node):
         collided = detector.detect(_Group(), approach_dist=0.05,
                                    collision_thresh=threshold)
         return grasps[~collided]
+
+    def _span_between_jaws(self, row, cloud):
+        """How wide the object actually is where this grasp closes, metres.
+
+        None when there is nothing between the jaws to measure.
+
+        Why measure at all when the model reports a width: because that
+        width is what GraspNet *recommends the gripper open to*, learned and
+        binned over a 100 mm gripper's range. This one spans 44 mm, so the
+        recommendation is coarse exactly where it has to be fine, and a
+        candidate whose real material is 30 mm across can come back asking
+        for 50. Measured, run 1789014831: every near-object candidate for a
+        roll of tape was refused on the predicted width and the model has
+        never contributed a pick on this robot.
+
+        The cloud and the grasp are both in the camera frame, so this is
+        done there: rotate the points into the grasp's own frame, keep the
+        ones lying in the space the fingers will sweep through, and take
+        their extent along the closing direction.
+
+        The volume is graspnet-baseline's own, not a guess -- the same
+        masks its collision detector builds (utils/collision_detector.py):
+        the fingers occupy x in (depth - finger_length, depth), the object
+        sits between them at |y| < width/2, and the gripper's thickness is
+        |z| < height/2. FINGER_LENGTH is theirs too.
+        """
+        width, height, depth = row[1], row[2], row[3]
+        r_cam = row[4:13].reshape(3, 3)
+        t_cam = row[13:16]
+        local = (cloud - t_cam) @ r_cam            # camera -> grasp frame
+        between = (
+            (local[:, 0] > depth - FINGER_LENGTH) & (local[:, 0] < depth)
+            & (np.abs(local[:, 1]) < width / 2.0)
+            & (np.abs(local[:, 2]) < max(height, 1e-3) / 2.0))
+        if between.sum() < MIN_SPAN_POINTS:
+            return None
+        across = local[between, 1]
+        return float(across.max() - across.min())
 
     def _to_world(self, row, rot, trans):
         """One raw grasp row, in the target frame and our tool's convention.

@@ -146,7 +146,8 @@ NB_MODULE(openarm_can, m) {
         .def_rw("torque", &StateResult::torque)
         .def_rw("t_mos", &StateResult::t_mos)
         .def_rw("t_rotor", &StateResult::t_rotor)
-        .def_rw("valid", &StateResult::valid);
+        .def_rw("valid", &StateResult::valid)
+        .def_rw("status", &StateResult::status);
 
     // CANPacket struct
     nb::class_<CANPacket>(m, "CANPacket")
@@ -179,6 +180,7 @@ NB_MODULE(openarm_can, m) {
         .def("get_position", &Motor::get_position)
         .def("get_velocity", &Motor::get_velocity)
         .def("get_torque", &Motor::get_torque)
+        .def("get_status", &Motor::get_status)
         .def("get_state_tmos", &Motor::get_state_tmos)
         .def("get_state_trotor", &Motor::get_state_trotor)
         .def("get_send_can_id", &Motor::get_send_can_id)
