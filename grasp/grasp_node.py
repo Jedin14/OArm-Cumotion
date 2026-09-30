@@ -156,6 +156,24 @@ class GraspServer(Node):
         # Room left between the jaws and the object at the commanded width.
         # 0 accepts a grasp that needs the gripper at full stretch.
         self.declare_parameter('width_margin', 0.004)
+        # Whether a grasp wider than the jaws is refused at all.
+        #
+        # On, a grasp the model asks more opening for than the hardware has
+        # is measured against the cloud and kept only if the object between
+        # the jaws is genuinely narrower. That is the careful reading, and
+        # it threw away most of what the model proposed: measured, 'near
+        # object widths ran 87-87 mm' against a 40 mm span.
+        #
+        # Off, the width the model asked for is treated as an upper bound
+        # rather than a requirement, up to span_ceiling, and the opening
+        # actually commanded is clamped to what the jaws have. So 0-44 mm
+        # passes through as it does now and 44-100 mm is commanded as 44.
+        # The jaws close until they meet the object either way -- they are
+        # a position command against a torque cap, not a caliper -- so the
+        # cost of being wrong is a grasp that closes on nothing, which
+        # verify_grasp already catches.
+        self.declare_parameter('span_check', True)
+        self.declare_parameter('span_ceiling', 0.100)
         self.declare_parameter('collision_thresh', 0.01)
         self.declare_parameter('voxel_size', 0.01)
         self.declare_parameter('target_frame', 'world')
@@ -362,36 +380,64 @@ class GraspServer(Node):
             return
 
         wanted = np.array(request['point'], dtype=np.float64)
+        # 0 disables it: every grasp the model returns is considered,
+        # wherever it is. The radius exists because the model proposes for
+        # the whole scene and the cycle asked about one object, so without
+        # it a grasp meant for the next thing along gets flown at this one.
         radius = self.get_parameter('object_radius').value
         floor = self.get_parameter('min_score').value
         widest = (self.get_parameter('gripper_open').value
                   - self.get_parameter('width_margin').value)
         margin = self.get_parameter('width_margin').value
+        span_check = self.get_parameter('span_check').value
+        ceiling = self.get_parameter('span_ceiling').value
         keep, too_wide, too_far, too_weak = [], 0, 0, 0
-        rescued, near_widths = 0, []
+        rescued, clamped, near_widths = 0, 0, []
         for row in grasps:
             entry = self._to_world(row, rot, trans)
             if entry['score'] < floor:
                 too_weak += 1
                 continue
-            if np.linalg.norm(np.array(entry['position']) - wanted) > radius:
+            if (radius > 0.0
+                    and np.linalg.norm(
+                        np.array(entry['position']) - wanted) > radius):
                 too_far += 1
                 continue
             near_widths.append(entry['width'])
             if entry['width'] > widest:
-                # The model wants more opening than there is. Before
-                # refusing, ask the cloud how much object is actually
-                # between the jaws here -- that is the number the hardware
-                # has to satisfy, and it is often smaller.
-                span = self._span_between_jaws(row, cloud)
-                if span is None or span + margin > widest:
-                    too_wide += 1
-                    continue
-                entry['model_width'] = entry['width']
-                entry['width'] = round(span + margin, 4)
-                entry['width_source'] = 'measured'
-                rescued += 1
+                if span_check:
+                    # The model wants more opening than there is. Before
+                    # refusing, ask the cloud how much object is actually
+                    # between the jaws here -- that is the number the
+                    # hardware has to satisfy, and it is often smaller.
+                    # Measured first, then refused: never the other way
+                    # round, which is what the ordering here is protecting.
+                    span = self._span_between_jaws(row, cloud)
+                    if span is None or span + margin > widest:
+                        too_wide += 1
+                        continue
+                    entry['model_width'] = entry['width']
+                    entry['width'] = round(span + margin, 4)
+                    entry['width_source'] = 'measured'
+                    rescued += 1
+                else:
+                    # Treated as an upper bound, not a requirement. Past
+                    # the ceiling it is not this object at all and is still
+                    # refused.
+                    if entry['width'] > ceiling:
+                        too_wide += 1
+                        continue
+                    entry['model_width'] = entry['width']
+                    entry['width'] = round(widest, 4)
+                    entry['width_source'] = 'clamped'
+                    clamped += 1
             keep.append(entry)
+        if clamped:
+            self.get_logger().info(
+                f'{clamped} grasp(s) wider than the {widest * 1000:.0f} mm '
+                f'the jaws span were kept with the opening clamped to the '
+                f'span -- span_check is off, so the width the model asked '
+                f'for is an upper bound rather than a requirement')
         if rescued:
             self.get_logger().info(
                 f'{rescued} grasp(s) the model called too wide are makeable: '
@@ -401,15 +447,18 @@ class GraspServer(Node):
             # "The model found grasps and this gripper cannot make any of
             # them" is a different problem from "the model found nothing",
             # and from "they were all somewhere else". Say which.
+            limit = ceiling if not span_check else widest
             spread = ('' if not near_widths else
                       f' Near-object widths ran '
                       f'{min(near_widths) * 1000:.0f}-'
                       f'{max(near_widths) * 1000:.0f} mm.')
             self.get_logger().warn(
                 f'nothing usable from {len(grasps)} raw grasp(s): '
-                f'{too_weak} below score {floor:.2f}, {too_far} further than '
-                f'{radius * 1000:.0f} mm from the object, {too_wide} wider '
-                f'than the {widest * 1000:.0f} mm these jaws span.{spread}')
+                f'{too_weak} below score {floor:.2f}, '
+                f'{too_far} further than {radius * 1000:.0f} mm from the '
+                f'object, {too_wide} wider than the {limit * 1000:.0f} mm '
+                f'{"span_ceiling" if not span_check else "these jaws span"}'
+                f'.{spread}')
         keep.sort(key=lambda g: -g['score'])
         keep = keep[:self.get_parameter('max_candidates').value]
         self._publish(keep, request, self.target_frame)

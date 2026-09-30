@@ -240,14 +240,31 @@ def test_span_measures_what_fits(m):
           span(None, row(width, height, depth), here), tol=1e-9)
 
 
-def test_model_grasps_are_bounded_by_the_vertical_column(m):
-    """A side grasp cannot be flown down a column that only moves in z.
+def test_the_column_can_follow_the_grasp_axis(m):
+    """A side grasp is flown in along its own axis, or not at all.
 
-    The cycle's approach and retreat interpolate in z and hold x and y, so
-    a tilted *tool* is fine and a tilted *path* is not. The model proposes
-    both; the steep ones have to be skipped rather than driven down across
-    the object.
+    The approach and the retreat used to interpolate in z and hold x and y,
+    so a tilted *tool* was fine and a tilted *path* was not -- steep model
+    grasps had to be skipped rather than driven down across the object.
+    column_follows_grasp_axis lifts that by setting the pre-grasp back
+    along the tool's approach axis instead of straight above the grasp.
+
+    The reduction is the thing worth guarding: for a top-down grasp the
+    axis is (0, 0, -1), so the new arithmetic returns the old point and the
+    default path is unchanged.
     """
+    for yaw in (0.0, math.pi / 4, 1.0, -2.0, math.pi):
+        quat = m.top_down_quat(yaw)
+        check(f'approach_axis is the tool +Z at yaw {yaw:.2f}',
+              m.approach_axis(quat), quat_to_rot(quat)[:, 2])
+        check(f'and a unit vector at yaw {yaw:.2f}',
+              float(np.linalg.norm(m.approach_axis(quat))), 1.0)
+    # A grasp coming in horizontally: 90 degrees about world X.
+    side = m.quat_mul((math.sin(math.pi / 4), 0.0, 0.0, math.cos(math.pi / 4)),
+                      m.top_down_quat(0.0))
+    check('a 90 degree side grasp approaches horizontally',
+          m.approach_axis(side), [0.0, 1.0, 0.0])
+
     source = open(os.path.join(WS, 'pick_place_orchestrator.py')).read()
     proposals = source.split('def model_proposals(')[1].split('\n    def ')[0]
     check('the tilt is read off the candidate',
@@ -256,12 +273,22 @@ def test_model_grasps_are_bounded_by_the_vertical_column(m):
           'grasp_model_max_tilt' in proposals, True)
     check('the ones skipped are named, not silently dropped',
           'Skipped rather than mis-flown' in proposals, True)
-    check('the pre-grasp is straight up, which is why the limit exists',
-          "grasp[2] + approach" in proposals, True)
-    # The column itself, so this test fails if it ever learns to follow an
-    # approach axis and the limit is then wrong rather than merely cautious.
+    check('the pre-grasp goes back along the axis, not straight up',
+          'self.column_start(grasp, quat, approach)' in proposals, True)
+    check('and the limit is lifted once the column can follow it',
+          'column_follows_grasp_axis' in proposals, True)
+    start = source.split('def column_start(')[1].split('\n    def ')[0]
+    check('with the flag off the pre-grasp is still straight up',
+          'grasp[2] + height' in start, True)
+    check('and with it on it is set back along the axis',
+          'grasp[2] - az * height' in start, True)
+    descend = source.split('def _descend_column(')[1].split('\n    def ')[0]
+    check('a tilted column refuses the vertical stepping fallback rather '
+          'than flying a path nobody checked',
+          'refused-tilted-no-line' in descend, True)
     heights = source.split('def column_heights(')[1].split('\n    def ')[0]
-    check('the column is still a list of heights',
+    check('the stepping fallback is still a list of heights, which is why '
+          'it is refused rather than reused',
           'to_z if i == count else from_z' in heights, True)
 
 
@@ -275,7 +302,7 @@ def main():
     test_retry_ladder_escalates(module)
     test_span_uses_graspnets_own_jaw_volume()
     test_span_measures_what_fits(module)
-    test_model_grasps_are_bounded_by_the_vertical_column(module)
+    test_the_column_can_follow_the_grasp_axis(module)
 
     print()
     if FAILURES:

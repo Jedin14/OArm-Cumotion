@@ -253,6 +253,29 @@ def generate_launch_description():
 
     moveit_params = moveit_config.to_dict()
 
+    # How far the trajectory's first point may sit from where the arm
+    # actually is when execution starts, radians. MoveIt's default is 0.01
+    # and it is too tight for this robot.
+    #
+    # These are direct-drive motors with no brakes. cuMotion plans from the
+    # joint state it read, and in the milliseconds before the trajectory is
+    # validated the shoulder sags -- so the first point no longer matches
+    # and MoveIt refuses the whole thing. Measured, 10:35:23:
+    #
+    #   Invalid Trajectory: start point deviates from current robot state
+    #   more than 0.01
+    #   joint 'openarm_right_joint1': expected: -1.02558, current: -1.03666
+    #
+    # 11.1 mrad of sag against a 10 mrad tolerance. It came back as
+    # CONTROL_FAILED, which the orchestrator reasonably treats as "the
+    # controller failed part-way", and the cycle stopped without the arm
+    # having moved at all.
+    #
+    # 0.05 leaves 4.5x headroom on the measured sag. The cost is that
+    # execution may begin up to 0.05 rad from the planned first point, so
+    # the arm takes up that much slack as the trajectory starts.
+    moveit_params['trajectory_execution.allowed_start_tolerance'] = 0.05
+
     run_move_group_node = Node(
         package="moveit_ros_move_group",
         executable="move_group",

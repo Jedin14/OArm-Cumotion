@@ -77,7 +77,16 @@
       <child link="${ee_prefix}left_finger" />
       <origin xyz="0 0.006 0.015" rpy="0 0 0" />
       <axis xyz="0 1 0" />
-      <limit effort="333" lower="0.0" upper="0.044" velocity="10.0" />
+      <!-- Lower bound matches finger_joint1's, because this joint mimics it
+           with multiplier 1 and offset 0: whatever joint1 is commanded to,
+           this one is required to follow exactly. With lower="0.0" the pair
+           was inconsistent - joint1 could be driven to -0.030 while this
+           joint's floor was 0 - and cuRobo refuses to build a kinematic
+           model from it: "mimic joint can go out of it's lower limit as
+           active joint has larger range". That refusal is why the fingers
+           could not be given collision spheres, and the fingers are exactly
+           the links that were driving through the torso unchecked. -->
+      <limit effort="333" lower="-0.030" upper="0.044" velocity="10.0" />
       <mimic joint="${ee_prefix}finger_joint1" />
     </joint>
 

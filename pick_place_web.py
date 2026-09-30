@@ -149,6 +149,8 @@ ACTIONS = {
     'place': '/pick_place/place',
     'place_left': '/pick_place/place_left',
     'place_right': '/pick_place/place_right',
+    'go_pre_pick': '/pick_place/go_pre_pick',
+    'go_home': '/pick_place/go_home',
     'stop_arm': '/pick_place/stop_arm',
     'abort': '/pick_place/abort',
     'open_gripper': '/pick_place/open_gripper',

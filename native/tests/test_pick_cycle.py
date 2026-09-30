@@ -1871,14 +1871,41 @@ def main():
             walked = [g['joints'] for g in robot.goals
                       if not g['plan_only'] and g['kind'] == 'joint']
             mapped = len(robot.refreshes) - refreshed
-        # Straight to where they wait, and the map is taken from there:
-        # the grippers being in it is handled by exempting them, not by
-        # moving the robot out of the way.
-        check('the walk goes straight to the staging pose',
+        # The map is still taken from where they stand -- the grippers
+        # being in it is handled by exempting them, not by moving the
+        # robot out of the way.
+        check('the walk ends at the staging pose',
               walked[-1], PRE_PICK_JOINTS)
-        check('with no fold down to home on the way',
-              [j for j in walked
+        # boot_stage_home puts HOME back in the middle, and it is not a
+        # detour for its own sake. Both arms have been refused the direct
+        # route for the same self-collision, gripper against
+        # openarm_body_link0 -- measured left 1790058419 (invalid at index
+        # 8 of 32) and right 1790164017 (index 14 of 33), with cuMotion
+        # reporting success both times and MoveIt's validator throwing the
+        # path out. HOME is tucked in near the body centre, so neither leg
+        # of the trip sweeps across.
+        check('every arm reaches home before any reaches the staging pose',
+              ([j for j in walked
+                if max(abs(a - b) for a, b in zip(j, HOME_JOINTS)) < 1e-3]
+               and walked.index(PRE_PICK_JOINTS)
+               > max(i for i, j in enumerate(walked)
+                     if max(abs(a - b)
+                            for a, b in zip(j, HOME_JOINTS)) < 1e-3)), True)
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'boot_stage_home', value=False)])
+        with robot.lock:
+            robot.joints = list(DROP_JOINTS)
+            robot.goals.clear()
+        time.sleep(0.4)
+        orchestrator._walk_to_boot_pose()
+        with robot.lock:
+            direct = [g['joints'] for g in robot.goals
+                      if not g['plan_only'] and g['kind'] == 'joint']
+        check('and with it off the walk goes straight there, as it used to',
+              [j for j in direct
                if max(abs(a - b) for a, b in zip(j, HOME_JOINTS)) < 1e-3], [])
+        orchestrator.set_parameters([rclpy.parameter.Parameter(
+            'boot_stage_home', value=True)])
         check('and the map is captured from where they stand',
               mapped > 0, True)
         # The detour is still there for a stack that wants it.

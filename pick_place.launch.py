@@ -123,6 +123,15 @@ ORCHESTRATOR_ARGS = [
      'from there begins with the transit. The boot walk goes via HOME and '
      'maps the work area on the way through, because HOME is the one pose '
      'the map can be captured from without the robot in it.'),
+    ('boot_stage_home', 'true',
+     'Bring both arms to HOME first, then both to the staging pose. Not a '
+     'detour for its own sake: the direct route has been refused on both '
+     'arms for the same self-collision -- the gripper against '
+     'openarm_body_link0 -- whenever an arm starts far enough round that '
+     'the swing to pre_pick crosses the torso. cuMotion plans it and '
+     "MoveIt's validator throws it out mid-path. HOME is tucked in near "
+     'the body centre, so neither leg sweeps across. The boot walk only; '
+     'the cycle still never commands HOME.'),
     ('boot_via_home', 'false',
      'Whether the boot walk folds down to HOME to capture the map before '
      'going to where the arms wait. On, because on this robot the '
@@ -577,6 +586,30 @@ ORCHESTRATOR_ARGS = [
      'refresh only ever adds voxels, so without it the scene keeps every '
      'object that has ever been on the table, including the one just '
      'carried away.'),
+    ('recovery_max_joint_travel', '4.0',
+     'The joint-travel limit for the legs that get the arm out of trouble, '
+     'radians, as opposed to the ones that take it down to an object. '
+     'Looser on purpose: the tight budget exists to stop the arm swinging '
+     'across the workspace on the way toward the table, and applying it to '
+     'the move that lifts the arm away strands it instead. Measured three '
+     'times -- the descent fails, CLEAR costs more than 1.50 rad and is '
+     'refused, no refuge can be reached, and the arm is parked over the '
+     'table with the motors on. 0 removes the limit for recovery legs.'),
+    ('map_before_place', 'true',
+     'Refresh the octomap before the place looks for its drop target, for '
+     'the same reason the pick refreshes before looking. While something is '
+     'held this clears the stale map without recapturing -- capture_octomap '
+     'will not map a payload -- which still removes the voxels where the '
+     'object used to be, and those sit exactly where the arm is about to '
+     'fly.'),
+    ('map_after_place', 'true',
+     'And rebuild it again once the object is down and the hand is empty. '
+     'That is the first moment in the place half a map can honestly be '
+     'taken -- capture_octomap refuses while holding, because the payload '
+     'would be mapped as an obstacle that then travels on the tool. Without '
+     'it the scene ends the cycle holding the object twice: the voxels where '
+     'it was picked up from, which a refresh alone never removes, and the '
+     'ones where it was just put down.'),
     ('home_pose_tolerance', '0.05',
      'How close the measured joints must be to HOME, radians, before the map '
      'may be captured.'),
@@ -631,6 +664,17 @@ ORCHESTRATOR_ARGS = [
      '20 degrees, which on most objects grips just as well. Vertical is tried '
      'first and tilts in increasing order, so nothing tilts that need not; 0 '
      'restores the strict behaviour.'),
+    ('column_follows_grasp_axis', 'false',
+     "Fly the approach and the retreat along the grasp's own axis rather "
+     'than straight down. The descent\'s straight line is a Cartesian move '
+     'to a point, so it already goes wherever it is aimed; what pinned it '
+     'vertical was the pre-grasp being computed straight above the grasp. '
+     'With this on the pre-grasp is set back along the tool\'s approach '
+     'axis instead, so a side grasp is flown in from the side. It also '
+     'lifts grasp_model_max_tilt, which existed only because a steep model '
+     'grasp could not be flown; the pre-flight then measures whether the '
+     'arm can fly it rather than the cap assuming it cannot. Off by '
+     'default: it changes the path the arm takes near the table.'),
     ('grasp_tilt_steps', '2',
      'Tilt magnitudes to try between 0 and grasp_tilt_max.'),
     ('grasp_tilt_azimuths', '4',
@@ -659,6 +703,16 @@ ORCHESTRATOR_ARGS = [
     ('grasp_model_max_offset', '0.08',
      'How far a candidate list\'s object may be from the one being picked, '
      'metres, before it is treated as being about something else.'),
+    ('grasp_span_check', 'true',
+     'Whether the grasp server refuses a model grasp wider than the jaws. '
+     'Off treats that width as an upper bound and clamps the commanded '
+     'opening to the jaw span, so 0-44 mm is unchanged and 44-100 mm is '
+     'commanded as 44. Pushed to the grasp server, which owns the filter.'),
+    ('grasp_object_radius', '0.06',
+     'How far from the detected point a model grasp may be and still be '
+     'taken as being for this object, metres. 0 accepts them wherever they '
+     'are. It is the filter doing most of the rejecting -- measured, 26 of '
+     '30 raw grasps and then 23 of 27.'),
     ('use_grasp_recipes', 'true',
      'Ask the detector for the part of the object worth gripping rather '
      'than for the object -- "detect handle of the screwdriver" instead of '

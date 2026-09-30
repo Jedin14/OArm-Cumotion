@@ -142,7 +142,9 @@ from moveit_msgs.srv import (ApplyPlanningScene, GetCartesianPath,
                              GetStateValidity)
 from controller_manager_msgs.srv import SetHardwareComponentState
 from lifecycle_msgs.msg import State as LifecycleState
-from rcl_interfaces.srv import GetParameters
+from rcl_interfaces.msg import Parameter as ParameterMsg
+from rcl_interfaces.msg import ParameterType, ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParameters
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -184,6 +186,13 @@ RETRYABLE_MOVEIT_CODES = (
     -2,   # INVALID_MOTION_PLAN
     -6,   # TIMED_OUT
 )
+
+MOVEIT_CONTROL_FAILED = -4
+
+# How much the arm may have moved during a failed attempt and still count as
+# never having started, radians. Well under the smallest deliberate move and
+# well over sensor noise.
+NEVER_STARTED_SPREAD = 0.005
 
 # take_up_the_view returns this when the detector answered and there was
 # nothing in the frame. Distinct from False, which is "could not get
@@ -343,6 +352,21 @@ def tilt_quat(quat, tilt, azimuth):
             0.0,
             math.cos(half))
     return quat_mul(axis, quat)
+
+
+def approach_axis(quat):
+    """Unit vector the tool travels along to reach the object.
+
+    hand_tcp's +Z is the approach axis (see top_down_quat), so this is that
+    axis in world coordinates. For a strictly top-down grasp it is
+    (0, 0, -1) and the column that follows it is the vertical one the cycle
+    has always flown -- which is what makes this safe to key the general
+    case off.
+    """
+    x, y, z, w = quat
+    return (2.0 * (x * z + w * y),
+            2.0 * (y * z - w * x),
+            1.0 - 2.0 * (x * x + y * y))
 
 
 def top_down_quat(yaw):
@@ -1219,6 +1243,22 @@ class PickPlaceOrchestrator(Node):
         # On restores the fold down to HOME for a stack where that is not
         # wanted.
         self.declare_parameter('boot_via_home', False)
+        # Bring both arms to HOME first, then both to the staging pose.
+        #
+        # Not a detour for its own sake: the direct route has been refused
+        # on both arms for the same self-collision, gripper against
+        # openarm_body_link0, from a start posture far enough round that
+        # the swing crosses the torso. HOME is tucked in near the body
+        # centre, so neither leg of the trip sweeps across.
+        #
+        # The boot walk only. The cycle still never commands HOME.
+        self.declare_parameter('boot_stage_home', True)
+        # How far a joint goal may leave the arm from its target before the
+        # move counts as not having happened, radians. Generous on purpose:
+        # settling a tenth of a radian short under gravity is normal here,
+        # and what this catches is an arm that never moved -- measured at
+        # 1.719 rad with the controller reporting success.
+        self.declare_parameter('move_arrival_tolerance', 0.20)
         # Whether a cycle that starts with the arm already at the staging
         # pose looks from there instead of going to HOME first. The trip is
         # about ten seconds each way and buys a clear view and a fresh map;
@@ -1398,6 +1438,15 @@ class PickPlaceOrchestrator(Node):
         # locate_from_staging skips the refresh. Anything moved on the
         # table in between was invisible to the planner.
         self.declare_parameter('map_before_pick', True)
+        # And again once the object is down and the hand is empty. A
+        # refresh only ever adds voxels, so without the clear the scene
+        # ends the cycle holding the object twice: where it was picked
+        # up from and where it was put down.
+        self.declare_parameter('map_after_place', True)
+        # And before the place looks for its drop target. While something
+        # is held this clears the stale map without recapturing, because
+        # capture_octomap will not map a payload -- see _drop_on_detected.
+        self.declare_parameter('map_before_place', True)
         # HOME is the only pose the octomap may be captured from, and it is not
         # READY. READY holds the arm out over the table so the camera can see
         # the work surface -- which means the arm is *in the frame*, and a map
@@ -1605,6 +1654,25 @@ class PickPlaceOrchestrator(Node):
         # order, so nothing tilts that does not need to. 0 restores the strict
         # top-down behaviour.
         self.declare_parameter('grasp_tilt_max', 0.35)
+        # Fly the approach and the retreat along the grasp's own axis
+        # instead of straight down.
+        #
+        # The descent's straight line is a Cartesian move to a point, so it
+        # already goes wherever it is aimed; what pinned it vertical was the
+        # pre-grasp being computed straight above the grasp, and the
+        # stepping fallback interpolating z at fixed x and y. This moves the
+        # first and refuses the second, so a tilted grasp is flown along its
+        # axis or not at all.
+        #
+        # Off by default because it changes the path the arm takes near the
+        # table, which is the one place a wrong path is expensive. With it
+        # off, column_start returns exactly what it always did.
+        self.declare_parameter('column_follows_grasp_axis', False)
+        # How far the tool may settle from the end of a proved straight-line
+        # approach before the descent's own proof stops applying, metres.
+        # Measured: 28.1 mm short was enough that no orientation descended
+        # from where the arm stood, out of 24 tried.
+        self.declare_parameter('approach_landing_tolerance', 0.015)
         # The same limit, applied to the model's own grasps, rad.
         #
         # GraspNet proposes full 6-DoF grasps and some of them come in from
@@ -1634,6 +1702,20 @@ class PickPlaceOrchestrator(Node):
         # Always a first try: a part prompt that finds nothing falls
         # straight back to the plain object, because a recipe that makes an
         # object unpickable would be worse than no recipe.
+        # Passed through to the grasp server, which owns the filtering
+        # but has no panel of its own. Held here so the one settings file
+        # and the one page cover the whole cell.
+        #
+        # grasp_span_check off treats the width the model asks for as an
+        # upper bound rather than a requirement and clamps the commanded
+        # opening to what the jaws have. Measured: near-object widths of
+        # 87 mm against a 40 mm span threw away most of what the model
+        # proposed, and the jaws close against a torque cap anyway.
+        self.declare_parameter('grasp_span_check', True)
+        # How far from the detected point a model grasp may be and still be
+        # taken as being for this object, metres. 0 accepts them wherever
+        # they are. Measured: at 0.06 it rejected 26 of 30 and 23 of 27.
+        self.declare_parameter('grasp_object_radius', 0.06)
         self.declare_parameter('use_grasp_recipes', True)
         self.declare_parameter('grasp_recipes',
                                grasp_recipes.DEFAULT_RECIPE_FILE)
@@ -1796,6 +1878,9 @@ class PickPlaceOrchestrator(Node):
         # which reached the table. 1.5 rad sits between with margin either
         # side. 0 disables the check.
         self.declare_parameter('column_max_joint_travel', 1.5)
+        # The same limit, for the legs that get the arm *out* rather than
+        # down. Deliberately looser: see _descend_column. 0 removes it.
+        self.declare_parameter('recovery_max_joint_travel', 4.0)
         # Carry the object out through the pre-pick pose rather than straight
         # from the lift to the drop. The lift ends low over the work surface
         # and the drop pose is across it, and a direct joint goal came back
@@ -1888,6 +1973,16 @@ class PickPlaceOrchestrator(Node):
         # The posture the approach will start from, so a candidate can be
         # scored on how far the arm has to travel to take it up.
         self._approach_from = None
+        # True/False/None: did the last joint goal actually arrive? None
+        # means no joint goal has been judged yet.
+        self._last_move_reached_goal = None
+        # True while a leg is getting the arm out of trouble rather
+        # than taking it somewhere useful. Only the joint-travel budget
+        # reads it -- see _descend_column.
+        self._recovering = False
+        # What the grasp server was last told, so a settled cell does not
+        # re-push every cycle. None means it has never been told.
+        self._grasp_pushed = None
         # Why the pre-flight refused, when it did. Set means "checked and
         # impossible", which no retry recovers.
         self._preflight_reason = None
@@ -2078,6 +2173,13 @@ class PickPlaceOrchestrator(Node):
                             self._srv_place_left, callback_group=self.cb)
         self.create_service(Trigger, '/pick_place/place_right',
                             self._srv_place_right, callback_group=self.cb)
+        self._grasp_params = self.create_client(
+            SetParameters, '/grasp_server/set_parameters',
+            callback_group=self.cb)
+        self.create_service(Trigger, '/pick_place/go_pre_pick',
+                            self._srv_go_pre_pick, callback_group=self.cb)
+        self.create_service(Trigger, '/pick_place/go_home',
+                            self._srv_go_home, callback_group=self.cb)
         self.create_service(Trigger, '/pick_place/stop_arm',
                             self._srv_stop_arm, callback_group=self.cb)
         self.create_service(Trigger, '/pick_place/abort', self._srv_abort,
@@ -2251,6 +2353,157 @@ class PickPlaceOrchestrator(Node):
         # is actually over.
         self._set_state('IDLE', detail)
 
+    def detector_silence(self):
+        """Why /vlm/detections is quiet, in a sentence, having checked.
+
+        "Nothing is publishing" was asserted rather than measured, and the
+        two cases it runs together want completely different responses.
+
+        Measured, 12:20: the node was alive, subscribed and being prompted,
+        and every inference step was dying with CUDA out of memory -- a
+        GR00T evaluation server left running from the previous afternoon
+        held 6.31 GiB of a 15.46 GiB card, leaving the detector 256 MiB
+        short. The panel said the model was gated and needed a HuggingFace
+        login, which had been true days earlier and was not true now, and
+        the search went to the wrong place again.
+
+        A publisher on the topic is the thing that tells them apart: no
+        publisher means the process is gone, a publisher means it is there
+        and failing, and its own log says how.
+        """
+        try:
+            publishers = self.count_publishers('/vlm/detections')
+        except Exception:                            # noqa: BLE001 - optional
+            publishers = None
+        if publishers is None:
+            return ('the detector is not answering, and the publisher count '
+                    'for /vlm/detections could not be read, so whether the '
+                    'node is running is unknown. Check its log.')
+        if publishers == 0:
+            return ('the detector is not answering -- nothing is publishing '
+                    '/vlm/detections at all, so the node is not running. The '
+                    'bringup starts it, so it has most likely started and '
+                    'exited: check its output for a model load failure '
+                    '(paligemma-3b-pt-224 is gated and needs a HuggingFace '
+                    'login). Otherwise start it with '
+                    'VLM/run_vlm_detector.sh.')
+        return (f'the detector is running -- {publishers} publisher(s) on '
+                f'/vlm/detections -- but it produced no detection. So this '
+                f'is not a missing node and not a HuggingFace login: the '
+                f'node is up and its inference is failing. Read its log; '
+                f'CUDA out of memory is the one that has bitten here, and '
+                f'it is usually another process holding the card rather '
+                f'than this one being too big. nvidia-smi names them.')
+
+    def _blame_boot_failure(self, arm, where, wanted):
+        """Say whether the pose or the route to it is the problem.
+
+        The orchestrator only ever sees a MoveIt error code, and -2 covers
+        both "no plan exists" and "a plan was found and then rejected".
+        Those want opposite responses -- re-record the pose, or get the arm
+        out of where it is standing -- and the code alone cannot tell them
+        apart.
+
+        /check_state_validity can, because it answers about a posture
+        rather than a motion. If both ends are clear and the move still
+        fails, what failed is the path between them, and the only thing
+        that changes it is moving the arm before asking again.
+
+        Measured, run 1790058419: the left arm was drooped at joint3 1.510
+        with joint4 at 0.342, cuMotion returned success on all three
+        attempts, and MoveIt threw every one out with the left fingers
+        against openarm_body_link0 at path index 8 of 32. Nothing in the
+        orchestrator's log said so -- it said "It is where it is".
+        """
+        if self._last_move_reached_goal is False:
+            # The move ran and fell short, which is not a planning refusal
+            # at all -- so none of the posture reasoning below applies, and
+            # offering it sends the reader after a self-collision that did
+            # not happen.
+            self.get_logger().error(
+                f'the {arm} arm was given a plan and flew part of it. That '
+                f'is not a refusal, so there is nothing wrong with the pose '
+                f'or the route -- see the reason logged just above.')
+            return
+        here = None
+        with self._lock:
+            measured = [self._arm_positions.get(j) for j in self.arm_joints]
+        if not any(v is None for v in measured):
+            here = self.posture_is_clear(measured, f'BOOT_{arm.upper()}_START')
+        there = self.posture_is_clear(wanted, f'BOOT_{arm.upper()}_GOAL')
+        if there is False:
+            self.get_logger().error(
+                f'{where} itself is in collision for the {arm} arm, so no '
+                f'route to it can exist. Re-record it somewhere clear.')
+            return
+        if here is False:
+            self.get_logger().error(
+                f'the {arm} arm is standing in collision right now, so '
+                f'every plan from here starts invalid. Move it clear by '
+                f'hand, or with record_states.py --play, before booting.')
+            return
+        if here and there:
+            self.get_logger().error(
+                f'both {where} and where the {arm} arm stands are clear, so '
+                f'what failed is the path between them -- a plan was found '
+                f'and then thrown out. Self-collision is the usual reason '
+                f'from a drooped start: the arm sags after the motors are '
+                f'released, and the straight way back up sweeps the gripper '
+                f'through the body. Look for "Computed path is not valid" '
+                f'in move_group, which names the two links. Lift the arm '
+                f'clear by hand and boot again, or set boot_via_home to put '
+                f'a waypoint in the middle.')
+            return
+        self.get_logger().warn(
+            f'could not check whether {where} or the {arm} arm\'s current '
+            f'posture is clear -- /check_state_validity did not answer, so '
+            f'the cause of the refusal is unknown.')
+
+    def _stage_both_through_home(self, order):
+        """Bring every arm to HOME before any of them goes to pre_pick.
+
+        Both arms have been refused the direct route, for the same reason
+        and against the same link. Measured:
+
+          left  1790058419  openarm_left_left_finger  vs openarm_body_link0
+          right 1790164017  openarm_right_right_finger vs openarm_body_link0
+
+        cuMotion returned success both times and MoveIt's own validator
+        threw the path out -- invalid at index 8 of 32 and 14 of 33, the
+        middle of the route rather than its end. So pre_pick is reachable
+        and the way there is not, from a start posture far enough round
+        that the straight swing takes the gripper through the torso. The
+        right arm was at joint1 +1.430 against pre_pick's -1.344: 159
+        degrees apart, with the body in between.
+
+        HOME is folded and tucked in near the body centre, so both legs of
+        the trip are short and neither sweeps across. It costs a fold down
+        and back on every bringup, which is why the cycle itself does not
+        use HOME -- this is the boot walk only, and only because the
+        direct route demonstrably fails.
+
+        Not fatal. A HOME that cannot be reached is worth saying and
+        carrying on from: the direct route may still work, and refusing to
+        try it would turn a recoverable boot into a stopped one.
+        """
+        if not self.get_parameter('boot_stage_home').value:
+            return
+        self._set_state('BOOT', 'both arms to home, before either stages')
+        for arm in order:
+            if self._abort.is_set():
+                return
+            self.configure_arm(arm)
+            self._set_state('BOOT', f'{arm} arm to home')
+            if self._move_to_joints(self.home_positions(),
+                                    f'BOOT_{arm.upper()}_HOME',
+                                    skip_if_there=True):
+                continue
+            self.get_logger().warn(
+                f'the {arm} arm could not be walked to home on the way to '
+                f'the staging pose. Going straight there instead, which is '
+                f'the route that fails when the arm starts far enough round '
+                f'for the gripper to sweep through the body.')
+
     def boot_destination(self, arm):
         """Where this arm waits: the picking arm and the other one differ.
 
@@ -2357,6 +2610,7 @@ class PickPlaceOrchestrator(Node):
                 mapped = (self._map_on_the_way()
                           if self.get_parameter('boot_via_home').value
                           else False)
+                self._stage_both_through_home(order)
                 for arm in order:
                     if self._abort.is_set():
                         break
@@ -2379,6 +2633,7 @@ class PickPlaceOrchestrator(Node):
                             f'the {arm} arm could not be walked to {where}. '
                             f'It is where it is; check it before starting a '
                             f'cycle.')
+                        self._blame_boot_failure(arm, where, list(joints))
                 if not mapped and not failed:
                     # From where they now stand. The arm is in the camera's
                     # view at the staging pose and that is exactly what the
@@ -2638,6 +2893,7 @@ class PickPlaceOrchestrator(Node):
                 f'ignored and the built-in default used instead. Save the '
                 f'settings again from the panel to clear it out of the file.')
         applied = self.apply_settings(settings)
+        self.push_grasp_settings()
         self.get_logger().info(
             f'sequence ({len(self._sequence)} steps): '
             f'{" -> ".join(self._sequence)}')
@@ -2645,6 +2901,59 @@ class PickPlaceOrchestrator(Node):
             self.get_logger().info(
                 f'settings from {os.path.basename(path)}: '
                 + ', '.join(f'{k}={v}' for k, v in sorted(applied.items())))
+
+    def push_grasp_settings(self):
+        """Hand the grasp server the two filters the panel owns.
+
+        It is a separate node with its own parameters and no page of its
+        own, so without this the checkbox would sit in the settings file
+        changing nothing. Fire and forget: the server may not be up, and a
+        cell that refused to start because the grasp model is absent
+        would be worse than one that picks top-down.
+
+        Called at every cycle rather than once at startup. Measured, run
+        1790240802: the push at load_config ran 0.3 s after launch, found
+        the service not ready -- the grasp server was still loading
+        GraspNet's weights -- skipped, and never ran again, so the
+        settings reached nothing for the life of the session. Retrying per
+        cycle costs one service call on a node that is by then long up,
+        and the values are remembered so a settled cell stays quiet.
+        """
+        wanted_now = (bool(self.get_parameter('grasp_span_check').value),
+                      float(self.get_parameter('grasp_object_radius').value))
+        if not self._grasp_params.service_is_ready():
+            if self._grasp_pushed is not None:
+                # It was up and has gone. Say so once rather than silently
+                # carrying on with settings nothing is applying.
+                self.get_logger().warn(
+                    'the grasp server has gone away, so its span check and '
+                    'object radius are no longer being applied')
+                self._grasp_pushed = None
+            return
+        if self._grasp_pushed == wanted_now:
+            return
+        wanted = [
+            ('span_check',
+             ParameterValue(type=ParameterType.PARAMETER_BOOL,
+                            bool_value=bool(self.get_parameter(
+                                'grasp_span_check').value))),
+            ('object_radius',
+             ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
+                            double_value=float(self.get_parameter(
+                                'grasp_object_radius').value))),
+        ]
+        request = SetParameters.Request()
+        request.parameters = [ParameterMsg(name=name, value=value)
+                              for name, value in wanted]
+        if self._await(self._grasp_params.call_async(request), 3.0) is None:
+            self.get_logger().warn(
+                'the grasp server did not answer its set_parameters call, '
+                'so its filtering is whatever it started with')
+            return
+        self._grasp_pushed = wanted_now
+        self.get_logger().info(
+            f'grasp server: span_check={wanted_now[0]}, '
+            f'object_radius={wanted_now[1]:.3f} m')
 
     def apply_settings(self, settings):
         """Set the UI-settable parameters. Returns what was actually applied."""
@@ -2822,6 +3131,49 @@ class PickPlaceOrchestrator(Node):
                 'finger_effort': (None if self._finger_effort is None
                                   else round(self._finger_effort, 4)),
             }
+
+    def _rejected_before_moving(self, code, path):
+        """Was this a CONTROL_FAILED the arm was never started for?
+
+        -4 covers two opposite situations. A controller that aborted
+        part-way is a real fault, and resending would drive the arm back
+        into whatever stopped it. A trajectory MoveIt refused to *begin*
+        is a race, not a fault: cuMotion plans from the joint state it
+        read, and these motors have no brakes, so the shoulder sags in the
+        milliseconds before the trajectory is validated and its first
+        point no longer matches where the arm is.
+
+        Measured, 10:35:23 -- "Invalid Trajectory: start point deviates
+        from current robot state more than 0.01, joint
+        openarm_right_joint1: expected -1.02558, current -1.03666". 11.1
+        mrad of sag against a 10 mrad tolerance. The cycle stopped dead
+        and the arm had not moved at all, which is what "it does not try
+        again" looked like from outside.
+
+        The sampled path separates them: an arm that never moved was never
+        started, so asking again -- which replans from where it now is --
+        is exactly the right response. allowed_start_tolerance in the
+        MoveIt config is the other half of this fix; this is the half that
+        does not need a rebuild to help.
+        """
+        if code != MOVEIT_CONTROL_FAILED or not path:
+            return False
+        frames = [p['joints'] for p in path if p.get('joints')]
+        if len(frames) < 2:
+            return False
+        spread = max(
+            max(abs(f[i] - frames[0][i]) for f in frames)
+            for i in range(len(frames[0])))
+        if spread > NEVER_STARTED_SPREAD:
+            return False
+        self.get_logger().warn(
+            f'the controller reported a failure but the arm never moved '
+            f'({spread * 1000:.1f} mrad over the whole attempt), so the '
+            f'trajectory was refused before it started rather than failing '
+            f'during it -- usually its first point no longer matching a '
+            f'sagging arm. Asking again, which replans from where the arm '
+            f'now is.')
+        return True
 
     def sample_motion(self):
         """Record where the arm goes *while* it moves, not just at the ends.
@@ -3381,6 +3733,11 @@ class PickPlaceOrchestrator(Node):
                     return {'joints': list(landed), 'tilt': None,
                             'quat': candidate_quat, 'margin': 0.0,
                             'solved': 0, 'tried': 0, 'linear': True,
+                            # Where the line was aimed. The whole proof
+                            # below is "from the end of this line", so the
+                            # descent has to know whether the arm got
+                            # there -- see _step_descend.
+                            'approach': tuple(approach),
                             'legs': legs, 'worst_leg': worst, 'travel': 0.0}
 
         best = None
@@ -3677,6 +4034,82 @@ class PickPlaceOrchestrator(Node):
     def _srv_place_right(self, _request, response):
         response.success, response.message = self._start_place('right')
         return response
+
+    def _srv_go_pre_pick(self, _request, response):
+        response.success, response.message = self._start_go_to(PRE_PICK_STATE)
+        return response
+
+    def _srv_go_home(self, _request, response):
+        response.success, response.message = self._start_go_to(HOME_STATE)
+        return response
+
+    def _start_go_to(self, where):
+        """Walk both arms to a named posture, on request from the panel.
+
+        Both arms, not the configured one: the panel's question is "put the
+        robot somewhere known", and leaving one arm out over the table
+        while the other parks is the half-answer that makes the next cycle
+        fail.
+        """
+        with self._lock:
+            if self._busy:
+                return False, 'something is already running -- Stop it first'
+        threading.Thread(target=self._run_go_to, args=(where,),
+                         daemon=True).start()
+        name = 'the staging pose' if where == PRE_PICK_STATE else 'home'
+        return True, f'walking both arms to {name}'
+
+    def _run_go_to(self, where):
+        with self._lock:
+            if self._busy:
+                return
+            self._busy = True
+        # A previous Stop leaves this set, and every move checks it -- so
+        # without clearing it the button would report success and move
+        # nothing, which is the failure this whole session has been about.
+        self._abort.clear()
+        try:
+            order = [arm for arm in (other_arm(self.launch_arm),
+                                     self.launch_arm) if arm]
+            name = ('the staging pose' if where == PRE_PICK_STATE else 'home')
+            self._set_state('BOOT', f'both arms to {name}')
+            reached, failed = [], []
+            with self.at_speed(self.get_parameter('boot_speed').value,
+                               'panel move'):
+                if where == PRE_PICK_STATE:
+                    # Same reason the boot walk does: the direct route
+                    # self-collides against the body from far enough round.
+                    self._stage_both_through_home(order)
+                for arm in order:
+                    if self._abort.is_set():
+                        break
+                    self.configure_arm(arm)
+                    target = (self.home_positions() if where == HOME_STATE
+                              else self.staging_joints(arm))
+                    if not target:
+                        failed.append(f'{arm} (no {where} recorded)')
+                        continue
+                    self._set_state('BOOT', f'{arm} arm to {name}')
+                    if self._move_to_joints(list(target),
+                                            f'GOTO_{arm.upper()}',
+                                            skip_if_there=True):
+                        reached.append(arm)
+                    else:
+                        failed.append(arm)
+            if failed:
+                self._set_state(
+                    'FAILED',
+                    f'{", ".join(failed)} could not reach {name}'
+                    + (f'; {", ".join(reached)} did' if reached else ''))
+            else:
+                self._set_state('IDLE', f'both arms at {name}')
+        except Exception as exc:                     # noqa: BLE001 - reported
+            self.get_logger().error(f'the move to {where} crashed: {exc}')
+            self._set_state('FAILED', str(exc))
+        finally:
+            with self._lock:
+                self._busy = False
+            self.publish_status()
 
     def _srv_stop_arm(self, _request, response):
         response.success, response.message = self._start_stop_arm()
@@ -3998,7 +4431,8 @@ class PickPlaceOrchestrator(Node):
                 self.log_motion(label, method, 'ok', target=target,
                                 attempt=attempt, before=before, path=path)
                 return True
-            if code not in RETRYABLE_MOVEIT_CODES:
+            if (code not in RETRYABLE_MOVEIT_CODES
+                    and not self._rejected_before_moving(code, path)):
                 # Nothing about the goal changes by asking again.
                 self.get_logger().error(
                     f'{label}: MoveIt error code {code}, not retryable')
@@ -4206,7 +4640,146 @@ class PickPlaceOrchestrator(Node):
             jc.weight = 1.0
             constraints.joint_constraints.append(jc)
         req.goal_constraints = [constraints]
-        return self._send_move_goal(req, label)
+        with self._lock:
+            started_from = [self._arm_positions.get(j)
+                            for j in self.arm_joints]
+        if not self._send_move_goal(req, label):
+            return False
+        return self._arrived_at_joints(positions, label, started_from)
+
+    def _arrived_at_joints(self, positions, label, started_from=None):
+        """Did the arm actually get there? True/False.
+
+        A successful goal is not an arrival. The joint trajectory
+        controllers here carry no `constraints` block, so they enforce no
+        goal tolerance and report "Goal reached, success!" when the
+        trajectory's clock runs out -- whatever the arm is doing.
+
+        Measured, run 1790223007: the right arm was commanded from HOME to
+        the staging pose. cuMotion planned it, move_group sent it to
+        right_joint_trajectory_controller, the controller ran for 9.2 s and
+        reported success, and the arm did not move at all -- joint4 stayed
+        at 0.2005 to four decimals for ten seconds while its reference sat
+        1.719 rad away. The boot then announced "right at pre_pick" and the
+        map was captured with the arm somewhere else entirely.
+
+        Deliberately generous. This is not a precision check -- settling a
+        tenth of a radian short under gravity is normal on a brakeless arm
+        and is measured elsewhere. It is here to catch a move that did not
+        happen, which is a different size of error.
+        """
+        self._last_move_reached_goal = None
+        self.settle_joints(list(positions), label)
+        worst = self.joint_error(list(positions), fresh=True)
+        if worst is None:
+            # Not "unknown, carry on". Nothing below this point can be
+            # trusted without feedback, and a move that cannot be checked
+            # has to read as a failure or the cycle plans its next leg
+            # from a posture nobody has confirmed.
+            self.get_logger().error(
+                f'{label}: no joint feedback arrived after the goal, so '
+                f'whether the arm moved cannot be established. Treating '
+                f'that as a failure: every later leg would be planned from '
+                f'a posture nothing has confirmed. Check that '
+                f'/joint_states is still publishing -- ros2 topic hz '
+                f'/joint_states.')
+            return False
+        limit = self.get_parameter('move_arrival_tolerance').value
+        if worst <= limit:
+            self._last_move_reached_goal = True
+            return True
+        self._last_move_reached_goal = False
+        with self._lock:
+            here = [self._arm_positions.get(j) for j in self.arm_joints]
+        # Did anything change at all? A real arm that merely fell short
+        # still moved, and still jitters at rest. Readings identical to the
+        # last bit across a whole move mean the feedback stopped changing,
+        # which is a different fault and points somewhere else entirely.
+        #
+        # Measured, run 1790223944: the first six moves of the run showed
+        # 0.075 to 2.454 rad of joint spread; from the second cycle's
+        # TRANSIT onward every move showed exactly 0.00000 across 40
+        # samples, on both arms, velocities and efforts included. The
+        # controllers reported success throughout and the arm did not move.
+        if (started_from and all(v is not None for v in started_from)
+                and all(v is not None for v in here)
+                and all(a == b for a, b in zip(started_from, here))):
+            self.get_logger().error(
+                f'{label}: the arm is {worst:.3f} rad from the goal and its '
+                f'joint readings are bit-identical to before the move -- not '
+                f'merely close, the same numbers. A real arm jitters at '
+                f'rest, so this is the feedback having stopped changing '
+                f'rather than the arm having stayed put. Everything above it '
+                f'is reporting success against a stale snapshot. Check the '
+                f'driver is still cycling: ros2 topic hz /joint_states, and '
+                f'native/check_motors.sh for what each motor last said.')
+            self.log_motion(label, 'joint', 'feedback-frozen',
+                            target=[round(v, 5) for v in positions],
+                            landed=[round(v, 5) for v in here],
+                            error_rad=round(worst, 4))
+            return False
+        gaps = [abs(h - w) if h is not None else 0.0
+                for h, w in zip(here, positions)]
+        k = max(range(len(gaps)), key=lambda i: gaps[i])
+        self.get_logger().error(
+            f'{label}: the goal came back successful and the arm is still '
+            f'{worst:.3f} rad away -- worst on '
+            f'{self.arm_joints[k].rsplit("_", 1)[-1]}, {here[k]:.4f} against '
+            f'{positions[k]:.4f} commanded. The controllers here enforce no '
+            f'goal tolerance, so "success" means the trajectory ran out of '
+            f'time, not that the arm followed it. Check that this arm is '
+            f'driving: native/check_motors.sh reports the torque each joint '
+            f'is holding and how far behind its reference it is.')
+        self._blame_short_move(positions, here, started_from, label)
+        self.log_motion(label, 'joint', 'did-not-arrive',
+                        target=[round(v, 5) for v in positions],
+                        landed=[round(v, 5) for v in here if v is not None],
+                        error_rad=round(worst, 4))
+        return False
+
+    def _blame_short_move(self, positions, here, started_from, label):
+        """Why the arm stopped short: out of torque, or cut off?
+
+        The tell is how far each joint got as a *fraction* of its own
+        travel. A joint that runs out of torque stops where its own load
+        beats it, so the fractions scatter -- the loaded joints fall behind
+        and the light ones arrive. A trajectory that stops being delivered
+        freezes every joint at the same instant, so they all stop at the
+        same fraction whatever they were carrying.
+
+        Measured, 10:46: the right arm's seven joints stopped at 64.6, 64.2,
+        66.7, 66.6, 67.6, 66.8 and 66.6 per cent. The USB CAN adapter had
+        dropped off the bus five seconds into the move -- 'peak_usb can0:
+        Rx urb aborted (-71)', 'usb 1-7.1: USB disconnect' -- and
+        re-enumerated two seconds later, so by the time anything was asked
+        the link was healthy again and nothing downstream had noticed.
+        """
+        if not started_from or any(v is None for v in started_from):
+            return
+        if any(v is None for v in here):
+            return
+        done = []
+        for start, now, goal in zip(started_from, here, positions):
+            travel = goal - start
+            if abs(travel) < 0.05:          # too short to read a fraction off
+                continue
+            done.append((now - start) / travel)
+        if len(done) < 3:
+            return
+        spread = max(done) - min(done)
+        mean = sum(done) / len(done)
+        if spread > 0.05 or not 0.02 < mean < 0.95:
+            return
+        self.get_logger().error(
+            f'{label}: every joint stopped at about {mean * 100:.0f} per cent '
+            f'of its own travel, within {spread * 100:.1f} points of each '
+            f'other. Joints do not run out of torque in unison -- that is '
+            f'the trajectory having stopped being delivered part-way, with '
+            f'the arm holding wherever it had got to. Check the CAN link '
+            f'rather than the arm: dmesg | grep -i peak_usb, and look for '
+            f'"Rx urb aborted" or "USB disconnect" around the time of the '
+            f'move. The adapter re-enumerates within a couple of seconds, '
+            f'so everything looks healthy again by the time anything asks.')
 
     def await_joint_states(self, timeout=2.0):
         """Wait for a reading of the arm now configured.
@@ -4567,8 +5140,42 @@ class PickPlaceOrchestrator(Node):
                 'carrying the object: not remapping, so the payload is not '
                 'captured and the existing map is kept')
             return False
+        # Prove the camera can still fill a map *before* throwing away the
+        # one we have.
+        #
+        # Measured, run 1790311315: the boot walk captured 107,690 bytes of
+        # tree, this method cleared it, the recapture came back empty, and
+        # the planner spent the whole cycle checking against nothing --
+        # DESCEND found no line, CLEAR found no line, neither refuge could
+        # be reached and the arm was left parked over the table. A refresh
+        # that fails is survivable; a clear followed by a refresh that
+        # fails is not, because it destroys a map that was working.
+        #
+        # So: capture into the existing map first, which is additive and
+        # cannot lose anything. Only if that produced a map worth having is
+        # the clear worth the risk.
+        had = self.octomap_voxels()
+        if not self.capture_octomap(anywhere=True, in_frame=True):
+            self.get_logger().warn(
+                'could not refresh the map, so the one already in the scene '
+                'is being kept rather than cleared')
+            return False
+        if had and not self.octomap_voxels():
+            self.get_logger().error(
+                'the camera added nothing to a map that already had '
+                f'{had} bytes in it, so it is being kept as it is. Clearing '
+                f'now would leave the planner checking against nothing at '
+                f'all, which is worse than a map a few seconds out of date.')
+            return False
         self.clear_octomap()
-        return self.capture_octomap(anywhere=True, in_frame=True)
+        if self.capture_octomap(anywhere=True, in_frame=True):
+            return True
+        self.get_logger().error(
+            'the map was cleared and the recapture failed, so the planner '
+            'is now checking against nothing. This is the one case worth '
+            'restarting for -- every leg from here will refuse for want of '
+            'a scene rather than for want of reach.')
+        return False
 
     def arrive_at_home(self):
         """Refresh the map from home, then take up the observation pose.
@@ -5249,13 +5856,35 @@ class PickPlaceOrchestrator(Node):
         return True
 
     def refresh_octomap(self):
-        if not self.octomap_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().info(
-                '/octomap_gater/refresh unavailable (octomap:=live, or the '
-                'gater is not running) -- skipping refresh')
-            return False
-        result = self._await(self.octomap_client.call_async(Trigger.Request()), 5.0)
-        return bool(result and result.success)
+        """Let the map take in what the camera can see now. True/False.
+
+        Two ways the cell can be wired, and this works in both.
+
+        With octomap:=static a gater sits between the camera and
+        move_group and passes frames only when asked, so a refresh is that
+        request. With octomap:=live there is no gater: depth flows
+        continuously and the map is always taking in new frames, so a
+        refresh is simply the waiting -- the clear that precedes it has
+        emptied the map and it refills on its own.
+
+        Returning False for live was wrong and made the mode unusable:
+        capture_octomap gives up on a False, so with no gater the map was
+        never captured, never checked, and never reported. Measured, run
+        1790241834: the gater logged "frames sent" at both refreshes and
+        move_group counted 0 image messages in every ten-second window of
+        the run, so the map was empty from boot -- and live, the one wiring
+        that avoids that relay entirely, did nothing at all.
+        """
+        if self.octomap_client.wait_for_service(timeout_sec=2.0):
+            result = self._await(
+                self.octomap_client.call_async(Trigger.Request()), 5.0)
+            return bool(result and result.success)
+        self.get_logger().info(
+            'no octomap gater, so the map is updating continuously '
+            '(octomap:=live). Waiting for it to take the scene in rather '
+            'than asking for frames.')
+        self._abort.wait(self.get_parameter('octomap_settle_time').value)
+        return True
 
     def _planner_parameter(self, name):
         """One parameter off the cuMotion node.
@@ -7001,6 +7630,39 @@ class PickPlaceOrchestrator(Node):
             f'posture it was sent to')
         return False
 
+    def column_start(self, grasp, quat, height):
+        """Where the approach column begins, `height` back along the axis.
+
+        The cycle has always started it straight up, which is right for a
+        top-down grasp and wrong for every other one: the tool arrives
+        tilted but travels down, so past a modest angle the jaws come
+        across the object rather than onto it. Backing off along the
+        grasp's own approach axis instead makes the line the tool flies
+        the line the grasp was proposed along.
+
+        Reduces exactly to the old behaviour when the grasp is vertical --
+        approach_axis is then (0, 0, -1), so this returns
+        grasp + (0, 0, height) -- which is why it can be the one path
+        rather than a branch.
+        """
+        if not self.get_parameter('column_follows_grasp_axis').value:
+            return (grasp[0], grasp[1], grasp[2] + height)
+        ax, ay, az = approach_axis(quat)
+        return (grasp[0] - ax * height,
+                grasp[1] - ay * height,
+                grasp[2] - az * height)
+
+    def column_is_vertical(self, quat, tolerance=0.02):
+        """Is this grasp's column the vertical one, within tolerance?
+
+        The stepping fallback in _descend_column interpolates z at fixed
+        x and y, so it can only fly a vertical column. On a tilted one it
+        would quietly substitute a different path for the one that was
+        checked, which is the substitution linear_only exists to refuse.
+        """
+        ax, ay, _ = approach_axis(quat)
+        return math.hypot(ax, ay) <= tolerance
+
     def column_heights(self, from_z, to_z):
         """The z values to visit, from just below from_z down to exactly to_z.
 
@@ -7353,10 +8015,22 @@ class PickPlaceOrchestrator(Node):
             # vertical (dz -13.8, -14.0, -14.0, -14.0 mm). This one is not, and
             # aiming past a non-repeatable error just overshoots.
             correct = self.get_parameter('descend_offset_correction').value
-            # The column legs are the ones near the table, so they carry the
-            # joint-travel limit: a 150 mm line that costs three radians is
-            # the arm going through the surface, not down to the object.
-            budget = self.get_parameter('column_max_joint_travel').value
+            # The column legs are the ones near the table, so they carry
+            # the joint-travel limit: a 150 mm line that costs three radians
+            # is the arm going through the surface, not down to the object.
+            #
+            # Getting *out* is judged differently. The budget is there to
+            # stop the arm swinging across the workspace on its way toward
+            # the table; applied to the move that lifts it away, it strands
+            # the arm instead. Measured three times, most recently run
+            # 1790311315: the descent failed, CLEAR's line solved but cost
+            # 3.18 rad against the 1.50 budget and was refused, neither
+            # refuge could then be reached, and the arm was left parked over
+            # the table with the motors on. A wide swing upward is worse
+            # than a narrow one; it is much better than not moving.
+            budget = self.get_parameter(
+                'recovery_max_joint_travel' if self._recovering
+                else 'column_max_joint_travel').value
             if skip_checked:
                 self.get_logger().info(
                     f'{label}: straight line without collision checking -- '
@@ -7420,6 +8094,22 @@ class PickPlaceOrchestrator(Node):
                 return False
             self.get_logger().warn(
                 f'{label}: no straight line available, stepping instead')
+
+        if not self.column_is_vertical(quat):
+            # The stepping fallback below interpolates z at fixed x and y,
+            # so it can only fly a vertical column. Flying it for a tilted
+            # grasp would substitute a different path for the one the
+            # pre-flight checked -- the arm would come down onto the object
+            # rather than in along the grasp's axis. Refuse instead, which
+            # is what linear_only means everywhere else.
+            self.get_logger().error(
+                f'{label}: this grasp comes in off vertical, and no straight '
+                f'line was available for it. The stepping fallback can only '
+                f'fly a vertical column, so it would not be the path that '
+                f'was checked -- refusing rather than substituting one.')
+            self.log_motion(label, 'cartesian', 'refused-tilted-no-line',
+                            target=[round(v, 5) for v in target])
+            return False
 
         heights = self.column_heights(from_z, to_z)
         total = len(heights)
@@ -7637,9 +8327,10 @@ class PickPlaceOrchestrator(Node):
             self._pick_hold_offset = None
 
         grasp = (point[0], point[1], grasp_z)
-        pregrasp = (point[0], point[1],
-                    grasp_z + self.get_parameter('approach_height').value)
-        return grasp, pregrasp, top_down_quat(yaw), point
+        quat = top_down_quat(yaw)
+        pregrasp = self.column_start(
+            grasp, quat, self.get_parameter('approach_height').value)
+        return grasp, pregrasp, quat, point
 
     # -- verification --------------------------------------------------------
 
@@ -7869,6 +8560,9 @@ class PickPlaceOrchestrator(Node):
             self._set_state('FAILED', 'recorded states are missing')
             return
         self.add_table()
+        # The grasp server is usually still loading its weights when the
+        # startup push runs, so this is the one that actually lands.
+        self.push_grasp_settings()
 
         # The planner first, before any motion at all. It is a precondition for
         # every goal in the cycle, and finding out after the arm has moved is
@@ -7928,14 +8622,7 @@ class PickPlaceOrchestrator(Node):
             # seconds of every launch on a 401 from HuggingFace, because
             # paligemma-3b-pt-224 is a gated model and the local cache had
             # been emptied. Four runs were spent looking at the robot.
-            self._set_state(
-                'FAILED',
-                'the detector is not answering -- nothing is publishing '
-                '/vlm/detections. The bringup starts it, so it has most '
-                'likely started and exited: check its output for a model '
-                'load failure (paligemma-3b-pt-224 is gated and needs a '
-                'HuggingFace login). Otherwise start it with '
-                'VLM/run_vlm_detector.sh.')
+            self._set_state('FAILED', self.detector_silence())
             return
         if not view:
             self._set_state(
@@ -8150,8 +8837,7 @@ class PickPlaceOrchestrator(Node):
                 self.get_logger().error(
                     f'no answer from the detector, so nothing can be said '
                     f'about whether "{self.prompt}" is in the frame. This '
-                    f'is not an empty table -- it is an empty topic. Start '
-                    f'it with VLM/run_vlm_detector.sh and press Pick again.')
+                    f'is not an empty table. {self.detector_silence()}')
                 return NO_DETECTOR
             # An empty frame is an answer. The detector looked and there was
             # nothing there, and a second look from HOME finds the same
@@ -8180,6 +8866,15 @@ class PickPlaceOrchestrator(Node):
         """
         ctx = dict(self._ctx or {}, states=states, why='holding')
         self._step_pre_pick(ctx)
+        # The controller reports SUCCESS when the trajectory ends, not when
+        # the arm arrives, and this arm is still converging for seconds
+        # afterwards -- more so with a payload on it and no brakes to hold
+        # the shoulder. Judging at the instant the goal returns is judging
+        # mid-flight: measured, run 1790054584, joint1 was 96 mrad out when
+        # the goal came back and the verdict was taken there and then.
+        wanted = ((states or {}).get(PRE_PICK_STATE) or {}).get('joints')
+        if wanted:
+            self.settle_joints(list(wanted), 'HOLDING')
         held = self.held_object() or 'the object'
         if self.at_state(PRE_PICK_STATE, states):
             self._set_state(
@@ -8271,6 +8966,18 @@ class PickPlaceOrchestrator(Node):
             self.safe_shutdown(states, 'after a failed place')
             self._set_state('FAILED', 'place failed')
             return
+        # Empty-handed at last, which is the first moment in this half a
+        # map can honestly be taken. Dropping it and retaking it here is
+        # what stops the next cycle planning against a scene holding both
+        # copies of the object -- the voxels where it used to be, which a
+        # refresh alone never removes, and the ones where it now is.
+        #
+        # Not sooner: capture_octomap refuses while holding, because the
+        # payload would be mapped as an obstacle that then travels on the
+        # tool, and a bare clear at the start of the place would leave the
+        # drop planning against nothing at all.
+        if self.get_parameter('map_after_place').value:
+            self.refresh_map_in_place()
         self._set_state('DONE')
 
     # -- getting out of trouble ----------------------------------------------
@@ -8939,6 +9646,14 @@ class PickPlaceOrchestrator(Node):
         approach = self.get_parameter('approach_height').value
         drop = strategy['z_offset']
         limit = math.degrees(self.get_parameter('grasp_model_max_tilt').value)
+        if self.get_parameter('column_follows_grasp_axis').value:
+            # The cap is there because the column was vertical and a steep
+            # grasp would have been flown down across the object rather
+            # than along its own axis. Once the column follows the axis,
+            # the reason for the cap is gone; what is left is whether the
+            # arm can fly it, which the pre-flight measures rather than
+            # assumes.
+            limit = 0.0
         out, too_tilted = [], []
         for entry in payload.get('grasps') or []:
             position = entry.get('position')
@@ -8952,10 +9667,13 @@ class PickPlaceOrchestrator(Node):
             grasp = (position[0], position[1], position[2] + drop)
             out.append({
                 'grasp': grasp,
-                # Straight up, because that is the way back down: the
-                # descent is a vertical column whatever the tool's
-                # orientation. It is also why the tilt is bounded above.
-                'pregrasp': (grasp[0], grasp[1], grasp[2] + approach),
+                # Back along this grasp's own approach axis, which for a
+                # top-down one is straight up and for a side one is out to
+                # the side. Before column_follows_grasp_axis this was always
+                # straight up -- the way back down was a vertical column
+                # whatever the tool's orientation, which is why the tilt had
+                # to be bounded above.
+                'pregrasp': self.column_start(grasp, quat, approach),
                 'quat': tuple(quat),
                 'source': 'model',
                 'score': entry.get('score'),
@@ -9335,6 +10053,34 @@ class PickPlaceOrchestrator(Node):
             if entry.get('tilt') is not None:
                 settling[6] = entry['tilt']
             self.settle_joints(settling, 'DESCEND')
+        elif entry and entry.get('approach'):
+            # The linear branch had no settle at all, and it is the branch
+            # that most needs one: it proves the descent *from the end of
+            # the line*, so everything it promised is conditional on the
+            # arm arriving there.
+            #
+            # Measured, run 1790164017: the approach was proved 100% on all
+            # three legs, TRANSIT settled 28.1 mm short, and from where the
+            # arm actually stood no orientation descended at all -- 24
+            # tried. The descent was then refused for costing 2.81 rad
+            # against a 1.50 rad budget, by which point the arm was low
+            # over the table and CLEAR could not lift it out either. The
+            # gap was measured and logged as a warning at TRANSIT and
+            # nothing acted on it.
+            # settle_at returns (where it landed, how far off) -- not a
+            # distance. Unpacking it wrongly is what made the descent raise
+            # "'>' not supported between instances of 'tuple' and 'float'"
+            # and took a whole cycle down with it.
+            _landed, left = self.settle_at(entry['approach'], 'DESCEND')
+            if left is not None and left > self.get_parameter(
+                    'approach_landing_tolerance').value:
+                self.get_logger().error(
+                    f'DESCEND: the approach was proved as a straight line '
+                    f'and the arm settled {left * 1000:.0f} mm from the end '
+                    f'of it. Everything the pre-flight promised was measured '
+                    f'from that end, so it does not describe where the arm '
+                    f'now stands -- expect the descent below to fail on '
+                    f'geometry rather than on the grasp.')
         self._report_posture_drift('DESCEND')
 
         # Ask the question again, from where the arm actually is.
@@ -10110,6 +10856,19 @@ class PickPlaceOrchestrator(Node):
         something held is lowered onto something else. Nothing is gained by
         arriving fast and the object is already in the jaws.
         """
+        if self.get_parameter('map_before_place').value:
+            # Before the detector is asked where to put it, for the same
+            # reason the pick refreshes before looking: the scene it plans
+            # the drop through should be the scene as it is now, not as it
+            # was when the object was still on the table.
+            #
+            # capture_octomap declines while something is held -- the
+            # payload would be mapped as an obstacle that then travels on
+            # the tool -- so with a full gripper this clears the stale map
+            # and says why it stopped there. The voxels where the object
+            # used to be go either way, which is the half that matters
+            # most: they sit exactly where the arm is about to fly.
+            self.refresh_map_in_place()
         target, why = self.place_target()
         if target is None and self.get_parameter(
                 'place_look_from_home').value:
@@ -10423,12 +11182,23 @@ class PickPlaceOrchestrator(Node):
                                                             'sequence says so'))
 
     def at_state(self, name, states):
-        """Is the arm already standing at a recorded posture?"""
+        """Is the arm already standing at a recorded posture?
+
+        Insists on a reading that arrived after the question was asked,
+        for the reason at_home_pose() does: the cached one can still
+        describe the posture from *before* the move that was just flown.
+        The callback and the caller are different threads.
+
+        Measured, run 1790054584 cycle 1: PRE_PICK_STATE came back ok at
+        10:44:32.83 and this said "short of the staging pose" in the same
+        breath, off a reading taken before the arm set out. The pick had
+        worked; only the sentence describing it was wrong.
+        """
         entry = (states or {}).get(name) or {}
         wanted = entry.get('joints')
         if not wanted:
             return False
-        error = self.joint_error(list(wanted))
+        error = self.joint_error(list(wanted), fresh=True)
         if error is None:
             return False
         return error <= self.get_parameter('at_goal_tolerance').value
@@ -10796,7 +11566,12 @@ class PickPlaceOrchestrator(Node):
             return True
         start = list(here) if here is not None else list(grasp)
         self._set_state('CLEAR', why)
-        lifted = self.lift_column(start, pregrasp, quat, 'CLEAR')
+        # Everything from here is about getting clear, not about precision.
+        self._recovering = True
+        try:
+            lifted = self.lift_column(start, pregrasp, quat, 'CLEAR')
+        finally:
+            self._recovering = False
         if not lifted:
             self.get_logger().error(
                 f'could not lift clear of the surface {why}: the arm is '

@@ -359,6 +359,18 @@ nav.top button[aria-selected="true"] {
         <button class="grow" id="btn-open">Open</button>
         <button class="grow" id="btn-grip">Grip</button>
       </div>
+      <!-- Both arms, not the configured one: leaving one out over the
+           table while the other parks is the half-answer that makes the
+           next cycle fail. Pre-pick goes via home, because the direct
+           route self-collides against the body from far enough round. -->
+      <div class="row">
+        <button class="grow" id="btn-pre-pick">Both to pre-pick</button>
+        <button class="grow" id="btn-home">Both to home</button>
+      </div>
+      <div class="about" id="park-about">
+        walks both arms to a known posture &mdash; pre-pick goes via home,
+        and the motors stay on
+      </div>
       <!-- Two-step, because it cannot be undone from here: putting the
            motors back on is a power operation and needs the bringup
            restarted. The arm parks at home first and only then lets go --
@@ -1533,6 +1545,8 @@ $('btn-stop').onclick = () => {
   act('stop_arm');
 };
 $('btn-abort').onclick = () => act('abort');
+$('btn-pre-pick').onclick = () => act('go_pre_pick');
+$('btn-home').onclick = () => act('go_home');
 $('btn-open').onclick = () => act('open_gripper');
 $('btn-grip').onclick = () => act('grip');
 

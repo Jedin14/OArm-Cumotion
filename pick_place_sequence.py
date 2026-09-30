@@ -177,6 +177,18 @@ SETTINGS = [
      'about': 'Added to the detected top of the object. Positive stops the '
               'tool above it. Raise if the arm presses into the surface, '
               'lower if the jaws close above the object.'},
+    {'name': 'grasp_tilt_max', 'label': 'Grasp tilt allowance', 'unit': 'rad',
+     'type': 'double', 'min': 0.0, 'max': 0.6, 'step': 0.05,
+     'about': 'How far off vertical the gripper may come down. 0 is a '
+              'strictly top-down grasp: six constraints on seven joints at '
+              'a fixed point, which near the edge of the envelope often has '
+              'no solution clear of the joint stops. 0.35 rad is 20 degrees '
+              'and grips most objects just as well. Vertical is always '
+              'tried first and tilts in increasing order, so nothing tilts '
+              'that need not. Raising it will not buy a side grasp: the '
+              'descent and the lift are a vertical column, so past a modest '
+              'tilt the jaws come down across the object rather than onto '
+              'it.'},
     {'name': 'grasp_finger_min', 'label': 'Holding threshold', 'unit': 'm',
      'type': 'double', 'min': -1.0, 'max': 0.02, 'step': 0.001,
      'about': 'Measured finger opening above which the jaws count as '
@@ -262,6 +274,26 @@ SETTINGS = [
               'in the octomap to say so. If no plan stays put, the arm '
               'stops where it is, still holding, rather than swinging '
               'across.'},
+    {'name': 'grasp_span_check', 'label': 'Check the model grasp fits',
+     'unit': '', 'type': 'bool',
+     'about': 'On, a grasp the model wants more opening for than the jaws '
+              'have is measured against the point cloud and kept only if '
+              'the object between the jaws is really narrower. Off, that '
+              'width is treated as an upper bound instead and the opening '
+              'commanded is clamped to what the jaws span, so 0-44 mm is '
+              'unchanged and 44-100 mm is commanded as 44. Measured: '
+              'near-object widths of 87 mm against a 40 mm span threw away '
+              'most of what the model proposed, and the jaws close against '
+              'a torque cap rather than to a measured width anyway.'},
+    {'name': 'grasp_object_radius', 'label': 'Model grasp search radius',
+     'unit': 'm', 'type': 'double', 'min': 0.0, 'max': 0.30, 'step': 0.01,
+     'about': 'How far from the detected point a model grasp may be and '
+              'still count as being for this object. 0 accepts them '
+              'wherever they are. Measured at 0.06 it was the filter doing '
+              'most of the rejecting -- 26 of 30 raw grasps, then 23 of 27 '
+              '-- so raising it is usually what lets a side grasp through, '
+              'and lowering it is what stops one object borrowing its '
+              "neighbour's grasp."},
     {'name': 'descend_close_gap', 'label': 'Close the descent gap',
      'unit': '', 'type': 'bool',
      'about': 'Fly the remainder when the descent stops short of the grasp. '

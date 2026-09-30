@@ -700,6 +700,25 @@ def main():
           and runner.index('self._busy = False')
           < runner.index('self.publish_status()'), True)
 
+    section('helpers that return a pair are unpacked as one')
+    # Measured: settle_at returns (where it landed, how far off), and a call
+    # site that took it as a single value turned the whole descent into
+    #
+    #   step 'descend' raised: '>' not supported between instances of
+    #   'tuple' and 'float'
+    #
+    # The cycle then failed, neither refuge could be reached, and the arm was
+    # left parked over the table with the motors on. Nothing caught it,
+    # because that branch is not on the path the fake robot flies -- so the
+    # guard is on the source rather than on the behaviour.
+    for helper in ('settle_at',):
+        calls = [line.strip() for line in source.splitlines()
+                 if f'self.{helper}(' in line]
+        bad = [line for line in calls
+               if not re.match(r'^[\w.\[\]]+\s*,\s*[\w.\[\]]+\s*=', line)]
+        check(f'every {helper}() call unpacks both of its return values',
+              bad, [])
+
     section('launch arguments do not collide with the ones we include')
     # This is not hypothetical. Adding a launch argument called `config_file`
     # took the entire bringup down with
@@ -743,10 +762,17 @@ def main():
     else:
         # The ones we pass deliberately are not collisions -- they are the
         # interface. Everything else sharing a name is an accident.
+        # use_rviz sat outside this set for a long time without failing,
+        # because the check reads the *installed* launch files and the
+        # installed openarm_bimanual_moveit_config was older than its
+        # source. Rebuilding that package surfaced it. It is passed
+        # explicitly into launch_everything.launch.py beside
+        # use_fake_hardware and octomap, so it is interface, not accident.
         intended = {'use_fake_hardware', 'right_can_interface',
                     'left_can_interface', 'octomap', 'tool_frame',
                     'collision_activation_distance', 'robot_description',
-                    'use_sim_time', 'arm', 'prompt', 'model_id', '4d'}
+                    'use_sim_time', 'arm', 'prompt', 'model_id', '4d',
+                    'use_rviz'}
         clashes = sorted((name, theirs[name]) for name in ours & set(theirs)
                          if name not in intended)
         check('no launch argument of ours shadows one we include', clashes, [])
@@ -757,11 +783,23 @@ def main():
     except ImportError as exc:
         print(f'      skipped: {exc}')
     else:
-        check('every action the page can press has a service behind it',
+        # The frozen list is the tripwire: adding a button should be a
+        # deliberate act, not something that slips in.
+        check('the page presses exactly the actions we expect',
               sorted(pick_place_web.ACTIONS),
-              ['abort', 'grip', 'open_gripper', 'place', 'place_left',
-               'place_right', 'reload_config', 'save_config', 'start',
-               'stop_arm'])
+              ['abort', 'go_home', 'go_pre_pick', 'grip', 'open_gripper',
+               'place', 'place_left', 'place_right', 'reload_config',
+               'save_config', 'start', 'stop_arm'])
+        # And the part the name always promised but never did: that each
+        # one actually reaches a service. A button whose service does not
+        # exist fails at the click, with the panel reporting only that the
+        # call did not answer -- which reads as the robot being down.
+        orch = open(os.path.join(WS, 'pick_place_orchestrator.py')).read()
+        served = set(re.findall(
+            r"create_service\(\s*Trigger,\s*'(/pick_place/[a-z_]+)'", orch))
+        check('and every one of them has a service behind it',
+              sorted(path for path in pick_place_web.ACTIONS.values()
+                     if path not in served), [])
 
         # What the field shows has to be what the cycle asks. It asks for
         # the part first where there is a recipe for one, so a panel

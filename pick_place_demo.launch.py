@@ -55,12 +55,16 @@ FORWARDED = ['arm', 'arm_selection', 'prompt', 'states_file', 'place_mode',
              'place_speed',
              'place_after_pick', 'boot_walk', 'boot_pose', 'boot_speed',
              'locate_from_staging', 'boot_other_arm', 'grasp_table_clearance',
-             'boot_via_home', 'recover_after_contact', 'carry_guard',
+             'boot_via_home', 'boot_stage_home',
+             'recover_after_contact', 'carry_guard',
              'use_home',
-             'grasp_z_offset', 'grasp_max_depth', 'descend_close_gap',
+             'grasp_z_offset', 'grasp_max_depth', 'grasp_tilt_max',
+             'column_follows_grasp_axis',
+             'descend_close_gap',
              'descend_gap_max', 'home_requires_pre_pick',
              'disengage_on_failure', 'disengage_on_contact',
              'refresh_octomap_at_home', 'map_before_pick',
+             'map_after_place', 'map_before_place',
              'planner_probe_timeout',
              'use_table_collision', 'table_z']
 
@@ -151,6 +155,12 @@ def generate_launch_description():
             description='After a torque trip: motors off, let it settle, '
                         'motors on, glide to the staging pose.'),
         DeclareLaunchArgument(
+            'boot_stage_home', default_value='true',
+            description='Bring both arms to HOME first, then both to the '
+                        'staging pose. The direct route self-collides '
+                        'against the body when an arm starts far enough '
+                        'round. The boot walk only.'),
+        DeclareLaunchArgument(
             'boot_other_arm', default_value='pre_pick',
             description='Where the arm that is not picking waits: "home", '
                         '"pre_pick" or "leave". HOME keeps it out of the '
@@ -194,6 +204,16 @@ def generate_launch_description():
             description='Clear the octomap and retake it at the start of '
                         'every pick, so the plan is made against the table '
                         'as it is now rather than as the boot walk left it.'),
+        DeclareLaunchArgument(
+            'map_before_place', default_value='true',
+            description='Refresh the octomap before the place looks for its '
+                        'drop target. While holding, this clears the stale '
+                        'map without recapturing.'),
+        DeclareLaunchArgument(
+            'map_after_place', default_value='true',
+            description='Clear and retake the octomap once the object is '
+                        'down and the hand is empty, so the next cycle does '
+                        'not see the object in both places at once.'),
         DeclareLaunchArgument(
             'planner_probe_timeout', default_value='10.0',
             description='Seconds the pre-flight planner probe waits for '
@@ -271,6 +291,16 @@ def generate_launch_description():
             'object_moved_eps', default_value='0.05',
             description='How far the object must have moved for a place to '
                         'count, metres. 0.0 to rehearse on fake hardware.'),
+        DeclareLaunchArgument(
+            'column_follows_grasp_axis', default_value='false',
+            description="Fly the approach and retreat along the grasp's own "
+                        'axis instead of straight down, so a side grasp is '
+                        'flown in from the side.'),
+        DeclareLaunchArgument(
+            'grasp_tilt_max', default_value='0.35',
+            description='How far off vertical the gripper may come down, '
+                        'radians. 0 is strictly top-down. Vertical is tried '
+                        'first either way, so nothing tilts that need not.'),
         DeclareLaunchArgument(
             'grasp_z_offset', default_value='-0.030',
             description='Added to the *top* of the object to get the grasp '
