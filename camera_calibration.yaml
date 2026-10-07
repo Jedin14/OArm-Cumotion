@@ -1,0 +1,41 @@
+when: '2026-10-06T15:33:13'
+method: arm point cloud fitted to the robot model
+evidence: 12 arm poses, 30849 depth points fitted to the URDF meshes
+frame: camera_bottom_screw_frame
+parent: world
+xyz:
+- -6.0e-05
+- -0.00617
+- 0.4961
+rpy:
+- 0.02168
+- -0.0788
+- -0.01063
+previous_xyz:
+- -0.00411
+- -0.01741
+- 0.51525
+previous_rpy:
+- -0.00236
+- -0.04046
+- -0.01006
+error_before_mm: 2.8
+error_after_mm: 2.4
+moved_mm: 22.6
+turned_deg: 2.59
+fit:
+  iteration: 26
+  gate_mm: 6.0
+  matched: 21803
+  rms_mm: 2.786927633617735
+  step_mm: 0.056504915160069065
+  step_deg: 0.016064657872361082
+  plane_rms_mm: 3.562246581712553
+  inlier_fraction: 0.8351000032415962
+within_5mm_before: 0.6766630495544376
+within_5mm_after: 0.7068366164542295
+poses: 12
+agreement_before_pct: 62.50878672852524
+agreement_after_pct: 64.63269935438841
+click_shift_mm_avg: 13.598600161690996
+click_shift_mm_max: 21.17325639368763

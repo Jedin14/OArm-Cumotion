@@ -49,7 +49,11 @@ CumotionMoveGroupClient::CumotionMoveGroupClient(const rclcpp::Node::SharedPtr &
   node_(node),
   client_cb_group_(node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive))
 {
-  std::string action_name = "cumotion_" + group_name + "/move_group";
+  // One server for every group, as the 3.2.5 plugin this replaces had it:
+  // cumotion_planner.py serves "cumotion/move_group". The 4.x per-group name
+  // ("cumotion_<group>/move_group") has no server here and would wait forever.
+  (void)group_name;
+  std::string action_name = "cumotion/move_group";
   client_ = rclcpp_action::create_client<moveit_msgs::action::MoveGroup>(
     node_,
     action_name,
@@ -75,8 +79,12 @@ void CumotionMoveGroupClient::updateGoal(
 
 bool CumotionMoveGroupClient::sendGoal()
 {
-  result_ready = false;
-  success = false;
+  {
+    std::lock_guard<std::mutex> lock(result_mutex_);
+    result_ready = false;
+    success = false;
+    plan_response = moveit_msgs::msg::MotionPlanDetailedResponse();
+  }
 
   moveit_msgs::msg::PlanningOptions plan_options;
   plan_options.planning_scene_diff = planning_scene_;
@@ -101,55 +109,35 @@ bool CumotionMoveGroupClient::sendGoal()
 
 void CumotionMoveGroupClient::getGoal()
 {
-  using namespace std::chrono_literals;
-
+  // Only the goal handle is looked at here. The result is handled in one
+  // place, resultCallback; this used to process it a second time,
+  // concurrently, writing the same plan_response.
   if (get_goal_handle_) {
     if (goal_h_.wait_for(std::chrono::milliseconds(kGetGoalWaitIntervalInMs)) !=
       std::future_status::ready)
     {
       return;
     }
-
-    GoalHandle::SharedPtr goal_handle = goal_h_.get();
-
-    if (!goal_handle) {
-      RCLCPP_ERROR(node_->get_logger(), "Goal was rejected by server");
-      return;
-    }
-    auto result_future = client_->async_get_result(goal_handle);
-    result_future_ = result_future;
     get_goal_handle_ = false;
-  }
-
-  if (get_result_handle_) {
-    if (result_future_.wait_for(std::chrono::milliseconds(kGetGoalWaitIntervalInMs)) !=
-      std::future_status::ready)
-    {
-      return;
-    }
-
-    auto res = result_future_.get();
-
-    RCLCPP_INFO(node_->get_logger(), "Checking results");
-
-    if (res.code == rclcpp_action::ResultCode::SUCCEEDED) {
-      RCLCPP_INFO(node_->get_logger(), "Success");
+    if (!goal_h_.get()) {
+      RCLCPP_ERROR(node_->get_logger(), "Goal was rejected by server");
+      std::lock_guard<std::mutex> lock(result_mutex_);
       result_ready = true;
       success = false;
-      plan_response.error_code = res.result->error_code;
-      if (plan_response.error_code.val == 1) {
-        success = true;
-        plan_response.trajectory_start = res.result->trajectory_start;
-        plan_response.group_name = planning_request_.group_name;
-        plan_response.trajectory.resize(1);
-        plan_response.trajectory[0] = res.result->planned_trajectory;
-        plan_response.processing_time = {res.result->planning_time};
-      }
-    } else {
-      RCLCPP_INFO(node_->get_logger(), "Failed");
     }
-    get_result_handle_ = false;
   }
+}
+
+bool CumotionMoveGroupClient::takeResult(
+  moveit_msgs::msg::MotionPlanDetailedResponse & response, bool & ok)
+{
+  std::lock_guard<std::mutex> lock(result_mutex_);
+  if (!result_ready) {
+    return false;
+  }
+  ok = success;
+  response = plan_response;
+  return true;
 }
 
 void CumotionMoveGroupClient::goalResponseCallback(const GoalHandle::SharedPtr & future)
@@ -157,6 +145,7 @@ void CumotionMoveGroupClient::goalResponseCallback(const GoalHandle::SharedPtr &
   auto goal_handle = future.get();
   if (!goal_handle) {
     RCLCPP_ERROR(node_->get_logger(), "Goal was rejected by server");
+    std::lock_guard<std::mutex> lock(result_mutex_);
     result_ready = true;
     success = false;
   } else {
@@ -177,31 +166,36 @@ void CumotionMoveGroupClient::resultCallback(const GoalHandle::WrappedResult & r
 {
   RCLCPP_INFO(node_->get_logger(), "Received result");
 
-  result_ready = true;
-  success = false;
-
+  // Build the whole response first, then publish it under the lock with
+  // result_ready set *last*, so solve() can never see a half-written one.
+  moveit_msgs::msg::MotionPlanDetailedResponse response;
+  bool ok = false;
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
+      response.error_code = result.result->error_code;
+      if (response.error_code.val == moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
+        ok = true;
+        response.trajectory_start = result.result->trajectory_start;
+        response.group_name = planning_request_.group_name;
+        response.trajectory = {result.result->planned_trajectory};
+        response.processing_time = {result.result->planning_time};
+      }
       break;
     case rclcpp_action::ResultCode::ABORTED:
       RCLCPP_ERROR(node_->get_logger(), "Goal was aborted");
-      return;
+      break;
     case rclcpp_action::ResultCode::CANCELED:
       RCLCPP_ERROR(node_->get_logger(), "Goal was canceled");
-      return;
+      break;
     default:
       RCLCPP_ERROR(node_->get_logger(), "Unknown result code");
-      return;
+      break;
   }
 
-  plan_response.error_code = result.result->error_code;
-  if (plan_response.error_code.val == 1) {
-    success = true;
-    plan_response.trajectory_start = result.result->trajectory_start;
-    plan_response.group_name = planning_request_.group_name;
-    plan_response.trajectory = {result.result->planned_trajectory};
-    plan_response.processing_time = {result.result->planning_time};
-  }
+  std::lock_guard<std::mutex> lock(result_mutex_);
+  plan_response = std::move(response);
+  success = ok;
+  result_ready = true;
 }
 
 }  // namespace manipulation

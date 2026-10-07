@@ -41,10 +41,13 @@
 
   <xacro:arg name="bimanual" default="false" />
 
-  <xacro:arg name="right_arm_base_xyz" default="0.0 -0.051 0.698" />
+  <!-- V7 (2026-10-06): arm mount moved by (+12.6, +6.2, +36.4) mm so that the
+       camera can sit at its tape-measured position (V4) and still agree with what it
+       sees of the arms (CALIBRATE, 24 poses). Was 0.0 -/+0.051 0.698. See cam_org.txt. -->
+  <xacro:arg name="right_arm_base_xyz" default="0.0126 -0.0448 0.7344" />
   <xacro:arg name="right_arm_base_rpy" default="1.5708 0 0" />
 
-  <xacro:arg name="left_arm_base_xyz" default="0.0 0.051 0.698" />
+  <xacro:arg name="left_arm_base_xyz" default="0.0126 0.0572 0.7344" />
   <xacro:arg name="left_arm_base_rpy" default="-1.5708 0 0" />
 
   <xacro:arg name="can_fd" default="true" />
@@ -85,8 +88,9 @@
   />
   <xacro:include filename="$(find realsense2_description)/urdf/_d455.urdf.xacro" />
   <xacro:sensor_d455 parent="world" name="camera">
-    <!-- Measured camera mount position; retain verified +60 deg ROS pitch. -->
-    <origin xyz="0.10175 0.000 0.99272" rpy="0 1.0472 0"/>
+    <!-- V7: the V4 tape position, orientation fine-tuned by CALIBRATE (the arms were
+         moved instead, see right_arm_base_xyz). History in cam_org.txt. -->
+    <origin xyz="0.01233 0.000 0.53131" rpy="0.02056 -0.07726 -0.01912"/>
   </xacro:sensor_d455>
 
 

@@ -276,11 +276,21 @@ def generate_launch_description():
     # the arm takes up that much slack as the trajectory starts.
     moveit_params['trajectory_execution.allowed_start_tolerance'] = 0.05
 
+    # Respawned, like cumotion_planner in launch_everything.launch.py. It
+    # dies with SIGSEGV (exit -11) and no message -- measured on 2026-09-30,
+    # mid-goal during click_to_move's calibration -- and without this the
+    # stack is left half alive: controllers, RViz and the camera up, nothing
+    # planning, and every client waiting out its timeouts. A respawned one
+    # comes back with the SRDF's collision matrix and an empty octomap; the
+    # clients re-apply their own scene changes (click_to_move does, before
+    # every move).
     run_move_group_node = Node(
         package="moveit_ros_move_group",
         executable="move_group",
         output="screen",
         parameters=[moveit_params],
+        respawn=True,
+        respawn_delay=3.0,
     )
 
     rviz_cfg = os.path.join(

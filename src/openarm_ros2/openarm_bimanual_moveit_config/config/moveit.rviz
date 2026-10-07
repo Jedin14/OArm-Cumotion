@@ -410,6 +410,18 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /curobo/voxels
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Clicked point
+      Namespaces:
+        {}
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /click_to_move/marker
+      Value: true
     - Alpha: 1
       Auto Size:
         Auto Size Factor: 1

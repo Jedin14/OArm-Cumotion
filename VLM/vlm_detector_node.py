@@ -11,8 +11,8 @@ changed, all forced by how this workspace is wired:
 
 2. The camera->robot transform comes from tf2, not a hardcoded matrix.
    The prototype had T_CAM_TO_ROBOT = (0.150, 0.450, 0.600), but the
-   calibrated mount in v10.urdf.xacro is xyz="0.10175 0 0.93272" rpy="0 1.0472 0"
-   parented to `world` (see cam_org.txt). tf2 tracks that automatically, so
+   mount lives in v10.urdf.xacro, parented to `world` (history and current
+   version in cam_org.txt; click_to_move.py CALIBRATE measures it). tf2 tracks that automatically, so
    re-measuring the mount needs no change here.
 
 3. No cv_bridge. It is built against numpy 1.x and throws an _ARRAY_API ABI

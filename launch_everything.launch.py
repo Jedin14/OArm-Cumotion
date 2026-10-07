@@ -63,6 +63,27 @@ def generate_launch_description():
         default_value='0.03',
         description='Clearance cuMotion keeps from every obstacle, metres.'
     )
+    # The D455's minimum depth range shrinks with the depth resolution: about
+    # 0.4-0.5 m at 848x480, about 0.2 m at 424x240. With the V3 mount
+    # (cam_org.txt) the camera looks flat at surfaces 0.3-0.5 m away, inside
+    # the 848x480 blind zone, so click_to_move read wrong depths there. The
+    # old high, tilted mount saw the table from further off, which is why
+    # 848x480 was fine for the VLM. Go back to 848x480x15 only for work that
+    # is all beyond ~0.5 m: it is more precise at range.
+    declare_depth_profile = DeclareLaunchArgument(
+        'depth_profile',
+        default_value='424x240x15',
+        description='D455 depth stream WxHxFPS. Lower resolution = shorter '
+                    'minimum range (424x240: ~0.2 m, 848x480: ~0.45 m).'
+    )
+    declare_boot_pre_pick = DeclareLaunchArgument(
+        'boot_pre_pick',
+        default_value='true',
+        description='Once move_group and cuMotion are up, walk both arms slowly '
+                    'to their recorded pre_pick_state (boot_pre_pick.py). '
+                    'pick_place_demo sets this false: the orchestrator does its '
+                    'own boot walk.'
+    )
     declare_tool_frame = DeclareLaunchArgument(
         'tool_frame',
         default_value='openarm_right_hand_tcp',
@@ -131,8 +152,16 @@ def generate_launch_description():
         declare_4d,
         declare_tool_frame,
         declare_collision_distance,
+        declare_boot_pre_pick,
+        declare_depth_profile,
         demo_launch,
-        cumotion_node
+        cumotion_node,
+        ExecuteProcess(
+            cmd=['python3', '/workspaces/isaac_ros-dev/boot_pre_pick.py'],
+            output='screen',
+            additional_env={'PYTHONUNBUFFERED': '1'},
+            condition=IfCondition(LaunchConfiguration('boot_pre_pick')),
+        ),
     ]
 
     is_4d_enabled = PythonExpression(["'", enable_4d, "' == 'true'"])
@@ -175,7 +204,7 @@ def generate_launch_description():
         )
 
         realsense_args = {
-            'depth_module.depth_profile': '848x480x15',
+            'depth_module.depth_profile': LaunchConfiguration('depth_profile'),
             'rgb_camera.color_profile': '640x480x15',
             'pointcloud.enable': 'false',
             'align_depth.enable': 'true',

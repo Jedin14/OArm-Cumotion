@@ -31,22 +31,25 @@ CumotionPlanningContext::CumotionPlanningContext(
 {
 }
 
-void CumotionPlanningContext::solve(planning_interface::MotionPlanDetailedResponse & res)
+bool CumotionPlanningContext::solve(planning_interface::MotionPlanDetailedResponse & res)
 {
   cumotion_interface_->solve(planning_scene_, request_, res);
+  return res.error_code_.val == moveit_msgs::msg::MoveItErrorCodes::SUCCESS;
 }
 
-void CumotionPlanningContext::solve(planning_interface::MotionPlanResponse & res)
+bool CumotionPlanningContext::solve(planning_interface::MotionPlanResponse & res)
 {
   planning_interface::MotionPlanDetailedResponse res_detailed;
-  solve(res_detailed);
+  const bool ok = solve(res_detailed);
 
-  res.error_code = res_detailed.error_code;
+  res.error_code_ = res_detailed.error_code_;
 
-  if (res) {
-    res.trajectory = res_detailed.trajectory[0];
-    res.planning_time = res_detailed.processing_time[0];
+  if (ok && !res_detailed.trajectory_.empty()) {
+    res.trajectory_ = res_detailed.trajectory_[0];
+    res.planning_time_ = res_detailed.processing_time_.empty() ? 0.0 :
+      res_detailed.processing_time_[0];
   }
+  return ok && !res_detailed.trajectory_.empty();
 }
 
 }  // namespace manipulation

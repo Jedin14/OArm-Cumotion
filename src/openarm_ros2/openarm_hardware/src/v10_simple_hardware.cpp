@@ -368,14 +368,18 @@ hardware_interface::return_type OpenArm_v10HW::write(
   for (size_t i = 0; i < ARM_DOF; ++i) {
     // Integral control to eliminate steady state error
     double error = pos_commands_[i] - pos_states_[i];
-    integral_errors_[i] += error * dt;
-    
+    // Deadband: inside the friction band the integral holds (see the header).
+    if (std::abs(error) > INTEGRAL_DEADBAND) {
+      integral_errors_[i] += error * dt;
+    }
+    const double i_cap = std::min(MAX_I_TORQUE, MAX_I_TORQUE_JOINT[i]);
+
     double i_torque = DEFAULT_KI[i] * integral_errors_[i];
-    // Anti-windup
-    i_torque = std::clamp(i_torque, -MAX_I_TORQUE, MAX_I_TORQUE);
-    // Clamp the integral error itself as well
+    // Anti-windup, per joint
+    i_torque = std::clamp(i_torque, -i_cap, i_cap);
+    // Clamp the integral error itself as well, so it cannot wind up past it
     if (DEFAULT_KI[i] > 0.0) {
-      integral_errors_[i] = std::clamp(integral_errors_[i], -MAX_I_TORQUE / DEFAULT_KI[i], MAX_I_TORQUE / DEFAULT_KI[i]);
+      integral_errors_[i] = std::clamp(integral_errors_[i], -i_cap / DEFAULT_KI[i], i_cap / DEFAULT_KI[i]);
     }
 
     double ff_torque = tau_commands_[i] + i_torque;

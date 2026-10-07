@@ -20,9 +20,9 @@
 #include <chrono>
 #include <memory>
 
-#include "moveit/planning_interface/planning_interface.hpp"
+#include "moveit/planning_interface/planning_interface.h"
 #include "moveit/planning_scene/planning_scene.h"
-#include "moveit/robot_state/conversions.hpp"
+#include "moveit/robot_state/conversions.h"
 #include "rclcpp/rclcpp.hpp"
 
 namespace nvidia
@@ -36,7 +36,10 @@ namespace
 {
 
 constexpr unsigned kSleepIntervalInMs = 5;
-constexpr unsigned kTimeoutIntervalInSeconds = 5;
+// cuMotion's own attempts take ~4.2 s to fail here, and a successful plan can
+// take longer than that; 5 s timed good plans out and left cuMotion planning
+// for a request nobody was waiting for any more.
+constexpr unsigned kTimeoutIntervalInSeconds = 30;
 
 }  // namespace
 
@@ -54,44 +57,53 @@ void CumotionInterface::solve(
   }
 
   rclcpp::Time start_time = node_->now();
+  moveit_msgs::msg::MotionPlanDetailedResponse plan;
+  bool ok = false;
+  bool ready = false;
   while (
-    !action_client_->result_ready &&
+    !(ready = action_client_->takeResult(plan, ok)) &&
     node_->now().seconds() - start_time.seconds() < kTimeoutIntervalInSeconds)
   {
     action_client_->getGoal();
     std::this_thread::sleep_for(std::chrono::milliseconds(kSleepIntervalInMs));
   }
 
-  if (!action_client_->result_ready) {
+  if (!ready) {
     RCLCPP_ERROR(node_->get_logger(), "Timed out!");
-    response.error_code.val = moveit_msgs::msg::MoveItErrorCodes::TIMED_OUT;
+    response.error_code_.val = moveit_msgs::msg::MoveItErrorCodes::TIMED_OUT;
     planner_busy = false;
     return;
   }
   RCLCPP_INFO(node_->get_logger(), "Received trajectory result");
 
-  if (!action_client_->success) {
+  if (!ok || plan.trajectory.empty()) {
     RCLCPP_ERROR(node_->get_logger(), "No trajectory");
-    response.error_code.val = moveit_msgs::msg::MoveItErrorCodes::PLANNING_FAILED;
+    response.error_code_.val = moveit_msgs::msg::MoveItErrorCodes::PLANNING_FAILED;
     planner_busy = false;
     return;
   }
   RCLCPP_INFO(node_->get_logger(), "Trajectory success!");
 
-  response.error_code = action_client_->plan_response.error_code;
-  response.description = action_client_->plan_response.description;
+  // A local copy, taken under the lock: nothing here reads state another
+  // thread can be writing.
+  response.error_code_ = plan.error_code;
+  response.description_ = plan.description;
   auto result_traj = std::make_shared<robot_trajectory::RobotTrajectory>(
     planning_scene->getRobotModel(), request.group_name);
-  moveit::core::RobotState robot_state(planning_scene->getRobotModel());
-  moveit::core::robotStateMsgToRobotState(
-    action_client_->plan_response.trajectory_start,
-    robot_state);
-  result_traj->setRobotTrajectoryMsg(
-    robot_state,
-    action_client_->plan_response.trajectory[0]);
-  response.trajectory.clear();
-  response.trajectory.push_back(result_traj);
-  response.processing_time = action_client_->plan_response.processing_time;
+  // Start from the scene's real state, never a bare RobotState: in MoveIt
+  // Humble that constructor leaves joint values *uninitialised*, and
+  // cuMotion's trajectory only sets the 14 arm joints, so the finger joints of
+  // every trajectory state were whatever was in memory. When that was NaN or
+  // huge, the path validation's self-collision check segfaulted inside FCL
+  // (DynamicAABBTreeCollisionManager::registerObjects) -- the move_group
+  // crash (exit -11) seen right after successful plans, 2026-09-30.
+  moveit::core::RobotState robot_state = planning_scene->getCurrentState();
+  moveit::core::robotStateMsgToRobotState(plan.trajectory_start, robot_state);
+  robot_state.update();
+  result_traj->setRobotTrajectoryMsg(robot_state, plan.trajectory[0]);
+  response.trajectory_.clear();
+  response.trajectory_.push_back(result_traj);
+  response.processing_time_ = plan.processing_time;
 
   planner_busy = false;
 }

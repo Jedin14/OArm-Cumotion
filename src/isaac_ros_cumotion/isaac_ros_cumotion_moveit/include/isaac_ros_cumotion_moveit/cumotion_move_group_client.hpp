@@ -20,6 +20,7 @@
 
 #include <future>
 #include <memory>
+#include <mutex>
 
 #include "moveit/planning_interface/planning_interface.h"
 #include "moveit/planning_scene/planning_scene.h"
@@ -49,6 +50,11 @@ public:
 
   void getGoal();
 
+  // Thread-safe: the action result arrives on the executor thread while
+  // solve() polls from the planning thread. Returns false until a result is
+  // in; then copies it out and says whether it is a trajectory.
+  bool takeResult(moveit_msgs::msg::MotionPlanDetailedResponse & response, bool & success);
+
   bool result_ready;
   bool success;
   moveit_msgs::msg::MotionPlanDetailedResponse plan_response;
@@ -61,6 +67,14 @@ private:
     const std::shared_ptr<const moveit_msgs::action::MoveGroup::Feedback> feedback);
 
   void resultCallback(const GoalHandle::WrappedResult & result);
+
+  // Guards result_ready, success and plan_response. They used to be written
+  // by resultCallback (executor thread) and getGoal (planning thread) at
+  // once, and read by solve() as soon as result_ready flipped -- which
+  // resultCallback did *before* filling the trajectory. solve() copying a
+  // vector another thread was resizing is what segfaulted move_group
+  // (exit -11) right after cuMotion returned a successful plan.
+  std::mutex result_mutex_;
 
   bool get_goal_handle_;
   bool get_result_handle_;

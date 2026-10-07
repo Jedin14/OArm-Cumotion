@@ -129,6 +129,117 @@ limits, and install troubleshooting.
 
 ---
 
+## 🎯 Click to move (cuMotion only)
+
+Take a frame, click a point on it, press MOVE, and the fingertips of the arm
+on that side go to the point, hold for 2 s, and go back. There is no VLM and no
+grasp model. The gripper is not commanded unless you pass `--close-gripper`. The robot bringup is the same as for pick and place,
+so MoveIt, cuMotion, the D455 and the octomap (static, via the gater) work
+exactly as they do there.
+
+```bash
+native/run_launch_everything.sh          # terminal 1 (arms walk to pre_pick_state)
+native/run_click_to_move.sh              # terminal 2
+```
+
+The window shows a captured frame, not live video:
+
+- **Left click** selects a point; its `x y z` shows in the window and as a
+  marker in RViz. The `x y z` is the clicked surface in `world`, in metres:
+  origin at the base of the stand, +x forward, +y the robot's left, +z up.
+  The shoulders are at (0, ±0.051, 0.698).
+- **MOVE** / `m` touches it with the left arm for the left half of the image
+  and the right arm for the right half.
+- **RECAPTURE** / `r` takes a new frame and rebuilds the octomap.
+- **CALIBRATE** / `c` measures the camera pose, and **APPLY** writes it.
+- `q` quits.
+
+**Do CALIBRATE once after any camera move.** Accuracy depends on three
+things, and the tool handles each:
+
+1. **What touches.** `hand_tcp` is 80 mm from the hand, but the fingertips
+   reach 95.4 mm, so the *fingertips* are aimed at the point
+   (`--tip-offset 0.0154`). Aiming `hand_tcp` there used to push the fingers
+   15 mm into the surface, where they slid off the spot. With the gripper
+   left alone (the default), the point sits midway between the fingertips.
+   `--close-gripper` shuts them first so they meet on the point and touch it.
+2. **The arm arriving.** The trajectory controller reports success before
+   the arm has converged; its gravity sag is only pulled out by the
+   hardware's slow integral term. So at 5 cm (`--standoff`) the arm is left
+   to settle, the fingertip is measured from the encoders, and any error
+   over 2 mm is flown out. The same correction is carried into the straight
+   move in. The last line in the window reports the result.
+3. **The camera pose.** The URDF mount was a tape measurement, and nothing
+   downstream can see its error; the arm goes exactly where the camera says.
+   **CALIBRATE measures it and fixes it by itself**
+   (`robot_camera_calibration.py`):
+   - It takes a clean frame, then moves each arm to up to 6 poses in view
+     (out of 12 candidate spots per arm; unreachable ones are skipped).
+   - At each pose it takes the arm as the depth camera sees it (thousands
+     of points: whatever is now nearer than the clean frame) and the
+     robot's own model of it (the URDF visual meshes, posed by the joint
+     encoders).
+   - It finds the camera pose that puts the one onto the other: robust
+     point-to-plane ICP over all poses, started from several guesses
+     around the tape measurement.
+   - Being a 3D fit, it can't confuse "camera lower" with "camera tilted",
+     which is what sank the earlier fingertip-pixel method.
+   - In simulation with the real meshes, depth noise, clutter, 1.5% depth
+     scale error and starting 65 mm / 9° off, it recovered the camera to
+     within a few mm.
+   - A plausible result (fit rms < 3 mm, under 12 cm / 15° of change) is
+     applied at once: written as the next version into `v10.urdf.xacro`,
+     `cam_org.txt` (as mm from the arm origin) and `VLM/vlm_detect.py`,
+     `openarm_description` rebuilt, and `robot_state_publisher` updated
+     live.
+   - The window reports how far off clicks *were* and the model/depth
+     agreement before and after. `camera_calibration.yaml` keeps the
+     numbers.
+
+   **OVERLAY** (`o`) draws the robot model on a fresh frame (green where the
+   depth camera agrees with it, red where not), so you can check the
+   calibration by eye whenever an arm is in view. Keep the space in front of
+   the camera clear to about 0.45 m while calibrating. `--manual-calibration`
+   is the old click-the-fingertip method.
+
+**TEACH** (`t`) removes what's left of the error: the arm bends under its own
+weight in its gearboxes, after the motor encoders, so the robot can't see it,
+and it changes with posture (5–14 mm rms between poses, up to ~30 mm). With
+TEACH on, the arm holds each touch while you nudge the fingertip onto the spot
+(arrow keys or LEFT/RIGHT/UP/DOWN, `+`/`-` = IN/OUT, 2 mm a press), then SAVE.
+The correction is stored per arm in `touch_corrections.yaml`, and every later
+touch applies it, whether TEACH is on or not: a smooth trend through all of that
+arm's taught touches (so it carries to places not taught), refined by the ones
+within 15 cm. **Teach at more than one distance from the camera:** the arm's
+error changes with reach, and touches taught only at 0.35 m did not hold at
+0.46 m. A few touches near, middle and far, left and right, per arm, are
+enough; delete the file to start over. The camera check of the gripper is off
+by default (`--camera-check`): in a front approach the hand is too close to the
+camera to measure.
+
+The approach is always from the front, the side the camera sees: along its line of
+sight to the point, else tilted 15°, else 30°, and never steeply downward. The octomap
+only knows the surfaces the camera sees, so coming from above or behind an object
+would pass through space nobody checked. `--orientation down` is the old top-down
+approach.
+
+The touch itself: close the gripper (only with `--close-gripper`); cuMotion joint goal to 5 cm from the
+point; settle, measure, correct; straight line in at 2 cm/s
+(`/compute_cartesian_path`); hold `--hold` s; straight line out; cuMotion
+back to the starting posture. The hand and finger links may touch the
+octomap (the clicked surface is in it); the rest of the arm is still
+collision-checked. That exemption is re-applied before every MOVE and
+CALIBRATE, because a restarted move_group forgets it.
+
+If move_group dies (it has segfaulted mid-goal, exit −11), the tool stops at
+once and says so rather than waiting out its timeouts. Both crashes seen on
+2026-09-30 came 0.6-1.5 s after a gripper command, with IK and a plan in
+flight while the fingers were moving. So the gripper is not commanded unless
+you ask with `--close-gripper`, and even then nothing is planned until the
+fingers have stopped. `demo.launch.py` now
+respawns move_group after 3 s; press RECAPTURE once it is back, because its
+octomap starts empty.
+
 ## 🤖 VLM-guided pick and place
 
 A PaliGemma detector finds the object, cuMotion plans to it, and the same
@@ -2733,11 +2844,48 @@ native setup uses `native/build` and `native/install`, so the two never collide.
   no longer dies when there is no `DISPLAY`.
 - **Camera mount**: the D455 pose lives in
   `src/openarm_description/urdf/robot/v10.urdf.xacro` as the `xacro:sensor_d455`
-  origin, currently `xyz="0.10175 0.000 0.93272" rpy="0 1.0472 0"` — 101.75 mm
-  forward, 932.72 mm high, tilted 60° forward. `cam_org.txt` tracks that
-  measurement and its history. Note this positions
-  `camera_bottom_screw_frame`; the D455's own geometry then puts `camera_link` at
-  roughly `x=119.9, y=47.5, z=930.3` mm, which is expected.
+  origin (it positions `camera_bottom_screw_frame`). `cam_org.txt` records the
+  current version and every earlier one. V3 was a tape measurement; measure it
+  properly with **CALIBRATE** in `click_to_move.py` (see Click to move), whose
+  APPLY writes the next version into the URDF, `cam_org.txt` and
+  `VLM/vlm_detect.py`.
+- **cuMotion's collision model**: `openarm.yml` now carries the robot's own
+  collision spheres (fitted by `native/make_collision_spheres.py`). Without
+  them cuMotion planned the gripper through the torso, MoveIt rejected the path
+  ("Computed path is not valid", finger vs `openarm_body_link0`), and every
+  goal failed with PLANNING_FAILED (−2). The planner override also now plans at
+  full speed and slows the trajectory down afterwards, because cuRobo's
+  `time_dilation_factor` cannot fit a detour around the torso, and it leaves
+  the graph planner off (`enable_graph_attempt: -1`), because that planner
+  wrongly reports valid states as colliding. A move with no direct path goes
+  via home.
+- **move_group crashes and cuMotion "stops planning" (fixed 2026-09-30)**:
+  three bugs, all reproduced on an isolated ROS domain before being fixed.
+  1. `isaac_ros_cumotion_moveit` (move_group's cuMotion plugin) built each
+     returned trajectory on an *uninitialised* `RobotState`, so the finger
+     joints held garbage; path validation's self-collision check then
+     segfaulted in FCL (exit −11). It also handled the result in two threads
+     without a lock, and timed out after a hard-coded 5 s. Patched in
+     `src/isaac_ros_cumotion/isaac_ros_cumotion_moveit` and built natively
+     into `native/install` (it overrides the prebuilt 3.2.5 in `native/root`):
+     `colcon build --base-paths src/isaac_ros_cumotion/isaac_ros_cumotion_moveit
+     --build-base native/build --install-base native/install`.
+  2. cuRobo's self-collision kernel only writes where it finds a collision and
+     never clears its reused output buffer, so one colliding trajectory made
+     the same interpolation steps "collide" in every later plan. After a few
+     bad goals every plan failed with TRAJOPT_FAIL until a restart. The node
+     (`cumotion_planner.py`) now zeroes those buffers before each plan.
+  3. Out-of-limits joint goals are refused, and start states and joints that
+     were not commanded (the other arm, sagging past a limit) are clamped
+     inside the limits. A self-check restarts the node if it ever stops being
+     able to plan a trivial move.
+  Measured: 150 plan-only goals, 110 of the 111 planned succeeded, steady to
+  the end, no crash. Before: crash at plan 58, or every plan failing after ~60.
+- **Depth profile**: `launch_everything.launch.py depth_profile:=...` sets the
+  D455 depth stream, default `424x240x15`. The V3 mount looks flat at surfaces
+  0.3-0.5 m away, and the D455's minimum range is about 0.45 m at 848x480 but
+  about 0.2 m at 424x240. Use `depth_profile:=848x480x15` for work that is all
+  further away; it is more precise at range.
 - **Core Dump Cleanup**: `./scripts/run_dev.sh` deletes large `core.*` crash dumps
   from the workspace before the container starts, so the disk does not fill up.
   The native flow does not create them in the workspace root.

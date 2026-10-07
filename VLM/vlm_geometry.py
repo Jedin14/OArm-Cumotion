@@ -312,7 +312,7 @@ def deproject(intrinsics, u, v, z):
 def axis_yaw_world(angle_deg, intrinsics, rot, z):
     """Image-plane long axis -> yaw in the world XY plane.
 
-    The camera is pitched 60deg forward, so the image angle is not a world
+    The camera looks forward, not down, so the image angle is not a world
     yaw. Turn it into a camera-frame direction first (a pixel step maps to
     dx/fx*z, dy/fy*z at constant depth), rotate that into the world, then
     project onto XY.

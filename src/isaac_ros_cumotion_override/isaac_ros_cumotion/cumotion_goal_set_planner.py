@@ -168,6 +168,7 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
 
             grasp_constraint_in_goal_frame = plan_req.grasp_approach_constraint_in_goal_frame
             retract_constraint_in_goal_frame = plan_req.retract_constraint_in_goal_frame
+            self.clear_self_collision_buffers()
             grasp_plan_result = self.motion_gen.plan_grasp(
                 start_state,
                 poses,
@@ -218,6 +219,8 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                 )
                 self.toggle_link_collision(plan_req.disable_collision_links, False)
 
+                self.clear_self_collision_buffers()
+
                 motion_gen_result = self.motion_gen.plan_single_js(
                     start_state,
                     goal_state,
@@ -253,6 +256,7 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                 if poses.shape[1] == 1:
                     poses.position = poses.position.view(-1, 3)
                     poses.quaternion = poses.quaternion.view(-1, 4)
+                    self.clear_self_collision_buffers()
                     motion_gen_result = self.motion_gen.plan_single(
                         start_state,
                         poses,
@@ -264,6 +268,7 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                         ),
                     )
                 else:
+                    self.clear_self_collision_buffers()
                     motion_gen_result = self.motion_gen.plan_goalset(
                         start_state,
                         poses,

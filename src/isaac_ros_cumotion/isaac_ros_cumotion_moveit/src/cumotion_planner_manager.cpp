@@ -17,7 +17,7 @@
 
 #include "isaac_ros_cumotion_moveit/cumotion_planner_manager.hpp"
 
-#include "moveit/planning_interface/planning_interface.hpp"
+#include "moveit/planning_interface/planning_interface.h"
 #include "moveit/planning_scene/planning_scene.h"
 #include "pluginlib/class_list_macros.hpp"
 

@@ -10,6 +10,7 @@
 from copy import deepcopy
 from os import path
 
+import os
 import threading
 import time
 
@@ -40,6 +41,8 @@ from moveit_msgs.msg import CollisionObject
 from moveit_msgs.msg import MoveItErrorCodes
 from moveit_msgs.msg import RobotTrajectory
 import numpy as np
+import yaml
+from isaac_ros_cumotion import scene_world
 from nvblox_msgs.srv import EsdfAndGradients
 import rclpy
 from rclpy.action import ActionServer
@@ -64,6 +67,12 @@ class CumotionActionServer(Node):
         self.declare_parameter('yml_file_path', rclpy.Parameter.Type.STRING)
         self.declare_parameter('time_dilation_factor', 0.5)
         self.declare_parameter('max_attempts', 10)
+        # Failed attempts before cuRobo's graph planner is tried; < 0 never.
+        # Off by default: with openarm.yml's collision spheres it reports
+        # "Start or End state in collision" for states the rest of cuRobo and
+        # MoveIt both call valid, and a failed graph attempt ends the whole
+        # plan -- measured 2026-09-30, 0/9 plans with it, 9/9 without.
+        self.declare_parameter('enable_graph_attempt', -1)
         self.declare_parameter('num_graph_seeds', 6)
         self.declare_parameter('num_trajopt_seeds', 6)
         self.declare_parameter('include_trajopt_retract_seed', True)
@@ -159,6 +168,8 @@ class CumotionActionServer(Node):
         self.__max_attempts = (
             self.get_parameter('max_attempts').get_parameter_value().integer_value
         )
+        graph = self.get_parameter('enable_graph_attempt').get_parameter_value().integer_value
+        self.__enable_graph_attempt = None if graph < 0 else graph
         self.__num_graph_seeds = (
             self.get_parameter('num_graph_seeds').get_parameter_value().integer_value
         )
@@ -275,6 +286,20 @@ class CumotionActionServer(Node):
             JointState, self.__joint_states_topic, self.js_callback, 10
         )
         self.__js_buffer = None
+        # What move_group checks paths against, for cuMotion to plan around
+        # (scene_world.py): tf for the camera pose, the stand column, and a
+        # cache for the decoded octomap.
+        import tf2_ros
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        try:
+            with open(self.__robot_file) as handle:
+                urdf_path = yaml.safe_load(handle)['robot_cfg']['kinematics']['urdf_path']
+        except Exception:                            # noqa: BLE001
+            urdf_path = '/workspaces/isaac_ros-dev/openarm.urdf'
+        self._static = scene_world.StaticObstacles(urdf_path, self.get_logger())
+        self._octomap = scene_world.OctomapCache()
+        self._shadowed = scene_world.ShadowedMap()
 
         # Call on_timer every 0.01 seconds
         self.timer = self.create_timer(0.01, self.on_timer)
@@ -584,12 +609,15 @@ class CumotionActionServer(Node):
                 objs.append(obj)
         return objs, supported_objects
 
-    def get_joint_trajectory(self, js: CuJointState, dt: float):
+    def get_joint_trajectory(self, js: CuJointState, dt: float, time_scale: float = 1.0):
+        """`time_scale` < 1 slows the trajectory down: t/s, v*s, a*s^2."""
         traj = RobotTrajectory()
         cmd_traj = JointTrajectory()
+        s = min(1.0, max(1e-3, float(time_scale or 1.0)))
+        dt = dt / s
         q_traj = js.position.cpu().view(-1, js.position.shape[-1]).numpy()
-        vel = js.velocity.cpu().view(-1, js.position.shape[-1]).numpy()
-        acc = js.acceleration.view(-1, js.position.shape[-1]).cpu().numpy()
+        vel = js.velocity.cpu().view(-1, js.position.shape[-1]).numpy() * s
+        acc = js.acceleration.view(-1, js.position.shape[-1]).cpu().numpy() * (s * s)
         for i in range(len(q_traj)):
             traj_pt = JointTrajectoryPoint()
             traj_pt.positions = q_traj[i].tolist()
@@ -648,6 +676,188 @@ class CumotionActionServer(Node):
                 xyzr_tensor[..., 3] = voxels.feature_tensor
                 self.publish_voxels(xyzr_tensor)
         return world_update_status
+
+    def _scene_world(self, scene, keep_clear, with_stand=True, with_octomap=True,
+                     arm_spheres=None):
+        """Give cuMotion move_group's obstacles: scene collision objects, the
+        camera box, the stand column and the octomap (cropped to the arms'
+        reach, and cleared within 10 cm of `keep_clear` -- the grippers at
+        the start and goal, which are allowed to touch the map: move_group's
+        allowed-collision matrix exempts them, and the touch itself is a
+        move_group Cartesian move)."""
+        cuboids, meshes, spheres, cylinders = [], [], [], []
+        for obj in scene.world.collision_objects:
+            for cu_obj in self.get_cumotion_collision_object(obj)[0]:
+                {Cuboid: cuboids, Mesh: meshes, Sphere: spheres,
+                 Cylinder: cylinders}.get(type(cu_obj), meshes).append(cu_obj)
+        notes = []
+        cam = self._static.camera(self._tf_buffer, self.__robot_base_frame)
+        if cam is not None:
+            cuboids.append(Cuboid(name='camera', pose=cam,
+                                  dims=list(scene_world.StaticObstacles.CAMERA_BOX)))
+            notes.append('camera')
+        if with_stand and self._static.stand is not None:
+            if not getattr(self, '_body_spheres_off', False):
+                # The stand is modelled exactly as a world mesh from here on,
+                # so the robot's own body spheres go: they overlap that mesh
+                # (and the calibrated camera box inside it), which made every
+                # start pose "colliding with world". Arm-vs-stand is then a
+                # world check against the real shape instead of a sphere fit.
+                self.motion_gen.kinematics.kinematics_config.disable_link_spheres(
+                    'openarm_body_link0')
+                self._body_spheres_off = True
+            v, f = self._static.stand
+            meshes.append(Mesh(name='stand', pose=[0, 0, 0, 1, 0, 0, 0],
+                               vertices=v.tolist(), faces=f.tolist()))
+            notes.append('stand')
+        if with_octomap and scene.world.octomap.octomap.data:
+            octomap = scene.world.octomap.octomap
+            centres, sizes = self._octomap.get(octomap)
+            o = scene.world.octomap.origin.position
+            centres = centres + [o.x, o.y, o.z]
+
+            def crop(c):
+                return ((np.abs(c[:, 0]) < 1.0) & (np.abs(c[:, 1]) < 1.0)
+                        & (c[:, 2] > -0.1) & (c[:, 2] < 1.4))
+
+            eye = self._static.eye(self._tf_buffer, self.__robot_base_frame)
+            (v, f), n = self._shadowed.mesh(centres, sizes, float(octomap.resolution) or 0.02,
+                                            eye, crop, keep_clear, spheres=arm_spheres)
+            if n:
+                meshes.append(Mesh(name='octomap', pose=[0, 0, 0, 1, 0, 0, 0],
+                                   vertices=v.tolist(), faces=f.tolist()))
+                surface, shadowed = self._shadowed.counts
+                notes.append(f'octomap {surface} cells + {shadowed - surface} hidden behind '
+                             f'them, {n} after clearing the grippers ({len(f)} triangles)')
+        world = WorldConfig(cuboid=cuboids, mesh=meshes, sphere=spheres,
+                            cylinder=cylinders).get_collision_check_world()
+        # cuRobo caches meshes by name: without this a new octomap under the
+        # same name is silently replaced by the old one.
+        self.motion_gen.clear_world_cache()
+        self.motion_gen.update_world(world)
+        self.get_logger().info('cuMotion world: ' + (', '.join(notes) or 'empty'))
+
+    def _robot_spheres(self, js):
+        """(N, 4) world collision spheres of the robot at a joint state."""
+        try:
+            state = self.motion_gen.kinematics.get_state(js.position.view(1, -1))
+            return state.link_spheres_tensor.view(-1, 4).cpu().numpy()
+        except Exception:                            # noqa: BLE001
+            return None
+
+    def _tcp_positions(self, js):
+        """World positions of both hand_tcp links for a joint state."""
+        try:
+            poses = self.motion_gen.kinematics.get_state(js.position.view(1, -1)).link_poses
+            return [poses[name].position.view(-1).cpu().numpy()
+                    for name in poses if name.endswith('hand_tcp')]
+        except Exception:                            # noqa: BLE001
+            return []
+
+    def _self_collision_costs(self):
+        """Every SelfCollisionCost inside motion_gen, found once."""
+        if getattr(self, '_sc_costs', None) is None:
+            from curobo.rollout.cost.self_collision_cost import SelfCollisionCost
+            found, seen, stack = [], set(), [(self.motion_gen, 0)]
+            while stack:
+                obj, depth = stack.pop()
+                if id(obj) in seen or depth > 8:
+                    continue
+                seen.add(id(obj))
+                if isinstance(obj, SelfCollisionCost):
+                    found.append(obj)
+                elif isinstance(obj, (list, tuple)):
+                    stack += [(x, depth + 1) for x in obj]
+                elif isinstance(obj, dict):
+                    stack += [(x, depth + 1) for x in obj.values()]
+                elif (hasattr(obj, '__dict__') and not isinstance(obj, torch.Tensor)
+                      and type(obj).__module__.startswith('curobo')):
+                    stack += [(x, depth + 1) for x in vars(obj).values()]
+            self._sc_costs = found
+            self.get_logger().info(f'{len(found)} self-collision cost buffers will be '
+                                   f'cleared before every plan')
+        return self._sc_costs
+
+    def clear_self_collision_buffers(self):
+        """Zero cuRobo's self-collision output buffers before a plan.
+
+        The self-collision kernel writes a distance only where it finds a
+        collision and never clears the others, and these buffers are reused
+        across plans. So once any trajectory collided at, say, interpolation
+        step 53, step 53 read as colliding for *every* later trajectory: the
+        final check rejected paths that were fine, and after a few bad goals
+        cuMotion answered TRAJOPT_FAIL to everything -- goals it had planned
+        twenty times -- until it was restarted. That is the arm that "didn't
+        move" (2026-09-30). Measured offline on this robot: 46/150 plans
+        without this, pre_pick and home failing every time after plan ~60;
+        115/150 with it, pre_pick and home 100/100.
+        """
+        for cost in self._self_collision_costs():
+            for name in ('_out_distance', '_out_vec', '_sparse_sphere_idx'):
+                buf = getattr(cost, name, None)
+                if isinstance(buf, torch.Tensor):
+                    buf.zero_()
+
+    def _still_healthy(self, start_state):
+        """Can the planner still do something trivial? Run after repeated
+        failures: a 0.05 rad move from where the arm is. If *that* fails, the
+        solver state is broken (see _within_limits) and every later plan would
+        fail too, so the node exits and launch respawns it -- ~30 s, instead
+        of an arm that never moves again."""
+        try:
+            goal = start_state.clone()
+            names = self.motion_gen.kinematics.kinematics_config.joint_names
+            limits = self.motion_gen.kinematics.kinematics_config.joint_limits.position
+            for i, name in enumerate(goal.joint_names):
+                if name in names:
+                    j = names.index(name)
+                    mid = 0.5 * float(limits[0][j] + limits[1][j])
+                    step = 0.05 if float(goal.position[0, i]) < mid else -0.05
+                    goal.position[0, i] += step
+                    break
+            self.motion_gen.reset(reset_seed=False)
+            self.clear_self_collision_buffers()
+            test = self.motion_gen.plan_single_js(
+                start_state, goal, MotionGenPlanConfig(max_attempts=4, enable_graph=False,
+                                                       enable_finetune_trajopt=False))
+            return bool(test.success.item()) or not test.valid_query
+        except Exception as exc:                     # noqa: BLE001
+            self.get_logger().warn(f'planner self-check could not run: {exc}')
+            return True
+
+    def _within_limits(self, js, commanded=(), label='state'):
+        """Clamp a joint state into cuRobo's joint limits, in place.
+
+        An out-of-limits joint *goal* poisons cuRobo: plan_single_js does not
+        check it, trajopt runs on it, and from then on every plan fails with
+        TRAJOPT_FAIL -- even goals that succeeded 20 times before -- until the
+        node is restarted (reproduced 2026-09-30, click_to_move's arm
+        "didn't move"). The hardware sags a little past its limits (right
+        joint3 read -1.604 against -1.571), and a 7-joint goal is completed
+        from the *current* reading of the other arm, so ordinary goals carried
+        such values. Joints nobody commanded, and the start state, are pulled
+        just inside (MoveIt allows the same 0.1 rad at the start). A commanded
+        joint more than 0.01 rad outside is refused: that goal is wrong.
+        Returns the name of a refused joint, or None.
+        """
+        limits = self.motion_gen.kinematics.kinematics_config.joint_limits.position
+        names = self.motion_gen.kinematics.kinematics_config.joint_names
+        margin = 1e-4
+        for i, name in enumerate(js.joint_names):
+            if name not in names:
+                continue
+            j = names.index(name)
+            lo, hi = float(limits[0][j]), float(limits[1][j])
+            value = float(js.position[0, i])
+            if lo + margin <= value <= hi - margin:
+                continue
+            if name in commanded and (value < lo - 0.01 or value > hi + 0.01):
+                return name
+            self.get_logger().info(
+                f'{label}: {name} = {value:.4f} is outside [{lo:.4f}, {hi:.4f}]; '
+                f'clamped')
+            js.position[0, i] = min(max(value, lo + margin), hi - margin)
+        return None
 
     def execute_callback(self, goal_handle):
         if self.planner_busy:
@@ -769,6 +979,13 @@ class CumotionActionServer(Node):
                     current_full_state.position[0, full_idx] = goal_js_pos_tensor[0, idx]
 
             goal_state = current_full_state
+            refused = self._within_limits(goal_state, set(goal_jnames), 'goal')
+            if refused is not None:
+                self.get_logger().error(
+                    f'Refusing a joint goal outside the joint limits ({refused}); '
+                    f'planning to it would break every plan after it')
+                result.error_code.val = MoveItErrorCodes.INVALID_GOAL_CONSTRAINTS
+                return result
             goal_pose = self.motion_gen.compute_kinematics(goal_state).ee_pose.clone()
         elif (
             len(plan_req.goal_constraints[0].position_constraints) > 0
@@ -817,14 +1034,38 @@ class CumotionActionServer(Node):
                 return result
         else:
             self.get_logger().error('Goal constraints not supported')
+        if start_state is not None:
+            self._within_limits(start_state, (), 'start')
         with self.lock:
             self.planner_busy = True
 
+        keep_clear = self._tcp_positions(start_state) if start_state is not None else []
+        if len(plan_req.goal_constraints[0].joint_constraints) > 0:
+            keep_clear += self._tcp_positions(goal_state)
+        else:
+            keep_clear.append(goal_pose.position.view(-1).cpu().numpy())
+        self._scene_world(scene, keep_clear)
+
         self.motion_gen.reset(reset_seed=False)
+        self.clear_self_collision_buffers()
+        # Planned at full speed and slowed down afterwards (get_joint_trajectory),
+        # not planned slow. cuRobo's time_dilation_factor makes the optimiser
+        # fit a slow trajectory into its fixed number of steps, and with the
+        # robot's own collision spheres in the model -- so that the path has to
+        # go round the torso -- that fails outright: measured 0/8 at 0.15
+        # against 4/4 undilated for the same home -> pre_pick move. A pure time
+        # scaling afterwards gives the same slow motion along a path that
+        # exists.
+        # No finetune pass. It only shortens the trajectory's timing, which
+        # is thrown away anyway (the trajectory is slowed afterwards), and on
+        # this robot it failed every approach goal click_to_move asked for --
+        # 0/10 with it, 10/10 without, all 10 valid in move_group
+        # (2026-10-06, FINETUNE_TRAJOPT_FAIL in the log).
         plan_config = MotionGenPlanConfig(
-            max_attempts=self.__max_attempts, 
-            enable_graph_attempt=1,
-            time_dilation_factor=time_dilation_factor
+            max_attempts=self.__max_attempts,
+            enable_graph=False,
+            enable_graph_attempt=self.__enable_graph_attempt,
+            enable_finetune_trajopt=False,
         )
         
         if len(plan_req.goal_constraints[0].joint_constraints) > 0:
@@ -839,7 +1080,50 @@ class CumotionActionServer(Node):
                 goal_pose,
                 plan_config,
             )
-            
+        if motion_gen_result.status in (MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION,):
+            # The stand column is a coarse hull; an arm parked close beside it
+            # can read as touching. Plan once more without it.
+            self.get_logger().warn('start state touches the modelled stand/obstacles; '
+                                   'replanning without the stand column')
+            self._scene_world(scene, keep_clear, with_stand=False)
+            self.motion_gen.reset(reset_seed=False)
+            self.clear_self_collision_buffers()
+            if len(plan_req.goal_constraints[0].joint_constraints) > 0:
+                motion_gen_result = self.motion_gen.plan_single_js(start_state, goal_state,
+                                                                   plan_config)
+            else:
+                motion_gen_result = self.motion_gen.plan_single(start_state, goal_pose,
+                                                                plan_config)
+        if (motion_gen_result.status == MotionGenStatus.INVALID_START_STATE_WORLD_COLLISION
+                and start_state is not None):
+            # Still colliding: the octomap claims space the arm is standing in
+            # -- usually cells filled in as hidden behind a surface. The arm
+            # is physically there, so that space is free; clear the map
+            # around the arm as it stands and plan away from it.
+            spheres = self._robot_spheres(start_state)
+            if spheres is not None:
+                self.get_logger().warn('start state inside the octomap; clearing the map '
+                                       'around the arm where it stands')
+                self._scene_world(scene, keep_clear, with_stand=False, arm_spheres=spheres)
+                self.motion_gen.reset(reset_seed=False)
+                self.clear_self_collision_buffers()
+                if len(plan_req.goal_constraints[0].joint_constraints) > 0:
+                    motion_gen_result = self.motion_gen.plan_single_js(start_state, goal_state,
+                                                                       plan_config)
+                else:
+                    motion_gen_result = self.motion_gen.plan_single(start_state, goal_pose,
+                                                                    plan_config)
+
+        failed = (not motion_gen_result.success.item()) and motion_gen_result.valid_query
+        self.__failures_in_a_row = (getattr(self, '_CumotionActionServer__failures_in_a_row', 0) + 1
+                                    if failed else 0)
+        if self.__failures_in_a_row >= 3 and not self._still_healthy(start_state):
+            self.get_logger().fatal(
+                'cuMotion can no longer plan even a 0.05 rad move: its solver state '
+                'is broken. Exiting so launch respawns a fresh planner.')
+            threading.Timer(0.5, lambda: os._exit(3)).start()
+        elif self.__failures_in_a_row >= 3:
+            self.__failures_in_a_row = 0
         with self.lock:
             self.planner_busy = False
         result = MoveGroup.Result()
@@ -847,7 +1131,8 @@ class CumotionActionServer(Node):
             result.error_code.val = MoveItErrorCodes.SUCCESS
             result.trajectory_start = plan_req.start_state
             traj = self.get_joint_trajectory(
-                motion_gen_result.optimized_plan, motion_gen_result.optimized_dt.item()
+                motion_gen_result.optimized_plan, motion_gen_result.optimized_dt.item(),
+                time_scale=time_dilation_factor
             )
             # Never allow invalid GPU output to reach MoveIt or a hardware
             # controller.  NaN/Inf joint values can make FCL crash while it
@@ -887,6 +1172,11 @@ class CumotionActionServer(Node):
             )
             if motion_gen_result.status == MotionGenStatus.IK_FAIL:
                 result.error_code.val = MoveItErrorCodes.NO_IK_SOLUTION
+            else:
+                # TRAJOPT_FAIL, GRAPH_FAIL, ...: left unset (0) this reached
+                # MoveIt as a generic FAILURE (-1), which callers cannot tell
+                # from a real fault. It is a plan that was not found.
+                result.error_code.val = MoveItErrorCodes.PLANNING_FAILED
 
         self.get_logger().info(
             'returned planning result (query, success, failure_status): '

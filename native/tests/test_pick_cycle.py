@@ -3550,8 +3550,8 @@ def main():
 
         # Which arm picks is decided by which half of the camera frame the
         # object is in, because that is what can be checked by looking at
-        # /vlm/debug_image. The two criteria agree anyway: the camera is
-        # pitched about world Y with no yaw, so optical +x -- image right --
+        # /vlm/debug_image. The two criteria agree anyway: the camera has no
+        # roll or yaw, so optical +x -- image right --
         # maps to world -y, the right arm's side.
         frame = {'image_size': list(IMAGE_SIZE)}
         width = IMAGE_SIZE[0]

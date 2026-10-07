@@ -35,7 +35,7 @@
   <joint name="openarm_left_openarm_body_link0_joint" type="fixed">
     <parent link="openarm_body_link0"/>
     <child link="openarm_left_link0"/>
-    <origin rpy="-1.5708 0 0" xyz="0.0 0.051 0.698"/>
+    <origin rpy="-1.5708 0 0" xyz="0.0126 0.0572 0.7344"/>
   </joint>
   <link name="openarm_left_link0">
     <visual name="openarm_left_link0_visual">
@@ -256,7 +256,7 @@
   <joint name="openarm_right_openarm_body_link0_joint" type="fixed">
     <parent link="openarm_body_link0"/>
     <child link="openarm_right_link0"/>
-    <origin rpy="1.5708 0 0" xyz="0.0 -0.051 0.698"/>
+    <origin rpy="1.5708 0 0" xyz="0.0126 -0.0448 0.7344"/>
   </joint>
   <link name="openarm_right_link0">
     <visual name="openarm_right_link0_visual">

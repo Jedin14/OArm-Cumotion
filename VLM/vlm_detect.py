@@ -94,13 +94,13 @@ COLOR_TOPIC = '/camera/camera/color/image_raw'
 DEPTH_TOPIC = '/camera/camera/aligned_depth_to_color/image_raw'
 INFO_TOPIC = '/camera/camera/color/camera_info'
 
-# The calibrated mount from v10.urdf.xacro: xyz="0.10175 0 0.93272"
-# rpy="0 1.0472 0", parented to world. Only used by --source realsense, where
+# The mount from v10.urdf.xacro (camera_bottom_screw_frame, see cam_org.txt),
+# parented to world. Only used by --source realsense, where
 # there is no tf2 to ask. If the mount is re-measured, the URDF is the truth
 # and this is a copy -- which is why it is opt-in via --mount rather than the
 # default.
-URDF_MOUNT_XYZ = (0.10175, 0.0, 0.93272)
-URDF_MOUNT_RPY = (0.0, 1.0472, 0.0)
+URDF_MOUNT_XYZ = (-0.00006, -0.00617, 0.49610)
+URDF_MOUNT_RPY = (0.02168, -0.07880, -0.01063)
 
 # realsense2_camera publishes optical frames; a bare pyrealsense2 pipeline does
 # not apply the ROS optical convention, so --source realsense needs it here.

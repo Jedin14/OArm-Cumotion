@@ -126,7 +126,18 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   // Integral gains to remove steady-state droop from URDF mass inaccuracies
   const std::vector<double> DEFAULT_KI = {20.0, 20.0, 20.0, 20.0,
                                           10.0, 10.0, 10.0, 0.5};
-  const double MAX_I_TORQUE = 20.0; // Nm limit for safety
+  const double MAX_I_TORQUE = 20.0; // Nm limit for safety (overall cap)
+  // Per-joint cap on the integral torque, Nm. It was 20 Nm on every joint,
+  // which on the small wrist motors (KP 10, gravity load < 1 Nm) let the
+  // integral wind up against static friction until the joint broke free and
+  // overshot: a slow limit cycle measured on the left arm at rest on
+  // 2026-10-07 (joint5 56 mrad, joint7 46 mrad peak-to-peak at 0.1-0.25 Hz).
+  // Gravity compensation carries the load; the integral only trims what the
+  // URDF masses get wrong, which needs far less.
+  const std::vector<double> MAX_I_TORQUE_JOINT = {8.0, 8.0, 6.0, 6.0, 1.5, 1.5, 1.5, 0.5};
+  // Below this position error the integral holds instead of growing: inside
+  // the static-friction band it can only wind up, not move the joint. rad.
+  const double INTEGRAL_DEADBAND = 0.0005;
 
   const double GRIPPER_JOINT_0_POSITION = 0.044; 
   const double GRIPPER_JOINT_1_POSITION = 0.0;

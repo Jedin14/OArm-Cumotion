@@ -353,6 +353,8 @@ def generate_launch_description():
             os.path.join(WS, 'launch_everything.launch.py')),
         launch_arguments={
             'tool_frame': tool_frame,
+            # The orchestrator's boot_walk parks the arms instead.
+            'boot_pre_pick': 'false',
             'octomap': LaunchConfiguration('octomap'),
             'collision_activation_distance':
                 LaunchConfiguration('collision_activation_distance'),

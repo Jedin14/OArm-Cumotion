@@ -1,13 +1,61 @@
 D455 mount position relative to `world`, as set in
 src/openarm_description/urdf/robot/v10.urdf.xacro (xacro:sensor_d455).
+The origin positions camera_bottom_screw_frame.
+The arm origin (openarm_{left,right}_link0) is at world x=0.0126, z=0.7344 m, y=-0.0448/+0.0572 m
+(moved in V7 from x=0, z=0.698, y=+/-0.051 -- see V7).
 
-current:    <origin xyz="0.10175 0.000 0.93272" rpy="0 1.0472 0"/>
+current (V7):    <origin xyz="0.01233 0.000 0.53131" rpy="0.02056 -0.07726 -0.01912"/>
 
-X = 101.75 mm   (forward)
-Y = 0 mm
-Z = 932.72 mm   (height)
-pitch = 1.0472 rad = 60 deg, tilted forward/down
+Position: the V4 tape measurement (12.33 mm in front of, 166.69 mm below the
+original arm origin). Orientation: roll 1.18, pitch -4.43, yaw -1.10 deg (CALIBRATE).
 
 history:
   X = 160.89 mm, Z = 728.46 mm    <origin xyz="0.16089 0.000 0.72846" rpy="0 1.0472 0"/>
   X = 104.89 mm, Z = 723.46 mm
+
+V2
+  <origin xyz="0.10175 0.000 0.99272" rpy="0 1.0472 0"/>
+  X = 101.75 mm   (forward)
+  Y = 0 mm
+  Z = 992.72 mm   (height, as set in the URDF; this file used to say 932.72 mm)
+  pitch = 1.0472 rad = 60 deg, tilted forward/down
+
+V3
+  <origin xyz="0.01106 0.000 0.47125" rpy="0 0 0"/>
+  X = 11.06 mm    (11.06 mm in front of the arm origin)
+  Y = 0 mm
+  Z = 471.25 mm   (226.75 mm below the arm origin, 698 - 226.75)
+  pitch = 0 rad, flat / straight ahead
+
+V4  (camera moved, 2026-10-05; tape measurement)
+  <origin xyz="0.01233 0.000 0.53131" rpy="0 0 0"/>
+  X = 12.33 mm    (12.33 mm in front of the arm origin)
+  Y = 0 mm
+  Z = 531.31 mm   (166.69 mm below the arm origin, 698 - 166.69)
+  pitch = 0 rad, flat / straight ahead
+
+V5
+  <origin xyz="-0.00411 -0.01741 0.51525" rpy="-0.00236 -0.04046 -0.01006"/>
+  -4.11 mm in front of and 182.75 mm below the arm origin, -17.41 mm to the left
+  calibrated 2026-10-06T14:29:11: 12 arm poses, 33997 depth points fitted to the URDF meshes
+  arm vs model 5.3 mm -> 2.9 mm; moved 28.8 mm, turned 2.39 deg from the previous version
+  NOTE: fitted to the arms, not the stand. In the URDF this puts the camera
+  inside the stand column (front face x = +30 mm): the arms' position relative
+  to the stand mesh is ~4 cm different from the real robot. Forcing the camera
+  onto the stand face made the fit fall apart (2026-10-06), so clicks need this
+  pose; the camera/stand overlap is exempt in the SRDF.
+
+V6
+  <origin xyz="-0.00006 -0.00617 0.49610" rpy="0.02168 -0.07880 -0.01063"/>
+  -0.06 mm in front of and 201.90 mm below the arm origin, -6.17 mm to the left
+  calibrated 2026-10-06T15:33:13: 12 arm poses, 30849 depth points fitted to the URDF meshes
+  arm vs model 2.8 mm -> 2.4 mm; moved 22.6 mm, turned 2.59 deg from the previous version
+
+V7  (2026-10-06)
+  <origin xyz="0.01233 0.000 0.53131" rpy="0.02056 -0.07726 -0.01912"/>
+  Camera at the V4 tape position; orientation from CALIBRATE (both saved runs
+  fitted together: 24 poses, 67% of points within 5 mm, rms 3.7 mm).
+  To keep what the camera sees of the arms, the ARMS were moved instead:
+  arm mount (+12.6, +6.2, +36.4) mm -> right 0.0126 -0.0448 0.7344,
+  left 0.0126 0.0572 0.7344 (v10.urdf.xacro and openarm.urdf).
+  Check: the shoulder axes should then be 734.4 mm above the stand base.
