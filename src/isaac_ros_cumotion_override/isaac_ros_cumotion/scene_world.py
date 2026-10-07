@@ -12,7 +12,6 @@ The planning scene, octomap included, already arrives with every request
 cuRobo world geometry:
 
     decode_octomap()   octomap_msgs binary OcTree -> occupied voxel boxes
-    boxes_mesh()       voxel boxes -> one triangle mesh
     ShadowedMap        the octomap's cells plus the space hidden behind them
                        from the camera, as one closed surface mesh
     StaticObstacles    the camera box (from tf) and the stand column
@@ -97,18 +96,6 @@ def _decode_full(data, res, threshold=0.0):
     if not centres:
         return np.zeros((0, 3)), np.zeros(0)
     return np.array(centres), np.array(sizes)
-
-
-def boxes_mesh(centres, sizes):
-    """Axis-aligned boxes -> (vertices (8N,3), faces (12N,3))."""
-    corners = np.array([[x, y, z] for z in (-0.5, 0.5) for y in (-0.5, 0.5) for x in (-0.5, 0.5)])
-    quads = np.array([[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4],
-                      [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]])
-    tris = np.concatenate([quads[:, [0, 1, 2]], quads[:, [0, 2, 3]]])
-    n = len(centres)
-    verts = (centres[:, None, :] + corners[None] * sizes[:, None, None]).reshape(-1, 3)
-    faces = (tris[None] + 8 * np.arange(n)[:, None, None]).reshape(-1, 3)
-    return verts, faces
 
 
 def quat_wxyz(rotation):

@@ -35,41 +35,10 @@ def dictionary():
     return cv2.aruco.getPredefinedDictionary(DICTIONARY)
 
 
-def detect(bgr, info, ids_wanted=None):
-    """{id: (rvec, tvec, corners (4,2))} for each marker found, in the colour
-    camera's optical frame (metres). Pose by IPPE for a square: the four
-    corners at their sub-pixel positions, lens distortion included."""
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
-    params = cv2.aruco.DetectorParameters_create()
-    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    params.cornerRefinementWinSize = 5
-    params.cornerRefinementMaxIterations = 50
-    params.cornerRefinementMinAccuracy = 0.01
-    corners, ids, _rejected = cv2.aruco.detectMarkers(gray, dictionary(), parameters=params)
-    out = {}
-    if ids is None:
-        return out
-    k = np.array(info.k, dtype=np.float64).reshape(3, 3)
-    d = np.array(info.d, dtype=np.float64) if len(info.d) else np.zeros(5)
-    half = MARKER_MM / 2000.0
-    obj = np.array([[-half, half, 0], [half, half, 0], [half, -half, 0], [-half, -half, 0]],
-                   dtype=np.float64)
-    for c, i in zip(corners, ids.ravel()):
-        i = int(i)
-        if ids_wanted is not None and i not in ids_wanted:
-            continue
-        img = c.reshape(4, 2).astype(np.float64)
-        ok, rvec, tvec = cv2.solvePnP(obj, img, k, d, flags=cv2.SOLVEPNP_IPPE_SQUARE)
-        if ok:
-            out[i] = (rvec.ravel(), tvec.ravel(), img)
-    return out
-
-
 # Where a flag nominally sits in the hand frame: off the end of the rail, the
 # printed face looking back along -Z (towards the wrist). Only used to pick the
 # right one of the two pose solutions before a flag has been calibrated.
 NOMINAL_NORMAL = np.array([0.0, 0.0, -1.0])
-TIP_IN_HAND = np.array([0.0, 0.0, 0.0955])   # fingertip midpoint (openarm_hand.xacro)
 CALIBRATION_FILE = os.path.join(WS, 'marker_calibration.yaml')
 
 

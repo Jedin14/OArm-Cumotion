@@ -33,6 +33,8 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
 
     def warmup(self):
         self.get_logger().info('warming up cuMotion, wait until ready')
+        # ~27 s, almost all of it cuRobo's own kernel/CUDA-graph set-up: a
+        # warm-up without graph search and goal sets took as long (2026-10-07).
         self.motion_gen.warmup(enable_graph=True, n_goalset=100, warmup_js_trajopt=True)
         self.get_logger().info('cuMotion is ready for planning queries!')
 
