@@ -58,6 +58,9 @@ OCTOMAP_NAME = '<octomap>'
 # in the hand frame, finger mesh spans 0.6585..0.7534 at an offset of -0.673,
 # so the tip is at 0.015 + 0.0804 = 0.0954 m; hand_tcp is at 0.080.
 FINGERTIP_BEYOND_TCP = 0.0154
+# The vacuum extension fitted past the fingertips (2026-10-08): the working
+# tip is this much further out along the tool axis. --tool-extension.
+TOOL_EXTENSION = 0.020
 
 
 # Same fallback as pick_place_orchestrator's home_joint_positions: symmetric,
@@ -66,7 +69,10 @@ HOME_JOINTS = [0.0, 0.0, 0.0, 0.20, 0.0, 0.0, 0.0]
 
 
 # cuMotion's optimiser is stochastic; the same goal resent usually succeeds.
-RETRYABLE = {MoveItErrorCodes.PLANNING_FAILED, MoveItErrorCodes.TIMED_OUT}
+# CONTROL_FAILED: usually the arm was still moving when the plan started and
+# MoveIt refused it (start point > 0.05 rad from the arm); worth one more try.
+RETRYABLE = {MoveItErrorCodes.PLANNING_FAILED, MoveItErrorCodes.TIMED_OUT,
+             MoveItErrorCodes.CONTROL_FAILED}
 
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX

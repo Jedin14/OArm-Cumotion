@@ -79,10 +79,9 @@ def generate_launch_description():
     declare_boot_pre_pick = DeclareLaunchArgument(
         'boot_pre_pick',
         default_value='true',
-        description='Once move_group and cuMotion are up, walk both arms slowly '
-                    'to their recorded pre_pick_state (boot_pre_pick.py). '
-                    'pick_place_demo sets this false: the orchestrator does its '
-                    'own boot walk.'
+        description='Once move_group is up, walk both arms to their recorded '
+                    'navigation_state (boot_pre_pick.py; click_to_move switches '
+                    'to pre_pick when picking starts).'
     )
     declare_tool_frame = DeclareLaunchArgument(
         'tool_frame',

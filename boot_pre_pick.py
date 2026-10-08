@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Walk both arms to their recorded pre_pick_state once the robot is up.
+"""Walk both arms to a recorded pose (navigation_state) once the robot is up.
 
 Started by launch_everything.launch.py (boot_pre_pick:=true, the default),
-then exits. An arm that is already there, or has no recording in
+then exits. The arms boot into navigation_state (--state picks another);
+click_to_move takes them to pre_pick when you start picking. An arm that is already there, or has no recording in
 pick_place_states_<arm>.yaml, is left alone.
 
 Fast path (both arms at once, ~4 s after launch):
@@ -39,7 +40,6 @@ from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 WS = os.path.dirname(os.path.abspath(__file__))
-STATE = 'pre_pick_state'
 # The folded posture both arms can reach from almost anywhere. A direct cuMotion move
 # that cannot be planned goes via here instead.
 HOME = [0.0, 0.0, 0.0, 0.20, 0.0, 0.0, 0.0]
@@ -120,11 +120,11 @@ class BootPrePick(Node):
         if data.get('arm', arm) != arm:
             self.get_logger().warn(f'{arm}: {path} was recorded for the {data["arm"]} arm')
             return None
-        joints = ((data.get('states') or {}).get(STATE) or {}).get('joints')
+        joints = ((data.get('states') or {}).get(self.args.state) or {}).get('joints')
         if not joints or len(joints) != 7:
             self.get_logger().warn(
-                f'{arm}: no {STATE} in {path}; left where it is. Record one with '
-                f'"python3 record_states.py --arm {arm} {STATE}"')
+                f'{arm}: no {self.args.state} in {path}; left where it is. Record one with '
+                f'"python3 record_states.py --arm {arm} {self.args.state}"')
             return None
         return [float(v) for v in joints]
 
@@ -203,13 +203,13 @@ class BootPrePick(Node):
         for arm, positions in goals.items():
             code, jt = self.send(self.goal(arm, positions, 'ompl', plan_only=True), 15.0)
             if code != MoveItErrorCodes.SUCCESS or jt is None or not jt.points:
-                log.warn(f'{arm}: OMPL could not plan to {STATE} (code {code})')
+                log.warn(f'{arm}: OMPL could not plan to {self.args.state} (code {code})')
                 return False
             plans.append(jt)
         merged = merge(plans)
         if not self.collision_free(merged):
             return False
-        log.info(f'{" and ".join(goals)}: moving to {STATE} together '
+        log.info(f'{" and ".join(goals)}: moving to {self.args.state} together '
                  f'({seconds(merged.points[-1]):.1f} s, velocity {self.args.velocity:.2f})')
         return self.execute(merged)
 
@@ -220,20 +220,20 @@ class BootPrePick(Node):
         for arm, positions in goals.items():
             tries = 0
             while True:
-                log.info(f'{arm}: moving to {STATE} with cuMotion')
+                log.info(f'{arm}: moving to {self.args.state} with cuMotion')
                 code, _jt = self.send(self.goal(arm, positions, 'cumotion', plan_only=False))
                 if code == MoveItErrorCodes.SUCCESS:
-                    log.info(f'{arm}: at {STATE}')
+                    log.info(f'{arm}: at {self.args.state}')
                     break
                 tries += 1
                 if code in (MoveItErrorCodes.PLANNING_FAILED, MoveItErrorCodes.FAILURE) \
                         and tries >= 2:
-                    log.info(f'{arm}: no direct path to {STATE}; going via home')
+                    log.info(f'{arm}: no direct path to {self.args.state}; going via home')
                     home, _ = self.send(self.goal(arm, HOME, 'cumotion', plan_only=False))
                     if home == MoveItErrorCodes.SUCCESS:
                         continue
                 if time.monotonic() > deadline:
-                    log.error(f'{arm}: could not reach {STATE} (last code {code})')
+                    log.error(f'{arm}: could not reach {self.args.state} (last code {code})')
                     ok = False
                     break
                 log.warn(f'{arm}: not yet (code {code}); cuMotion may still be warming up, '
@@ -261,13 +261,13 @@ class BootPrePick(Node):
                     return False
                 time.sleep(0.2)
             if max(abs(a - b) for a, b in zip(self.current(arm_joints(arm)), target)) < ARRIVED:
-                log.info(f'{arm}: already at {STATE}')
+                log.info(f'{arm}: already at {self.args.state}')
                 continue
             goals[arm] = target
         if not goals:
             return True
         if self.together(goals):
-            log.info(f'at {STATE} {time.monotonic() - start:.1f} s after start')
+            log.info(f'at {self.args.state} {time.monotonic() - start:.1f} s after start')
             return True
         log.warn('falling back to cuMotion, one arm at a time')
         left = {a: g for a, g in goals.items()
@@ -279,6 +279,8 @@ class BootPrePick(Node):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    parser.add_argument('--state', default='navigation_state',
+                        help='pose from pick_place_states_<arm>.yaml to walk to')
     parser.add_argument('--velocity', type=float, default=0.4,
                         help='velocity and acceleration scaling, 0..1')
     parser.add_argument('--order', nargs='+', choices=['left', 'right'],

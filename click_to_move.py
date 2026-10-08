@@ -71,13 +71,13 @@ A touch (MOVE)
    `world` through tf. It goes on /click_to_move/marker.
 2. The arm is chosen by the half of the frame: left half -> left arm.
 3. Right after the click the whole touch is planned (reach, a front
-   approach along the camera ray or tilted 15/30 deg, a collision-free
+   approach with the tool level (horizontal), turned 0/15/30 deg, a collision-free
    cuMotion path, the straight line in); MOVE turns green or red.
-4. MOVE: fly the planned path through the point 5 cm out (`--standoff`)
-   without stopping; straight line to 1 cm short (`--fast-line-speed`);
-   one correction there -- from the gripper flags if they are in view, else
-   from the joints; the last centimetre slowly (`--contact-speed`), stopping
-   on contact; hold `--hold` s; straight back out; retrace the approach path
+4. MOVE: fly the planned path to the point 10 cm out (`--standoff`); one
+   correction there -- from the gripper flags if they are in view, else
+   from the joints; then ONE straight line along the tool axis: fast to
+   1 cm short (`--fast-line-speed`), the last centimetre slowly
+   (`--contact-speed`), stopping on contact; hold `--hold` s; straight back out; retrace the approach path
    back to the starting posture. (Gripper closed first with --close-gripper.)
 
 Code layout
@@ -107,13 +107,15 @@ from rclpy.executors import MultiThreadedExecutor
 
 import gripper_markers as gm
 from ctm.camera_calibration import CameraCalibrationMixin
-from ctm.common import FINGERTIP_BEYOND_TCP, FONT, MoveGroupDown, WINDOW, decode_image
+from ctm.common import (FINGERTIP_BEYOND_TCP, FONT, TOOL_EXTENSION, MoveGroupDown, WINDOW,
+                        decode_image)
 from ctm.flags import FlagsMixin
+from ctm.modes import ModesMixin, load_poses
 from ctm.robot import ClickToMove
 from ctm.touch import TouchMixin
 
 
-class App(TouchMixin, FlagsMixin, CameraCalibrationMixin):
+class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
     """The OpenCV window, and the worker threads that capture and move."""
 
     def __init__(self, node):
@@ -123,6 +125,9 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin):
         self.check = None             # the reach check of the current pick (dict)
         self.unreachable = None       # (H, W) bool: surface beyond either arm's reach
         self.plan_lock = threading.Lock()
+        self.last_touch = None        # an arm that is out, and how to bring it back
+        self.poses = load_poses()     # {arm: {navigation_state, pre_pick_state, drop_state}}
+        self.mode = None              # 'navigation' / 'pick' / None (see ctm/modes.py)
         self.buttons = {}             # name -> (x0, y0, x1, y1) in window pixels
         self.status = 'capturing...'
         self.detail = ''
@@ -240,7 +245,12 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin):
         self.say(f'{where}, {arm} arm - checking it can be touched...')
         check = {'pick': self.pick, 'where': where, 'ok': None, 'plan': None}
         self.check = check
-        threading.Thread(target=self.check_pick, args=(check,), daemon=True).start()
+        if self.mode != 'pick':
+            # First point: into pick mode (both arms to pre_pick), then the check.
+            self.in_background(lambda: self.ensure_pick_mode() and
+                               self.check_pick(check, in_job=True))
+        else:
+            threading.Thread(target=self.check_pick, args=(check,), daemon=True).start()
 
     def press(self, name):
         if self.teaching and name in ('left', 'right', 'up', 'down', 'in', 'out', 'save',
@@ -264,6 +274,12 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin):
             self.in_background(self.apply_calibration)
         elif name == 'markers':
             self.in_background(self.calibrate_markers)
+        elif name == 'return':
+            self.in_background(self.return_to_start)
+        elif name == 'navigation':
+            self.in_background(lambda: self.go_mode('navigation'))
+        elif name == 'pickmode':
+            self.in_background(lambda: self.go_mode('pick'))
         elif name == 'overlay':
             if self.overlay is not None:
                 self.overlay = None
@@ -320,7 +336,7 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin):
         elif self.calibrating:
             head = 'calibrating by itself - keep the view clear   ABORT / x'
         else:
-            head = 'click  MOVE/m  RECAPTURE/r  CALIBRATE/c  OVERLAY/o  TEACH/t  FLAGS/f'
+            head = (f'[{(self.mode or "?").upper()}]  click a point   keys: m n p b r c o t f')
         for i, text in enumerate((head + ('  [busy]' if self.busy else ''), self.status)):
             y = 22 + 22 * i
             cv2.putText(img, text, (8, y), FONT, 0.5, (0, 0, 0), 3)
@@ -351,6 +367,12 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin):
                       (0, 100, 220) if self.teach else (70, 70, 120)),
                      ('markers', 'FLAGS', (0, 140, 0) if self.markers is not None and idle
                       else (100, 100, 40) if idle else grey)]
+            specs += [('navigation', 'NAVIGATION', (160, 110, 0) if self.mode == 'navigation'
+                       else (110, 80, 30) if idle else grey),
+                      ('pickmode', 'PICK MODE', (0, 160, 160) if self.mode == 'pick'
+                       else (30, 100, 100) if idle else grey)]
+            if self.last_touch is not None:
+                specs.append(('return', 'RETURN', (0, 0, 200) if idle else grey))
             if self.calibration is not None:
                 specs.append(('apply', 'APPLY', (0, 120, 200) if idle else grey))
         self.buttons = {}
@@ -389,6 +411,11 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin):
             _ok, message = self.node.ensure_grippers_in_octomap(patience=60.0)
             self.say(message)
             self.capture()
+            self.mode = self.detect_mode()
+            self.say({'navigation': 'navigation mode: click a point to start picking',
+                      'pick': 'pick mode: click a point, then MOVE'}.get(
+                self.mode, 'arms are in neither navigation nor pre_pick: press NAVIGATION (n) '
+                           'or PICK MODE (p)'))
         self.in_background(startup)
         while rclpy.ok():
             cv2.imshow(WINDOW, self.draw())
@@ -422,6 +449,12 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin):
                 self.press('teach')
             elif key in (ord('f'), ord('F')):
                 self.press('markers')
+            elif key in (ord('b'), ord('B')):
+                self.press('return')
+            elif key in (ord('n'), ord('N')):
+                self.press('navigation')
+            elif key in (ord('p'), ord('P')):
+                self.press('pickmode')
         cv2.destroyAllWindows()
 
 
@@ -429,24 +462,31 @@ def make_parser():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--arm', choices=['auto', 'left', 'right'], default='auto',
                         help='auto: left half of the frame -> left arm, right half -> right')
-    parser.add_argument('--standoff', type=float, default=0.05,
-                        help='the fingertips first stop this far from the point, then move '
-                             'straight in, m')
+    parser.add_argument('--standoff', type=float, default=0.10,
+                        help='the tip first stops this far from the point (corrections '
+                             'happen there), then moves in on one straight line, m')
     parser.add_argument('--line-speed', type=float, default=0.02,
                         help='fingertip speed for the straight move in and out, m/s')
     parser.add_argument('--touch-offset', type=float, default=0.0,
                         help='stop the fingertips this far short of the measured surface, m. '
                              'The arm is compliant (~6 N per cm of push), so 0 is safe')
-    parser.add_argument('--tip-offset', type=float, default=FINGERTIP_BEYOND_TCP,
-                        help='closed fingertips beyond hand_tcp along the tool axis, m')
+    parser.add_argument('--tool-extension', type=float, default=TOOL_EXTENSION,
+                        help='tool fitted past the fingertips (vacuum extension), m; the '
+                             'working tip is this much further out')
+    parser.add_argument('--tip-offset', type=float, default=None,
+                        help='working tip beyond hand_tcp along the tool axis, m (default: '
+                             'fingertips 15.4 mm + --tool-extension)')
     parser.add_argument('--close-gripper', action='store_true',
                         help='close the gripper before touching and calibrating, so the '
                              'fingertips meet at one point. Off by default: the gripper is '
                              'never commanded, and the point is aimed midway between the '
                              'fingertips')
     parser.add_argument('--hold', type=float, default=2.0, help='seconds to stay touching')
+    parser.add_argument('--drop-hold', type=float, default=1.0,
+                        help='after a touch: seconds at drop_state before pre_pick '
+                             '(negative: skip the drop pose, return straight to pre_pick)')
     parser.add_argument('--fast-line-speed', type=float, default=0.06,
-                        help='tool speed for the straight moves in (to 1 cm short) and out, m/s')
+                        help='tool speed for the straight line in (to 1 cm short) and out, m/s')
     parser.add_argument('--contact-speed', type=float, default=0.025,
                         help='tool speed for the last, guarded centimetre, m/s')
     parser.add_argument('--past-contact', type=float, default=0.01,
@@ -460,7 +500,7 @@ def make_parser():
     parser.add_argument('--tolerance', type=float, default=0.002,
                         help='fingertip error at the approach worth correcting, m')
     parser.add_argument('--corrections', type=int, default=1,
-                        help='correction moves 1 cm short, at most')
+                        help='correction moves at the approach point, at most')
     parser.add_argument('--no-auto-apply', action='store_true',
                         help='CALIBRATE stops at the result; APPLY writes it')
     parser.add_argument('--calib-points-per-arm', type=int, default=6,
@@ -490,8 +530,15 @@ def make_parser():
     return parser
 
 
+def parse_args(argv=None):
+    args = make_parser().parse_args(argv)
+    if args.tip_offset is None:                  # fingertips beyond hand_tcp, plus the extension
+        args.tip_offset = FINGERTIP_BEYOND_TCP + args.tool_extension
+    return args
+
+
 def main():
-    args = make_parser().parse_args()
+    args = parse_args()
 
     rclpy.init()
     node = ClickToMove(args)

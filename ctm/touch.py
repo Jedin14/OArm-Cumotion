@@ -1,6 +1,6 @@
 """A touch: the reach check after a click, the plan of the whole touch,
-and the sequence itself (approach, correct 1 cm short, guarded contact,
-hold, back out, retrace home); plus TEACH."""
+and the sequence itself (approach, correct out at the approach point, one straight
+line in with guarded contact, hold, back out, retrace home); plus TEACH."""
 
 import time
 
@@ -53,7 +53,7 @@ class TouchMixin:
         markers_on = self.markers is not None and self.markers.has_arm(arm) and p_cam is not None
         return point + learned, learned, taught, markers_on
 
-    def check_pick(self, check):
+    def check_pick(self, check, in_job=False):
         """Right after a click: can its arm touch that point -- reach, a
         front approach, a collision-free path and the straight line in, all
         planned, nothing moved. The plan is kept for MOVE if nothing changes."""
@@ -61,7 +61,7 @@ class TouchMixin:
         _u, _v, point, arm, origin = check['pick']
         try:
             with self.plan_lock:
-                if self.check is not check or self.busy:
+                if self.check is not check or (self.busy and not in_job):
                     return
                 node.require_move_group()
                 node.ensure_grippers_in_octomap()
@@ -76,7 +76,7 @@ class TouchMixin:
             plan, why, aim, start = None, f'could not check ({exc})', None, None
         check.update(ok=plan is not None, plan=plan, aim=aim, start=start,
                      time=time.monotonic())
-        if self.check is not check or self.busy:
+        if self.check is not check or (self.busy and not in_job):
             return
         if plan is not None:
             self.say(f'{check["where"]}: the {arm} arm can touch it [{plan["label"]}]'
@@ -92,7 +92,9 @@ class TouchMixin:
             return
         _u, _v, point, arm, origin = self.pick
         scene = self.frame                           # the frame clicked on: no arm in it
-        self.in_background(lambda: self.touch(arm, point, origin, scene))
+        # Never from navigation: both arms to pre_pick first, then the touch.
+        self.in_background(lambda: self.ensure_pick_mode() and
+                           self.touch(arm, point, origin, scene))
 
     # -- the touch ------------------------------------------------------------
 
@@ -270,6 +272,69 @@ class TouchMixin:
                       'the way)' if tally['path'] else 'not reachable')
 
     def touch(self, arm, point, origin, scene=None):
+        """Touch `point` with `arm`, then always try to bring the arm back --
+        also when something failed part-way (an arm left out at the board,
+        with every later move failing, was the "stuck" of 2026-10-07)."""
+        self.last_touch = None
+        try:
+            self._touch(arm, point, origin, scene)
+        except Exception as exc:                     # noqa: BLE001 - shown in the window
+            self.say(f'{arm} arm: touch failed ({exc}); bringing it back', True)
+        finally:
+            if self.last_touch is not None:
+                self.return_to_start()
+
+    def return_to_start(self):
+        """Back out along the tool axis (if near the surface), let the joints
+        settle, then retrace the approach path to the starting posture --
+        planning a way back only if that is not possible. Also the RETURN
+        button (b). True once the arm is back."""
+        node, args = self.node, self.node.args
+        lt = self.last_touch
+        if lt is None:
+            self.say('nothing to return from: no arm is out')
+            return True
+        arm = lt['arm']
+        if not lt['out']:
+            self.say(f'{arm} arm: backing straight out')
+            if node.line_move(arm, lt['out_to'], lt['quat'], f'{arm} out',
+                              speed=args.fast_line_speed) is None:
+                # MoveIt may see this pose as colliding (TEACH nudges once put
+                # the left forearm against the camera model): then every checked
+                # move fails. The way out is the line it came in on, unchecked.
+                self.say(f'{arm} arm: backing out along the way in (model says this pose '
+                         f'touches something)')
+                if node.line_move(arm, lt['out_to'], lt['quat'], f'{arm} out (unchecked)',
+                                  speed=args.fast_line_speed, check=False) is None:
+                    node.move_joints(arm, lt['above'], f'{arm} retreat', via_home=False)
+            lt['out'] = True
+        node.settle(arm, lt['above'], timeout=1.5)   # plans must start from where it is
+        # Back to pre_pick the way it came (retrace; planned if that fails) ...
+        self.say(f'{arm} arm: returning the way it came')
+        back = node.retrace(arm, lt['trajectory'], f'{arm} return')
+        if not back:
+            node.settle(arm, lt['start'], timeout=1.0)
+            back = node.move_joints(arm, lt['start'], f'{arm} return', via_home=False)
+        # ... then straight on to the drop pose, hold, and back to pre_pick.
+        drop = self.pose(arm, 'drop_state') if args.drop_hold >= 0 else None
+        if back and drop is not None and not lt.get('dropped'):
+            lt['dropped'] = True                     # once per touch, also after a RETURN
+            self.say(f'{arm} arm: to the drop pose')
+            if node.move_joints(arm, drop, f'{arm} to drop', via_home=False):
+                self.say(f'{arm} arm: at the drop pose; holding {args.drop_hold:g} s')
+                time.sleep(args.drop_hold)
+            else:
+                self.say(f'{arm} arm: could not reach the drop pose; staying at pre_pick', True)
+            self.say(f'{arm} arm: back to pre_pick')
+            back = node.move_joints(arm, lt['start'], f'{arm} return', via_home=False)
+        if back:
+            self.last_touch = None
+            return True
+        self.say(f'{arm} arm: could not get back to the start posture -- press RETURN (b) to '
+                 f'try again', True)
+        return False
+
+    def _touch(self, arm, point, origin, scene=None):
         node, args = self.node, self.node.args
         start = node.arm_positions(arm)
         if start is None:
@@ -310,7 +375,7 @@ class TouchMixin:
             self.say(f'{arm} arm: not moving -- {why}.', True)
             return
         axis, quat = plan['axis'], plan['quat']
-        approach, contact, above = plan['approach'], plan['contact'], plan['above']
+        approach, contact = plan['approach'], plan['contact']
         node.publish_target(contact, quat)
         self.say(f'{arm} arm: planned in {time.monotonic() - t0:.1f} s [{plan["label"]}]'
                  + (f'; taught correction from {taught} touches' if taught else '')
@@ -318,6 +383,10 @@ class TouchMixin:
                  + ('; AT THE EDGE OF REACH - a correction may not fit' if plan['edge']
                     else ''))
 
+        # From here on the arm is out: touch() brings it back whatever happens.
+        self.last_touch = {'arm': arm, 'trajectory': plan['trajectory'], 'start': start,
+                           'above': plan['above'], 'quat': quat, 'out_to': approach,
+                           'out': True}
         ok, _ = node.execute(plan['trajectory'], f'{arm} approach')
         if not ok:
             self.say(f'{arm} arm: the approach did not complete', True)
@@ -325,38 +394,41 @@ class TouchMixin:
         offset = np.zeros(3)
         vis = np.zeros(3)            # flag measurement: real fingertip = model + vis
         off_at_approach = None
-        # Straight on through the 5 cm point, no stop: one correction 1 cm
-        # short does what two stops did (5 cm and 1 cm), in a third of the
-        # time -- the whole touch used to take 23-28 s, half of it waiting.
+        # Corrections happen out at the approach point (--standoff, 10 cm),
+        # away from the object. From there the way in is ONE straight line
+        # along the tool axis: fast to 1 cm short, then slow until it feels
+        # the surface -- no sideways moves on the way in (a correction 1 cm
+        # short used to put a visible jog right before the contact).
+        node.settle(arm, plan['above'], timeout=args.settle_time)
+        d = None
+        if markers_on:
+            for k in range(args.corrections):        # measure, correct (, measure again)
+                d = self.marker_offset(arm, p_cam, aim, axis, approach, 'the approach')
+                if d is None:
+                    break
+                if k == 0:
+                    off_at_approach = float(np.linalg.norm(d - (d @ axis) * axis))
+                if np.linalg.norm(d) <= 0.001:
+                    break
+                vis = vis + d
+                moved = node.line_move(arm, approach - vis + offset, quat, f'{arm} flag fix',
+                                       speed=args.fast_line_speed)
+                if moved is None:
+                    break
+                node.settle(arm, moved, timeout=args.settle_time)
+        if d is None and not np.any(vis):
+            # No flag in view: at least get the joints onto their targets.
+            offset, off_at_approach = self.correct_to(arm, approach, axis, quat,
+                                                      'the approach', plan['above'], offset)
+
         short = contact - axis * min(0.01, args.standoff / 2)
+        self.last_touch['out'] = False
+        ends, touched = None, False
         near = node.line_move(arm, short - vis + offset, quat, f'{arm} in',
                               speed=args.fast_line_speed)
-        ends, touched = None, False
         if near is not None:
-            d = None
-            if markers_on:
-                node.settle(arm, near, timeout=args.settle_time)
-                for k in range(args.corrections):    # measure, correct (, measure again)
-                    d = self.marker_offset(arm, p_cam, aim, axis, short, '1 cm short')
-                    if d is None:
-                        break
-                    if k == 0:
-                        off_at_approach = float(np.linalg.norm(d - (d @ axis) * axis))
-                    if np.linalg.norm(d) <= 0.001:
-                        break
-                    vis = vis + d
-                    moved = node.line_move(arm, short - vis + offset, quat, f'{arm} flag fix',
-                                           speed=args.fast_line_speed)
-                    if moved is None:
-                        break
-                    if k + 1 < args.corrections:
-                        node.settle(arm, moved, timeout=args.settle_time)
-            if d is None and not np.any(vis):
-                # No flag in view: at least get the joints onto their targets.
-                offset, off_at_approach = self.correct_to(arm, short, axis, quat,
-                                                          '1 cm short', near, offset)
-            # The last centimetre: slow, and stops when it feels the surface,
-            # so the depth comes from the object itself, not from the camera.
+            # The last centimetre, on the same line: slow, and stops when it
+            # feels the surface, so the depth comes from the object itself.
             ends, touched = node.guarded_line(
                 arm, contact + axis * plan['beyond'] - vis + offset, quat, f'{arm} contact')
         if ends is None:
@@ -383,7 +455,7 @@ class TouchMixin:
                                f'sideways ({seen_by})'
                                + (f', flags moved it {1000 * np.linalg.norm(vis):.1f} mm'
                                   if markers_on else '')
-                               + (f', {1000 * off_at_approach:.1f} mm off at 1 cm short'
+                               + (f', {1000 * off_at_approach:.1f} mm off at the approach'
                                   if off_at_approach is not None else '')
                                + f'; {held - t0:.1f} s to touch')
                 node.get_logger().info(self.detail)
@@ -394,17 +466,7 @@ class TouchMixin:
                                  scene)
             else:
                 time.sleep(max(0.0, args.hold - (time.monotonic() - held)))
-        self.say(f'{arm} arm: backing straight out')
-        if node.line_move(arm, approach - vis + offset, quat, f'{arm} out',
-                          speed=args.fast_line_speed) is None:
-            node.move_joints(arm, above, f'{arm} retreat', velocity=args.touch_velocity,
-                             via_home=False)
-        self.say(f'{arm} arm: returning the way it came')
-        back = node.retrace(arm, plan['trajectory'], f'{arm} return')
-        if not back:
-            back = node.move_joints(arm, start, f'{arm} return', via_home=False)
-        if ends is not None and back:
+        self.last_touch['out_to'] = approach - vis + offset
+        if self.return_to_start() and ends is not None:
             self.say(f'{arm} arm: done in {time.monotonic() - t0:.1f} s. Click the next point '
                      f'and press MOVE.')
-        elif not back:
-            self.say(f'{arm} arm: could not return to the start posture', True)

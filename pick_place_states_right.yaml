@@ -7,13 +7,20 @@ arm: right
 states:
   pre_pick_state:
     joints: [-1.3439, 0.680678, -0.610865, 1.91986, 0.593412, -0.680678, 1.44862]
-    joint_names: [openarm_right_joint1, openarm_right_joint2, openarm_right_joint3,
-      openarm_right_joint4, openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
+    joint_names: [openarm_right_joint1, openarm_right_joint2, openarm_right_joint3, openarm_right_joint4,
+      openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
     tcp_xyz: [0.0354, -0.1734, 0.4969]
     recorded: '2026-09-22T10:16:32'
   drop_state:
-    joints: [-0.396162, 0.185206, -0.310712, 2.180323, 0.141718, 0.536164, -0.663577]
-    joint_names: [openarm_right_joint1, openarm_right_joint2, openarm_right_joint3,
-      openarm_right_joint4, openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
-    tcp_xyz: [0.2146, -0.0112, 0.456]
-    recorded: '2026-09-03T11:00:22'
+    joints: [-0.872665, 0.733038, -0.558505, 1.658063, 0.541052, -0.471239, -0.523599]
+    joint_names: [openarm_right_joint1, openarm_right_joint2, openarm_right_joint3, openarm_right_joint4,
+      openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
+    recorded: '2026-10-08T00:00:00'
+    note: mirrored 2026-10-08
+    mirrored_from: left:drop_state
+  navigation_state:
+    joints: [-0.872665, 0.087266, 0.087266, 2.007129, 0.0, 0.0, 0.0]
+    joint_names: [openarm_right_joint1, openarm_right_joint2, openarm_right_joint3, openarm_right_joint4,
+      openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
+    recorded: '2026-10-08T00:00:00'
+    note: SRDF navigation

@@ -269,35 +269,28 @@ class ClickToMove(Node):
     def candidates(self, point, cam_origin):
         """[(label, approach axis, quat, ring)] to try, in rings of preference.
 
-        The axis is the tool's +Z, the direction the fingertips travel in.
-        Front only: along the camera's line of sight to the point, then
-        tilted 15 deg, then 30 deg -- always from the side the camera sees.
-        Only that side is mapped: the octomap knows nothing about the top or
-        back of an object, so an approach from above went through space
-        nobody had checked. preplan() stops at the first ring that yields a
-        plan.
+        The axis is the tool's +Z, the direction the tip travels in. It is
+        always horizontal -- the end effector stays parallel to the ground,
+        never tilted down (2026-10-08) -- and from the side the camera sees:
+        the camera's line of sight to the point, flattened, then turned 15 and
+        30 deg either way. Any roll about the axis is allowed. The far side and
+        top of an object are not in the octomap, so it is never approached
+        from there. preplan() stops at the first ring that yields a plan.
         """
-        ray = point - cam_origin
-        ray /= np.linalg.norm(ray)
-        out = []
+        ray = np.array(point, dtype=float) - cam_origin
+        ray[2] = 0.0                                 # horizontal
+        ray /= max(np.linalg.norm(ray), 1e-9)
         up = np.array([0.0, 0.0, 1.0])
-        side = np.cross(up, ray)
-        side /= max(np.linalg.norm(side), 1e-9)
-        tilts = [(0, 0.0, 0.0)] + [(1, yaw, pitch) for yaw, pitch in
-                                   ((15, 0), (-15, 0), (0, 15), (0, -15))]
-        tilts += [(2, yaw, 0.0) for yaw in (30, -30)]
-        for ring, yaw, pitch in tilts:
-            axis = (rot_about(up, math.radians(yaw)) @
-                    rot_about(side, math.radians(pitch)) @ ray)
+        out = []
+        for ring, yaw in ((0, 0), (1, 15), (1, -15), (2, 30), (2, -30)):
+            axis = rot_about(up, math.radians(yaw)) @ ray
+            axis[2] = 0.0
             axis /= np.linalg.norm(axis)
-            if axis[2] < -math.sin(math.radians(25)):
-                continue                             # steeply down = from above
             for deg in (0, 90, -90, 180):
-                label = (f'front roll {deg:+d}' if ring == 0 else
-                         f'front tilt {yaw:+.0f}/{pitch:+.0f} roll {deg:+d}')
+                label = (f'level roll {deg:+d}' if ring == 0 else
+                         f'level turn {yaw:+d} roll {deg:+d}')
                 out.append((label, axis,
-                            quat_from_matrix(tool_frame_along(axis, math.radians(deg))),
-                            ring))
+                            quat_from_matrix(tool_frame_along(axis, math.radians(deg))), ring))
         return out
 
     def tcp_for_tip(self, tip, axis):
@@ -572,7 +565,7 @@ class ClickToMove(Node):
     def seeds(self, arm, start):
         return [start, HOME_JOINTS] + ([self.retract[arm]] if arm in self.retract else [])
 
-    def cartesian_plan(self, arm, position, quat, start_joints=None):
+    def cartesian_plan(self, arm, position, quat, start_joints=None, check=True):
         """Straight line of hand_tcp to `position`, planned, not moved.
 
         From where the arm is, or from `start_joints` (so a whole touch can
@@ -588,7 +581,7 @@ class ClickToMove(Node):
         req.link_name = f'openarm_{arm}_hand_tcp'
         req.max_step = 0.005
         req.jump_threshold = 0.0
-        req.avoid_collisions = True
+        req.avoid_collisions = check
         if start_joints is None:
             req.start_state.is_diff = True
         else:
@@ -650,7 +643,7 @@ class ClickToMove(Node):
         seconds = lambda p: p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
         end = np.array(jt.points[-1].positions)
         gap = float(np.max(np.abs(np.array(now) - end)))
-        if gap > 0.15:
+        if gap > 0.4:                # TEACH nudges can move it ~0.3 rad off the path
             return False
         lead = max(0.3, gap / 0.3) if gap > 0.002 else 0.0     # <= 0.3 rad/s onto the path
         total = seconds(jt.points[-1])
@@ -709,7 +702,7 @@ class ClickToMove(Node):
             return False, False
         return True, False
 
-    def line_move(self, arm, position, quat, label, speed=None):
+    def line_move(self, arm, position, quat, label, speed=None, check=True):
         """Straight line of hand_tcp from where it is to `position`.
 
         Returns the joints the line ends on (what the arm should settle to),
@@ -720,7 +713,7 @@ class ClickToMove(Node):
         so it is re-timed here to a constant speed (`--line-speed` unless
         given).
         """
-        fraction, trajectory, final = self.cartesian_plan(arm, position, quat)
+        fraction, trajectory, final = self.cartesian_plan(arm, position, quat, check=check)
         if trajectory is None or fraction < 0.98:
             self.get_logger().warn(f'{label}: only {100 * fraction:.0f}% of the straight line '
                                    f'solves')
@@ -886,4 +879,6 @@ class ClickToMove(Node):
             self.get_logger().warn(f'{label}: MoveIt error {code} (attempt {attempt})')
             if code not in RETRYABLE:
                 return code
+            if code == MoveItErrorCodes.CONTROL_FAILED:
+                time.sleep(0.6)              # let the arm finish moving; replan from there
         return code
