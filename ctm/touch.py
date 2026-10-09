@@ -217,22 +217,34 @@ class TouchMixin:
         tally = {'ik': 0, 'path': 0, 'line': 0}
         edge = []                    # plans with no room for corrections, if that is all
         rings = {}
-        for cand in node.candidates(point, origin):
+        for cand in node.candidates(point, origin, top_down=self.top_down, arm=arm):
             rings.setdefault(cand[3], []).append(cand)
         for ring in sorted(rings):
             solved = []
             for label, axis, quat, _ring in rings[ring]:
                 approach = node.tcp_for_tip(aim - axis * args.standoff, axis)
                 contact = node.tcp_for_tip(aim - axis * args.touch_offset, axis)
-                for seed in node.seeds(arm, start):
+                # Up to 3 different arm postures for this approach: from one,
+                # the straight line can run into a wrist limit half-way (then
+                # it is refused: joint jump), from another it goes through.
+                found = []
+                for seed in node.seeds(arm, start, approach, quat):
                     above = node.solve_ik(arm, approach, quat, seed)
-                    if above is None:
+                    if above is None or any(np.max(np.abs(np.subtract(above, f))) < 0.1
+                                            for f in found):
                         continue
                     if node.solve_ik(arm, contact, quat, above) is not None:
-                        cost = sum(abs(x - y) for x, y in zip(above, start))
+                        found.append(above)
+                        # joint travel, plus a penalty for a joint near its limit:
+                        # no room left there for the line in or a correction
+                        room = min(node.limit_room(arm, above),
+                                   node.limit_room(arm, found[-1]))
+                        cost = (sum(abs(x - y) for x, y in zip(above, start))
+                                + 20.0 * max(0.0, 0.1 - room))
                         solved.append((cost, label, axis, quat, approach, contact, above))
-                        break
-                else:
+                        if len(found) >= 3:
+                            break
+                if not found:
                     tally['ik'] += 1
             solved.sort(key=lambda s_: s_[0])
             if self.markers is not None and self.markers.has_arm(arm):
@@ -264,10 +276,13 @@ class TouchMixin:
             if plan['trajectory'] is not None:
                 return plan, None
             tally['path'] += 1
+        how = 'from above' if self.top_down else 'from the front'
         if tally['path'] == 0 and tally['line'] == 0:
-            return None, 'out of reach from the front (no arm posture gets there)'
+            return None, f'out of reach {how} (no arm posture gets there)'
         if tally['line'] and not tally['path']:
-            return None, 'the straight line in is blocked or out of reach'
+            return None, (f'the straight line in {how} is blocked, or runs the wrist out of '
+                          f'range part-way' + (' -- try a point nearer the robot, or TOP DOWN '
+                                               'off' if self.top_down else ''))
         return None, ('no collision-free path to the approach point (something is in '
                       'the way)' if tally['path'] else 'not reachable')
 

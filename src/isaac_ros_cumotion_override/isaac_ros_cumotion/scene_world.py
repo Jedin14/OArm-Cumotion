@@ -98,6 +98,25 @@ def _decode_full(data, res, threshold=0.0):
     return np.array(centres), np.array(sizes)
 
 
+def cuboids_mesh(cuboids):
+    """cuRobo Cuboids (pose x y z qw qx qy qz, dims) -> one mesh (vertices,
+    faces). For scenes with more boxes than cuRobo's cuboid cache (20): the
+    unseen-space walls are a few hundred (click_to_move, ctm/walls.py)."""
+    corners = np.array([[x, y, z] for z in (-0.5, 0.5) for y in (-0.5, 0.5) for x in (-0.5, 0.5)])
+    quads = np.array([[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4],
+                      [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]])
+    tris = np.concatenate([quads[:, [0, 1, 2]], quads[:, [0, 2, 3]]])
+    verts, faces = [], []
+    for n_, c in enumerate(cuboids):
+        x, y, z, w, qx, qy, qz = [float(v) for v in c.pose]
+        r = np.array([[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * w), 2 * (qx * qz + qy * w)],
+                      [2 * (qx * qy + qz * w), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * w)],
+                      [2 * (qx * qz - qy * w), 2 * (qy * qz + qx * w), 1 - 2 * (qx * qx + qy * qy)]])
+        verts.append((corners * np.asarray(c.dims, float)) @ r.T + [x, y, z])
+        faces.append(tris + 8 * n_)
+    return np.concatenate(verts), np.concatenate(faces)
+
+
 def quat_wxyz(rotation):
     m = rotation
     t = m[0, 0] + m[1, 1] + m[2, 2]

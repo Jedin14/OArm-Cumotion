@@ -13,9 +13,10 @@ import warnings
 import numpy as np
 import yaml
 from control_msgs.action import GripperCommand
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Pose, PoseStamped
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
-from moveit_msgs.msg import (AllowedCollisionEntry, AllowedCollisionMatrix, Constraints,
+from moveit_msgs.msg import (AllowedCollisionEntry, AllowedCollisionMatrix, CollisionObject,
+                             Constraints,
                              JointConstraint, MoveItErrorCodes, PlanningScene,
                              PlanningSceneComponents, RobotTrajectory)
 from moveit_msgs.srv import (ApplyPlanningScene, GetCartesianPath, GetPlanningScene,
@@ -28,16 +29,21 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image, JointState
+from shape_msgs.msg import SolidPrimitive
 from std_srvs.srv import Empty, Trigger
 from tf2_ros import Buffer, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import Marker, MarkerArray
 
 import robot_camera_calibration as rcc
+from ctm import walls
 from ctm.common import (BASE_FRAME, COLOR_TOPIC, DEPTH_TOPIC, HOME_JOINTS, INFO_TOPIC,
                         MoveGroupDown, OCTOMAP_NAME, RETRYABLE, SCREW_FRAME, WS, arm_joints,
                         decode_image, gripper_links, matrix_from_quat, pixel_ray,
                         quat_from_matrix, rot_about, tool_frame_along)
+
+
+JUMP = 0.15                     # rad: the most any joint may move between 5 mm line steps
 
 
 class ClickToMove(Node):
@@ -214,6 +220,31 @@ class ClickToMove(Node):
             self._surface = surface
         return surface
 
+    def joint_limits(self, arm):
+        """[(lower, upper)] for the arm's 7 joints, from the URDF."""
+        if not hasattr(self, '_limits'):
+            self._limits = {}
+            try:
+                with open(os.path.join(WS, 'openarm.urdf')) as handle:
+                    urdf = handle.read()
+                for a in ('left', 'right'):
+                    lim = []
+                    for name in arm_joints(a):
+                        m = re.search(r'<joint name="%s".*?lower="([-\d.e]+)" upper="([-\d.e]+)"'
+                                      % name, urdf, re.S)
+                        lim.append((float(m.group(1)), float(m.group(2))))
+                    self._limits[a] = lim
+            except (OSError, AttributeError):
+                pass
+        return self._limits.get(arm)
+
+    def limit_room(self, arm, joints):
+        """Smallest distance of any joint from its limit, rad (inf if unknown)."""
+        lim = self.joint_limits(arm)
+        if lim is None:
+            return float('inf')
+        return min(min(q - lo, hi - q) for q, (lo, hi) in zip(joints, lim))
+
     def fk(self, arm, joints, links):
         """{link: 4x4 world<-link} for this arm at `joints`, from move_group."""
         if not self.fk_client.wait_for_service(timeout_sec=2.0):
@@ -266,7 +297,7 @@ class ClickToMove(Node):
             raise ValueError(f'no tf {BASE_FRAME} -> {frame_id}')
         return m[:3, :3] @ p_cam + m[:3, 3], m[:3, 3], z
 
-    def candidates(self, point, cam_origin):
+    def candidates(self, point, cam_origin, top_down=False, arm=None):
         """[(label, approach axis, quat, ring)] to try, in rings of preference.
 
         The axis is the tool's +Z, the direction the tip travels in. It is
@@ -277,6 +308,28 @@ class ClickToMove(Node):
         top of an object are not in the octomap, so it is never approached
         from there. preplan() stops at the first ring that yields a plan.
         """
+        if top_down:
+            # TOP DOWN: the tool straight down onto the point (an object lying
+            # flat), turned about the vertical in 45 deg steps. Where straight
+            # down cannot make the 10 cm line (this arm's wrist runs out of
+            # range ~44 cm out: 2026-10-08), the tool may lean 10, then 20 deg,
+            # wrist back towards the robot -- still coming down onto the top.
+            out = []
+            shoulder = self.lookup(BASE_FRAME, f'openarm_{arm}_link1') if arm else None
+            outward = np.array(point, dtype=float) - (shoulder[:3, 3] if shoulder is not None
+                                                      else np.zeros(3))
+            outward[2] = 0.0
+            outward /= max(np.linalg.norm(outward), 1e-9)
+            for ring, lean in ((0, 0), (1, 10), (2, 20)):
+                axis = np.array([0.0, 0.0, -1.0]) * math.cos(math.radians(lean)) \
+                    + outward * math.sin(math.radians(lean))
+                for deg in (0, 90, -90, 180, 45, -45, 135, -135):
+                    label = (f'top-down yaw {deg:+d}' if lean == 0 else
+                             f'top-down lean {lean} yaw {deg:+d}')
+                    out.append((label, axis,
+                                quat_from_matrix(tool_frame_along(axis, math.radians(deg))),
+                                ring))
+            return out
         ray = np.array(point, dtype=float) - cam_origin
         ray[2] = 0.0                                 # horizontal
         ray /= max(np.linalg.norm(ray), 1e-9)
@@ -413,6 +466,45 @@ class ClickToMove(Node):
             return False, 'move_group refused the gripper/octomap exemption'
         return True, ('grippers, stand, camera and arm bases may touch the octomap; the '
                       'moving arm links are still checked')
+
+    def refresh_walls(self, optical):
+        """After a capture: walls in the planning scene where the camera cannot
+        see -- above and below its picture, from just in front of the nearest
+        thing it saw (ctm/walls.py). Returns how many boxes, or None."""
+        _c, _d, info = self.latest()
+        t_wo = self.lookup(BASE_FRAME, optical)
+        if info is None or t_wo is None or not self.scene_query.wait_for_service(timeout_sec=5.0):
+            return None
+        request = GetPlanningScene.Request()
+        request.components.components = PlanningSceneComponents.OCTOMAP
+        result = self.wait(self.scene_query.call_async(request), 5.0)
+        nearest = None
+        if result is not None:
+            o = result.scene.world.octomap
+            nearest = walls.nearest_seen(o.octomap, np.array(
+                [o.origin.position.x, o.origin.position.y, o.origin.position.z]))
+        start = (nearest - walls.AHEAD) if nearest is not None else walls.X_MIN
+        obj = CollisionObject()
+        obj.header.frame_id = BASE_FRAME
+        obj.id = walls.WALL_ID
+        obj.operation = CollisionObject.ADD
+        for centre, size in walls.boxes(t_wo, info, start):
+            box = SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[float(v) for v in size])
+            pose = Pose()
+            pose.position.x, pose.position.y, pose.position.z = map(float, centre)
+            pose.orientation.w = 1.0
+            obj.primitives.append(box)
+            obj.primitive_poses.append(pose)
+        if not obj.primitives:
+            obj.operation = CollisionObject.REMOVE
+        scene = PlanningScene(is_diff=True)
+        scene.world.collision_objects = [obj]
+        applied = self.wait(self.scene_apply.call_async(
+            ApplyPlanningScene.Request(scene=scene)), 5.0)
+        if applied is None or not applied.success:
+            self.get_logger().warn('could not put the unseen-space walls into the scene')
+            return None
+        return len(obj.primitives)
 
     def alive(self, timeout=3.0):
         """Does move_group answer at all? Its names linger in DDS after it
@@ -562,8 +654,49 @@ class ClickToMove(Node):
             return None
         return [found[n] for n in arm_joints(arm)]
 
-    def seeds(self, arm, start):
-        return [start, HOME_JOINTS] + ([self.retract[arm]] if arm in self.retract else [])
+    def seeds(self, arm, start, tcp=None, quat=None):
+        """Starting postures for IK. For a tool pointing straight down, the
+        three stored top-down postures (ctm/topdown_seeds.npz) nearest `tcp`
+        at the same turn come first: from the usual seeds KDL never finds one."""
+        out = [start, HOME_JOINTS] + ([self.retract[arm]] if arm in self.retract else [])
+        if tcp is None or quat is None:
+            return out
+        r = matrix_from_quat(*quat)
+        if r[2, 2] > -0.85:                          # not (near) top-down
+            return out
+        table = self._topdown_seeds()
+        if table is None or f'{arm}_q' not in table:
+            return out
+        turn = math.atan2(r[1, 0], r[0, 0])
+        same = np.abs(np.angle(np.exp(1j * (table[f'{arm}_turn'] - turn)))) < math.radians(25)
+        if not same.any():
+            return out
+        idx = np.flatnonzero(same)
+        near = idx[np.argsort(np.linalg.norm(table[f'{arm}_tcp'][idx] - tcp, axis=1))[:3]]
+        seeds = [table[f'{arm}_q'][i] for i in near]
+        lim = self.joint_limits(arm)
+        if lim is not None:
+            # cuRobo often parks a joint right on its limit; start KDL inside
+            # them so it settles on a posture with room to move if there is one.
+            lo, hi = np.array(lim).T
+            seeds = [np.clip(q, lo + 0.15, hi - 0.15) for q in seeds]
+        return [q.tolist() for q in seeds] + out
+
+    def _topdown_seeds(self):
+        if not hasattr(self, '_td'):
+            self._td = None
+            try:
+                raw = dict(np.load(os.path.join(WS, 'ctm', 'topdown_seeds.npz')))
+                for arm in ('left', 'right'):
+                    if f'{arm}_yaw' in raw:          # the tool x axis's heading per entry
+                        raw[f'{arm}_turn'] = np.array([
+                            math.atan2(*tool_frame_along(np.array([0.0, 0.0, -1.0]),
+                                                         math.radians(y))[[1, 0], 0])
+                            for y in raw[f'{arm}_yaw']])
+                self._td = raw
+            except (OSError, ValueError) as exc:
+                self.get_logger().warn(f'no top-down seeds ({exc}); run ctm/make_topdown_seeds.py')
+        return self._td
 
     def cartesian_plan(self, arm, position, quat, start_joints=None, check=True):
         """Straight line of hand_tcp to `position`, planned, not moved.
@@ -580,7 +713,12 @@ class ClickToMove(Node):
         req.group_name = f'{arm}_arm'
         req.link_name = f'openarm_{arm}_hand_tcp'
         req.max_step = 0.005
+        # No joint may move more than JUMP between two 5 mm steps (a real step
+        # needs < 0.05 rad). With jump detection off, a top-down line once
+        # flipped IK branch mid-path: the arm would have swung 0.5 m off the
+        # line and back (simulated, 2026-10-08).
         req.jump_threshold = 0.0
+        req.revolute_jump_threshold = JUMP
         req.avoid_collisions = check
         if start_joints is None:
             req.start_state.is_diff = True
@@ -602,12 +740,22 @@ class ClickToMove(Node):
         trajectory = result.solution
         points = trajectory.joint_trajectory.points
         names = list(trajectory.joint_trajectory.joint_names)
+        fraction = float(result.fraction)
+        # And check it here too: cut the path at any jump.
+        n = len(points)
+        for k in range(1, n):
+            if np.max(np.abs(np.subtract(points[k].positions, points[k - 1].positions))) > JUMP:
+                self.get_logger().warn(f'straight line to {np.round(position, 3)}: joint jump '
+                                       f'at step {k}/{n}; cut there')
+                del points[k:]
+                fraction *= (k - 1) / max(1, n - 1)      # the share of the line before it
+                break
         final = None
         if points:
             end = dict(zip(names, points[-1].positions))
             final = [end.get(n) for n in arm_joints(arm)]
             final = None if None in final else final
-        return float(result.fraction), trajectory, final
+        return fraction, trajectory, final
 
     @staticmethod
     def retime(trajectory, length, speed):
@@ -785,9 +933,25 @@ class ClickToMove(Node):
             return None, False
         return (self.arm_positions(arm) if stopped else final), stopped
 
-    def plan_joints(self, arm, positions, velocity=None):
-        """cuMotion plan to `positions`, not executed: (code, trajectory)."""
-        goal = self._joint_goal(arm, positions, velocity)
+    def plan_joints(self, arm, positions, velocity=None, tries=2):
+        """A plan to `positions`, not executed: (code, trajectory).
+
+        cuMotion, retried once (its optimiser starts from random seeds). A
+        big turn of the tool -- level at pre_pick to straight down for TOP
+        DOWN -- still defeats it now and then; then MoveIt's sampling planner
+        (OMPL, checked against the same octomap) finds the way."""
+        for _ in range(tries):
+            code, trajectory = self._plan_joints_once(arm, positions, velocity)
+            if code != MoveItErrorCodes.PLANNING_FAILED:
+                return code, trajectory
+        code_o, trajectory_o = self._plan_joints_once(arm, positions, velocity, 'ompl')
+        if code_o == MoveItErrorCodes.SUCCESS:
+            self.get_logger().info(f'{arm}: cuMotion found no path; OMPL did')
+            return code_o, trajectory_o
+        return code, trajectory
+
+    def _plan_joints_once(self, arm, positions, velocity=None, pipeline='cumotion'):
+        goal = self._joint_goal(arm, positions, velocity, pipeline)
         goal.planning_options.plan_only = True
         handle = self.wait(self.move_client.send_goal_async(goal), 15.0)
         if handle is None:
@@ -830,16 +994,16 @@ class ClickToMove(Node):
         goal.planning_options.plan_only = False
         return self._send_until_planned(goal, label)
 
-    def _joint_goal(self, arm, positions, velocity=None):
+    def _joint_goal(self, arm, positions, velocity=None, pipeline='cumotion'):
         if not self.move_client.wait_for_server(timeout_sec=5.0):
             raise MoveGroupDown('/move_action is not served')
         velocity = self.args.velocity if velocity is None else velocity
         goal = MoveGroup.Goal()
         req = goal.request
         req.group_name = f'{arm}_arm'
-        req.pipeline_id = 'cumotion'
-        req.num_planning_attempts = 1
-        req.allowed_planning_time = self.args.planning_time
+        req.pipeline_id = pipeline
+        req.num_planning_attempts = 1 if pipeline == 'cumotion' else 4
+        req.allowed_planning_time = self.args.planning_time if pipeline == 'cumotion' else 3.0
         req.max_velocity_scaling_factor = velocity
         req.max_acceleration_scaling_factor = velocity
         req.start_state.is_diff = True

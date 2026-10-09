@@ -43,7 +43,9 @@ WS = os.path.dirname(os.path.abspath(__file__))
 # The folded posture both arms can reach from almost anywhere. A direct cuMotion move
 # that cannot be planned goes via here instead.
 HOME = [0.0, 0.0, 0.0, 0.20, 0.0, 0.0, 0.0]
-ARRIVED = 0.02            # rad: an arm this close to pre_pick is left alone
+ARRIVED = 0.02            # rad: an arm this close to its target is left alone
+UNSTICK = 0.15            # share of the way to the target, to lift an arm off the stand
+UNSTICK_TIME = 1.5        # s for that
 SAMPLE = 0.05             # s: merged trajectory resolution and check spacing
 
 
@@ -196,6 +198,48 @@ class BootPrePick(Node):
 
     # -- the two ways there ---------------------------------------------------
 
+    def in_collision(self, arm):
+        """Is this arm's current posture touching something, per MoveIt?"""
+        if not self.validity.wait_for_service(timeout_sec=5.0):
+            return False
+        req = GetStateValidity.Request()
+        req.group_name = f'{arm}_arm'
+        req.robot_state.is_diff = True
+        res = wait(self.validity.call_async(req), 2.0)
+        if res is None or res.valid:
+            return False
+        bodies = sorted({(c.contact_body_1, c.contact_body_2) for c in res.contacts})[:3]
+        self.get_logger().info(f'{arm}: starts touching {bodies or "something"}')
+        return True
+
+    def unstick(self, goals):
+        """Arms that power on touching something get lifted clear first.
+
+        Hanging at power-on, the right hand reads as touching the stand's
+        (coarse) collision mesh; planners then refuse every path out of it
+        and the boot used to wait 40 s for cuMotion instead (2026-10-09).
+        The first UNSTICK of the way to the target, slowly and unchecked,
+        lifts the hand forward, away from the stand -- the same way the
+        planned move would have started anyway."""
+        stuck = [arm for arm in goals if self.in_collision(arm)]
+        if not stuck:
+            return False
+        plans = []
+        for arm in stuck:
+            now = np.array(self.current(arm_joints(arm)))
+            target = now + UNSTICK * (np.array(goals[arm]) - now)
+            jt = JointTrajectory()
+            jt.joint_names = arm_joints(arm)
+            for k, t in enumerate((0.0, UNSTICK_TIME)):
+                p = JointTrajectoryPoint(positions=(now if k == 0 else target).tolist(),
+                                         velocities=[0.0] * 7)
+                p.time_from_start.sec = int(t)
+                p.time_from_start.nanosec = int((t % 1.0) * 1e9)
+                jt.points.append(p)
+            plans.append(jt)
+        self.get_logger().info(f'{" and ".join(stuck)}: lifting clear of the stand first')
+        return self.execute(merge(plans))
+
     def together(self, goals):
         """Fast path: OMPL plans, merged, checked, executed. True if done."""
         log = self.get_logger()
@@ -266,6 +310,7 @@ class BootPrePick(Node):
             goals[arm] = target
         if not goals:
             return True
+        self.unstick(goals)
         if self.together(goals):
             log.info(f'at {self.args.state} {time.monotonic() - start:.1f} s after start')
             return True

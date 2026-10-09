@@ -651,6 +651,12 @@ class CumotionActionServer(Node):
                         sphere_list.append(cumotion_object)
                     elif isinstance(cumotion_object, Mesh):
                         mesh_list.append(cumotion_object)
+            if len(cuboid_list) > self.__collision_cache['obb'] - 2:
+                # more boxes than the cuboid cache holds: one mesh (see _scene_world)
+                v, f = scene_world.cuboids_mesh(cuboid_list)
+                mesh_list.append(Mesh(name='scene_boxes', pose=[0, 0, 0, 1, 0, 0, 0],
+                                      vertices=v.tolist(), faces=f.tolist()))
+                cuboid_list = []
 
             world_model = WorldConfig(
                 cuboid=cuboid_list,
@@ -691,6 +697,14 @@ class CumotionActionServer(Node):
                 {Cuboid: cuboids, Mesh: meshes, Sphere: spheres,
                  Cylinder: cylinders}.get(type(cu_obj), meshes).append(cu_obj)
         notes = []
+        if len(cuboids) > self.__collision_cache['obb'] - 2:
+            # More boxes than cuRobo has room for (it then fails every plan:
+            # "number of OBB is larger than collision cache"): one mesh instead.
+            v, f = scene_world.cuboids_mesh(cuboids)
+            meshes.append(Mesh(name='scene_boxes', pose=[0, 0, 0, 1, 0, 0, 0],
+                               vertices=v.tolist(), faces=f.tolist()))
+            notes.append(f'{len(cuboids)} scene boxes as one mesh')
+            cuboids = []
         cam = self._static.camera(self._tf_buffer, self.__robot_base_frame)
         if cam is not None:
             cuboids.append(Cuboid(name='camera', pose=cam,

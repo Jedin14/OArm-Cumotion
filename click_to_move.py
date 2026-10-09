@@ -141,6 +141,7 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
         self.overlay = None           # (pixels (N,2), agree (N,) bool): robot model on the image
         self.markers = gm.MarkerCalibration.load()   # None until CALIBRATE MARKERS has run
         self.teach = False            # TEACH mode: hold each touch for nudges
+        self.top_down = node.args.top_down   # approach straight down instead of level
         self.teaching = False         # a touch is being taught right now
         self.abort = threading.Event()
 
@@ -202,7 +203,10 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
             self.unreachable = None
             self.node.get_logger().warn(f'reach map: {exc}')
         self.say('frame captured; rebuilding the octomap...')
-        self.say(f'{self.node.rebuild_octomap()}. Click a point, then MOVE.')
+        message = self.node.rebuild_octomap()
+        n = self.node.refresh_walls(self.frame[3])
+        self.say(f'{message}' + ('' if n is None else f'; walls above and below the picture ({n})')
+                 + '. Click a point, then MOVE.')
 
     # -- input ----------------------------------------------------------------
 
@@ -260,6 +264,22 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
             self.teach = not self.teach
             self.say('TEACH on: after each touch, nudge the fingertip onto the spot and SAVE'
                      if self.teach else 'TEACH off: touches use what was taught')
+        elif name == 'topdown':
+            if self.busy:
+                return
+            self.top_down = not self.top_down
+            self.say('TOP DOWN on: the tool comes straight down from 10 cm above the point '
+                     '(objects lying flat)' if self.top_down else
+                     'TOP DOWN off: the tool approaches level, from the camera side')
+            if self.pick is not None and self.mode == 'pick':
+                # the last check planned the other way round: check again
+                _u, _v, p, _arm, _o = self.pick
+                check = {'pick': self.pick, 'ok': None, 'plan': None,
+                         'where': f'x={p[0]:+.3f} y={p[1]:+.3f} z={p[2]:+.3f}'}
+                self.check = check
+                threading.Thread(target=self.check_pick, args=(check,), daemon=True).start()
+            else:
+                self.check = None
         elif name == 'skip':
             self.answer('skip')
         elif name == 'abort':
@@ -336,7 +356,8 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
         elif self.calibrating:
             head = 'calibrating by itself - keep the view clear   ABORT / x'
         else:
-            head = (f'[{(self.mode or "?").upper()}]  click a point   keys: m n p b r c o t f')
+            head = (f'[{(self.mode or "?").upper()}{" TOP DOWN" if self.top_down else ""}]  '
+                    f'click a point   keys: m n p d b r c o t f')
         for i, text in enumerate((head + ('  [busy]' if self.busy else ''), self.status)):
             y = 22 + 22 * i
             cv2.putText(img, text, (8, y), FONT, 0.5, (0, 0, 0), 3)
@@ -363,6 +384,8 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
                      ('recapture', 'RECAPTURE', (150, 90, 0) if idle else grey),
                      ('calibrate', 'CALIBRATE', (140, 0, 140) if idle else grey),
                      ('overlay', 'OVERLAY', (0, 140, 140) if idle or self.overlay else grey),
+                     ('topdown', 'TOP DOWN ON' if self.top_down else 'TOP DOWN',
+                      (0, 90, 230) if self.top_down else (70, 70, 120)),
                      ('teach', 'TEACH ON' if self.teach else 'TEACH',
                       (0, 100, 220) if self.teach else (70, 70, 120)),
                      ('markers', 'FLAGS', (0, 140, 0) if self.markers is not None and idle
@@ -451,6 +474,8 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
                 self.press('markers')
             elif key in (ord('b'), ord('B')):
                 self.press('return')
+            elif key in (ord('d'), ord('D')):
+                self.press('topdown')
             elif key in (ord('n'), ord('N')):
                 self.press('navigation')
             elif key in (ord('p'), ord('P')):
@@ -482,6 +507,9 @@ def make_parser():
                              'never commanded, and the point is aimed midway between the '
                              'fingertips')
     parser.add_argument('--hold', type=float, default=2.0, help='seconds to stay touching')
+    parser.add_argument('--top-down', action='store_true',
+                        help='start with TOP DOWN on: approach straight down from --standoff '
+                             'above the point (objects lying flat) instead of level')
     parser.add_argument('--drop-hold', type=float, default=1.0,
                         help='after a touch: seconds at drop_state before pre_pick '
                              '(negative: skip the drop pose, return straight to pre_pick)')
