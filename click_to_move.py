@@ -205,7 +205,7 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
         self.say('frame captured; rebuilding the octomap...')
         message = self.node.rebuild_octomap()
         n = self.node.refresh_walls(self.frame[3])
-        self.say(f'{message}' + ('' if n is None else f'; walls above and below the picture ({n})')
+        self.say(f'{message}' + ('' if n is None else f'; walls around the picture ({n})')
                  + '. Click a point, then MOVE.')
 
     # -- input ----------------------------------------------------------------
@@ -293,7 +293,7 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
         elif name == 'apply':
             self.in_background(self.apply_calibration)
         elif name == 'markers':
-            self.in_background(self.calibrate_markers)
+            self.in_background(self.auto_calibrate)
         elif name == 'return':
             self.in_background(self.return_to_start)
         elif name == 'navigation':
@@ -388,7 +388,7 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
                       (0, 90, 230) if self.top_down else (70, 70, 120)),
                      ('teach', 'TEACH ON' if self.teach else 'TEACH',
                       (0, 100, 220) if self.teach else (70, 70, 120)),
-                     ('markers', 'FLAGS', (0, 140, 0) if self.markers is not None and idle
+                     ('markers', 'AUTO CAL', (0, 140, 0) if self.markers is not None and idle
                       else (100, 100, 40) if idle else grey)]
             specs += [('navigation', 'NAVIGATION', (160, 110, 0) if self.mode == 'navigation'
                        else (110, 80, 30) if idle else grey),
@@ -507,6 +507,10 @@ def make_parser():
                              'never commanded, and the point is aimed midway between the '
                              'fingertips')
     parser.add_argument('--hold', type=float, default=2.0, help='seconds to stay touching')
+    parser.add_argument('--live-flags', action='store_true',
+                        help='also measure the gripper flags during each touch (only useful '
+                             'if the arm does not hide them); normally they are used once, '
+                             'by AUTO CAL')
     parser.add_argument('--top-down', action='store_true',
                         help='start with TOP DOWN on: approach straight down from --standoff '
                              'above the point (objects lying flat) instead of level')

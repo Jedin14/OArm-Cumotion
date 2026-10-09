@@ -11,6 +11,11 @@ import robot_camera_calibration as rcc
 from ctm.common import ARM_REACH, BASE_FRAME, NUDGE
 from ctm.corrections import learned_correction, save_correction
 
+# The last NEAR m onto the surface is the only part where the gripper (its
+# fingers, this arm only) may touch the octomap; everything before it is
+# checked for every link.
+NEAR = 0.03
+
 
 class TouchMixin:
     """Part of click_to_move.App; uses self.node, self.frame, self.say..."""
@@ -42,16 +47,18 @@ class TouchMixin:
                           interpolation=cv2.INTER_NEAREST).astype(bool)
 
     def aim_for(self, arm, point, p_cam):
-        """(aim, learned, taught, markers_on): where to send the fingertip.
-        The TEACH corrections always apply -- they are the best first guess.
-        With calibrated flags the camera then measures the fingertip against
-        the click itself and corrects whatever is left; if no flag is in view
-        the taught correction still stands (it used to be dropped as soon as
-        any flag was calibrated, which left the right arm with no correction
-        at all when its one flag was hidden, 2026-10-07)."""
-        learned, _used, taught = learned_correction(arm, point)
-        markers_on = self.markers is not None and self.markers.has_arm(arm) and p_cam is not None
+        """(aim, learned, taught, markers_on): where to send the fingertip --
+        the saved corrections (AUTO CAL and TEACH) for this arm, point and
+        mode. The gripper flags are a one-time calibration tool (AUTO CAL):
+        in normal work the arm hides them, so touches do not look for them
+        unless --live-flags."""
+        learned, _used, taught = learned_correction(arm, point, self.mode_name())
+        markers_on = (self.node.args.live_flags and self.markers is not None
+                      and self.markers.has_arm(arm) and p_cam is not None)
         return point + learned, learned, taught, markers_on
+
+    def mode_name(self):
+        return 'top-down' if self.top_down else 'level'
 
     def check_pick(self, check, in_job=False):
         """Right after a click: can its arm touch that point -- reach, a
@@ -98,7 +105,8 @@ class TouchMixin:
 
     # -- the touch ------------------------------------------------------------
 
-    def correct_to(self, arm, tcp_goal, axis, quat, label, expected, offset=None):
+    def correct_to(self, arm, tcp_goal, axis, quat, label, expected, offset=None,
+                   corrections=None, too_far=0.04):
         """Settle on `expected` joints, measure the fingertip, and fly out the
         error. Returns the offset that had to be added to the command (world,
         m) and the error left over (m).
@@ -113,7 +121,8 @@ class TouchMixin:
         wanted = tcp_goal + axis * args.tip_offset
         offset = np.zeros(3) if offset is None else np.array(offset, dtype=float)
         best = None                                  # (residual, offset, joints)
-        for attempt in range(args.corrections + 1):
+        corrections = args.corrections if corrections is None else corrections
+        for attempt in range(corrections + 1):
             t0 = time.monotonic()
             joint_err = node.settle(arm, expected)
             waited = time.monotonic() - t0
@@ -132,9 +141,9 @@ class TouchMixin:
                 node.settle(arm, best[2])
                 return best[1], best[0]
             best = (residual, offset.copy(), expected)
-            if residual <= args.tolerance or attempt == args.corrections:
+            if residual <= args.tolerance or attempt == corrections:
                 break
-            if residual > 0.04:
+            if residual > too_far:
                 self.say(f'{arm} arm: {1000 * residual:.0f} mm off at {label} -- too far '
                          f'for a correction; not correcting', True)
                 break
@@ -172,7 +181,7 @@ class TouchMixin:
                     node.line_move(arm, command + nudge, quat, f'{arm} nudge')
                 elif what == 'save':
                     total = learned + nudge
-                    n = save_correction(arm, point, total)
+                    n = save_correction(arm, point, total, mode=self.mode_name())
                     self.say(f'TEACH: saved ({1000 * total[0]:+.0f}, {1000 * total[1]:+.0f}, '
                              f'{1000 * total[2]:+.0f}) mm for the {arm} arm here '
                              f'({n} corrections stored)')
@@ -233,7 +242,9 @@ class TouchMixin:
                     if above is None or any(np.max(np.abs(np.subtract(above, f))) < 0.1
                                             for f in found):
                         continue
-                    if node.solve_ik(arm, contact, quat, above) is not None:
+                    # the posture NEAR cm short of the surface, fully checked:
+                    # gripper included (it may only touch the clicked surface)
+                    if node.solve_ik(arm, contact - axis * NEAR, quat, above) is not None:
                         found.append(above)
                         # joint travel, plus a penalty for a joint near its limit:
                         # no room left there for the line in or a correction
@@ -247,24 +258,36 @@ class TouchMixin:
                 if not found:
                     tally['ik'] += 1
             solved.sort(key=lambda s_: s_[0])
-            if self.markers is not None and self.markers.has_arm(arm):
+            if self.node.args.live_flags and self.markers is not None \
+                    and self.markers.has_arm(arm):
                 solved = self._flags_in_view_first(arm, solved)
             for _cost, label, axis, quat, approach, contact, above in solved:
                 # Cheap checks first (~50 ms line, ~100 ms room); a cuMotion
                 # plan costs 0.5 s, a failed one ~5 s.
-                # The contact move aims past the surface; at the edge of reach
-                # 3 mm past is enough (it stops on contact anyway).
-                for beyond in (args.past_contact, min(args.past_contact, 0.003)):
-                    fraction, _t, _f = node.cartesian_plan(arm, contact + axis * beyond, quat,
-                                                           start_joints=above)
-                    if fraction >= 0.98:
-                        break
+                # The line in, fully checked -- every link, the gripper too --
+                # to NEAR short of the surface; only the last NEAR (the
+                # contact) lets this arm's fingers touch the map. It aims past
+                # the surface; at the edge of reach 3 mm past is enough (it
+                # stops on contact anyway).
+                fraction, _t, near_joints = node.cartesian_plan(
+                    arm, contact - axis * NEAR, quat, start_joints=above)
+                if fraction < 0.98 or near_joints is None:
+                    tally['line'] += 1
+                    continue
+                with node.fingers_touching(arm):
+                    for beyond in (args.past_contact, min(args.past_contact, 0.003)):
+                        fraction, _t, _f = node.cartesian_plan(
+                            arm, contact + axis * beyond, quat, start_joints=near_joints)
+                        if fraction >= 0.98:
+                            break
+                    room = (fraction >= 0.98 and self._room_to_correct(
+                        arm, contact + axis * beyond, axis, quat, above))
                 if fraction < 0.98:
                     tally['line'] += 1
                     continue
                 plan = {'label': label, 'axis': axis, 'quat': quat, 'approach': approach,
                         'contact': contact, 'above': above, 'beyond': beyond, 'edge': False}
-                if not self._room_to_correct(arm, contact + axis * beyond, axis, quat, above):
+                if not room:
                     edge.append(dict(plan, edge=True))       # only if nothing better
                     continue
                 _code, plan['trajectory'] = node.plan_joints(arm, above)
@@ -312,6 +335,11 @@ class TouchMixin:
         arm = lt['arm']
         if not lt['out']:
             self.say(f'{arm} arm: backing straight out')
+            if not lt.get('near_out') and 'out_short' in lt:
+                with node.fingers_touching(arm):     # still at the surface
+                    if node.line_move(arm, lt['out_short'], lt['quat'], f'{arm} off the surface',
+                                      speed=args.fast_line_speed) is not None:
+                        lt['near_out'] = True
             if node.line_move(arm, lt['out_to'], lt['quat'], f'{arm} out',
                               speed=args.fast_line_speed) is None:
                 # MoveIt may see this pose as colliding (TEACH nudges once put
@@ -433,54 +461,66 @@ class TouchMixin:
                 node.settle(arm, moved, timeout=args.settle_time)
         if d is None and not np.any(vis):
             # No flag in view: at least get the joints onto their targets.
-            offset, off_at_approach = self.correct_to(arm, approach, axis, quat,
-                                                      'the approach', plan['above'], offset)
+            # TOP DOWN: the arm sags much more reaching down (36-42 mm off at
+            # the approach, 2026-10-09): two corrections, and larger ones.
+            offset, off_at_approach = self.correct_to(
+                arm, approach, axis, quat, 'the approach', plan['above'], offset,
+                corrections=max(args.corrections, 2) if self.top_down else None,
+                too_far=0.06 if self.top_down else 0.04)
 
-        short = contact - axis * min(0.01, args.standoff / 2)
+        short = contact - axis * NEAR
         self.last_touch['out'] = False
+        self.last_touch['out_short'] = short - vis + offset
         ends, touched = None, False
+        # In to NEAR short of the surface, every link checked (the gripper too).
         near = node.line_move(arm, short - vis + offset, quat, f'{arm} in',
                               speed=args.fast_line_speed)
         if near is not None:
-            # The last centimetre, on the same line: slow, and stops when it
-            # feels the surface, so the depth comes from the object itself.
-            ends, touched = node.guarded_line(
-                arm, contact + axis * plan['beyond'] - vis + offset, quat, f'{arm} contact')
+            # The last NEAR, on the same line: only now may this arm's fingers
+            # touch the octomap -- slowly, stopping when it feels the surface,
+            # so the depth comes from the object itself.
+            with node.fingers_touching(arm):
+                ends, touched = node.guarded_line(
+                    arm, contact + axis * plan['beyond'] - vis + offset, quat, f'{arm} contact')
+                if ends is not None:
+                    held = time.monotonic()
+                    node.settle(arm, ends, timeout=0.1)
+                    how = 'felt the surface' if touched else 'no contact felt'
+                    self.say(f'{arm} arm: touching ({how}); holding {args.hold:.0f} s')
+                    tip = node.fingertip(arm)
+                    seen_by = 'joints'
+                    if tip is not None:
+                        if markers_on:
+                            # Where the camera sees the fingertip now, against the click.
+                            here = node.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+                            d = (self.marker_offset(arm, p_cam, aim, axis, here[:3, 3], 'the touch')
+                                 if here is not None else None)
+                            tip = tip + (d if d is not None else vis)
+                            seen_by = 'camera' if d is not None else 'joints + flags'
+                        miss = aim - tip
+                        along = float(miss @ axis)
+                        sideways = float(np.linalg.norm(miss - along * axis))
+                        self.detail = (f'last touch: {how}; tip {1000 * sideways:.1f} mm from the click '
+                                       f'sideways ({seen_by})'
+                                       + (f', flags moved it {1000 * np.linalg.norm(vis):.1f} mm'
+                                          if markers_on else '')
+                                       + (f', {1000 * off_at_approach:.1f} mm off at the approach'
+                                          if off_at_approach is not None else '')
+                                       + f'; {held - t0:.1f} s to touch')
+                        node.get_logger().info(self.detail)
+                    if self.teach:
+                        here = node.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+                        self.teach_touch(arm, point, learned, axis, quat,
+                                         here[:3, 3] if here is not None else contact - vis + offset,
+                                         scene)
+                    else:
+                        time.sleep(max(0.0, args.hold - (time.monotonic() - held)))
+                # back off the surface the way it came, fingers still allowed
+                if node.line_move(arm, short - vis + offset, quat, f'{arm} off the surface',
+                                  speed=args.fast_line_speed) is not None:
+                    self.last_touch['near_out'] = True
         if ends is None:
             self.say(f'{arm} arm: no straight line in; could not touch', True)
-        else:
-            held = time.monotonic()
-            node.settle(arm, ends, timeout=0.1)
-            how = 'felt the surface' if touched else 'no contact felt'
-            self.say(f'{arm} arm: touching ({how}); holding {args.hold:.0f} s')
-            tip = node.fingertip(arm)
-            seen_by = 'joints'
-            if tip is not None:
-                if markers_on:
-                    # Where the camera sees the fingertip now, against the click.
-                    here = node.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
-                    d = (self.marker_offset(arm, p_cam, aim, axis, here[:3, 3], 'the touch')
-                         if here is not None else None)
-                    tip = tip + (d if d is not None else vis)
-                    seen_by = 'camera' if d is not None else 'joints + flags'
-                miss = aim - tip
-                along = float(miss @ axis)
-                sideways = float(np.linalg.norm(miss - along * axis))
-                self.detail = (f'last touch: {how}; tip {1000 * sideways:.1f} mm from the click '
-                               f'sideways ({seen_by})'
-                               + (f', flags moved it {1000 * np.linalg.norm(vis):.1f} mm'
-                                  if markers_on else '')
-                               + (f', {1000 * off_at_approach:.1f} mm off at the approach'
-                                  if off_at_approach is not None else '')
-                               + f'; {held - t0:.1f} s to touch')
-                node.get_logger().info(self.detail)
-            if self.teach:
-                here = node.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
-                self.teach_touch(arm, point, learned, axis, quat,
-                                 here[:3, 3] if here is not None else contact - vis + offset,
-                                 scene)
-            else:
-                time.sleep(max(0.0, args.hold - (time.monotonic() - held)))
         self.last_touch['out_to'] = approach - vis + offset
         if self.return_to_start() and ends is not None:
             self.say(f'{arm} arm: done in {time.monotonic() - t0:.1f} s. Click the next point '

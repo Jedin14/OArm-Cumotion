@@ -3,6 +3,7 @@ and the motion primitives (plans, straight lines, guarded contact,
 retrace) that the touch is built from."""
 
 import collections
+import contextlib
 import math
 import os
 import re
@@ -417,8 +418,13 @@ class ClickToMove(Node):
         time.sleep(self.args.octomap_settle)
         return f'octomap rebuilt ({result.message})' if result else 'octomap refresh timed out'
 
-    def allow_grippers_in_octomap(self):
-        """Hand + finger links of both arms may touch <octomap>; nothing else.
+    def allow_grippers_in_octomap(self, touching=None):
+        """What may touch <octomap>: the links that never move (stand, camera,
+        arm bases) always; and the two fingers of the arm `touching`, only
+        while it makes contact (fingers_touching()). Nothing else -- the
+        hand and fingers used to be exempt all the time, so the checks let
+        the gripper pass through OTHER objects on the way to the one clicked
+        (2026-10-09).
 
         The matrix is read, extended and sent back whole: a diff carrying an
         ACM replaces it wholesale, and a partial one would throw away every
@@ -452,9 +458,12 @@ class ClickToMove(Node):
         # and made every start state "in collision" (2026-10-06).
         static = ['openarm_body_link0', 'camera_link', 'openarm_left_link0',
                   'openarm_right_link0']
+        fingers = ([f'openarm_{touching}_left_finger', f'openarm_{touching}_right_finger']
+                   if touching else [])
         for link in gripper_links('left') + gripper_links('right') + static:
             if link in index:
-                rows[index[link]][octomap] = rows[octomap][index[link]] = True
+                allowed = link in static or link in fingers
+                rows[index[link]][octomap] = rows[octomap][index[link]] = allowed
         updated = AllowedCollisionMatrix(entry_names=names)
         updated.entry_values = [AllowedCollisionEntry(enabled=row) for row in rows]
         scene = PlanningScene(is_diff=True, allowed_collision_matrix=updated)
@@ -464,8 +473,21 @@ class ClickToMove(Node):
             return False, 'move_group did not answer (busy?); gripper not exempted yet'
         if not applied.success:
             return False, 'move_group refused the gripper/octomap exemption'
-        return True, ('grippers, stand, camera and arm bases may touch the octomap; the '
-                      'moving arm links are still checked')
+        return True, ('stand, camera and arm bases may touch the octomap'
+                      + (f'; the {touching} fingers too, for the contact' if touching else
+                         '; the arms and grippers are all checked'))
+
+    @contextlib.contextmanager
+    def fingers_touching(self, arm):
+        """While inside: this arm's two fingers may touch the octomap (the last
+        few cm onto the clicked surface). Revoked on the way out, always."""
+        ok, message = self.allow_grippers_in_octomap(touching=arm)
+        if not ok:
+            self.get_logger().warn(f'{arm} fingers: {message}')
+        try:
+            yield ok
+        finally:
+            self.allow_grippers_in_octomap(touching=None)
 
     def refresh_walls(self, optical):
         """After a capture: walls in the planning scene where the camera cannot
@@ -881,9 +903,14 @@ class ClickToMove(Node):
         """Straight line towards `position`, slow, stopping on contact.
 
         The joint torques of this arm are watched against their level just
-        before the move; when any joint departs from it by more than
-        --contact-torque (and by more than 6x its resting noise) for 30 ms,
-        the move is cancelled and the arm holds there. Returns (joints,
+        before the move. Contact is a torque departure of more than
+        --contact-torque (and 6x its resting noise) for 30 ms AND the tool
+        stalled: under 1 mm of progress in 0.2 s while the command still
+        moves on. Torque alone was not enough: in a TOP DOWN posture the left
+        arm lags its command by ~60 mrad, its controller pushes harder to
+        catch up, and that read as contact 1-2 cm above the object
+        (2026-10-09) -- a lagging arm still moves, a blocked one does not.
+        The move is then cancelled and the arm holds there. Returns (joints,
         contact) -- contact False if it reached `position` without touching
         anything, or if the torques were too noisy to watch.
         """
@@ -915,6 +942,26 @@ class ClickToMove(Node):
             else:
                 limit = np.maximum(args.contact_torque, 6.0 * noise)
                 over = {'n': 0}
+                p0 = m[:3, 3] if m is not None else None
+                way = ((np.asarray(position) - p0) / max(length, 1e-6)) if p0 is not None else None
+                track = collections.deque()             # (time, progress along the line)
+                t0 = time.monotonic()
+
+                def stalled():
+                    if p0 is None:
+                        return True                     # cannot tell: torque decides
+                    now = time.monotonic()
+                    tcp = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+                    if tcp is None:
+                        return True
+                    track.append((now, float((tcp[:3, 3] - p0) @ way)))
+                    while track and now - track[0][0] > 0.2:
+                        track.popleft()
+                    if now - t0 < 0.3 or len(track) < 5:
+                        return False                    # still getting going
+                    commanded = min(1.0, (now - t0) / wanted) * length
+                    moved = track[-1][1] - track[0][1]
+                    return moved < 0.001 and commanded - track[-1][1] > 0.003
 
                 def watch():
                     e = self.arm_efforts(arm)
@@ -922,11 +969,14 @@ class ClickToMove(Node):
                         return False
                     hit = np.any(np.abs(np.array(e) - mean) > limit)
                     over['n'] = over['n'] + 1 if hit else 0
-                    if over['n'] >= 3:
+                    if over['n'] >= 3 and stalled():
                         j = int(np.argmax(np.abs(np.array(e) - mean) / limit))
                         self.get_logger().info(
-                            f'{label}: contact ({names[j]} {e[j] - mean[j]:+.2f} Nm)')
+                            f'{label}: contact ({names[j]} {e[j] - mean[j]:+.2f} Nm, '
+                            f'stopped advancing)')
                         return True
+                    if not hit:
+                        stalled()                       # keep the track going
                     return False
         ok, stopped = self.execute(trajectory, label, timeout=wanted + 20.0, watch=watch)
         if not ok:

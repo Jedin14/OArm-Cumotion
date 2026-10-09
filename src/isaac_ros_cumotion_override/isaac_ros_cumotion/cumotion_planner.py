@@ -687,10 +687,10 @@ class CumotionActionServer(Node):
                      arm_spheres=None):
         """Give cuMotion move_group's obstacles: scene collision objects, the
         camera box, the stand column and the octomap (cropped to the arms'
-        reach, and cleared within 10 cm of `keep_clear` -- the grippers at
-        the start and goal, which are allowed to touch the map: move_group's
-        allowed-collision matrix exempts them, and the touch itself is a
-        move_group Cartesian move)."""
+        reach, and cleared only within 3 cm of `keep_clear`, the tool points
+        at the start and goal: 10 cm used to delete objects right next to the
+        approach point, so a plan could sweep through them -- 2026-10-09).
+        The contact itself is a move_group Cartesian move."""
         cuboids, meshes, spheres, cylinders = [], [], [], []
         for obj in scene.world.collision_objects:
             for cu_obj in self.get_cumotion_collision_object(obj)[0]:

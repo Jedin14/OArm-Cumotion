@@ -10,6 +10,7 @@ from moveit_msgs.msg import MoveItErrorCodes
 
 import gripper_markers as gm
 import robot_camera_calibration as rcc
+from ctm.corrections import replace_auto
 from ctm.common import (BASE_FRAME, TCP_IN_HAND, decode_image, pixel_ray, quat_from_matrix,
                         tool_frame_along)
 
@@ -302,6 +303,127 @@ class FlagsMixin:
         self.detail = '; '.join(report)
         self.say(f'flags calibrated ({", ".join(str(i) for i in sorted(result))}): touches now '
                  f'correct themselves with them')
+
+    def measure_tip(self, arm):
+        """Where the fingertip really is (world), from the gripper flags in a
+        few fresh colour frames, or None if no calibrated flag is seen."""
+        node = self.node
+        _c, _d, info = node.latest()
+        optical = self.frame[3] if self.frame is not None else 'camera_color_optical_frame'
+        t_wo = node.lookup(BASE_FRAME, optical)
+        hand = node.lookup(BASE_FRAME, f'openarm_{arm}_hand')
+        if info is None or t_wo is None or hand is None or self.markers is None:
+            return None, []
+        frames = []
+        for _ in range(node.args.marker_frames):
+            msg = node.fresh_color(timeout=1.0)
+            if msg is None:
+                break
+            frames.append(decode_image(msg))
+        r_ow = t_wo[:3, :3].T
+        ids = self.markers.ids(arm)
+        expected = {i: r_ow @ hand[:3, :3] @ self.markers.hand_marker(i)[:3, 2] for i in ids}
+        seen = gm.observe(frames, info, ids, expected)
+        if not seen:
+            return None, []
+        hand_cam, used = gm.hand_from_flags(
+            seen, {i: self.markers.hand_marker(i) for i in ids}, r_ow @ hand[:3, :3])
+        tip_in_hand = np.array([0.0, 0.0, TCP_IN_HAND + node.args.tip_offset])
+        tip_cam = hand_cam[:3, :3] @ tip_in_hand + hand_cam[:3, 3]
+        return t_wo[:3, :3] @ tip_cam + t_wo[:3, 3], used
+
+    def auto_calibrate(self):
+        """AUTO CAL: the one-time calibration with the gripper flags.
+
+        In normal work the arm hides its flags from the camera, so they are
+        not used during touches. Instead, once, with the work area clear,
+        each arm visits ~18 spots in open space in front of the camera, tool
+        level as in a touch, posed so its flags face the camera; at each the
+        flags give where the fingertip really is and the joints where they
+        think it is. The difference -- the arm's flex and sag, and the
+        camera calibration's error, which the joints cannot see -- is saved
+        as this arm's "auto" corrections in touch_corrections.yaml; every
+        touch after uses them. TEACH samples are kept. Rerun after moving the
+        camera, the flags or the arm mounts.
+        """
+        node = self.node
+        if self.markers is None or not all(self.markers.has_arm(a) for a in ('left', 'right')):
+            self.say('AUTO CAL: first, where the flags sit on the grippers (FLAGS)...')
+            self.calibrate_markers()
+            if self.markers is None:
+                self.say('AUTO CAL needs the gripper flags calibrated -- see the message above',
+                         True)
+                return
+        self.say('AUTO CAL: taking a clean frame (keep the area in front of the camera clear)')
+        self.capture()
+        if self.frame is None or not self.ensure_pick_mode():
+            return
+        t_wo = node.lookup(BASE_FRAME, self.frame[3])
+        targets = self.marker_targets(t_wo)
+        origin = t_wo[:3, 3]
+        self.abort.clear()
+        self.calibrating = True
+        report = []
+        try:
+            for arm in ('right', 'left'):
+                if not self.markers.has_arm(arm):
+                    report.append(f'{arm}: no calibrated flag, skipped')
+                    continue
+                start = self.pose(arm, 'pre_pick_state') or node.arm_positions(arm)
+                measured, errors, k = [], [], 0
+                spots = [p for a, p in targets if a == arm]
+                for tip in spots:
+                    if self.abort.is_set():
+                        raise KeyboardInterrupt
+                    k += 1
+                    # the posture a touch here would use: level, along the
+                    # camera's line of sight, from pre_pick -- with a flag in view
+                    best, best_n = None, 0
+                    for label, axis, quat, ring in node.candidates(tip, origin):
+                        if ring != 0:
+                            continue
+                        sol = node.solve_ik(arm, node.tcp_for_tip(tip, axis), quat, start)
+                        n = self.flag_visible(arm, sol) if sol is not None else 0
+                        if n > best_n:
+                            best, best_n = sol, n
+                        if best_n >= 2:
+                            break
+                    if best is None:
+                        continue
+                    self.say(f'AUTO CAL {arm} {k}/{len(spots)}: moving')
+                    if not node.move_joints(arm, best, f'autocal {k}', via_home=False):
+                        continue
+                    node.settle(arm, best, timeout=3.0)
+                    model = node.fingertip(arm)
+                    real, used = self.measure_tip(arm)
+                    if model is None or real is None:
+                        self.say(f'AUTO CAL {arm} {k}/{len(spots)}: flags not seen; skipped')
+                        continue
+                    error = real - model
+                    if np.linalg.norm(error) > 0.06:
+                        self.say(f'AUTO CAL {arm} {k}: {1000 * np.linalg.norm(error):.0f} mm is '
+                                 f'implausible; skipped', True)
+                        continue
+                    measured.append((real, model - real))   # aim there to land here
+                    errors.append(float(np.linalg.norm(error)))
+                    self.say(f'AUTO CAL {arm} {k}/{len(spots)}: tip {1000 * errors[-1]:.1f} mm '
+                             f'from where the joints put it (flags {used})')
+                node.move_joints(arm, start, f'{arm} back to pre_pick', via_home=False)
+                if len(measured) >= 4:
+                    replace_auto(arm, measured)
+                    report.append(f'{arm}: {len(measured)} spots, arm error median '
+                                  f'{1000 * np.median(errors):.1f} mm (max '
+                                  f'{1000 * max(errors):.1f}) -- saved')
+                else:
+                    report.append(f'{arm}: only {len(measured)} spots measured, NOT saved '
+                                  f'(are its flags facing the camera?)')
+        except KeyboardInterrupt:
+            self.say('AUTO CAL aborted; nothing more saved')
+            return
+        finally:
+            self.calibrating = False
+        self.detail = '; '.join(report)
+        self.say('AUTO CAL done: ' + '; '.join(report))
 
     def _flags_in_view_first(self, arm, solved):
         """`solved` in the same order, but postures where both gripper flags

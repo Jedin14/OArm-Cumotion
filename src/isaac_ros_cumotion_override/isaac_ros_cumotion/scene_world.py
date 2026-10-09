@@ -295,7 +295,7 @@ class ShadowedMap:
             self.counts = (surface, len(cells))
         return self._cells
 
-    def mesh(self, centres, sizes, res, eye, crop, keep_clear, clear_radius=0.10,
+    def mesh(self, centres, sizes, res, eye, crop, keep_clear, clear_radius=0.03,
              spheres=None, sphere_margin=0.03):
         """spheres: (N, 4) x y z r -- the arm where it is; cells within r +
         sphere_margin of any are cleared too (the arm is physically there)."""
