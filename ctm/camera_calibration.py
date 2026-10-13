@@ -134,7 +134,7 @@ class CameraCalibrationMixin:
             best = roll_across_view(axis, ray)
             for roll in (best, best + math.pi):
                 quat = quat_from_matrix(tool_frame_along(axis, roll))
-                tcp = node.tcp_for_tip(tip, axis)
+                tcp = node.tcp_for_tip(tip, axis, arm)
                 for seed in seeds:
                     joints = node.solve_ik(arm, tcp, quat, seed)
                     if joints is not None:

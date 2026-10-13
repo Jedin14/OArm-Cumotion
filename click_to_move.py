@@ -28,7 +28,7 @@ Why a touch lands where it does -- the three errors, and what handles each
    reach 95.4 mm (finger joint at z=0.015, finger mesh 80.4 mm beyond it; see
    openarm_hand.xacro). Aiming hand_tcp at the point drove the fingertips
    15 mm into the surface, and a stiff arm pressed into a surface slides off
-   the spot. So the goal is the fingertips, `--tip-offset` beyond hand_tcp
+   the spot. So the goal is the working tip (fingertips + that arm's tool) beyond hand_tcp
    along the tool axis. The gripper is not commanded by default, so the point
    is aimed midway between the fingertips; `--close-gripper` shuts them
    first so they meet at one point and actually touch it.
@@ -106,16 +106,18 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 
 import gripper_markers as gm
+from ctm import armcal
+from ctm.armcal_run import ArmCalMixin
 from ctm.camera_calibration import CameraCalibrationMixin
-from ctm.common import (FINGERTIP_BEYOND_TCP, FONT, TOOL_EXTENSION, MoveGroupDown, WINDOW,
-                        decode_image)
+from ctm import tools as tl
+from ctm.common import FONT, MoveGroupDown, WINDOW, decode_image
 from ctm.flags import FlagsMixin
 from ctm.modes import ModesMixin, load_poses
 from ctm.robot import ClickToMove
 from ctm.touch import TouchMixin
 
 
-class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
+class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
     """The OpenCV window, and the worker threads that capture and move."""
 
     def __init__(self, node):
@@ -128,6 +130,7 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
         self.last_touch = None        # an arm that is out, and how to bring it back
         self.poses = load_poses()     # {arm: {navigation_state, pre_pick_state, drop_state}}
         self.mode = None              # 'navigation' / 'pick' / None (see ctm/modes.py)
+        self.arm_models = armcal.ArmModels()   # CALIBRATE ARMS results, if any
         self.buttons = {}             # name -> (x0, y0, x1, y1) in window pixels
         self.status = 'capturing...'
         self.detail = ''
@@ -135,6 +138,7 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
         # Calibration: the view being clicked, the answer, and a result to apply.
         self.calib_view = None        # (bgr, predicted (u, v) or None, index, total)
         self.calib_answer = None
+        self.confirming = False       # CALIBRATE ARMS waiting for CONFIRM / CANCEL
         self.calib_event = threading.Event()
         self.calibration = None
         self.calibrating = False
@@ -256,6 +260,25 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
         else:
             threading.Thread(target=self.check_pick, args=(check,), daemon=True).start()
 
+    def change_tool(self, arm, toggle=False, step=0.0):
+        """Switch an arm's tool on/off or change its length; the touches use
+        the new working tip from now on."""
+        if self.busy:
+            self.say('tool: not while an arm is moving', True)
+            return
+        t = self.node.args.tools[arm]
+        if toggle:
+            t['on'] = not t['on']
+        elif step:
+            t['on'] = True
+            t['length'] = float(min(tl.MAX_LENGTH, max(tl.STEP, t['length'] + step)))
+        tl.apply(self.node.args, self.node.args.tools)
+        tl.save(self.node.args.tools)
+        self.say(f'{arm} arm: ' + (f'tool on, {t["length"] * 1000:.0f} mm past the fingertips'
+                                   if t['on'] else 'no tool: the fingertips touch')
+                 + (f' ({"[ ]" if arm == "left" else ", ."} change the length)'))
+        self.check = None                       # the last check was for the old tip
+
     def press(self, name):
         if self.teaching and name in ('left', 'right', 'up', 'down', 'in', 'out', 'save',
                                       'skip'):
@@ -280,8 +303,12 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
                 threading.Thread(target=self.check_pick, args=(check,), daemon=True).start()
             else:
                 self.check = None
+        elif name in ('tool_left', 'tool_right'):
+            self.change_tool(name[5:], toggle=True)
         elif name == 'skip':
             self.answer('skip')
+        elif name == 'confirm':
+            self.answer('confirm')
         elif name == 'abort':
             self.answer('abort')
         elif name == 'move':
@@ -293,7 +320,7 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
         elif name == 'apply':
             self.in_background(self.apply_calibration)
         elif name == 'markers':
-            self.in_background(self.auto_calibrate)
+            self.in_background(self.calibrate_arms)
         elif name == 'return':
             self.in_background(self.return_to_start)
         elif name == 'navigation':
@@ -367,12 +394,15 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
     def with_buttons(self, img):
         """The frame with a button bar under it (OpenCV has no widgets)."""
         h, w = img.shape[:2]
-        bar = np.full((84, w, 3), 40, np.uint8)
+        row2 = not self.teaching and not self.calibrating
+        bar = np.full((84 + (42 if row2 else 0), w, 3), 40, np.uint8)
         grey = (90, 90, 90)
         if self.teaching:
             nudge = (120, 90, 0)
             specs = [(n, n.upper(), nudge) for n in ('left', 'right', 'up', 'down', 'in', 'out')]
             specs += [('save', 'SAVE', (0, 150, 0)), ('skip', 'SKIP', (90, 90, 90))]
+        elif self.calibrating and getattr(self, 'confirming', False):
+            specs = [('confirm', 'CONFIRM', (0, 150, 0)), ('abort', 'CANCEL', (0, 0, 170))]
         elif self.calibrating:
             specs = [('abort', 'ABORT', (0, 0, 170))]
         else:
@@ -388,7 +418,7 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
                       (0, 90, 230) if self.top_down else (70, 70, 120)),
                      ('teach', 'TEACH ON' if self.teach else 'TEACH',
                       (0, 100, 220) if self.teach else (70, 70, 120)),
-                     ('markers', 'AUTO CAL', (0, 140, 0) if self.markers is not None and idle
+                     ('markers', 'CAL ARMS', (0, 140, 0) if self.arm_models.params and idle
                       else (100, 100, 40) if idle else grey)]
             specs += [('navigation', 'NAVIGATION', (160, 110, 0) if self.mode == 'navigation'
                        else (110, 80, 30) if idle else grey),
@@ -414,15 +444,33 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
                         (255, 255, 255), 2)
             self.buttons[name] = (x, h + 6, x1, h + 44)
             x = x1 + gap
+        if row2:
+            # the tools, on a second row: click = on/off, [ ] and , . = length
+            x = 8
+            for arm in ('left', 'right'):
+                t = self.node.args.tools[arm]
+                x1 = x + 150
+                colour = (0, 110, 160) if t['on'] else (70, 70, 70)
+                cv2.rectangle(bar, (x, 50), (x1, 82), colour, -1)
+                cv2.rectangle(bar, (x, 50), (x1, 82), (255, 255, 255), 1)
+                text = tl.label(arm, t)
+                (tw, th), _ = cv2.getTextSize(text, FONT, 0.5, 1)
+                cv2.putText(bar, text, (x + (150 - tw) // 2, 66 + th // 2), FONT, 0.5,
+                            (255, 255, 255), 1)
+                self.buttons[f'tool_{arm}'] = (x, h + 50, x1, h + 82)
+                x = x1 + gap
+            cv2.putText(bar, 'tool length: [ ] left   , . right', (x + 6, 70), FONT, 0.4,
+                        (200, 200, 200), 1)
+        y0 = 42 if row2 else 0
         if self.pick and not self.calibrating:
             _u, _v, p, arm, _o = self.pick
             info = f'{arm} arm   x={p[0]:+.3f}  y={p[1]:+.3f}  z={p[2]:+.3f} m (world)'
-            cv2.putText(bar, info, (8, 62), FONT, 0.5, (0, 255, 255), 1)
+            cv2.putText(bar, info, (8, 62 + y0), FONT, 0.5, (0, 255, 255), 1)
         if self.detail:
             text = self.detail
             while cv2.getTextSize(text, FONT, 0.4, 1)[0][0] > w - 16 and len(text) > 10:
                 text = text[:-4] + '...'
-            cv2.putText(bar, text, (8, 78), FONT, 0.4, (200, 200, 200), 1)
+            cv2.putText(bar, text, (8, 78 + y0), FONT, 0.4, (200, 200, 200), 1)
         return np.vstack((img, bar))
 
     def run(self):
@@ -456,7 +504,9 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
                 if key in keys:
                     self.answer(keys[key])
             elif self.calibrating:
-                if key in (ord('s'), ord('S')):
+                if key in (ord('y'), ord('Y'), 13, 10) and getattr(self, 'confirming', False):
+                    self.answer('confirm')
+                elif key in (ord('s'), ord('S')):
                     self.answer('skip')
                 elif key in (ord('x'), ord('X'), 27):
                     self.answer('abort')
@@ -480,6 +530,9 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin):
                 self.press('navigation')
             elif key in (ord('p'), ord('P')):
                 self.press('pickmode')
+            elif key in (ord('['), ord(']'), ord(','), ord('.')):
+                arm = 'left' if key in (ord('['), ord(']')) else 'right'
+                self.change_tool(arm, step=tl.STEP if key in (ord(']'), ord('.')) else -tl.STEP)
         cv2.destroyAllWindows()
 
 
@@ -495,12 +548,10 @@ def make_parser():
     parser.add_argument('--touch-offset', type=float, default=0.0,
                         help='stop the fingertips this far short of the measured surface, m. '
                              'The arm is compliant (~6 N per cm of push), so 0 is safe')
-    parser.add_argument('--tool-extension', type=float, default=TOOL_EXTENSION,
-                        help='tool fitted past the fingertips (vacuum extension), m; the '
-                             'working tip is this much further out')
-    parser.add_argument('--tip-offset', type=float, default=None,
-                        help='working tip beyond hand_tcp along the tool axis, m (default: '
-                             'fingertips 15.4 mm + --tool-extension)')
+    for arm in ('left', 'right'):
+        parser.add_argument(f'--tool-extension-{arm}', type=float, default=None,
+                            help=f'tool fitted past the {arm} fingertips, m (0 = none); default: '
+                                 f'as last set in the window (tools.yaml)')
     parser.add_argument('--close-gripper', action='store_true',
                         help='close the gripper before touching and calibrating, so the '
                              'fingertips meet at one point. Off by default: the gripper is '
@@ -519,7 +570,7 @@ def make_parser():
                              '(negative: skip the drop pose, return straight to pre_pick)')
     parser.add_argument('--fast-line-speed', type=float, default=0.06,
                         help='tool speed for the straight line in (to 1 cm short) and out, m/s')
-    parser.add_argument('--contact-speed', type=float, default=0.025,
+    parser.add_argument('--contact-speed', type=float, default=0.015,
                         help='tool speed for the last, guarded centimetre, m/s')
     parser.add_argument('--past-contact', type=float, default=0.01,
                         help='how far past the measured surface the guarded move may go '
@@ -527,6 +578,12 @@ def make_parser():
     parser.add_argument('--contact-torque', type=float, default=0.3,
                         help='joint torque change that counts as touching, Nm (0 = do not '
                              'watch: stop at the measured surface instead)')
+    parser.add_argument('--max-touch-torque', type=float, default=2.0,
+                        help='hard limit while touching: stop at once if any joint torque '
+                             'rises this much above its level before the move, Nm')
+    parser.add_argument('--soft-tool-torque', type=float, default=1.0,
+                        help='the torque limit while touching with a tool on (the rubber '
+                             'vacuum extension must not be crushed or bent), Nm')
     parser.add_argument('--settle-time', type=float, default=1.0,
                         help='how long to let the arm converge before measuring it, s')
     parser.add_argument('--tolerance', type=float, default=0.002,
@@ -564,8 +621,13 @@ def make_parser():
 
 def parse_args(argv=None):
     args = make_parser().parse_args(argv)
-    if args.tip_offset is None:                  # fingertips beyond hand_tcp, plus the extension
-        args.tip_offset = FINGERTIP_BEYOND_TCP + args.tool_extension
+    # each arm's working tip beyond hand_tcp: the fingertips, plus its tool
+    args.tools = tl.load()
+    for arm in ('left', 'right'):
+        length = getattr(args, f'tool_extension_{arm}')
+        if length is not None:
+            args.tools[arm] = {'on': length > 0, 'length': length if length > 0 else 0.020}
+    tl.apply(args, args.tools)
     return args
 
 

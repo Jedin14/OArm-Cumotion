@@ -111,14 +111,14 @@ class FlagsMixin:
         if not seen:
             node.get_logger().info(f'flags at {label}: none of {ids} in view')
             return None
-        tip_in_hand = np.array([0.0, 0.0, TCP_IN_HAND + node.args.tip_offset])
+        tip_in_hand = np.array([0.0, 0.0, TCP_IN_HAND + node.args.tip_offsets[arm]])
         hand_cam, used = gm.hand_from_flags(
             seen, {i: self.markers.hand_marker(i) for i in ids}, r_ow @ hand[:3, :3])
         tip_cam = hand_cam[:3, :3] @ tip_in_hand + hand_cam[:3, 3]
         # each flag on its own, for the agreement check
         tips = [m_cam[:3, 3] + hand_cam[:3, :3] @ (tip_in_hand - self.markers.hand_marker(i)[:3, 3])
                 for i, (m_cam, _n, _s) in seen.items()]
-        should = tcp_goal + axis * node.args.tip_offset          # world, model
+        should = tcp_goal + axis * node.args.tip_offsets[arm]          # world, model
         desired_cam = p_cam + r_ow @ (should - aim)
         d = t_wo[:3, :3] @ (tip_cam - desired_cam)
         node.get_logger().info(
@@ -203,7 +203,7 @@ class FlagsMixin:
                     node.move_joints(current, starts[current], f'{current} return')
                 current = arm
                 axis = (tip - cam) / np.linalg.norm(tip - cam)
-                tcp = node.tcp_for_tip(tip, axis)
+                tcp = node.tcp_for_tip(tip, axis, arm)
                 # a base roll from which the whole sweep solves, both flags in view
                 sweep, best = None, -1
                 for roll0 in (0, 90, -90, 180):
@@ -295,9 +295,9 @@ class FlagsMixin:
             self.say('flag calibration failed: ' + '; '.join(report) + ' -- are the flags '
                      'facing back towards the wrist, flat, and clear of the motor?', True)
             return
-        merged = dict(self.markers.data) if self.markers is not None else {}
-        merged.update(result)
-        cal = gm.MarkerCalibration(merged)
+        # Replaces the old calibration whole: a flag not measured this time
+        # may have been moved since, so its old position is not kept.
+        cal = gm.MarkerCalibration(result)
         cal.save(note=datetime.datetime.now().isoformat(timespec='seconds'))
         self.markers = cal
         self.detail = '; '.join(report)
@@ -328,7 +328,7 @@ class FlagsMixin:
             return None, []
         hand_cam, used = gm.hand_from_flags(
             seen, {i: self.markers.hand_marker(i) for i in ids}, r_ow @ hand[:3, :3])
-        tip_in_hand = np.array([0.0, 0.0, TCP_IN_HAND + node.args.tip_offset])
+        tip_in_hand = np.array([0.0, 0.0, TCP_IN_HAND + node.args.tip_offsets[arm]])
         tip_cam = hand_cam[:3, :3] @ tip_in_hand + hand_cam[:3, 3]
         return t_wo[:3, :3] @ tip_cam + t_wo[:3, 3], used
 
@@ -347,12 +347,23 @@ class FlagsMixin:
         camera, the flags or the arm mounts.
         """
         node = self.node
-        if self.markers is None or not all(self.markers.has_arm(a) for a in ('left', 'right')):
+
+        def ready(arm):                  # both of this arm's flags have a measured position
+            return self.markers is not None and all(
+                i in self.markers.data for i in gm.IDS[arm])
+
+        if not all(ready(a) for a in ('left', 'right')):
             self.say('AUTO CAL: first, where the flags sit on the grippers (FLAGS)...')
             self.calibrate_markers()
-            if self.markers is None:
-                self.say('AUTO CAL needs the gripper flags calibrated -- see the message above',
-                         True)
+            if not all(ready(a) for a in ('left', 'right')):
+                # Never on with an old or partial flag calibration: on 2026-10-09 it did,
+                # with one flag calibrated before it was moved, and saved 2-3 cm of
+                # wrong corrections for the right arm.
+                missing = [i for a in ('left', 'right') for i in gm.IDS[a]
+                           if self.markers is None or i not in self.markers.data]
+                self.say(f'AUTO CAL stopped: flags {missing} have no measured position. Make '
+                         f'sure all four are seen (python3 gripper_markers.py --live) and run '
+                         f'it again.', True)
                 return
         self.say('AUTO CAL: taking a clean frame (keep the area in front of the camera clear)')
         self.capture()
@@ -366,8 +377,8 @@ class FlagsMixin:
         report = []
         try:
             for arm in ('right', 'left'):
-                if not self.markers.has_arm(arm):
-                    report.append(f'{arm}: no calibrated flag, skipped')
+                if not ready(arm):
+                    report.append(f'{arm}: flags not calibrated, skipped')
                     continue
                 start = self.pose(arm, 'pre_pick_state') or node.arm_positions(arm)
                 measured, errors, k = [], [], 0
@@ -382,7 +393,7 @@ class FlagsMixin:
                     for label, axis, quat, ring in node.candidates(tip, origin):
                         if ring != 0:
                             continue
-                        sol = node.solve_ik(arm, node.tcp_for_tip(tip, axis), quat, start)
+                        sol = node.solve_ik(arm, node.tcp_for_tip(tip, axis, arm), quat, start)
                         n = self.flag_visible(arm, sol) if sol is not None else 0
                         if n > best_n:
                             best, best_n = sol, n
@@ -409,7 +420,7 @@ class FlagsMixin:
                     self.say(f'AUTO CAL {arm} {k}/{len(spots)}: tip {1000 * errors[-1]:.1f} mm '
                              f'from where the joints put it (flags {used})')
                 node.move_joints(arm, start, f'{arm} back to pre_pick', via_home=False)
-                if len(measured) >= 4:
+                if len(measured) >= 8:
                     replace_auto(arm, measured)
                     report.append(f'{arm}: {len(measured)} spots, arm error median '
                                   f'{1000 * np.median(errors):.1f} mm (max '

@@ -278,7 +278,7 @@ class ClickToMove(Node):
         m = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
         if m is None:
             return None
-        return m[:3, 3] + m[:3, 2] * self.args.tip_offset
+        return m[:3, 3] + m[:3, 2] * self.args.tip_offsets[arm]
 
     def pixel_to_world(self, u, v, depth_img, info, frame_id):
         """(point, camera origin, depth) in world, or raises ValueError."""
@@ -347,9 +347,9 @@ class ClickToMove(Node):
                             quat_from_matrix(tool_frame_along(axis, math.radians(deg))), ring))
         return out
 
-    def tcp_for_tip(self, tip, axis):
-        """hand_tcp position that puts the fingertips at `tip`."""
-        return np.asarray(tip) - axis * self.args.tip_offset
+    def tcp_for_tip(self, tip, axis, arm):
+        """hand_tcp position that puts this arm's working tip at `tip`."""
+        return np.asarray(tip) - axis * self.args.tip_offsets[arm]
 
     # -- ROS calls from worker threads ----------------------------------------
 
@@ -902,11 +902,12 @@ class ClickToMove(Node):
     def guarded_line(self, arm, position, quat, label):
         """Straight line towards `position`, slow, stopping on contact.
 
-        The joint torques of this arm are watched against their level just
-        before the move. Contact is a torque departure of more than
-        --contact-torque (and 6x its resting noise) for 30 ms AND the tool
-        stalled: under 1 mm of progress in 0.2 s while the command still
-        moves on. Torque alone was not enough: in a TOP DOWN posture the left
+        Contact is a joint torque rising by more than --contact-torque (and
+        6x its resting noise) against half a second before, for 30 ms, AND
+        the tool stalled: under 0.5 mm of progress in 0.12 s while the
+        command still moves on. Whatever happens, a joint torque rising by
+        --max-touch-torque against a second before stops it. Torque alone
+        was not enough: in a TOP DOWN posture the left
         arm lags its command by ~60 mrad, its controller pushes harder to
         catch up, and that read as contact 1-2 cm above the object
         (2026-10-09) -- a lagging arm still moves, a blocked one does not.
@@ -916,6 +917,16 @@ class ClickToMove(Node):
         """
         args = self.args
         names = arm_joints(arm)
+        # let the arm come to rest first: a lagging arm still settling made the
+        # baseline "too noisy" and contact went unwatched (simulated, 2026-10-12)
+        t_end, prev = time.monotonic() + 0.8, self.arm_positions(arm)
+        while time.monotonic() < t_end:
+            time.sleep(0.05)
+            now = self.arm_positions(arm)
+            if prev is not None and now is not None and \
+                    np.max(np.abs(np.subtract(now, prev))) < 0.0005:
+                break
+            prev = now
         samples = []
         t_end = time.monotonic() + 0.25        # torque baseline (100 Hz: 25 samples)
         while time.monotonic() < t_end:
@@ -930,54 +941,90 @@ class ClickToMove(Node):
         m = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
         length = (float(np.linalg.norm(np.asarray(position) - m[:3, 3]))
                   if m is not None else 0.02)
-        wanted = self.retime(trajectory, length, args.contact_speed)
+        # A tool on (the rubber vacuum extension) squashes: the tip keeps
+        # creeping on contact, so "stopped advancing" shows late and the push
+        # builds. With a tool: slower, a lower limit, and contact on the
+        # torque rise alone.
+        soft = bool(getattr(args, 'tools', {}).get(arm, {}).get('on'))
+        max_torque = min(args.max_touch_torque, args.soft_tool_torque) if soft \
+            else args.max_touch_torque
+        wanted = self.retime(trajectory, length,
+                             min(args.contact_speed, 0.01) if soft else args.contact_speed)
         watch = None
         if args.contact_torque > 0 and len(samples) >= 10:
             base = np.array(samples)
-            mean, noise = base.mean(0), base.std(0)
-            if noise.max() > 0.15:
-                self.get_logger().warn(
-                    f'{label}: joint torques too noisy to feel contact (worst '
-                    f'{noise.max():.2f} Nm on {names[int(noise.argmax())]}); not watching')
-            else:
-                limit = np.maximum(args.contact_torque, 6.0 * noise)
-                over = {'n': 0}
-                p0 = m[:3, 3] if m is not None else None
-                way = ((np.asarray(position) - p0) / max(length, 1e-6)) if p0 is not None else None
-                track = collections.deque()             # (time, progress along the line)
-                t0 = time.monotonic()
+            noise = base.std(0)
+            # Torques are compared with their own recent past, not with the
+            # level before the move: reaching out changes gravity's pull on the
+            # shoulder and the lag the controller fights by over 2 Nm in free
+            # air -- against the start level that stopped touches short of the
+            # wall at "2 Nm" (2026-10-13). A contact is fast, those are slow.
+            limit = np.minimum(np.maximum(args.contact_torque, 6.0 * min(noise.max(), 0.15)),
+                               0.8 * max_torque)
+            history = collections.deque([(time.monotonic(), e) for e in samples])
+            p0 = m[:3, 3] if m is not None else None
+            way = ((np.asarray(position) - p0) / max(length, 1e-6)) if p0 is not None else None
+            track = collections.deque()                 # (time, progress along the line)
+            t0 = time.monotonic()
+            count = {'contact': 0, 'cap': 0}
 
-                def stalled():
-                    if p0 is None:
-                        return True                     # cannot tell: torque decides
-                    now = time.monotonic()
-                    tcp = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
-                    if tcp is None:
-                        return True
-                    track.append((now, float((tcp[:3, 3] - p0) @ way)))
-                    while track and now - track[0][0] > 0.2:
-                        track.popleft()
-                    if now - t0 < 0.3 or len(track) < 5:
-                        return False                    # still getting going
-                    commanded = min(1.0, (now - t0) / wanted) * length
-                    moved = track[-1][1] - track[0][1]
-                    return moved < 0.001 and commanded - track[-1][1] > 0.003
+            def stalled():
+                if p0 is None:
+                    return True                         # cannot tell: torque decides
+                now = time.monotonic()
+                tcp = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+                if tcp is None:
+                    return True
+                track.append((now, float((tcp[:3, 3] - p0) @ way)))
+                # 0.12 s, not 0.2: every 0.1 s of waiting for the stall to show
+                # is ~0.4 Nm more push on the surface (simulated, 2026-10-13)
+                while track and now - track[0][0] > 0.12:
+                    track.popleft()
+                if now - t0 < 0.3 or len(track) < 4:
+                    return False                        # still getting going
+                commanded = min(1.0, (now - t0) / wanted) * length
+                moved = track[-1][1] - track[0][1]
+                return moved < 0.0005 and commanded - track[-1][1] > 0.0015
 
-                def watch():
-                    e = self.arm_efforts(arm)
-                    if e is None:
-                        return False
-                    hit = np.any(np.abs(np.array(e) - mean) > limit)
-                    over['n'] = over['n'] + 1 if hit else 0
-                    if over['n'] >= 3 and stalled():
-                        j = int(np.argmax(np.abs(np.array(e) - mean) / limit))
-                        self.get_logger().info(
-                            f'{label}: contact ({names[j]} {e[j] - mean[j]:+.2f} Nm, '
-                            f'stopped advancing)')
-                        return True
-                    if not hit:
-                        stalled()                       # keep the track going
+            def past(seconds):
+                """The torques `seconds` ago (the oldest kept if not that old)."""
+                now = time.monotonic()
+                for t, e in history:
+                    if now - t <= seconds:
+                        return np.array(e)
+                return np.array(history[-1][1])
+
+            def watch():
+                e = self.arm_efforts(arm)
+                is_stalled = stalled()
+                if e is None:
                     return False
+                now = time.monotonic()
+                history.append((now, e))
+                while history and now - history[0][0] > 1.2:
+                    history.popleft()
+                e = np.array(e)
+                if now - t0 < 0.4:
+                    return False            # starting: the arm takes up its lag (3 cm out)
+                # the hard limit: --max-touch-torque on any joint, against 1 s ago
+                big = np.abs(e - past(1.0))
+                count['cap'] = count['cap'] + 1 if np.any(big > max_torque) else 0
+                if count['cap'] >= 2:
+                    j = int(np.argmax(big))
+                    self.get_logger().warn(
+                        f'{label}: stopped at the torque limit ({names[j]} '
+                        f'{big[j]:.2f} Nm, max {max_torque:.1f})')
+                    return True
+                # contact: blocked (no progress) and a torque rising against 0.5 s ago
+                rise = np.abs(e - past(0.5))
+                count['contact'] = count['contact'] + 1 if np.any(rise > limit) else 0
+                if (count['contact'] >= 3 or noise.max() > 1.0) and (is_stalled or (
+                        soft and count['contact'] >= 3)):
+                    j = int(np.argmax(rise / limit))
+                    self.get_logger().info(f'{label}: contact ({names[j]} {rise[j]:+.2f} Nm '
+                                           f'in 0.5 s, stopped advancing)')
+                    return True
+                return False
         ok, stopped = self.execute(trajectory, label, timeout=wanted + 20.0, watch=watch)
         if not ok:
             return None, False
@@ -1016,14 +1063,14 @@ class ClickToMove(Node):
         return code, (result.result.planned_trajectory if code == MoveItErrorCodes.SUCCESS
                       else None)
 
-    def move_joints(self, arm, positions, label, velocity=None, via_home=True):
+    def move_joints(self, arm, positions, label, velocity=None, via_home=True, attempts=None):
         """cuMotion joint goal, going via HOME_JOINTS if there is no direct path.
 
         cuRobo's optimiser only finds detours so long; from an arm hanging by
         the torso the direct path to pre_pick needs a longer one and fails
         every time, while via home both legs plan (measured 2026-09-30).
         """
-        code = self._move_joints_once(arm, positions, label, velocity)
+        code = self._move_joints_once(arm, positions, label, velocity, attempts)
         if code == MoveItErrorCodes.SUCCESS:
             return True
         if not via_home:
@@ -1038,11 +1085,26 @@ class ClickToMove(Node):
         return self._move_joints_once(arm, positions, label, velocity) == \
             MoveItErrorCodes.SUCCESS
 
-    def _move_joints_once(self, arm, positions, label, velocity=None):
-        """cuMotion joint goal through move_group. Returns the MoveIt code."""
+    def _move_joints_once(self, arm, positions, label, velocity=None, attempts=None):
+        """Joint goal through move_group: cuMotion, and if it finds no path,
+        MoveIt's sampling planner (OMPL) -- cuMotion's optimiser misses some
+        longer repositioning moves (simulated CALIBRATE ARMS, 2026-10-12: a
+        third of them). Returns the MoveIt code."""
         goal = self._joint_goal(arm, positions, velocity)
         goal.planning_options.plan_only = False
-        return self._send_until_planned(goal, label)
+        code = self._send_until_planned(goal, label, attempts)
+        # CONTROL_FAILED too: a cuMotion plan from a stale start state is
+        # refused by the controller, every retry alike; OMPL starts from
+        # move_group's own, current state (2026-10-13)
+        if code in (MoveItErrorCodes.PLANNING_FAILED, MoveItErrorCodes.FAILURE,
+                    MoveItErrorCodes.CONTROL_FAILED):
+            goal = self._joint_goal(arm, positions, velocity, 'ompl')
+            goal.planning_options.plan_only = False
+            ompl = self._send_until_planned(goal, f'{label} (OMPL)')
+            if ompl == MoveItErrorCodes.SUCCESS:
+                self.get_logger().info(f'{label}: cuMotion found no path; OMPL did')
+                return ompl
+        return code
 
     def _joint_goal(self, arm, positions, velocity=None, pipeline='cumotion'):
         if not self.move_client.wait_for_server(timeout_sec=5.0):
@@ -1074,8 +1136,8 @@ class ClickToMove(Node):
         goal.planning_options.planning_scene_diff.robot_state.is_diff = True
         return goal
 
-    def _send_until_planned(self, goal, label):
-        for attempt in range(1, self.args.attempts + 1):
+    def _send_until_planned(self, goal, label, attempts=None):
+        for attempt in range(1, (attempts or self.args.attempts) + 1):
             handle = self.wait(self.move_client.send_goal_async(goal), 15.0)
             if handle is None:
                 self.require_move_group()

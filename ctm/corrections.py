@@ -34,11 +34,14 @@ def load_corrections():
         return []
 
 
-def _sample(arm, point, correction, source, mode):
-    return plain({'arm': arm, 'point': [round(float(v), 4) for v in point],
-                  'correction': [round(float(v), 4) for v in correction],
-                  'source': source, 'mode': mode,
-                  'when': datetime.datetime.now().isoformat(timespec='seconds')})
+def _sample(arm, point, correction, source, mode, model=None):
+    out = {'arm': arm, 'point': [round(float(v), 4) for v in point],
+           'correction': [round(float(v), 4) for v in correction],
+           'source': source, 'mode': mode,
+           'when': datetime.datetime.now().isoformat(timespec='seconds')}
+    if model:
+        out['model'] = model            # taught on top of this arm model (CALIBRATE ARMS)
+    return plain(out)
 
 
 def _write(samples):
@@ -48,9 +51,9 @@ def _write(samples):
                      '# fingertip had to be aimed, relative to a point, to land on it.\n' + text)
 
 
-def save_correction(arm, point, correction, mode='level', source='teach'):
+def save_correction(arm, point, correction, mode='level', source='teach', model=None):
     samples = load_corrections()
-    samples.append(_sample(arm, point, correction, source, mode))
+    samples.append(_sample(arm, point, correction, source, mode, model))
     _write(samples)
     return len(samples)
 
@@ -66,7 +69,7 @@ def replace_auto(arm, measured, mode='level'):
     return len(samples)
 
 
-def learned_correction(arm, point, mode='level'):
+def learned_correction(arm, point, mode='level', model=None):
     """(correction (3,), samples nearby, samples in all) for this arm at this point.
 
     Two layers, so a correction carries to where nothing was taught yet:
@@ -80,7 +83,10 @@ def learned_correction(arm, point, mode='level'):
     * a Gaussian-weighted (sigma 6 cm) blend of what the trend still misses
       at the samples within CORRECTION_RADIUS, for the local detail.
     """
-    samples = [s_ for s_ in load_corrections() if s_.get('arm') == arm]
+    # Only samples taught on top of the same arm model: one taught before a
+    # CALIBRATE ARMS would correct again what the model already corrects.
+    samples = [s_ for s_ in load_corrections()
+               if s_.get('arm') == arm and s_.get('model') == model]
     same = [s_ for s_ in samples if s_.get('mode', 'level') == mode]
     if len(same) >= 3:                       # this mode's own, when there are enough
         samples = same

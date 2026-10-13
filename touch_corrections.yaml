@@ -1,5 +1,5 @@
-# Touch corrections taught with click_to_move.py TEACH: where the fingertip
-# had to be aimed, relative to the clicked point, to land on it.
+# Touch corrections (click_to_move.py TEACH and AUTO CAL): where the
+# fingertip had to be aimed, relative to a point, to land on it.
 samples:
 - arm: left
   point:

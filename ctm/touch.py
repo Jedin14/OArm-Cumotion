@@ -8,7 +8,8 @@ import cv2
 import numpy as np
 
 import robot_camera_calibration as rcc
-from ctm.common import ARM_REACH, BASE_FRAME, NUDGE
+from ctm.kinematics import directions
+from ctm.common import ARM_REACH, BASE_FRAME, NUDGE, matrix_from_quat, quat_from_matrix
 from ctm.corrections import learned_correction, save_correction
 
 # The last NEAR m onto the surface is the only part where the gripper (its
@@ -41,7 +42,8 @@ class TouchMixin:
         left = (us.ravel() * sx < info.width / 2.0) if args.arm == 'auto' else \
             np.full(len(z), args.arm == 'left')
         shoulder = np.where(left[:, None], shoulders['left'][:3, 3], shoulders['right'][:3, 3])
-        beyond = np.linalg.norm(world - shoulder, axis=1) - args.tip_offset - ARM_REACH
+        tip = np.where(left, args.tip_offsets['left'], args.tip_offsets['right'])
+        beyond = np.linalg.norm(world - shoulder, axis=1) - tip - ARM_REACH
         bad = ((z > 0.1) & (beyond > 0)).reshape(vs.shape).astype(np.uint8)
         return cv2.resize(bad, (bgr.shape[1], bgr.shape[0]),
                           interpolation=cv2.INTER_NEAREST).astype(bool)
@@ -52,7 +54,8 @@ class TouchMixin:
         mode. The gripper flags are a one-time calibration tool (AUTO CAL):
         in normal work the arm hides them, so touches do not look for them
         unless --live-flags."""
-        learned, _used, taught = learned_correction(arm, point, self.mode_name())
+        learned, _used, taught = learned_correction(arm, point, self.mode_name(),
+                                                    self.arm_models.tag(arm))
         markers_on = (self.node.args.live_flags and self.markers is not None
                       and self.markers.has_arm(arm) and p_cam is not None)
         return point + learned, learned, taught, markers_on
@@ -106,7 +109,7 @@ class TouchMixin:
     # -- the touch ------------------------------------------------------------
 
     def correct_to(self, arm, tcp_goal, axis, quat, label, expected, offset=None,
-                   corrections=None, too_far=0.04):
+                   corrections=None, too_far=0.04, settle=None):
         """Settle on `expected` joints, measure the fingertip, and fly out the
         error. Returns the offset that had to be added to the command (world,
         m) and the error left over (m).
@@ -118,13 +121,13 @@ class TouchMixin:
         restored and the loop stops.
         """
         node, args = self.node, self.node.args
-        wanted = tcp_goal + axis * args.tip_offset
+        wanted = tcp_goal + axis * args.tip_offsets[arm]
         offset = np.zeros(3) if offset is None else np.array(offset, dtype=float)
         best = None                                  # (residual, offset, joints)
         corrections = args.corrections if corrections is None else corrections
         for attempt in range(corrections + 1):
             t0 = time.monotonic()
-            joint_err = node.settle(arm, expected)
+            joint_err = node.settle(arm, expected, timeout=settle)
             waited = time.monotonic() - t0
             tip = node.fingertip(arm)
             if tip is None:
@@ -181,7 +184,8 @@ class TouchMixin:
                     node.line_move(arm, command + nudge, quat, f'{arm} nudge')
                 elif what == 'save':
                     total = learned + nudge
-                    n = save_correction(arm, point, total, mode=self.mode_name())
+                    n = save_correction(arm, point, total, mode=self.mode_name(),
+                                        model=self.arm_models.tag(arm))
                     self.say(f'TEACH: saved ({1000 * total[0]:+.0f}, {1000 * total[1]:+.0f}, '
                              f'{1000 * total[2]:+.0f}) mm for the {arm} arm here '
                              f'({n} corrections stored)')
@@ -219,7 +223,7 @@ class TouchMixin:
         node, args = self.node, self.node.args
         shoulder = node.lookup(BASE_FRAME, f'openarm_{arm}_link1')
         if shoulder is not None:
-            far = float(np.linalg.norm(aim - shoulder[:3, 3])) - args.tip_offset - ARM_REACH
+            far = float(np.linalg.norm(aim - shoulder[:3, 3])) - args.tip_offsets[arm] - ARM_REACH
             if far > 0:
                 return None, (f'out of reach: {100 * far:.0f} cm beyond what the {arm} arm '
                               f'can reach')
@@ -231,8 +235,8 @@ class TouchMixin:
         for ring in sorted(rings):
             solved = []
             for label, axis, quat, _ring in rings[ring]:
-                approach = node.tcp_for_tip(aim - axis * args.standoff, axis)
-                contact = node.tcp_for_tip(aim - axis * args.touch_offset, axis)
+                approach = node.tcp_for_tip(aim - axis * args.standoff, axis, arm)
+                contact = node.tcp_for_tip(aim - axis * args.touch_offset, axis, arm)
                 # Up to 3 different arm postures for this approach: from one,
                 # the straight line can run into a wrist limit half-way (then
                 # it is refused: joint jump), from another it goes through.
@@ -244,24 +248,48 @@ class TouchMixin:
                         continue
                     # the posture NEAR cm short of the surface, fully checked:
                     # gripper included (it may only touch the clicked surface)
-                    if node.solve_ik(arm, contact - axis * NEAR, quat, above) is not None:
-                        found.append(above)
-                        # joint travel, plus a penalty for a joint near its limit:
-                        # no room left there for the line in or a correction
-                        room = min(node.limit_room(arm, above),
-                                   node.limit_room(arm, found[-1]))
-                        cost = (sum(abs(x - y) for x, y in zip(above, start))
-                                + 20.0 * max(0.0, 0.1 - room))
-                        solved.append((cost, label, axis, quat, approach, contact, above))
-                        if len(found) >= 3:
-                            break
+                    near_q = node.solve_ik(arm, contact - axis * NEAR, quat, above)
+                    if near_q is None:
+                        continue
+                    app_c, con_c, quat_c = approach, contact, quat
+                    if self.arm_models.has(arm):
+                        # CALIBRATE ARMS: the joints that, by the arm model, put
+                        # the real tool NEAR short of the surface, level -- and
+                        # where the URDF puts those joints, which is what the
+                        # planner gets. So the sag is taken out of the tilt as
+                        # well as the position (the tool used to dip). Taken at
+                        # the posture NEAR short; re-taken at contact (_touch).
+                        # (gear play: each joint's last move there is the line in)
+                        cmd = self.arm_models.command(arm, contact - axis * NEAR,
+                                                      matrix_from_quat(*quat), near_q,
+                                                      node.joint_limits(arm),
+                                                      directions(above, near_q))
+                        if cmd is None:
+                            continue
+                        delta = cmd[0] - (contact - axis * NEAR)
+                        quat_c = quat_from_matrix(cmd[1])
+                        app_c, con_c = approach + delta, contact + delta
+                        above = node.solve_ik(arm, app_c, quat_c, above)
+                        near_q = (node.solve_ik(arm, con_c - axis * NEAR, quat_c, above)
+                                  if above is not None else None)
+                        if above is None or near_q is None:
+                            continue
+                    found.append(above)
+                    # joint travel, plus a penalty for a joint near its limit:
+                    # no room left there for the line in or a correction
+                    room = min(node.limit_room(arm, above), node.limit_room(arm, near_q))
+                    cost = (sum(abs(x - y) for x, y in zip(above, start))
+                            + 20.0 * max(0.0, 0.1 - room))
+                    solved.append((cost, label, axis, quat_c, app_c, con_c, above, (contact, quat)))
+                    if len(found) >= 3:
+                        break
                 if not found:
                     tally['ik'] += 1
             solved.sort(key=lambda s_: s_[0])
             if self.node.args.live_flags and self.markers is not None \
                     and self.markers.has_arm(arm):
                 solved = self._flags_in_view_first(arm, solved)
-            for _cost, label, axis, quat, approach, contact, above in solved:
+            for _cost, label, axis, quat, approach, contact, above, raw in solved:
                 # Cheap checks first (~50 ms line, ~100 ms room); a cuMotion
                 # plan costs 0.5 s, a failed one ~5 s.
                 # The line in, fully checked -- every link, the gripper too --
@@ -286,7 +314,8 @@ class TouchMixin:
                     tally['line'] += 1
                     continue
                 plan = {'label': label, 'axis': axis, 'quat': quat, 'approach': approach,
-                        'contact': contact, 'above': above, 'beyond': beyond, 'edge': False}
+                        'contact': contact, 'above': above, 'beyond': beyond, 'edge': False,
+                        'contact_raw': raw}
                 if not room:
                     edge.append(dict(plan, edge=True))       # only if nothing better
                     continue
@@ -314,6 +343,7 @@ class TouchMixin:
         also when something failed part-way (an arm left out at the board,
         with every later move failing, was the "stuck" of 2026-10-07)."""
         self.last_touch = None
+        self.last_contact = None
         try:
             self._touch(arm, point, origin, scene)
         except Exception as exc:                     # noqa: BLE001 - shown in the window
@@ -475,6 +505,38 @@ class TouchMixin:
         # In to NEAR short of the surface, every link checked (the gripper too).
         near = node.line_move(arm, short - vis + offset, quat, f'{arm} in',
                               speed=args.fast_line_speed)
+        if near is not None and self.arm_models.has(arm):
+            # The arm model's correction where the contact really happens: the
+            # plan took it NEAR short, and gravity's sag changes over those last
+            # cm (2-7 mm, simulated 2026-10-12). Re-aim there and slide the
+            # line sideways before going in (the tilt stays as planned).
+            raw, level = plan['contact_raw']
+            q_c = node.solve_ik(arm, contact, quat, near)
+            cmd = (self.arm_models.command(arm, raw, matrix_from_quat(*level), q_c,
+                                           node.joint_limits(arm), directions(near, q_c))
+                   if q_c is not None else None)
+            con = cmd[0] if cmd is not None else contact
+            if np.linalg.norm(con - contact) > 0.0005:
+                moved = node.line_move(arm, con - axis * NEAR - vis + offset, quat,
+                                       f'{arm} re-aim', speed=args.fast_line_speed)
+                if moved is not None:
+                    contact = con
+                    short = contact - axis * NEAR
+                    self.last_touch['out_short'] = short - vis + offset
+                    near = moved
+        if near is not None:
+            # Where the arm really got to, NEAR short: a joint-space controller
+            # under gravity stops short of its command -- 27 mm at the approach
+            # on the robot, and the one correction out there did not carry
+            # through the line in and the re-aim (touches 7-8 mm off,
+            # 2026-10-13). Fly it out here; the contact line keeps the offset.
+            # Up to 4, until within --tolerance, each after a longer settle:
+            # with 2 the left arm (rubber tool) still ended 10-17 mm off -- each
+            # correction took out only about half (robot, 2026-10-13).
+            offset, _left = self.correct_to(
+                arm, short - vis, axis, quat, 'NEAR short', near, offset,
+                corrections=4, too_far=0.05, settle=max(args.settle_time, 2.0))
+            self.last_touch['out_short'] = short - vis + offset
         if near is not None:
             # The last NEAR, on the same line: only now may this arm's fingers
             # touch the octomap -- slowly, stopping when it feels the surface,
@@ -489,6 +551,12 @@ class TouchMixin:
                     self.say(f'{arm} arm: touching ({how}); holding {args.hold:.0f} s')
                     tip = node.fingertip(arm)
                     seen_by = 'joints'
+                    if tip is not None and self.arm_models.has(arm):
+                        # where the arm model says the tip really is
+                        here_q = node.arm_positions(arm)
+                        tip = tip + self.arm_models.tip_shift(arm, here_q, args.tip_offsets[arm],
+                                                              directions(near, here_q))
+                        seen_by = 'arm model'
                     if tip is not None:
                         if markers_on:
                             # Where the camera sees the fingertip now, against the click.
@@ -497,6 +565,8 @@ class TouchMixin:
                                  if here is not None else None)
                             tip = tip + (d if d is not None else vis)
                             seen_by = 'camera' if d is not None else 'joints + flags'
+                        self.last_contact = {'arm': arm, 'tip': tip, 'aim': aim,
+                                             'axis': axis, 'felt': touched}
                         miss = aim - tip
                         along = float(miss @ axis)
                         sideways = float(np.linalg.norm(miss - along * axis))

@@ -58,9 +58,11 @@ OCTOMAP_NAME = '<octomap>'
 # in the hand frame, finger mesh spans 0.6585..0.7534 at an offset of -0.673,
 # so the tip is at 0.015 + 0.0804 = 0.0954 m; hand_tcp is at 0.080.
 FINGERTIP_BEYOND_TCP = 0.0154
-# The vacuum extension fitted past the fingertips (2026-10-08): the working
-# tip is this much further out along the tool axis. --tool-extension.
-TOOL_EXTENSION = 0.020
+# Tools fitted past the fingertips, per arm, by default (ctm/tools.py keeps
+# the current ones, switched and sized in the window): the working tip is
+# this much further out along the tool axis. The left arm has a 2 cm vacuum
+# extension, the right arm none (2026-10-12).
+TOOL_EXTENSION = {'left': 0.020, 'right': 0.0}
 
 
 # Same fallback as pick_place_orchestrator's home_joint_positions: symmetric,

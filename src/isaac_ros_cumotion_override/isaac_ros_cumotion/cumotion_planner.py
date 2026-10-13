@@ -282,10 +282,16 @@ class CumotionActionServer(Node):
         self.warmup()
         self.__query_count = 0
         self.__tensor_args = self.motion_gen.tensor_args
+        # Its own callback group: in the node's default group the 100 Hz
+        # sphere timer below starved it, and planning started from a joint
+        # state minutes old -- every right-arm move then failed "start point
+        # deviates from current robot state" (CALIBRATE ARMS, 2026-10-13).
         self.subscription = self.create_subscription(
-            JointState, self.__joint_states_topic, self.js_callback, 10
+            JointState, self.__joint_states_topic, self.js_callback, 10,
+            callback_group=MutuallyExclusiveCallbackGroup()
         )
         self.__js_buffer = None
+        self.__js_stamp = 0.0
         # What move_group checks paths against, for cuMotion to plan around
         # (scene_world.py): tf for the camera pose, the stand column, and a
         # cache for the decoded octomap.
@@ -301,8 +307,10 @@ class CumotionActionServer(Node):
         self._octomap = scene_world.OctomapCache()
         self._shadowed = scene_world.ShadowedMap()
 
-        # Call on_timer every 0.01 seconds
-        self.timer = self.create_timer(0.01, self.on_timer)
+        # The robot's collision spheres for RViz: 10 Hz is plenty (it was
+        # 100 Hz, and took the joint state's turn). In the default group on
+        # purpose: it uses the GPU kinematics, never alongside a plan.
+        self.timer = self.create_timer(0.1, self.on_timer)
 
         self.__update_link_spheres_server = UpdateLinkSpheresServer(
             server_node=self,
@@ -315,6 +323,7 @@ class CumotionActionServer(Node):
         )
 
     def js_callback(self, msg):
+        self.__js_stamp = time.monotonic()
         self.__js_buffer = {
             'joint_names': msg.name,
             'position': msg.position,
@@ -947,6 +956,10 @@ class CumotionActionServer(Node):
                 )
                 return result
 
+            age = time.monotonic() - self.__js_stamp
+            if age > 0.5:
+                self.get_logger().warn(
+                    f'joint_state is {age:.1f} s old: planning from where the arm was then')
             # read joint state:
             state = CuJointState.from_position(
                 position=self.tensor_args.to_device(self.__js_buffer['position']).unsqueeze(0),
