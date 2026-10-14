@@ -24,6 +24,10 @@ AHEAD = 0.05                    # m: start this far in front of the nearest thin
 Y_MAX = 0.9                     # m: half width
 SLICE = 0.02                    # m: slice thickness along x
 WALL_ID = 'unseen_walls'
+# No way in through these walls, ever: a corridor under a low box, lowered
+# 10 cm for the hand, let it hit the table the camera cannot see
+# (2026-10-14). A low box is reached with a roll or tilt that keeps the hand
+# above them, or not at all.
 
 
 def nearest_seen(octomap_msg, origin):

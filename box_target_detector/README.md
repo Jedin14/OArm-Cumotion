@@ -50,7 +50,7 @@ Load the model **once** at startup, then call `detect()` for each frame the robo
 ```python
 from box_detector import BoxTargetDetector
 
-detector = BoxTargetDetector(tol=0.5)      # loads the model and warms it up (~1–2 s)
+detector = BoxTargetDetector(tol=0.3)      # loads the model and warms it up (~1–2 s)
 
 result = detector.detect(frame)            # frame: BGR numpy array, shape (H, W, 3)
 if result is None:
@@ -70,7 +70,7 @@ result = detector.detect_bytes(jpeg_bytes)
 ### Command line (for testing)
 
 ```bash
-python3 box_detector.py <image> [--tol 0.5] [--conf 0.5] [--device cpu|0] [--annotate out.jpg]
+python3 box_detector.py <image> [--tol 0.3] [--conf 0.5] [--device cpu|0] [--annotate out.jpg]
 ```
 
 `--annotate` saves a debug image. The target is drawn in thick red with a cross at its centroid, other top-row boxes in yellow, and all remaining boxes in blue.
@@ -99,6 +99,7 @@ python3 box_detector.py <image> [--tol 0.5] [--conf 0.5] [--device cpu|0] [--ann
 | `bbox` | Target box corners `[x1, y1, x2, y2]` in pixels |
 | `confidence` | Detection confidence of the target box (0–1) |
 | `num_boxes` | Total boxes detected in the frame |
+| `boxes` | Every detected box as `[x1, y1, x2, y2]` (pixels), the target among them |
 | `image_width`, `image_height` | Size of the input frame, so the coordinates can be interpreted |
 
 ### Coordinate system
@@ -120,7 +121,7 @@ python3 box_detector.py <image> [--tol 0.5] [--conf 0.5] [--device cpu|0] [--ann
 
 | Parameter | Default | Description |
 |---|---|---|
-| `tol` | `0.5` | Top-row leeway as a fraction of box height (0.5 = ±50%). Can also be set per call: `detect(frame, tol=0.3)`. The next row of boxes sits about 1 box height lower, so keep it below about 0.8. |
+| `tol` | `0.3` | Top-row leeway as a fraction of box height (0.3 = ±30%). Can also be set per call: `detect(frame, tol=0.5)`. The next row of boxes sits about 1 box height lower, so keep it below about 0.8. |
 | `conf` | `0.5` | Minimum detection confidence. Raise it to ignore uncertain detections. |
 | `device` | `None` | `None` uses the GPU if one is available. `"cpu"` forces CPU; `"0"` selects the first GPU. |
 | `model_path` | `box_model.pt` | Path to the model weights, which must sit next to the script. |

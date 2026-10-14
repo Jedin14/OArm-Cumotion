@@ -253,6 +253,44 @@ def tcp_batch(arm, q, params=None, dirs=None):
     return base @ t
 
 
+def ik_batch(arm, target, seeds, limits, iters=25, tol=1e-4):
+    """Plain-URDF IK for hand_tcp at `target` (4x4) from many starting
+    postures at once: damped least squares with the exact (geometric)
+    Jacobian, all seeds in one batch -- milliseconds, so the planner can ask
+    "can the arm get there at all?" before any slow, collision-aware IK.
+    Returns the solutions (k, 7), distinct by 0.2 rad, best first."""
+    q = np.array(seeds, float)
+    lo, hi = np.array(limits, float).T
+    q = np.clip(q, lo, hi)
+    pt, rt = target[:3, 3], target[:3, :3]
+    for _ in range(iters):
+        frames, joints = frames_batch(arm, q)
+        t = frames[-1]
+        p_err = pt - t[:, :3, 3]
+        r_rel = rt @ np.transpose(t[:, :3, :3], (0, 2, 1))       # target * current^T
+        w_err = 0.5 * np.stack([r_rel[:, 2, 1] - r_rel[:, 1, 2], r_rel[:, 0, 2] - r_rel[:, 2, 0],
+                                r_rel[:, 1, 0] - r_rel[:, 0, 1]], axis=1)
+        err = np.concatenate([p_err, w_err], axis=1)                # (n, 6)
+        jac = np.zeros((len(q), 6, 7))
+        for k, (origin, axis) in enumerate(joints):
+            jac[:, :3, k] = np.cross(axis, t[:, :3, 3] - origin)
+            jac[:, 3:, k] = axis
+        jt = np.transpose(jac, (0, 2, 1))
+        dq = np.linalg.solve(jt @ jac + 1e-4 * np.eye(7), jt @ err[:, :, None])[:, :, 0]
+        q = np.clip(q + dq, lo, hi)
+    frames, _j = frames_batch(arm, q)
+    t = frames[-1]
+    pos = np.linalg.norm(pt - t[:, :3, 3], axis=1)
+    rot = np.linalg.norm(t[:, :3, :3] - rt, axis=(1, 2))
+    good = np.flatnonzero((pos < tol) & (rot < 1e-3))
+    good = good[np.argsort(pos[good] + rot[good])]
+    out = []
+    for i in good:
+        if all(np.max(np.abs(q[i] - o)) > 0.2 for o in out):
+            out.append(q[i])
+    return np.array(out).reshape(-1, 7)
+
+
 def directions(before, after, still=0.005):
     """+1 / -1 per joint: which way it moved from `before` to `after` (0 if
     it hardly moved -- its gear play stays where it was, unknown)."""

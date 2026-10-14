@@ -2,11 +2,9 @@
 lands on it -- kept in touch_corrections.yaml, and the correction they give
 at a new point.
 
-Samples come from TEACH (you nudge the tip onto the spot: source "teach") and
-from AUTO CAL (the gripper flags measure the real tip across the workspace,
-once: source "auto"). Each records the tool's mode ("level" or "top-down"):
-the arm sags differently reaching down, so a mode uses its own samples when
-it has enough of them.
+Samples come from TEACH (you nudge the tip onto the spot), on top of the
+current arm model (CAL ARMS). Each records the tool's mode ("level" or "top-down"):
+the arm sags differently reaching down, so a mode uses only its own samples.
 """
 
 import datetime
@@ -47,24 +45,13 @@ def _sample(arm, point, correction, source, mode, model=None):
 def _write(samples):
     text = yaml.safe_dump({'samples': samples}, sort_keys=False)
     with open(CORRECTIONS_FILE, 'w') as handle:
-        handle.write('# Touch corrections (click_to_move.py TEACH and AUTO CAL): where the\n'
+        handle.write('# Touch corrections (click_to_move.py TEACH): where the\n'
                      '# fingertip had to be aimed, relative to a point, to land on it.\n' + text)
 
 
 def save_correction(arm, point, correction, mode='level', source='teach', model=None):
     samples = load_corrections()
     samples.append(_sample(arm, point, correction, source, mode, model))
-    _write(samples)
-    return len(samples)
-
-
-def replace_auto(arm, measured, mode='level'):
-    """AUTO CAL: this arm's samples from an earlier AUTO CAL in this mode give
-    way to `measured` [(point, correction)]; TEACH samples are kept."""
-    samples = [s_ for s_ in load_corrections()
-               if not (s_.get('arm') == arm and s_.get('source') == 'auto'
-                       and s_.get('mode', 'level') == mode)]
-    samples += [_sample(arm, p, c, 'auto', mode) for p, c in measured]
     _write(samples)
     return len(samples)
 
@@ -87,9 +74,9 @@ def learned_correction(arm, point, mode='level', model=None):
     # CALIBRATE ARMS would correct again what the model already corrects.
     samples = [s_ for s_ in load_corrections()
                if s_.get('arm') == arm and s_.get('model') == model]
-    same = [s_ for s_ in samples if s_.get('mode', 'level') == mode]
-    if len(same) >= 3:                       # this mode's own, when there are enough
-        samples = same
+    # this mode's own only: a top-down touch's correction says nothing about
+    # a front one (front was right with none, 2026-10-14)
+    samples = [s_ for s_ in samples if s_.get('mode', 'level') == mode]
     if not samples:
         return np.zeros(3), 0, 0
     pts = np.array([s_['point'] for s_ in samples], dtype=float)

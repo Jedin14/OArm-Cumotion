@@ -15,7 +15,7 @@ Python:
     result = detector.detect(frame)          # frame: BGR numpy array (H, W, 3)
 
 Command line (for testing):
-    python3 box_detector.py samples/frame_00600.jpg --tol 0.5 --annotate out.jpg
+    python3 box_detector.py samples/frame_00600.jpg --tol 0.3 --annotate out.jpg
 """
 import argparse
 import json
@@ -40,10 +40,10 @@ def select_target(xyxy, tol):
 
 
 class BoxTargetDetector:
-    def __init__(self, model_path=DEFAULT_MODEL, tol=0.5, conf=0.5, device=None):
+    def __init__(self, model_path=DEFAULT_MODEL, tol=0.3, conf=0.5, device=None):
         """
         model_path: path to the trained YOLO weights.
-        tol:        top-row leeway as a fraction of box height (0.5 = +/-50%).
+        tol:        top-row leeway as a fraction of box height (0.3 = +/-30%).
         conf:       minimum detection confidence (0-1).
         device:     "cpu", "0" (first GPU), ... ; None picks GPU if available.
         """
@@ -75,6 +75,7 @@ class BoxTargetDetector:
             "bbox": [round(float(v), 1) for v in (x1, y1, x2, y2)],
             "confidence": round(float(r.boxes.conf[target]), 3),
             "num_boxes": len(xyxy),
+            "boxes": [[round(float(v), 1) for v in b] for b in xyxy],
             "image_width": w,
             "image_height": h,
         }
@@ -108,7 +109,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("image", help="path to an image file")
     ap.add_argument("--model", default=DEFAULT_MODEL)
-    ap.add_argument("--tol", type=float, default=0.5, help="top-row leeway as a fraction of box height")
+    ap.add_argument("--tol", type=float, default=0.3, help="top-row leeway as a fraction of box height")
     ap.add_argument("--conf", type=float, default=0.5, help="detection confidence threshold")
     ap.add_argument("--device", default=None, help='"cpu" or GPU index such as "0"')
     ap.add_argument("--annotate", metavar="OUT.jpg", help="also save an annotated image")

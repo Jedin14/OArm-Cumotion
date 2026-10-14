@@ -73,11 +73,11 @@ A touch (MOVE)
 3. Right after the click the whole touch is planned (reach, a front
    approach with the tool level (horizontal), turned 0/15/30 deg, a collision-free
    cuMotion path, the straight line in); MOVE turns green or red.
-4. MOVE: fly the planned path to the point 10 cm out (`--standoff`); one
-   correction there -- from the gripper flags if they are in view, else
-   from the joints; then ONE straight line along the tool axis: fast to
-   1 cm short (`--fast-line-speed`), the last centimetre slowly
-   (`--contact-speed`), stopping on contact; hold `--hold` s; straight back out; retrace the approach path
+4. MOVE: fly the planned path to the point 10 cm out (`--standoff`), aimed
+   with the arm model (CAL ARMS); a correction there from the joints, and
+   up to four more 3 cm short; then ONE straight line along the tool axis
+   (`--fast-line-speed`), the last 3 cm slowly (`--contact-speed`),
+   stopping on contact; hold `--hold` s; straight back out; retrace the approach path
    back to the starting posture. (Gripper closed first with --close-gripper.)
 
 Code layout
@@ -85,9 +85,12 @@ Code layout
 click_to_move.py           the window (App), command-line options, main()
 ctm/robot.py               ClickToMove node: ROS/MoveIt interface, motion primitives
 ctm/touch.py               reach check, preplan, the touch sequence, TEACH
-ctm/flags.py               gripper flags: visibility, measurement, FLAGS calibration
+ctm/armcal.py, armcal_run.py, board.py, kinematics.py
+                           CAL ARMS: the arm model, its fit and the calibration run
 ctm/camera_calibration.py  CALIBRATE / APPLY / OVERLAY
 ctm/corrections.py         TEACH corrections (touch_corrections.yaml)
+ctm/modes.py, tools.py, walls.py
+                           navigation/pick modes, gripper tools, unseen-area walls
 ctm/common.py              constants, geometry and image helpers
 
 Touching needs two exemptions, as in pick_place_orchestrator: the hand and
@@ -105,20 +108,20 @@ import numpy as np
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 
-import gripper_markers as gm
 from ctm import armcal
 from ctm.armcal_run import ArmCalMixin
 from ctm.camera_calibration import CameraCalibrationMixin
 from ctm import tools as tl
-from ctm.common import FONT, MoveGroupDown, WINDOW, decode_image
-from ctm.flags import FlagsMixin
+from ctm.common import BASE_FRAME, FONT, MoveGroupDown, WINDOW, decode_image
 from ctm.modes import ModesMixin, load_poses
 from ctm.robot import ClickToMove
 from ctm.touch import TouchMixin
 
 
-class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
+class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
     """The OpenCV window, and the worker threads that capture and move."""
+
+    HINT = 'click a point   keys: m n p d b r c o t f'
 
     def __init__(self, node):
         self.node = node
@@ -143,7 +146,6 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixi
         self.calibration = None
         self.calibrating = False
         self.overlay = None           # (pixels (N,2), agree (N,) bool): robot model on the image
-        self.markers = gm.MarkerCalibration.load()   # None until CALIBRATE MARKERS has run
         self.teach = False            # TEACH mode: hold each touch for nudges
         self.top_down = node.args.top_down   # approach straight down instead of level
         self.teaching = False         # a touch is being taught right now
@@ -231,34 +233,53 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixi
             return
         if self.busy or self.frame is None:
             return
-        bgr, depth, info, frame_id = self.frame
-        if v >= bgr.shape[0]:
+        if v >= self.frame[0].shape[0]:
             return                                   # the button bar, off a button
-        dh, dw = depth.shape
-        bh, bw = bgr.shape[:2]
-        try:
-            point, origin, z = self.node.pixel_to_world(
-                int(u * dw / bw), int(v * dh / bh), depth, info, frame_id)
-        except Exception as exc:                     # noqa: BLE001
-            self.pick = None
-            self.say(f'pixel ({u}, {v}): {exc}', True)
+        check = self.select_point(u, v)
+        if check is None:
             return
-        if self.node.args.arm != 'auto':
-            arm = self.node.args.arm
-        else:
-            arm = 'left' if u < bw / 2.0 else 'right'
-        self.pick = (u, v, point, arm, origin)
-        self.node.publish_marker(point)
-        where = f'x={point[0]:+.3f} y={point[1]:+.3f} z={point[2]:+.3f} (depth {z:.2f} m)'
-        self.say(f'{where}, {arm} arm - checking it can be touched...')
-        check = {'pick': self.pick, 'where': where, 'ok': None, 'plan': None}
-        self.check = check
         if self.mode != 'pick':
             # First point: into pick mode (both arms to pre_pick), then the check.
             self.in_background(lambda: self.ensure_pick_mode() and
                                self.check_pick(check, in_job=True))
         else:
             threading.Thread(target=self.check_pick, args=(check,), daemon=True).start()
+
+    def select_point(self, u, v, world=None):
+        """Pixel (u, v) of the captured frame -> the point to touch (world,
+        from the depth there, or `world` if given) and its arm (by the half
+        of the frame). Sets self.pick and a fresh self.check (not run yet);
+        returns the check, or None if there is no depth there."""
+        bgr, depth, info, frame_id = self.frame
+        dh, dw = depth.shape
+        bh, bw = bgr.shape[:2]
+        try:
+            point, origin, z = self.node.pixel_to_world(
+                int(u * dw / bw), int(v * dh / bh), depth, info, frame_id)
+        except Exception as exc:                     # noqa: BLE001
+            if world is None:
+                self.pick = None
+                self.say(f'pixel ({u:.0f}, {v:.0f}): {exc}', True)
+                return None
+            m = self.node.lookup(BASE_FRAME, frame_id)
+            origin, z = m[:3, 3], float(np.linalg.norm(np.asarray(world) - m[:3, 3]))
+        if world is not None:
+            point = np.asarray(world, float)
+        if self.node.args.arm != 'auto':
+            arm = self.node.args.arm
+        else:
+            arm = 'left' if u < bw / 2.0 else 'right'
+        self.pick = (int(u), int(v), point, arm, origin)
+        self.node.publish_marker(point)
+        where = f'x={point[0]:+.3f} y={point[1]:+.3f} z={point[2]:+.3f} (depth {z:.2f} m)'
+        self.say(f'{where}, {arm} arm - checking it can be touched...')
+        check = {'pick': self.pick, 'where': where, 'ok': None, 'plan': None}
+        self.check = check
+        return check
+
+    def on_key(self, key):
+        """A key the window loop does not know: True if handled (subclasses)."""
+        return False
 
     def change_tool(self, arm, toggle=False, step=0.0):
         """Switch an arm's tool on/off or change its length; the touches use
@@ -384,12 +405,37 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixi
             head = 'calibrating by itself - keep the view clear   ABORT / x'
         else:
             head = (f'[{(self.mode or "?").upper()}{" TOP DOWN" if self.top_down else ""}]  '
-                    f'click a point   keys: m n p d b r c o t f')
+                    f'{self.HINT}')
         for i, text in enumerate((head + ('  [busy]' if self.busy else ''), self.status)):
             y = 22 + 22 * i
             cv2.putText(img, text, (8, y), FONT, 0.5, (0, 0, 0), 3)
             cv2.putText(img, text, (8, y), FONT, 0.5, (255, 255, 255), 1)
         return self.with_buttons(img)
+
+    def main_buttons(self, idle, grey):
+        """[(name, label, colour)] of the button bar when nothing special is on."""
+        ok = self.check['ok'] if self.check is not None else None
+        move_colour = (grey if not (idle and self.pick) else (0, 150, 0) if ok
+                       else (0, 120, 200) if ok is None else (0, 0, 150))
+        specs = [('move', 'MOVE', move_colour),
+                 ('recapture', 'RECAPTURE', (150, 90, 0) if idle else grey),
+                 ('calibrate', 'CALIBRATE', (140, 0, 140) if idle else grey),
+                 ('overlay', 'OVERLAY', (0, 140, 140) if idle or self.overlay else grey),
+                 ('topdown', 'TOP DOWN ON' if self.top_down else 'TOP DOWN',
+                  (0, 90, 230) if self.top_down else (70, 70, 120)),
+                 ('teach', 'TEACH ON' if self.teach else 'TEACH',
+                  (0, 100, 220) if self.teach else (70, 70, 120)),
+                 ('markers', 'CAL ARMS', (0, 140, 0) if self.arm_models.params and idle
+                  else (100, 100, 40) if idle else grey)]
+        specs += [('navigation', 'NAVIGATION', (160, 110, 0) if self.mode == 'navigation'
+                   else (110, 80, 30) if idle else grey),
+                  ('pickmode', 'PICK MODE', (0, 160, 160) if self.mode == 'pick'
+                   else (30, 100, 100) if idle else grey)]
+        if self.last_touch is not None:
+            specs.append(('return', 'RETURN', (0, 0, 200) if idle else grey))
+        if self.calibration is not None:
+            specs.append(('apply', 'APPLY', (0, 120, 200) if idle else grey))
+        return specs
 
     def with_buttons(self, img):
         """The frame with a button bar under it (OpenCV has no widgets)."""
@@ -406,28 +452,7 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixi
         elif self.calibrating:
             specs = [('abort', 'ABORT', (0, 0, 170))]
         else:
-            idle = not self.busy
-            ok = self.check['ok'] if self.check is not None else None
-            move_colour = (grey if not (idle and self.pick) else (0, 150, 0) if ok
-                           else (0, 120, 200) if ok is None else (0, 0, 150))
-            specs = [('move', 'MOVE', move_colour),
-                     ('recapture', 'RECAPTURE', (150, 90, 0) if idle else grey),
-                     ('calibrate', 'CALIBRATE', (140, 0, 140) if idle else grey),
-                     ('overlay', 'OVERLAY', (0, 140, 140) if idle or self.overlay else grey),
-                     ('topdown', 'TOP DOWN ON' if self.top_down else 'TOP DOWN',
-                      (0, 90, 230) if self.top_down else (70, 70, 120)),
-                     ('teach', 'TEACH ON' if self.teach else 'TEACH',
-                      (0, 100, 220) if self.teach else (70, 70, 120)),
-                     ('markers', 'CAL ARMS', (0, 140, 0) if self.arm_models.params and idle
-                      else (100, 100, 40) if idle else grey)]
-            specs += [('navigation', 'NAVIGATION', (160, 110, 0) if self.mode == 'navigation'
-                       else (110, 80, 30) if idle else grey),
-                      ('pickmode', 'PICK MODE', (0, 160, 160) if self.mode == 'pick'
-                       else (30, 100, 100) if idle else grey)]
-            if self.last_touch is not None:
-                specs.append(('return', 'RETURN', (0, 0, 200) if idle else grey))
-            if self.calibration is not None:
-                specs.append(('apply', 'APPLY', (0, 120, 200) if idle else grey))
+            specs = self.main_buttons(not self.busy, grey)
         self.buttons = {}
         gap = 6
         width = min(146, (w - 16 - gap * (len(specs) - 1)) // len(specs))
@@ -530,6 +555,8 @@ class App(TouchMixin, FlagsMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixi
                 self.press('navigation')
             elif key in (ord('p'), ord('P')):
                 self.press('pickmode')
+            elif self.on_key(key):
+                pass
             elif key in (ord('['), ord(']'), ord(','), ord('.')):
                 arm = 'left' if key in (ord('['), ord(']')) else 'right'
                 self.change_tool(arm, step=tl.STEP if key in (ord(']'), ord('.')) else -tl.STEP)
@@ -543,6 +570,14 @@ def make_parser():
     parser.add_argument('--standoff', type=float, default=0.10,
                         help='the tip first stops this far from the point (corrections '
                              'happen there), then moves in on one straight line, m')
+    parser.add_argument('--top-standoff', type=float, default=0.12,
+                        help='TOP DOWN: the tip flies (tool level) to this far above the top, '
+                             'the wrist turns down there, then it goes straight down, m')
+    parser.add_argument('--vacuum-lean', type=float, default=30,
+                        help='TOP DOWN with a tool on: the most the tool may lean off '
+                             'straight down (deg). Straight down first, then the smallest '
+                             'lean that reaches; default no real cap (bellows cup). '
+                             '0 = straight down only')
     parser.add_argument('--line-speed', type=float, default=0.02,
                         help='fingertip speed for the straight move in and out, m/s')
     parser.add_argument('--touch-offset', type=float, default=0.0,
@@ -558,10 +593,6 @@ def make_parser():
                              'never commanded, and the point is aimed midway between the '
                              'fingertips')
     parser.add_argument('--hold', type=float, default=2.0, help='seconds to stay touching')
-    parser.add_argument('--live-flags', action='store_true',
-                        help='also measure the gripper flags during each touch (only useful '
-                             'if the arm does not hide them); normally they are used once, '
-                             'by AUTO CAL')
     parser.add_argument('--top-down', action='store_true',
                         help='start with TOP DOWN on: approach straight down from --standoff '
                              'above the point (objects lying flat) instead of level')
@@ -572,7 +603,7 @@ def make_parser():
                         help='tool speed for the straight line in (to 1 cm short) and out, m/s')
     parser.add_argument('--contact-speed', type=float, default=0.015,
                         help='tool speed for the last, guarded centimetre, m/s')
-    parser.add_argument('--past-contact', type=float, default=0.01,
+    parser.add_argument('--past-contact', type=float, default=0.02,
                         help='how far past the measured surface the guarded move may go '
                              'before giving up on feeling it, m')
     parser.add_argument('--contact-torque', type=float, default=0.3,
@@ -595,10 +626,6 @@ def make_parser():
     parser.add_argument('--calib-points-per-arm', type=int, default=6,
                         help='fingertips CALIBRATE collects per arm before moving on '
                              '(out of 12 candidate spots each)')
-    parser.add_argument('--marker-frames', type=int, default=8,
-                        help='colour frames averaged for each flag measurement')
-    parser.add_argument('--marker-poses-per-arm', type=int, default=3,
-                        help='poses per arm for CALIBRATE MARKERS (FLAGS)')
     parser.add_argument('--calib-depths', type=float, nargs=2, default=[0.30, 0.40],
                         metavar=('NEAR', 'FAR'),
                         help='camera distances for the calibration fingertip grid, m')
@@ -620,7 +647,11 @@ def make_parser():
 
 
 def parse_args(argv=None):
-    args = make_parser().parse_args(argv)
+    return finish_args(make_parser().parse_args(argv))
+
+
+def finish_args(args):
+    """What the options imply: each arm's tools and working tip."""
     # each arm's working tip beyond hand_tcp: the fingertips, plus its tool
     args.tools = tl.load()
     for arm in ('left', 'right'):
@@ -631,8 +662,8 @@ def parse_args(argv=None):
     return args
 
 
-def main():
-    args = parse_args()
+def main(args=None, app_class=None):
+    args = parse_args() if args is None else args
 
     rclpy.init()
     node = ClickToMove(args)
@@ -640,7 +671,7 @@ def main():
     executor.add_node(node)
     threading.Thread(target=executor.spin, daemon=True).start()
     try:
-        App(node).run()
+        (app_class or App)(node).run()
     except KeyboardInterrupt:
         pass
     finally:

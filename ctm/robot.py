@@ -302,8 +302,11 @@ class ClickToMove(Node):
         """[(label, approach axis, quat, ring)] to try, in rings of preference.
 
         The axis is the tool's +Z, the direction the tip travels in. It is
-        always horizontal -- the end effector stays parallel to the ground,
-        never tilted down (2026-10-08) -- and from the side the camera sees:
+        horizontal -- the end effector parallel to the ground (2026-10-08) --
+        unless no level approach reaches: then tilted down 10, then 20 deg
+        (rings 3 and 4; a box at the left arm's full stretch, 2026-10-14,
+        where the sag correction straightened the elbow onto its limit just
+        short of the face). And from the side the camera sees:
         the camera's line of sight to the point, flattened, then turned 15 and
         30 deg either way. Any roll about the axis is allowed. The far side and
         top of an object are not in the octomap, so it is never approached
@@ -321,7 +324,18 @@ class ClickToMove(Node):
                                                       else np.zeros(3))
             outward[2] = 0.0
             outward /= max(np.linalg.norm(outward), 1e-9)
-            for ring, lean in ((0, 0), (1, 10), (2, 20)):
+            # A suction cup seals only (nearly) flat on the top: with a tool on
+            # (the vacuum), at most --vacuum-lean -- a 20 deg lean touched the
+            # top 4 mm from the click and picked nothing; straight down is
+            # beyond the wrist (joint 6, +-45 deg) past ~40 cm, where the
+            # camera cannot see the table anyway (2026-10-14).
+            # (A bellows cup seals tilted: no cap by default -- the planner
+            # takes the smallest lean that reaches, 2026-10-14.)
+            tool_on = bool(getattr(self.args, 'tools', {}).get(arm, {}).get('on'))
+            limit = self.args.vacuum_lean if tool_on else 30
+            leans = tuple((k, lean) for k, lean in enumerate((0, 10, 15, 20, 25, 30))
+                          if lean <= limit)
+            for ring, lean in leans:
                 axis = np.array([0.0, 0.0, -1.0]) * math.cos(math.radians(lean)) \
                     + outward * math.sin(math.radians(lean))
                 for deg in (0, 90, -90, 180, 45, -45, 135, -135):
@@ -336,15 +350,19 @@ class ClickToMove(Node):
         ray /= max(np.linalg.norm(ray), 1e-9)
         up = np.array([0.0, 0.0, 1.0])
         out = []
-        for ring, yaw in ((0, 0), (1, 15), (1, -15), (2, 30), (2, -30)):
-            axis = rot_about(up, math.radians(yaw)) @ ray
-            axis[2] = 0.0
-            axis /= np.linalg.norm(axis)
-            for deg in (0, 90, -90, 180):
-                label = (f'level roll {deg:+d}' if ring == 0 else
-                         f'level turn {yaw:+d} roll {deg:+d}')
-                out.append((label, axis,
-                            quat_from_matrix(tool_frame_along(axis, math.radians(deg))), ring))
+        for tilt, base in ((0, 0), (10, 3), (20, 4)):
+            for ring, yaw in ((0, 0), (1, 15), (1, -15), (2, 30), (2, -30)):
+                axis = rot_about(up, math.radians(yaw)) @ ray
+                axis[2] = 0.0
+                axis /= np.linalg.norm(axis)
+                axis = axis * math.cos(math.radians(tilt)) - up * math.sin(math.radians(tilt))
+                for deg in (0, 90, -90, 180):
+                    head = 'level' if tilt == 0 else f'tilted {tilt}'
+                    label = (f'{head} roll {deg:+d}' if yaw == 0 else
+                             f'{head} turn {yaw:+d} roll {deg:+d}')
+                    out.append((label, axis,
+                                quat_from_matrix(tool_frame_along(axis, math.radians(deg))),
+                                ring if tilt == 0 else base))
         return out
 
     def tcp_for_tip(self, tip, axis, arm):
@@ -655,7 +673,7 @@ class ClickToMove(Node):
         ik.group_name = f'{arm}_arm'
         ik.ik_link_name = f'openarm_{arm}_hand_tcp'
         ik.avoid_collisions = True
-        ik.timeout.nanosec = int(0.2 * 1e9)
+        ik.timeout.nanosec = int(0.05 * 1e9)       # solvable poses solve in a few ms; failures cost the whole timeout
         ik.robot_state.joint_state.name = arm_joints(arm)
         ik.robot_state.joint_state.position = [float(v) for v in seed]
         pose = PoseStamped()
@@ -704,6 +722,35 @@ class ClickToMove(Node):
             seeds = [np.clip(q, lo + 0.15, hi - 0.15) for q in seeds]
         return [q.tolist() for q in seeds] + out
 
+    def fast_ik(self, arm, tcp, quat, start=None, want=3):
+        """Joint solutions (plain URDF, within limits, no collision check) for
+        hand_tcp at (tcp, quat), from 48 spread-out starting postures at once
+        (kinematics.ik_batch, ~20 ms) -- [] if the arm cannot get there at
+        all. A failed collision-aware IK costs its whole timeout; asking this
+        first took TOP DOWN planning from ~100 s to seconds (2026-10-14)."""
+        from ctm.kinematics import Arm, ik_batch
+        if not hasattr(self, '_kin'):
+            self._kin = {}
+        if arm not in self._kin:
+            self._kin[arm] = Arm(arm)
+        lim = self.joint_limits(arm)
+        if lim is None:
+            return []
+        lo, hi = np.array(lim).T
+        if not hasattr(self, '_ik_starts'):
+            self._ik_starts = {}
+        if arm not in self._ik_starts:
+            rng = np.random.default_rng(7)           # the same starts every time
+            self._ik_starts[arm] = rng.uniform(lo + 0.05, hi - 0.05, (48, 7))
+        seeds = self._ik_starts[arm]
+        if start is not None:
+            seeds = np.vstack([np.clip(start, lo, hi), seeds])
+        target = np.eye(4)
+        target[:3, :3] = matrix_from_quat(*quat)
+        target[:3, 3] = tcp
+        sols = ik_batch(self._kin[arm], target, seeds, list(zip(lo, hi)))
+        return [np.clip(q, lo + 0.01, hi - 0.01).tolist() for q in sols[:want]]
+
     def _topdown_seeds(self):
         if not hasattr(self, '_td'):
             self._td = None
@@ -720,12 +767,13 @@ class ClickToMove(Node):
                 self.get_logger().warn(f'no top-down seeds ({exc}); run ctm/make_topdown_seeds.py')
         return self._td
 
-    def cartesian_plan(self, arm, position, quat, start_joints=None, check=True):
+    def cartesian_plan(self, arm, position, quat, start_joints=None, check=True, via=None):
         """Straight line of hand_tcp to `position`, planned, not moved.
 
         From where the arm is, or from `start_joints` (so a whole touch can
         be checked before anything moves). Returns (fraction, trajectory,
-        final joints) -- trajectory None if it did not solve.
+        final joints) -- trajectory None if it did not solve. via: [(position,
+        quat)] waypoints before the end (a turn of the wrist in steps).
         """
         if not self.cartesian_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().warn('/compute_cartesian_path unavailable')
@@ -748,11 +796,13 @@ class ClickToMove(Node):
             req.start_state.is_diff = True
             req.start_state.joint_state.name = arm_joints(arm)
             req.start_state.joint_state.position = [float(v) for v in start_joints]
-        target = PoseStamped().pose
-        target.position.x, target.position.y, target.position.z = map(float, position)
-        (target.orientation.x, target.orientation.y,
-         target.orientation.z, target.orientation.w) = map(float, quat)
-        req.waypoints = [target]
+        req.waypoints = []
+        for pos, q in list(via or []) + [(position, quat)]:
+            target = PoseStamped().pose
+            target.position.x, target.position.y, target.position.z = map(float, pos)
+            (target.orientation.x, target.orientation.y,
+             target.orientation.z, target.orientation.w) = map(float, q)
+            req.waypoints.append(target)
         result = self.wait(self.cartesian_client.call_async(req), 10.0)
         if result is None:
             self.require_move_group()
@@ -872,7 +922,8 @@ class ClickToMove(Node):
             return False, False
         return True, False
 
-    def line_move(self, arm, position, quat, label, speed=None, check=True):
+    def line_move(self, arm, position, quat, label, speed=None, check=True, via=None,
+                  length=None):
         """Straight line of hand_tcp from where it is to `position`.
 
         Returns the joints the line ends on (what the arm should settle to),
@@ -883,30 +934,50 @@ class ClickToMove(Node):
         so it is re-timed here to a constant speed (`--line-speed` unless
         given).
         """
-        fraction, trajectory, final = self.cartesian_plan(arm, position, quat, check=check)
+        fraction, trajectory, final = self.cartesian_plan(arm, position, quat, check=check,
+                                                          via=via)
         if trajectory is None or fraction < 0.98:
             self.get_logger().warn(f'{label}: only {100 * fraction:.0f}% of the straight line '
                                    f'solves')
             return None
         if len(trajectory.joint_trajectory.points) < 2:
             return self.arm_positions(arm)           # already there
-        m = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
-        length = (float(np.linalg.norm(np.asarray(position) - m[:3, 3]))
-                  if m is not None else self.args.standoff)
+        if length is None:
+            m = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+            length = (float(np.linalg.norm(np.asarray(position) - m[:3, 3]))
+                      if m is not None else self.args.standoff)
         wanted = self.retime(trajectory, length, speed or self.args.line_speed)
         ok, _ = self.execute(trajectory, label, timeout=wanted + 20.0)
         if not ok:
             return None
         return final if final is not None else self.arm_positions(arm)
 
-    def guarded_line(self, arm, position, quat, label):
+    @staticmethod
+    def turn_steps(tcp_a, quat_a, tcp_b, quat_b, step_deg=10.0):
+        """[(tcp, quat)] from pose a to pose b, the tool turned in steps of at
+        most step_deg (the end, b, not included): a turn as a straight-line
+        path that never asks a joint to jump."""
+        from scipy.spatial.transform import Rotation, Slerp
+        rots = Rotation.from_quat([quat_a, quat_b])
+        angle = math.degrees((rots[0].inv() * rots[1]).magnitude())
+        n = max(1, int(math.ceil(angle / step_deg)))
+        slerp = Slerp([0.0, 1.0], rots)
+        out = []
+        for k in range(1, n):
+            f = k / n
+            out.append((np.asarray(tcp_a) + (np.asarray(tcp_b) - np.asarray(tcp_a)) * f,
+                        tuple(slerp([f]).as_quat()[0])))
+        return out
+
+    def guarded_line(self, arm, position, quat, label, needed=None):
         """Straight line towards `position`, slow, stopping on contact.
 
         Contact is a joint torque rising by more than --contact-torque (and
         6x its resting noise) against half a second before, for 30 ms, AND
         the tool stalled: under 0.5 mm of progress in 0.12 s while the
         command still moves on. Whatever happens, a joint torque rising by
-        --max-touch-torque against a second before stops it. Torque alone
+        --max-touch-torque against half a second before (after the first
+        0.8 s) stops it. Torque alone
         was not enough: in a TOP DOWN posture the left
         arm lags its command by ~60 mrad, its controller pushes harder to
         catch up, and that read as contact 1-2 cm above the object
@@ -935,12 +1006,21 @@ class ClickToMove(Node):
                 samples.append(e)
             time.sleep(0.01)
         fraction, trajectory, final = self.cartesian_plan(arm, position, quat)
-        if trajectory is None or fraction < 0.98:
-            self.get_logger().warn(f'{label}: only {100 * fraction:.0f}% of the line solves')
-            return None, False
         m = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
         length = (float(np.linalg.norm(np.asarray(position) - m[:3, 3]))
                   if m is not None else 0.02)
+        if trajectory is None or fraction < 0.98:
+            # At the edge of reach the line past the surface may not solve to
+            # its end; as far as it does is enough if that reaches `needed`
+            # (the surface): it stops on contact anyway. (A box at 55 cm: the
+            # last 12% of the line past it did not solve and the touch was
+            # skipped, 2026-10-13.)
+            if trajectory is None or needed is None or fraction * length < needed:
+                self.get_logger().warn(f'{label}: only {100 * fraction:.0f}% of the line solves')
+                return None, False
+            self.get_logger().info(f'{label}: {100 * fraction:.0f}% of the line solves - '
+                                   f'{1000 * fraction * length:.0f} mm, past the surface')
+            length = fraction * length
         # A tool on (the rubber vacuum extension) squashes: the tip keeps
         # creeping on contact, so "stopped advancing" shows late and the push
         # builds. With a tool: slower, a lower limit, and contact on the
@@ -1006,8 +1086,12 @@ class ClickToMove(Node):
                 e = np.array(e)
                 if now - t0 < 0.4:
                     return False            # starting: the arm takes up its lag (3 cm out)
-                # the hard limit: --max-touch-torque on any joint, against 1 s ago
-                big = np.abs(e - past(1.0))
+                # the hard limit: --max-touch-torque on any joint, against 0.5 s ago --
+                # not in the first 0.8 s: the arm taking up its lag as it starts
+                # read as 1.1 Nm on the shoulder and stopped a TOP DOWN pick 2.4 cm
+                # above the box (2026-10-14); at contact speed it is still >2 cm
+                # out then
+                big = np.abs(e - past(0.5)) if now - t0 >= 0.8 else np.zeros_like(e)
                 count['cap'] = count['cap'] + 1 if np.any(big > max_torque) else 0
                 if count['cap'] >= 2:
                     j = int(np.argmax(big))
@@ -1019,7 +1103,7 @@ class ClickToMove(Node):
                 rise = np.abs(e - past(0.5))
                 count['contact'] = count['contact'] + 1 if np.any(rise > limit) else 0
                 if (count['contact'] >= 3 or noise.max() > 1.0) and (is_stalled or (
-                        soft and count['contact'] >= 3)):
+                        soft and count['contact'] >= 3 and now - t0 >= 0.8)):
                     j = int(np.argmax(rise / limit))
                     self.get_logger().info(f'{label}: contact ({names[j]} {rise[j]:+.2f} Nm '
                                            f'in 0.5 s, stopped advancing)')

@@ -35,7 +35,7 @@ from ctm.kinematics import directions
 from ctm.common import (BASE_FRAME, WS, decode_image, pixel_ray, quat_from_matrix, rot_about,
                         tool_frame_along)
 
-WALL_ID = 11                    # the reference marker on the wall (old flag sheet, gripper_markers.pdf)
+WALL_ID = 11                    # the reference marker on the wall (docs/gripper_markers.pdf)
 WALL_MARKER = 0.050             # m: its black square (64 mm card)
 WALL_X = 0.50                   # m: the wall is this far in front of the robot (world x)
 POSTURES = 70                   # 45 overfitted the full model (2x error unseen, 2026-10-13)
