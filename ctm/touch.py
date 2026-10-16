@@ -10,8 +10,10 @@ import numpy as np
 
 import robot_camera_calibration as rcc
 from ctm.kinematics import directions
-from ctm.common import (ARM_REACH, BASE_FRAME, NUDGE, matrix_from_quat, quat_from_matrix,
+from ctm.common import (ARM_REACH, BASE_FRAME, NUDGE, decode_image, matrix_from_quat,
+                        quat_from_matrix,
                         tool_frame_along)
+from ctm import armcal
 from ctm.corrections import learned_correction, save_correction
 
 # The last NEAR m onto the surface is the only part where the gripper (its
@@ -181,6 +183,16 @@ class TouchMixin:
                 if what in steps:
                     nudge = nudge + steps[what] * NUDGE
                     node.line_move(arm, command + nudge, quat, f'{arm} nudge')
+                elif what == 'save' and getattr(self, 'anchor_mode', False):
+                    # ANCHOR (calibrate.py): the real tip is on the point now --
+                    # ground truth for the arm model's fit
+                    node.settle(arm, node.arm_positions(arm), timeout=1.5)
+                    n = armcal.save_anchor(arm, node.arm_positions(arm), point,
+                                           node.args.tip_offsets[arm])
+                    self.say(f'ANCHOR saved for the {arm} arm ({n} so far; 3-4 at different '
+                             f'spots, then REFIT)')
+                    time.sleep(0.8)
+                    return
                 elif what == 'save':
                     total = learned + nudge
                     n = save_correction(arm, point, total, mode=self.mode_name(),
@@ -305,6 +317,9 @@ class TouchMixin:
                     room = min(node.limit_room(arm, above), node.limit_room(arm, near_q))
                     cost = (sum(abs(x - y) for x, y in zip(above, start))
                             + 20.0 * max(0.0, 0.1 - room))
+                    if self.top_down and self.arm_models.pieces.get(arm) and \
+                            self.strip_visible(arm, above) < 4:
+                        cost += 3.0     # the camera cannot check the tip at the hover point
                     solved.append((cost, label, axis, quat_c, app_c, con_c, above, (contact, quat),
                                    way, standoff))
                     if len(found) >= 3:
@@ -380,6 +395,51 @@ class TouchMixin:
                                                'off' if self.top_down else ''))
         return None, ('no collision-free path to the approach point (something is in '
                       'the way)' if tally['path'] else 'not reachable')
+
+    def _top_vision_fix(self, arm, aim, way, standoff, approach, quat, offset):
+        """TOP DOWN, at the hover point: the gripper pieces face up -- read
+        them, and so where the real tip is, and move it over the point. No
+        model there: measured, sag and play and all. (shift for the targets
+        that follow, offset) -- or None if the pieces are not read (then the
+        arm model, as before)."""
+        node = self.node
+        boards = self.arm_models.pieces.get(arm)
+        if not boards or self.frame is None:
+            return None
+        t_wo = node.lookup(BASE_FRAME, self.frame[3])
+        if t_wo is None:
+            return None
+        want = np.asarray(aim, float) - way * standoff        # the tip, over the point
+        shift = np.zeros(3)
+        for attempt in range(3):
+            node.settle(arm, node.arm_positions(arm), timeout=1.0)
+            frames = []
+            for _ in range(6):
+                msg = node.fresh_color(timeout=1.0)
+                if msg is not None:
+                    frames.append(decode_image(msg))
+            real = self.tip_from_pieces(arm, frames, boards, t_wo, self.frame[2])
+            if real is None:
+                if attempt == 0:
+                    self.say(f'{arm} arm: pieces not seen above the box; using the arm model')
+                    return None
+                break
+            err = real - want
+            if np.linalg.norm(err) > 0.05:
+                self.say(f'{arm} arm: the camera puts the tip {1000 * np.linalg.norm(err):.0f} mm '
+                         f'off - too far to trust; using the arm model', True)
+                return None if attempt == 0 else (shift, offset)
+            self.say(f'{arm} arm: camera sees the tip {1000 * np.linalg.norm(err):.1f} mm from '
+                     f'over the point' + ('; moving it over' if np.linalg.norm(err) > 0.0015
+                                          else ''))
+            if np.linalg.norm(err) <= 0.0015:
+                break
+            shift = shift - err
+            if node.line_move(arm, approach + shift + offset, quat, f'{arm} over the point',
+                              speed=0.02) is None:
+                shift = shift + err
+                break
+        return shift, offset
 
     def _level_above(self, arm, aim, standoff, origin, down_q, down_tcp, down_quat):
         """TOP DOWN: the pose to fly to -- the tip `standoff` above the point,
@@ -569,6 +629,14 @@ class TouchMixin:
                 corrections=max(args.corrections, 2) if self.top_down else None,
                 too_far=0.06 if self.top_down else 0.04)
 
+        seen_fix = self.top_down and self._top_vision_fix(arm, aim, way, standoff, approach,
+                                                           quat, offset)
+        if seen_fix:
+            # the camera saw where the tip really is: shift what follows by it
+            shift, offset = seen_fix
+            approach, contact = approach + shift, contact + shift
+            self.last_touch['out_to'] = approach + offset
+
         short = contact - way * near_d
         stop = contact - way * correct_d
         self.last_touch['out'] = False
@@ -577,7 +645,7 @@ class TouchMixin:
         # In to CORRECT_AT short of the surface, every link checked (the gripper too).
         near = node.line_move(arm, stop + offset, quat, f'{arm} in',
                               speed=args.fast_line_speed)
-        if near is not None and self.arm_models.has(arm):
+        if near is not None and self.arm_models.has(arm) and not seen_fix:
             # The arm model's correction where the contact really happens: the
             # plan took it NEAR short, and gravity's sag changes over the last
             # cm (2-7 mm, simulated 2026-10-12). Re-aim there and slide the

@@ -121,7 +121,8 @@ from ctm.touch import TouchMixin
 class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
     """The OpenCV window, and the worker threads that capture and move."""
 
-    HINT = 'click a point   keys: m n p d b r c o t f'
+    HINT = 'click a point   keys: m n p d b r t'
+    CALIBRATION = False               # calibrate.py: CALIBRATE, OVERLAY, CAL ARMS, APPLY
 
     def __init__(self, node):
         self.node = node
@@ -281,6 +282,32 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
         """A key the window loop does not know: True if handled (subclasses)."""
         return False
 
+    def toggle_pieces(self):
+        """ARUCO EXT: the calibration pieces (still on the grippers) in the
+        planners, or not -- the same as calibrate.py has them, ~4 cm past the
+        rail's ends and towards the fingers."""
+        if self.busy:
+            self.say('ARUCO EXT: not while an arm is moving', True)
+            return
+        on = not self.node.pieces_on
+
+        def job():
+            self.node._pieces_off_done = False          # (off is otherwise sent once)
+            if not self.node.set_pieces(on):
+                self.say('ARUCO EXT: the planners did not take the change - try again', True)
+                return
+            self.node.pieces_on = on
+            self.say('ARUCO EXT on: the planners keep the ArUco pieces clear of everything'
+                     if on else 'ARUCO EXT off: the planners know only the gripper')
+            if self.pick is not None and self.mode == 'pick':
+                # the last check planned without (or with) them: check again
+                _u, _v, p, _arm, _o = self.pick
+                check = {'pick': self.pick, 'ok': None, 'plan': None,
+                         'where': f'x={p[0]:+.3f} y={p[1]:+.3f} z={p[2]:+.3f}'}
+                self.check = check
+                self.check_pick(check, in_job=True)
+        self.in_background(job)
+
     def change_tool(self, arm, toggle=False, step=0.0):
         """Switch an arm's tool on/off or change its length; the touches use
         the new working tip from now on."""
@@ -295,6 +322,8 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
             t['length'] = float(min(tl.MAX_LENGTH, max(tl.STEP, t['length'] + step)))
         tl.apply(self.node.args, self.node.args.tools)
         tl.save(self.node.args.tools)
+        # the planners' tool too (a thread: it waits on move_group and cuMotion)
+        threading.Thread(target=self.node.set_tool, daemon=True).start()
         self.say(f'{arm} arm: ' + (f'tool on, {t["length"] * 1000:.0f} mm past the fingertips'
                                    if t['on'] else 'no tool: the fingertips touch')
                  + (f' ({"[ ]" if arm == "left" else ", ."} change the length)'))
@@ -326,6 +355,8 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
                 self.check = None
         elif name in ('tool_left', 'tool_right'):
             self.change_tool(name[5:], toggle=True)
+        elif name == 'pieces':
+            self.toggle_pieces()
         elif name == 'skip':
             self.answer('skip')
         elif name == 'confirm':
@@ -418,22 +449,23 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
         move_colour = (grey if not (idle and self.pick) else (0, 150, 0) if ok
                        else (0, 120, 200) if ok is None else (0, 0, 150))
         specs = [('move', 'MOVE', move_colour),
-                 ('recapture', 'RECAPTURE', (150, 90, 0) if idle else grey),
-                 ('calibrate', 'CALIBRATE', (140, 0, 140) if idle else grey),
-                 ('overlay', 'OVERLAY', (0, 140, 140) if idle or self.overlay else grey),
-                 ('topdown', 'TOP DOWN ON' if self.top_down else 'TOP DOWN',
-                  (0, 90, 230) if self.top_down else (70, 70, 120)),
-                 ('teach', 'TEACH ON' if self.teach else 'TEACH',
-                  (0, 100, 220) if self.teach else (70, 70, 120)),
-                 ('markers', 'CAL ARMS', (0, 140, 0) if self.arm_models.params and idle
-                  else (100, 100, 40) if idle else grey)]
+                 ('recapture', 'RECAPTURE', (150, 90, 0) if idle else grey)]
+        if self.CALIBRATION:
+            specs += [('calibrate', 'CALIBRATE', (140, 0, 140) if idle else grey),
+                      ('overlay', 'OVERLAY', (0, 140, 140) if idle or self.overlay else grey),
+                      ('markers', 'CAL ARMS', (0, 140, 0) if self.arm_models.has('left')
+                       and idle else (100, 100, 40) if idle else grey)]
+        specs += [('topdown', 'TOP DOWN ON' if self.top_down else 'TOP DOWN',
+                   (0, 90, 230) if self.top_down else (70, 70, 120)),
+                  ('teach', 'TEACH ON' if self.teach else 'TEACH',
+                   (0, 100, 220) if self.teach else (70, 70, 120))]
         specs += [('navigation', 'NAVIGATION', (160, 110, 0) if self.mode == 'navigation'
                    else (110, 80, 30) if idle else grey),
                   ('pickmode', 'PICK MODE', (0, 160, 160) if self.mode == 'pick'
                    else (30, 100, 100) if idle else grey)]
         if self.last_touch is not None:
             specs.append(('return', 'RETURN', (0, 0, 200) if idle else grey))
-        if self.calibration is not None:
+        if self.CALIBRATION and self.calibration is not None:
             specs.append(('apply', 'APPLY', (0, 120, 200) if idle else grey))
         return specs
 
@@ -483,6 +515,18 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
                 cv2.putText(bar, text, (x + (150 - tw) // 2, 66 + th // 2), FONT, 0.5,
                             (255, 255, 255), 1)
                 self.buttons[f'tool_{arm}'] = (x, h + 50, x1, h + 82)
+                x = x1 + gap
+            if not self.CALIBRATION:                  # (calibrate.py: always on)
+                # ARUCO EXT: the calibration pieces in the planners
+                x1 = x + 130
+                on = self.node.pieces_on
+                cv2.rectangle(bar, (x, 50), (x1, 82), (0, 100, 220) if on else (70, 70, 70), -1)
+                cv2.rectangle(bar, (x, 50), (x1, 82), (255, 255, 255), 1)
+                text = 'ARUCO EXT ON' if on else 'ARUCO EXT OFF'
+                (tw, th), _ = cv2.getTextSize(text, FONT, 0.5, 1)
+                cv2.putText(bar, text, (x + (130 - tw) // 2, 66 + th // 2), FONT, 0.5,
+                            (255, 255, 255), 1)
+                self.buttons['pieces'] = (x, h + 50, x1, h + 82)
                 x = x1 + gap
             cv2.putText(bar, 'tool length: [ ] left   , . right', (x + 6, 70), FONT, 0.4,
                         (200, 200, 200), 1)
@@ -539,13 +583,13 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
                 self.in_background(self.capture)
             elif key in (ord('m'), ord('M'), 13, 10):
                 self.move()
-            elif key in (ord('c'), ord('C')):
+            elif key in (ord('c'), ord('C')) and self.CALIBRATION:
                 self.in_background(self.calibrate)
-            elif key in (ord('o'), ord('O')):
+            elif key in (ord('o'), ord('O')) and self.CALIBRATION:
                 self.press('overlay')
             elif key in (ord('t'), ord('T')):
                 self.press('teach')
-            elif key in (ord('f'), ord('F')):
+            elif key in (ord('f'), ord('F')) and self.CALIBRATION:
                 self.press('markers')
             elif key in (ord('b'), ord('B')):
                 self.press('return')

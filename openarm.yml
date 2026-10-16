@@ -662,7 +662,18 @@ robot_cfg:
           radius: 0.00500
         - center: [-0.00657, -0.00455, 0.00570]
           radius: 0.00500
-    collision_link_names: ["openarm_body_link0", "openarm_left_link0", "openarm_left_link1", "openarm_left_link2", "openarm_left_link3", "openarm_left_link4", "openarm_left_link5", "openarm_left_link6", "openarm_left_link7", "openarm_right_link0", "openarm_right_link1", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7", "openarm_left_hand", "openarm_left_left_finger", "openarm_left_right_finger", "openarm_right_hand", "openarm_right_left_finger", "openarm_right_right_finger"]
+    collision_link_names: ["openarm_body_link0", "openarm_left_link0", "openarm_left_link1", "openarm_left_link2", "openarm_left_link3", "openarm_left_link4", "openarm_left_link5", "openarm_left_link6", "openarm_left_link7", "openarm_right_link0", "openarm_right_link1", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7", "openarm_left_hand", "openarm_left_left_finger", "openarm_left_right_finger", "openarm_right_hand", "openarm_right_left_finger", "openarm_right_right_finger", "openarm_left_pieces", "openarm_right_pieces", "openarm_left_tool", "openarm_right_tool"]
+    # The calibration pieces folded round each gripper's rail (calibrate.py):
+    # a link fixed to each hand with 14 spheres reserved, OFF here -- the
+    # calibration switches them on at run time (planner_attach_object), the
+    # normal runs keep them off (2026-10-15).
+    extra_links:
+      openarm_left_pieces: {parent_link_name: openarm_left_hand, link_name: openarm_left_pieces, joint_name: openarm_left_pieces_joint, joint_type: FIXED, fixed_transform: [0, 0, 0, 1, 0, 0, 0]}
+      openarm_right_pieces: {parent_link_name: openarm_right_hand, link_name: openarm_right_pieces, joint_name: openarm_right_pieces_joint, joint_type: FIXED, fixed_transform: [0, 0, 0, 1, 0, 0, 0]}
+      # the tool past the fingertips (tools.yaml), set by click_to_move at start
+      openarm_left_tool: {parent_link_name: openarm_left_hand, link_name: openarm_left_tool, joint_name: openarm_left_tool_joint, joint_type: FIXED, fixed_transform: [0, 0, 0, 1, 0, 0, 0]}
+      openarm_right_tool: {parent_link_name: openarm_right_hand, link_name: openarm_right_tool, joint_name: openarm_right_tool_joint, joint_type: FIXED, fixed_transform: [0, 0, 0, 1, 0, 0, 0]}
+    extra_collision_spheres: {openarm_left_pieces: 14, openarm_right_pieces: 14, openarm_left_tool: 4, openarm_right_tool: 4}
     # Pairs not checked against each other, taken from the
     # SRDF's own disable_collisions list plus URDF joint
     # adjacency. Joint adjacency alone is not enough -- it
@@ -692,7 +703,15 @@ robot_cfg:
       openarm_right_hand: ["openarm_right_left_finger", "openarm_right_link3", "openarm_right_link4", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7", "openarm_right_right_finger"]
       openarm_right_left_finger: ["openarm_right_hand", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7", "openarm_right_right_finger"]
       openarm_right_right_finger: ["openarm_left_hand", "openarm_right_hand", "openarm_right_left_finger", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7"]
+      openarm_left_pieces: ["openarm_left_hand", "openarm_left_left_finger", "openarm_left_right_finger", "openarm_left_link5", "openarm_left_link6", "openarm_left_link7"]
+      openarm_right_pieces: ["openarm_right_hand", "openarm_right_left_finger", "openarm_right_right_finger", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7"]
+      openarm_left_tool: ["openarm_left_hand", "openarm_left_left_finger", "openarm_left_right_finger", "openarm_left_link5", "openarm_left_link6", "openarm_left_link7", "openarm_left_pieces"]
+      openarm_right_tool: ["openarm_right_hand", "openarm_right_left_finger", "openarm_right_right_finger", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7", "openarm_right_pieces"]
     self_collision_buffer:
+      openarm_left_pieces: 0.0
+      openarm_right_pieces: 0.0
+      openarm_left_tool: 0.0
+      openarm_right_tool: 0.0
       openarm_body_link0: 0.002
       openarm_left_link0: 0.002
       openarm_left_link1: 0.002

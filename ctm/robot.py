@@ -16,7 +16,8 @@ import yaml
 from control_msgs.action import GripperCommand
 from geometry_msgs.msg import Pose, PoseStamped
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
-from moveit_msgs.msg import (AllowedCollisionEntry, AllowedCollisionMatrix, CollisionObject,
+from moveit_msgs.msg import (AllowedCollisionEntry, AllowedCollisionMatrix,
+                             AttachedCollisionObject, CollisionObject,
                              Constraints,
                              JointConstraint, MoveItErrorCodes, PlanningScene,
                              PlanningSceneComponents, RobotTrajectory)
@@ -38,19 +39,56 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 import robot_camera_calibration as rcc
 from ctm import walls
-from ctm.common import (BASE_FRAME, COLOR_TOPIC, DEPTH_TOPIC, HOME_JOINTS, INFO_TOPIC,
+from ctm.common import (BASE_FRAME, COLOR_TOPIC, DEPTH_TOPIC, FINGERTIP_BEYOND_TCP,
+                        HOME_JOINTS, INFO_TOPIC,
                         MoveGroupDown, OCTOMAP_NAME, RETRYABLE, SCREW_FRAME, WS, arm_joints,
                         decode_image, gripper_links, matrix_from_quat, pixel_ray,
                         quat_from_matrix, rot_about, tool_frame_along)
 
 
 JUMP = 0.15                     # rad: the most any joint may move between 5 mm line steps
+# The calibration pieces folded round each gripper's rail stick out past the
+# gripper the robot model knows -- ~4 cm beyond the rail's ends and 4 cm
+# towards the fingers (2026-10-15). Only calibrate.py has them on: a box per
+# hand for MoveIt, in the hand frame (y along the rail, z towards the
+# fingers), and the same as 14 spheres on cuMotion's openarm_<arm>_pieces
+# link (reserved, off, in openarm.yml).
+PIECES_BOX_CENTRE = (0.0, 0.0, 0.027)
+PIECES_BOX_SIZE = (0.06, 0.20, 0.06)        # 22 cm end to end across the rail
+PIECES_SPHERES = [(0.0, float(y), z, 0.025) for y in np.linspace(-0.085, 0.085, 6)
+                  for z in (0.012, 0.042)]  # the outermost reach +-11 cm
+PIECES_SLOTS = 14                           # spheres reserved per pieces link in openarm.yml (unused: off)
+
+# The tool past the fingertips (tools.yaml: the left arm's vacuum cup), in the
+# planners as a cylinder 2.5 cm across from the fingertips to its end -- before
+# 2026-10-16 the planners knew only the hand and fingers, so the last 2 cm
+# were never checked. MoveIt: a cylinder attached to the hand; cuMotion:
+# spheres on the reserved openarm_<arm>_tool link (openarm.yml), off with no tool.
+HAND_TCP_Z = 0.08                           # hand -> hand_tcp along z (openarm.urdf)
+TOOL_DIAMETER = 0.025
+TOOL_SLOTS = 4                              # spheres reserved per tool link in openarm.yml
+
+
+def tool_spheres(length):
+    """cuMotion's spheres for a tool `length` m past the fingertips, hand
+    frame: radius half the diameter, from the fingertips to the end, none
+    past the end (it must still reach the surface)."""
+    r = TOOL_DIAMETER / 2
+    start = HAND_TCP_Z + FINGERTIP_BEYOND_TCP
+    last = start + max(length - r, 0.0)
+    n = int(min(TOOL_SLOTS, max(1, np.ceil((last - start) / 0.01) + 1)))
+    return [(0.0, 0.0, float(z), r) for z in np.linspace(start, last, n)]
+
+
+def tool_id(arm):
+    return f'tool_{arm}'
 
 
 class ClickToMove(Node):
     def __init__(self, args):
         super().__init__('click_to_move')
         self.args = args
+        self.pieces_on = False          # calibrate.py: the calibration pieces in the planners
         cb = ReentrantCallbackGroup()
 
         self.lock = threading.Lock()
@@ -212,8 +250,12 @@ class ClickToMove(Node):
                 return self._surface
         if not self.rsp_get.wait_for_service(timeout_sec=3.0):
             raise RuntimeError('robot_state_publisher is not answering')
-        got = self.wait(self.rsp_get.call_async(
-            GetParameters.Request(names=['robot_description'])), 5.0)
+        got = None
+        for _ in range(3):                           # a big string; it was slow once (sim)
+            got = self.wait(self.rsp_get.call_async(
+                GetParameters.Request(names=['robot_description'])), 10.0)
+            if got is not None and got.values and got.values[0].string_value:
+                break
         if got is None or not got.values or not got.values[0].string_value:
             raise RuntimeError('could not read robot_description')
         surface = rcc.RobotSurface(got.values[0].string_value)
@@ -476,9 +518,18 @@ class ClickToMove(Node):
         # and made every start state "in collision" (2026-10-06).
         static = ['openarm_body_link0', 'camera_link', 'openarm_left_link0',
                   'openarm_right_link0']
-        fingers = ([f'openarm_{touching}_left_finger', f'openarm_{touching}_right_finger']
-                   if touching else [])
-        for link in gripper_links('left') + gripper_links('right') + static:
+        fingers = ([f'openarm_{touching}_left_finger', f'openarm_{touching}_right_finger',
+                    tool_id(touching)] if touching else [])
+        # the tools too: checked like the gripper, free only at the contact
+        for name in (tool_id('left'), tool_id('right')):
+            if name not in index:
+                names.append(name)
+                for row in rows:
+                    row.append(False)
+                rows.append([False] * len(names))
+                index[name] = len(names) - 1
+        for link in gripper_links('left') + gripper_links('right') + static + \
+                [tool_id('left'), tool_id('right')]:
             if link in index:
                 allowed = link in static or link in fingers
                 rows[index[link]][octomap] = rows[octomap][index[link]] = allowed
@@ -565,9 +616,152 @@ class ClickToMove(Node):
         deadline = time.monotonic() + patience
         while True:
             ok, message = self.allow_grippers_in_octomap()
+            if ok:
+                self.set_pieces(self.pieces_on)
+                self.set_tool()
             if ok or time.monotonic() > deadline:
                 return ok, message
             time.sleep(2.0)
+
+    def set_pieces(self, on):
+        """The calibration pieces on both hands in the planners, or not:
+        boxes attached to the hands for MoveIt (IK, OMPL, straight lines),
+        spheres on cuMotion's pieces links. Called with the gripper exemption,
+        before every touch -- a respawned planner has forgotten them; turning
+        them off is done once (a calibration run may have left them on)."""
+        if not on and getattr(self, '_pieces_off_done', False):
+            return True
+        # each on its own: MoveIt's box even while cuMotion is still starting
+        # (with "and" a not-yet-ready cuMotion skipped the box too, and a whole
+        # CAL ARMS ran without the pieces -- they hit the wall, 2026-10-15)
+        ok_moveit = self._pieces_moveit(on)
+        ok_cumotion = self._pieces_cumotion(on)
+        ok = ok_moveit and ok_cumotion
+        if not on and ok:
+            self._pieces_off_done = True
+        return ok
+
+    def set_tool(self):
+        """Each arm's tool (args.tools) in both planners, as it is set now:
+        after a tool change, and with the gripper exemption before every
+        touch (a respawned planner has forgotten it)."""
+        ok = True
+        for arm in ('left', 'right'):
+            t = getattr(self.args, 'tools', {}).get(arm, {})
+            length = float(t.get('length', 0.0)) if t.get('on') else 0.0
+            ok &= self._tool_moveit(arm, length)
+            ok &= self._tool_cumotion(arm, length)
+        return ok
+
+    def _tool_moveit(self, arm, length):
+        scene = PlanningScene(is_diff=True)
+        scene.robot_state.is_diff = True
+        att = AttachedCollisionObject()
+        att.link_name = f'openarm_{arm}_hand'
+        att.touch_links = gripper_links(arm) + [f'openarm_{arm}_hand_tcp']
+        obj = att.object
+        obj.header.frame_id = att.link_name
+        obj.id = tool_id(arm)
+        if length <= 0.0:
+            obj.operation = CollisionObject.REMOVE
+            scene.world.collision_objects.append(CollisionObject(
+                id=obj.id, operation=CollisionObject.REMOVE))
+        else:
+            obj.operation = CollisionObject.ADD
+            obj.primitives.append(SolidPrimitive(type=SolidPrimitive.CYLINDER,
+                                                 dimensions=[float(length),
+                                                             float(TOOL_DIAMETER / 2)]))
+            pose = Pose()
+            pose.position.z = float(HAND_TCP_Z + FINGERTIP_BEYOND_TCP + length / 2)
+            pose.orientation.w = 1.0
+            obj.primitive_poses.append(pose)
+        scene.robot_state.attached_collision_objects.append(att)
+        if not self.scene_apply.wait_for_service(timeout_sec=5.0):
+            return False
+        applied = self.wait(self.scene_apply.call_async(ApplyPlanningScene.Request(scene=scene)),
+                            5.0)
+        if applied is None or not applied.success:
+            self.get_logger().warn(f'could not set the {arm} tool in the planning scene')
+            return False
+        return True
+
+    def _tool_cumotion(self, arm, length):
+        from isaac_ros_cumotion_interfaces.action import UpdateLinkSpheres
+        if not hasattr(self, '_spheres_client'):
+            self._spheres_client = ActionClient(self, UpdateLinkSpheres, 'planner_attach_object')
+        if not self._spheres_client.wait_for_server(timeout_sec=60.0 if length > 0 else 3.0):
+            self.get_logger().warn(f'cuMotion planner_attach_object unavailable: {arm} tool not set')
+            return False
+        spheres = tool_spheres(length) if length > 0 else []
+        goal = UpdateLinkSpheres.Goal(
+            attach_object=bool(spheres), object_link_name=f'openarm_{arm}_tool',
+            flattened_sphere_arr=[float(v) for sph in
+                                  (spheres + [(0.0, 0.0, 0.0, -10.0)]
+                                   * (TOOL_SLOTS - len(spheres)))
+                                  for v in sph] if spheres else [])
+        handle = self.wait(self._spheres_client.send_goal_async(goal), 5.0)
+        if handle is None or not handle.accepted:
+            self.get_logger().warn(f'cuMotion refused the {arm} tool spheres')
+            return False
+        self.wait(handle.get_result_async(), 5.0)
+        return True
+
+    def _pieces_cumotion(self, on):
+        from isaac_ros_cumotion_interfaces.action import UpdateLinkSpheres
+        if not hasattr(self, '_spheres_client'):
+            self._spheres_client = ActionClient(self, UpdateLinkSpheres, 'planner_attach_object')
+        if not self._spheres_client.wait_for_server(timeout_sec=60.0 if on else 3.0):
+            self.get_logger().warn('cuMotion planner_attach_object unavailable: pieces not set')
+            return False
+        for arm in ('left', 'right'):
+            goal = UpdateLinkSpheres.Goal(
+                attach_object=bool(on), object_link_name=f'openarm_{arm}_pieces',
+                flattened_sphere_arr=[float(v) for sph in
+                                      (PIECES_SPHERES + [(0.0, 0.0, 0.0, -10.0)]
+                                       * (PIECES_SLOTS - len(PIECES_SPHERES)))
+                                      for v in sph] if on else [])
+            handle = self.wait(self._spheres_client.send_goal_async(goal), 5.0)
+            if handle is None or not handle.accepted:
+                self.get_logger().warn(f'cuMotion refused the {arm} pieces spheres')
+                return False
+            self.wait(handle.get_result_async(), 5.0)
+        return True
+
+    def _pieces_moveit(self, on):
+        scene = PlanningScene(is_diff=True)
+        scene.robot_state.is_diff = True
+        for arm in ('left', 'right'):
+            link = f'openarm_{arm}_hand'
+            att = AttachedCollisionObject()
+            att.link_name = link
+            # (the wrist too, as in openarm.yml for cuMotion: fixed to the
+            # gripper, the pieces cannot reach links 5-7 -- without these
+            # MoveIt refused the head-on wall-marker touches, 2026-10-16)
+            att.touch_links = [link, f'openarm_{arm}_left_finger', f'openarm_{arm}_right_finger',
+                               f'openarm_{arm}_link5', f'openarm_{arm}_link6',
+                               f'openarm_{arm}_link7', f'openarm_{arm}_hand_tcp']
+            obj = att.object
+            obj.header.frame_id = link
+            obj.id = f'calibration_pieces_{arm}'
+            obj.operation = CollisionObject.ADD if on else CollisionObject.REMOVE
+            if not on:
+                scene.robot_state.attached_collision_objects.append(att)
+                scene.world.collision_objects.append(CollisionObject(
+                    id=obj.id, operation=CollisionObject.REMOVE))
+                continue
+            obj.primitives.append(SolidPrimitive(type=SolidPrimitive.BOX,
+                                                 dimensions=[float(v) for v in PIECES_BOX_SIZE]))
+            pose = Pose()
+            pose.position.x, pose.position.y, pose.position.z = map(float, PIECES_BOX_CENTRE)
+            pose.orientation.w = 1.0
+            obj.primitive_poses.append(pose)
+            scene.robot_state.attached_collision_objects.append(att)
+        applied = self.wait(self.scene_apply.call_async(ApplyPlanningScene.Request(scene=scene)),
+                            5.0)
+        if applied is None or not applied.success:
+            self.get_logger().warn('could not set the calibration pieces in the planning scene')
+            return False
+        return True
 
     def close_gripper(self, arm):
         """Fingers together, so the tips are one point. Result status ignored:
@@ -1058,9 +1252,12 @@ class ClickToMove(Node):
                 track.append((now, float((tcp[:3, 3] - p0) @ way)))
                 # 0.12 s, not 0.2: every 0.1 s of waiting for the stall to show
                 # is ~0.4 Nm more push on the surface (simulated, 2026-10-13)
-                while track and now - track[0][0] > 0.12:
+                # 0.08 s: wall contacts show on the elbow (joint 4) at 0.33-0.46 Nm
+                # by then (robot logs, 2026-10-15); each 0.04 s waited is ~0.6 mm
+                # more push at contact speed
+                while track and now - track[0][0] > 0.08:
                     track.popleft()
-                if now - t0 < 0.3 or len(track) < 4:
+                if now - t0 < 0.3 or len(track) < 3:
                     return False                        # still getting going
                 commanded = min(1.0, (now - t0) / wanted) * length
                 moved = track[-1][1] - track[0][1]
@@ -1099,14 +1296,14 @@ class ClickToMove(Node):
                         f'{label}: stopped at the torque limit ({names[j]} '
                         f'{big[j]:.2f} Nm, max {max_torque:.1f})')
                     return True
-                # contact: blocked (no progress) and a torque rising against 0.5 s ago
-                rise = np.abs(e - past(0.5))
+                # contact: blocked (no progress) and a torque rising against 0.3 s ago
+                rise = np.abs(e - past(0.3))
                 count['contact'] = count['contact'] + 1 if np.any(rise > limit) else 0
-                if (count['contact'] >= 3 or noise.max() > 1.0) and (is_stalled or (
-                        soft and count['contact'] >= 3 and now - t0 >= 0.8)):
+                if (count['contact'] >= 2 or noise.max() > 1.0) and (is_stalled or (
+                        soft and count['contact'] >= 2 and now - t0 >= 0.8)):
                     j = int(np.argmax(rise / limit))
                     self.get_logger().info(f'{label}: contact ({names[j]} {rise[j]:+.2f} Nm '
-                                           f'in 0.5 s, stopped advancing)')
+                                           f'in 0.3 s, stopped advancing)')
                     return True
                 return False
         ok, stopped = self.execute(trajectory, label, timeout=wanted + 20.0, watch=watch)

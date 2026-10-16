@@ -38,8 +38,9 @@ from ctm.common import (BASE_FRAME, WS, decode_image, pixel_ray, quat_from_matri
 WALL_ID = 11                    # the reference marker on the wall (docs/gripper_markers.pdf)
 WALL_MARKER = 0.050             # m: its black square (64 mm card)
 WALL_X = 0.50                   # m: the wall is this far in front of the robot (world x)
-POSTURES = 70                   # 45 overfitted the full model (2x error unseen, 2026-10-13)
-CANDIDATES = 180
+POSTURES = 100                  # per arm, spread over everywhere the camera sees and it reaches
+CANDIDATES = 320
+POSTURE_MINUTES = 16            # per arm: then fit with what there is (never stuck there)
 TOUCH_TILTS = (25, 18, 12)      # deg: the tool tilted this much, smaller where it does not reach
 TOUCH_CHECK_MM = 1.5            # touches worse than this go into the fit
 
@@ -154,6 +155,12 @@ class ArmCalMixin:
                      f'wall {WALL_X * 100:.0f} cm in front, in view of the camera, and try again',
                      True)
             return
+        if node.pieces_on and not node.set_pieces(True):
+            # never move without them: the folded pieces stick out 4 cm, and a
+            # run that planned without them hit the wall (2026-10-15)
+            self.say('CALIBRATE ARMS: the planners did not take the calibration pieces '
+                     '(is cuMotion up?) - not moving; try again in a moment', True)
+            return
         self.abort.clear()
         self.calibrating = True
         if not self.confirm_wall_marker(wall, t_wo, info):
@@ -172,27 +179,16 @@ class ArmCalMixin:
                                   f'before calibrating the {arm} arm')
                     break
                 samples, dirs = self._collect_postures(arm, t_wo, info)
+                # home while it fits (minutes): not left out at the last posture
+                self._back_to_pre_pick(arm)
                 if len(samples) < 15:
                     report.append(f'{arm}: only {len(samples)} postures with the pieces seen '
                                   f'- NOT calibrated (are the pieces on and facing the wrist?)')
                     continue
                 self._save_samples(arm, samples, t_wo, info, dirs)
-                self.say(f'{arm} arm: fitting {len(samples)} postures...')
                 log = node.get_logger().info
-                params, boards, stats = armcal.fit(arm, samples, t_wo, info, log=log,  # rough
-                                                      tip_offset=args.tip_offsets[arm], max_nfev=40)
-                samples, dropped, keep = armcal.drop_outliers(arm, samples, params, boards,
-                                                              t_wo, info)
-                dirs = dirs[keep]
-                self.say(f'{arm} arm: '
-                         + (f'{dropped} postures disagree (misread or moving), left out; '
-                            if dropped else '')
-                         + 'choosing the model that best predicts postures it has not seen...')
-                variant, scores = armcal.choose_model(arm, samples, dirs, t_wo, info, log=log)
-                params, boards, stats = armcal.fit(arm, samples, t_wo, info, log=log,
-                                                      tip_offset=args.tip_offsets[arm],
-                                                      dirs=dirs, variant=variant)
-                stats.update(dropped=dropped, model=variant, holdout_px=scores[variant])
+                params, boards, stats, samples, dirs, variant = self._fit_arm(
+                    arm, samples, dirs, t_wo, info)
                 play = params.get('hysteresis')
                 if play is not None and np.max(np.abs(play)) > 0.015:
                     j = int(np.argmax(np.abs(play)))
@@ -257,11 +253,44 @@ class ArmCalMixin:
         self.say('CALIBRATE ARMS: ' + ('; '.join(report) or 'nothing calibrated'),
                  not results)
 
-    def _collect_postures(self, arm, t_wo, info):
+    def _collect_postures(self, arm, t_wo, info, poses=None):
+        """Visit postures where the camera sees this arm's pieces and record
+        them: (samples, approach directions). poses: [(tip, tool axis, roll)]
+        to choose from; default the front ones."""
         node = self.node
         start = self.pose(arm, 'pre_pick_state') or node.arm_positions(arm)
-        origin = t_wo[:3, 3]
         rng = np.random.default_rng(1 if arm == 'left' else 2)
+        if poses is None:
+            poses = self._front_poses(arm, t_wo, info, rng)
+        else:
+            poses = list(poses)
+            rng.shuffle(poses)
+        cands, where = [], []
+        self.say(f'{arm} arm: choosing postures where the camera sees its pieces...')
+        for tip, axis, roll in poses:
+            if self.abort.is_set():
+                raise KeyboardInterrupt
+            if len(cands) >= CANDIDATES:
+                break
+            quat = quat_from_matrix(tool_frame_along(axis, math.radians(roll)))
+            tcp = node.tcp_for_tip(tip, axis, arm)
+            # can it get there at all (fast)? then collision-checked from there
+            seeds = node.fast_ik(arm, tcp, quat, start, want=1)
+            sol = node.solve_ik(arm, tcp, quat, seeds[0]) if seeds else None
+            if sol is not None and axis[2] < -0.6:
+                # pointing down: also clear where the arm really arrives, ~4 cm
+                # low (a top-down calibration at 6 cm brushed the table, 2026-10-14)
+                low = node.solve_ik(arm, tcp - np.array([0.0, 0.0, 0.04]), quat, sol)
+                if low is None or np.max(np.abs(np.subtract(low, sol))) > 0.4:
+                    continue
+            if sol is not None and self.strip_visible(arm, sol) >= 4:
+                cands.append(np.array(sol))
+                where.append(np.r_[np.asarray(tip) / 0.05, np.asarray(axis) / 0.35])
+        return self._visit_postures(arm, cands, start, rng, where)
+
+    def _front_poses(self, arm, t_wo, info, rng):
+        """CAL ARMS's postures: [(tip, tool axis, roll)] in front of the robot."""
+        origin = t_wo[:3, 3]
         # fingertip spots along camera rays in this arm's half, 32-44 cm out (the
         # strip is 11 cm behind the tip: nearer, it is too close to the camera
         # and off the picture) and always 6 cm in front of whatever the camera
@@ -270,45 +299,56 @@ class ArmCalMixin:
         bgr, depth, _info, _opt = self.frame
         h, w = depth.shape
         tips = []
-        for fu in ((0.08, 0.2, 0.32, 0.44) if arm == 'left' else (0.56, 0.68, 0.8, 0.92)):
-            for fv in (0.2, 0.4, 0.6, 0.8):
+        # this arm's half of the picture and a little past the middle (picks
+        # there go to either arm), top to bottom, near to far: everywhere the
+        # camera sees that the arm may be sent to
+        cols = (0.05, 0.14, 0.23, 0.32, 0.41, 0.55) if arm == 'left' else \
+            (0.45, 0.59, 0.68, 0.77, 0.86, 0.95)
+        for fu in cols:
+            for fv in (0.15, 0.32, 0.5, 0.68, 0.85):
                 du, dv = int(fu * w), int(fv * h)
                 patch = depth[max(0, dv - 8):dv + 9, max(0, du - 8):du + 9]
                 seen = patch[patch > 0.1]
                 limit = float(np.percentile(seen, 10)) - 0.06 if seen.size else 0.6
-                for dist in (0.32, 0.38, 0.44):
+                for dist in (0.30, 0.36, 0.42, 0.48, 0.54):
                     if dist <= limit:
                         ray = pixel_ray(fu * info.width, fv * info.height, info) * dist
                         tips.append(t_wo[:3, :3] @ ray + t_wo[:3, 3])
-        turns = [(0, 0), (0, -25), (0, -45), (25, 0), (-25, 0), (0, 15), (25, -30), (-25, -30)]
+        # level and tilted for front picks; 70 deg down and straight down for
+        # top-down ones -- one model for both (the top/bottom faces of the
+        # pieces face the camera then, 2026-10-15)
+        turns = [(0, 0), (0, -25), (0, -45), (25, 0), (-25, 0), (0, 15), (25, -30), (-25, -30),
+                 (0, -70), (0, -90), (25, -70), (-25, -70)]
         combos = [(t, tr, roll) for t in tips for tr in turns for roll in (0, 180, 90)]
         rng.shuffle(combos)
         up = np.array([0.0, 0.0, 1.0])
-        cands = []
-        self.say(f'{arm} arm: choosing postures where the camera sees its pieces...')
+        out = []
         for tip, (yaw, pitch), roll in combos:
-            if self.abort.is_set():
-                raise KeyboardInterrupt
-            if len(cands) >= CANDIDATES:
-                break
             ray = tip - origin
             ray[2] = 0.0
             ray /= np.linalg.norm(ray)
             sidev = np.cross(up, ray)
-            axis = rot_about(up, math.radians(yaw)) @ rot_about(sidev, math.radians(-pitch)) @ ray
-            quat = quat_from_matrix(tool_frame_along(axis, math.radians(roll)))
-            sol = node.solve_ik(arm, node.tcp_for_tip(tip, axis, arm), quat, start)
-            if sol is not None and self.strip_visible(arm, sol) >= 4:
-                cands.append(np.array(sol))
+            out.append((tip, rot_about(up, math.radians(yaw)) @ rot_about(sidev, math.radians(-pitch))
+                        @ ray, roll))
+        return out
+
+    def _visit_postures(self, arm, cands, start, rng, where=None):
+        """The most spread out of the candidate postures, visited and measured:
+        (samples, approach directions). Spread in where the tip is and which
+        way it points (5 cm ~ 20 deg ~ 1 unit) and in joint space alike -- so
+        the whole region the camera sees gets covered, in all its postures."""
+        node = self.node
         if not cands:
-            return []
-        # the most spread out, in joint space; then visited nearest-first
+            return [], np.zeros((0, 7))
+        feats = np.array(cands) / 0.5
+        if where is not None and len(where) == len(cands):
+            feats = np.hstack([feats, np.array(where)])
         chosen = [0]
-        dist = np.linalg.norm(np.array(cands) - cands[0], axis=1)
+        dist = np.linalg.norm(feats - feats[0], axis=1)
         while len(chosen) < min(POSTURES, len(cands)):
             nxt = int(np.argmax(dist))
             chosen.append(nxt)
-            dist = np.minimum(dist, np.linalg.norm(np.array(cands) - cands[nxt], axis=1))
+            dist = np.minimum(dist, np.linalg.norm(feats - feats[nxt], axis=1))
         order, here = [], np.array(start)
         left = set(chosen)
         while left:
@@ -318,9 +358,14 @@ class ArmCalMixin:
             here = cands[nxt]
         samples, dirs = [], []
         failed = 0
+        t_end = time.monotonic() + 60.0 * POSTURE_MINUTES
         for n, i in enumerate(order, start=1):
             if self.abort.is_set():
                 raise KeyboardInterrupt
+            if time.monotonic() > t_end:
+                self.say(f'{arm} arm: {POSTURE_MINUTES} min of postures done - fitting with '
+                         f'{len(samples)}')
+                break
             self.say(f'{arm} arm: posture {n}/{len(order)} ({len(samples)} measured)')
             # one cuMotion try, then OMPL: three cuMotion retries on the moves
             # it cannot plan cost up to 15 s a posture (2026-10-13)
@@ -359,6 +404,61 @@ class ArmCalMixin:
         self.calib_view = None
         return samples, np.array(dirs)
 
+    def tip_from_pieces(self, arm, frames, boards, t_wo, info):
+        """Where the real tip is (world), from the gripper pieces in these
+        frames and where the fit put them on the hand -- measured, not
+        modelled. None if no piece is seen well enough."""
+        seen = bd.detect_many(frames, arm, min_frames=max(1, len(frames) // 2))
+        if not seen:
+            return None
+        k = np.array(info.k, float).reshape(3, 3)
+        d = np.array(info.d, float) if len(info.d) else np.zeros(5)
+        c3 = bd.corners_3d(arm)
+        tip = np.array([0.0, 0.0, self.node.args.tip_offsets[arm], 1.0])
+        # plus where the anchors found the tip on the hand (REFIT): without it
+        # the camera and the arm model disagreed by its 30 mm (2026-10-16)
+        models = getattr(self, 'arm_models', None)
+        if models is not None and arm in models.params:
+            tip[:3] += models.params[arm].get('tip_delta', np.zeros(3))
+        tips = []
+        for piece in range(len(boards)):
+            ids = [i for i in seen if bd.piece_of(arm, i) == piece]
+            if len(ids) < 2:
+                continue
+            ok, rv, tv = cv2.solvePnP(np.concatenate([c3[i] for i in ids]),
+                                      np.concatenate([seen[i] for i in ids]), k, d)
+            if not ok:
+                continue
+            cam_piece = np.eye(4)
+            cam_piece[:3, :3] = cv2.Rodrigues(rv)[0]
+            cam_piece[:3, 3] = tv.ravel()
+            tips.append((t_wo @ cam_piece @ np.linalg.inv(boards[piece]) @ tip)[:3])
+        if not tips:
+            return None
+        return np.mean(tips, axis=0) + (models.shift(arm) if models is not None else 0.0)
+
+    def _fit_arm(self, arm, samples, dirs, t_wo, info):
+        """Rough fit, the postures it cannot explain left out, the model that
+        best predicts unseen postures, the final fit. (params, boards, stats,
+        samples kept, dirs kept, model name)"""
+        node, args = self.node, self.node.args
+        log = node.get_logger().info
+        self.say(f'{arm} arm: fitting {len(samples)} postures...')
+        params, boards, stats = armcal.fit(arm, samples, t_wo, info, log=log,  # rough
+                                              tip_offset=args.tip_offsets[arm], max_nfev=40)
+        samples, dropped, keep = armcal.drop_outliers(arm, samples, params, boards, t_wo, info)
+        dirs = dirs[keep]
+        self.say(f'{arm} arm: '
+                 + (f'{dropped} postures disagree (misread or moving), left out; '
+                    if dropped else '')
+                 + 'choosing the model that best predicts postures it has not seen...')
+        variant, scores = armcal.choose_model(arm, samples, dirs, t_wo, info, log=log)
+        params, boards, stats = armcal.fit(arm, samples, t_wo, info, log=log,
+                                              tip_offset=args.tip_offsets[arm],
+                                              dirs=dirs, variant=variant)
+        stats.update(dropped=dropped, model=variant, holdout_px=scores[variant])
+        return params, boards, stats, samples, dirs, variant
+
     def _save_samples(self, arm, samples, t_wo, info, dirs=None):
         """The raw measurements, so a fit can be redone and looked into offline:
         armcal_samples/<arm>_<time>.npz (joints, marker pixels, camera)."""
@@ -395,28 +495,30 @@ class ArmCalMixin:
         return float(np.sqrt(np.mean(np.square(errs)))) if errs else float('nan')
 
     def _back_to_pre_pick(self, arm):
-        """Bring `arm` to pre_pick and check it got there (within 0.05 rad on
-        every joint): a direct move, then via home. True when it is there."""
+        """Bring `arm` to pre_pick and check it got there (within 0.1 rad on
+        every joint -- it sags up to ~0.05 under gravity, which a 0.05 check
+        read as "could not get back", 2026-10-16): a direct move, then via
+        home. True when it is there."""
         node = self.node
         target = self.pose(arm, 'pre_pick_state')
         if target is None:
             return True
         here = node.arm_positions(arm)
         for via_home in (False, True):
-            if here is not None and max(abs(a - b) for a, b in zip(here, target)) < 0.05:
+            if here is not None and max(abs(a - b) for a, b in zip(here, target)) < 0.1:
                 return True
             self.say(f'{arm} arm: back to pre_pick...')
             if node.move_joints(arm, target, f'{arm} back to pre_pick', via_home=via_home):
                 node.settle(arm, target, timeout=2.0)
             here = node.arm_positions(arm)
-        ok = here is not None and max(abs(a - b) for a, b in zip(here, target)) < 0.05
+        ok = here is not None and max(abs(a - b) for a, b in zip(here, target)) < 0.1
         if not ok:
             self.say(f'{arm} arm: could not get back to pre_pick', True)
         return ok
 
     # -- the wall marker ------------------------------------------------------------
 
-    def find_wall_marker(self, t_wo, info):
+    def find_wall_marker(self, t_wo, info, marker_id=WALL_ID):
         """The reference marker (ID 11, 50 mm) on the wall: its centre in world
         -- the ray through its centre pixel, met with the wall's plane from the
         depth camera -- and how that compares with what is known (the wall
@@ -437,7 +539,7 @@ class ArmCalMixin:
             corners, ids, _ = cv2.aruco.detectMarkers(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY),
                                                       dictionary, parameters=params)
             if ids is not None:
-                seen += [c.reshape(4, 2) for c, i in zip(corners, ids.ravel()) if i == WALL_ID]
+                seen += [c.reshape(4, 2) for c, i in zip(corners, ids.ravel()) if i == marker_id]
         if len(seen) < 5:
             return None
         px = np.median(np.array(seen), axis=0)
@@ -453,12 +555,19 @@ class ArmCalMixin:
         dh, dw = depth.shape
         sx, sy = info.width / float(dw), info.height / float(dh)
         c_px = px.mean(0)
-        r = int(max(40, 3 * np.linalg.norm(px[0] - px[2])))
-        vs, us = np.mgrid[max(0, int(c_px[1] / sy) - r):min(dh, int(c_px[1] / sy) + r):2,
-                          max(0, int(c_px[0] / sx) - r):min(dw, int(c_px[0] / sx) + r):2]
+        # the plane from the depth on the marker's own card only (its 64 mm
+        # card around the 50 mm square): a wider patch took in the wall
+        # behind it and tilted the plane 77 deg (simulated, 2026-10-14)
+        card = c_px + (px - c_px) * (64.0 / 50.0)
+        r = int(np.max(np.abs(card - c_px))) + 2
+        vs, us = np.mgrid[max(0, int(c_px[1] / sy) - r):min(dh, int(c_px[1] / sy) + r),
+                          max(0, int(c_px[0] / sx) - r):min(dw, int(c_px[0] / sx) + r)]
+        inside = np.array([cv2.pointPolygonTest(card.astype(np.float32),
+                                                (float(u * sx), float(v * sy)), False) >= 0
+                           for u, v in zip(us.ravel(), vs.ravel())])
         z = depth[vs, us].ravel()
-        keep = z > 0.1
-        if keep.sum() < 100:
+        keep = (z > 0.1) & inside
+        if keep.sum() < 30:
             return None
         rays = np.array([pixel_ray(u * sx, v * sy, info) for u, v in
                          zip(us.ravel()[keep], vs.ravel()[keep])])
@@ -466,6 +575,11 @@ class ArmCalMixin:
         world = pts @ t_wo[:3, :3].T + t_wo[:3, 3]
         centre_w = np.median(world, axis=0)
         n = np.linalg.svd(world - centre_w)[2][2]
+        # once more without the points off that plane (edge pixels, noise)
+        on = np.abs((world - centre_w) @ n) < 0.004
+        if on.sum() >= 20:
+            centre_w = np.median(world[on], axis=0)
+            n = np.linalg.svd(world[on] - centre_w)[2][2]
         if n @ (t_wo[:3, 3] - centre_w) < 0:
             n = -n
         ray = t_wo[:3, :3] @ pixel_ray(c_px[0], c_px[1], info)
@@ -533,8 +647,8 @@ class ArmCalMixin:
         self.calib_event.clear()
         self.calib_answer = None
         self.confirming = True
-        self.say(f'CALIBRATE ARMS: check the wall marker overlay (x {c[0] * 100:.1f} cm, wall '
-                 f'turned {wall["tilt"]:.1f} deg), then CONFIRM or CANCEL')
+        self.say(f'check the wall marker overlay (x {c[0] * 100:.1f} cm, wall turned '
+                 f'{wall["tilt"]:.1f} deg), then CONFIRM or CANCEL')
         try:
             while not self.calib_event.wait(0.2):
                 if self.abort.is_set():

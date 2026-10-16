@@ -54,35 +54,59 @@ PRIOR = {'base_rot': 0.03, 'base_pos': 0.03, 'offset': 0.05, 'comply': 0.02,
 RAIL_Z = -0.08 + 0.004          # hand_tcp -> the back of the rail, along the tool axis
 
 
+FACE_HALF = 0.025                # m: the rail's half thickness, nominally (the flaps' offset)
+FACE_NORMALS = {'back': (0.0, 0.0, -1.0), 'top': (1.0, 0.0, 0.0), 'bottom': (-1.0, 0.0, 0.0)}
+
+
 def nominal_piece_in_tcp(k):
-    """Piece k as nominally mounted: on the back of the rail (printed face
-    looking back at the wrist, hand -z), RAIL_Y either side of the hand's
-    middle along the rail (hand y). Piece frame: origin bottom-left, x along
-    the rail."""
+    """Face k as nominally mounted (bd.face_of): the back face on the back of
+    the rail, looking at the wrist (hand -z); the top and bottom faces folded
+    over the rail's two long sides (hand +x and -x), reaching towards the
+    fingers. RAIL_Y either side of the hand's middle, along the rail (hand
+    y). Face frame: origin bottom-left, x along the rail, z out of the face."""
+    side, kind = bd.face_of(k)
+    y_c = bd.RAIL_Y if side == 0 else -bd.RAIL_Y
     x_b = np.array([0.0, 1.0, 0.0])
-    z_b = np.array([0.0, 0.0, -1.0])
+    z_b = np.array(FACE_NORMALS[kind])
     y_b = np.cross(z_b, x_b)
     m = np.eye(4)
     m[:3, :3] = np.column_stack([x_b, y_b, z_b])
-    centre = np.array([0.0, bd.RAIL_Y if k == 0 else -bd.RAIL_Y, RAIL_Z])
+    centre = (np.array([0.0, y_c, RAIL_Z]) if kind == 'back' else
+              np.array([z_b[0] * FACE_HALF, y_c, RAIL_Z + bd.CUT[1] / 2]))
     m[:3, 3] = centre - m[:3, :3] @ np.array([bd.SIZE[0] / 2, bd.SIZE[1] / 2, 0.0])
     return m
 
 
 def _snap_to_rail(m):
-    """A piece pose turned to lie flat on the rail (face along hand -z) and
-    moved onto it, keeping its turn and place along the rail."""
+    """A face pose turned square to the hand: its normal onto the nearest of
+    the three a face can have (hand -z, +x, -x), keeping its turn and place;
+    a back face also moved onto the rail's plane."""
     half = np.array([bd.SIZE[0] / 2, bd.SIZE[1] / 2, 0.0])
     centre = m[:3, 3] + m[:3, :3] @ half
-    n, want = m[:3, 2], np.array([0.0, 0.0, -1.0])
+    n = m[:3, 2]
+    want = max((np.array(v) for v in FACE_NORMALS.values()), key=lambda v: float(n @ v))
     axis = np.cross(n, want)
     s_, c_ = np.linalg.norm(axis), float(n @ want)
     turn = rotvec(axis / s_ * np.arctan2(s_, c_)) if s_ > 1e-9 else np.eye(3)
     out = np.eye(4)
     out[:3, :3] = turn @ m[:3, :3]
-    centre[2] = RAIL_Z
+    if want[2] < -0.5:                       # the back face: on the rail
+        centre[2] = RAIL_Z
     out[:3, 3] = centre - out[:3, :3] @ half
     return out
+
+
+def face_sigma(init, prior):
+    """Prior widths of a face's 6 pose numbers (rotation vector, shift; hand
+    frame): turned freely about its own normal, tilted off it little; slid
+    freely in its plane; off it little -- a back face (on the rail) 5 mm, a
+    flap (the rail's thickness not known) 10 mm."""
+    a = int(np.argmax(np.abs(init[:3, 2])))
+    rot = [prior['board_tilt']] * 3
+    rot[a] = prior['board_turn']
+    pos = [prior['board_pos']] * 3
+    pos[a] = prior['board_height'] if a == 2 else 0.01
+    return rot + pos
 
 
 def initial_pieces(arm, samples, t_wo, info):
@@ -171,8 +195,35 @@ def predict(arm_model, x, q, t_ow, k, d, ids, inits):
     return px.reshape(-1, 2)
 
 
+ANCHOR_MM = 1.0                 # an anchor's tip: this many mm count as one corner pixel
+ANCHORS_FILE = os.path.join(WS, 'armcal_anchors.yaml')
+
+
+def load_anchors(arm=None):
+    """[{arm, q, point, tip_offset, when}]: taught points -- the real tip was
+    nudged exactly onto `point` (world, from the camera) with the joints at q."""
+    try:
+        with open(ANCHORS_FILE) as handle:
+            rows = (yaml.safe_load(handle) or {}).get('anchors', [])
+    except (OSError, yaml.YAMLError):
+        rows = []
+    return [r for r in rows if arm is None or r.get('arm') == arm]
+
+
+def save_anchor(arm, q, point, tip_offset):
+    rows = load_anchors()
+    rows.append(plain({'arm': arm, 'q': [float(v) for v in q],
+                       'point': [float(v) for v in point], 'tip_offset': float(tip_offset),
+                       'when': datetime.datetime.now().isoformat(timespec='seconds')}))
+    with open(ANCHORS_FILE, 'w') as handle:
+        handle.write('# CAL ARMS anchors (calibrate.py ANCHOR): the real tip nudged exactly onto\n'
+                     '# a camera-measured point, with these joints. REFIT uses them.\n'
+                     + yaml.safe_dump({'anchors': rows}, sort_keys=False))
+    return sum(1 for r in rows if r['arm'] == arm)
+
+
 def fit(arm, samples, t_wo, info, log=print, touches=None, plane=None, tip_offset=0.0354,
-        max_nfev=400, dirs=None, variant=None):
+        max_nfev=400, dirs=None, variant=None, anchors=None):
     """samples: [(q (7), {marker id: (4, 2) pixels})] -- the strip postures.
     touches: [q (7)] at contact with `plane` (unit normal n, d: n . p = d,
     world, from the depth camera), the tool tilted both ways.
@@ -185,6 +236,10 @@ def fit(arm, samples, t_wo, info, log=print, touches=None, plane=None, tip_offse
     plane offset takes up the depth camera's bias and the contact's push.
 
     variant: a VARIANTS name (its priors; directions only if it uses them).
+    anchors: load_anchors() rows for this arm -- ground truth for where the
+    TIP is (the camera sees only the pieces: where the tip sits relative to
+    them is otherwise an assumption, and a wrong one put front touches 3 cm
+    low, 2026-10-16).
 
     Returns (params dict, [each piece's 4x4 in hand_tcp], stats)."""
     from scipy.optimize import least_squares
@@ -200,16 +255,29 @@ def fit(arm, samples, t_wo, info, log=print, touches=None, plane=None, tip_offse
     inits = initial_pieces(arm, samples, t_wo, info)
     n_b = N_ARM + 6 * len(inits)
     n_h = 7 if dirs is not None else 0                   # direction play, after the pieces
+    # with anchors: where the tip really is on the hand (3, hand_tcp frame) --
+    # the camera fixes the hand, only the anchors can say where its tip is --
+    # and a world shift (3) between the arm model (from the colour image) and
+    # the clicked points (from depth)
+    n_t = 6 if anchors else 0
     sigma = np.concatenate([arm_sigma(prior)]
-                           + [[prior['board_tilt']] * 2 + [prior['board_turn']]
-                              + [prior['board_pos']] * 2 + [prior['board_height']]] * len(inits))
+                           + [face_sigma(init, prior) for init in inits])
     meas = [(np.asarray(q, float), sorted(px), np.concatenate([px[i] for i in sorted(px)]))
             for q, px in samples]
     touches = [np.asarray(q, float) for q in (touches or [])]
     n_plane, d_plane = (np.asarray(plane[0], float), float(plane[1])) if plane else (None, 0.0)
     tip = np.array([0.0, 0.0, tip_offset, 1.0])
-    sigma = np.r_[sigma, [prior['hysteresis']] * n_h]
-    n_x = n_b + n_h + (1 if touches else 0)
+    # The tip on the hand: a few mm sideways (the cup is centred between the
+    # fingers), 1 cm along the tool (how far the bellows reach). Free (5 cm)
+    # it took a 30 mm SIDEWAYS offset from 4 anchors all at the wall: level,
+    # a hand offset and a world one look the same, and pointing down the
+    # hand one put the tool 3 cm beside the box (2026-10-16). The world shift
+    # takes what the anchors cannot place -- pointing down it is vertical,
+    # and the contact takes that up. Anchors in other turns (TOP DOWN) tell
+    # the two apart.
+    sigma = np.r_[sigma, [prior['hysteresis']] * n_h,
+                  [0.003, 0.003, 0.010, 0.05, 0.05, 0.05][:n_t]]
+    n_x = n_b + n_h + n_t + (1 if touches else 0)
     sigma_all = np.r_[sigma, [PLANE_SIGMA]] if touches else sigma
     dirs_all = np.asarray(dirs, float) if dirs is not None else None
 
@@ -223,6 +291,11 @@ def fit(arm, samples, t_wo, info, log=print, touches=None, plane=None, tip_offse
     local = np.concatenate([c3[i] for _q, ids, _o in meas for i in ids])
     obs_all = np.concatenate([obs for _q, _i, obs in meas])
     q_touch = np.array(touches) if touches else None
+    anchors = list(anchors or [])
+    q_anchor = np.array([r['q'] for r in anchors]) if anchors else None
+    p_anchor = np.array([r['point'] for r in anchors]) if anchors else None
+    tip_anchor = (np.array([[0.0, 0.0, r['tip_offset'], 1.0] for r in anchors])
+                  if anchors else None)
 
     def residuals(x):
         params, vs = _unpack(x, len(inits))
@@ -235,10 +308,18 @@ def fit(arm, samples, t_wo, info, log=print, touches=None, plane=None, tip_offse
         cam = world @ t_ow[:3, :3].T + t_ow[:3, 3]
         px, _ = cv2.projectPoints(cam.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), k, d)
         r = [(px.reshape(-1, 2) - obs_all).ravel()]
+        if anchors:
+            t_a = tcp_batch(model, q_anchor, params)
+            tip_d = np.r_[x[n_b + n_h:n_b + n_h + 3], 0.0]
+            tips_a = (np.einsum('nij,nj->ni', t_a, tip_anchor + tip_d)[:, :3]
+                      + x[n_b + n_h + 3:n_b + n_h + 6])
+            r.append(((tips_a - p_anchor) * 1000.0 / ANCHOR_MM).ravel())
         if touches:
             tips = (tcp_batch(model, q_touch, params) @ tip)[:, :3]
             r.append((tips @ n_plane - d_plane - x[-1]) * 1000.0 / TOUCH_MM)  # mm -> "px"
         r.append(x / sigma_all * PRIOR_WEIGHT)                      # priors, in "pixels"
+        # (anchors sit between the corners and the priors: their count is
+        # small; n_px below still counts only the corners)
         return np.concatenate(r)
 
     sol = least_squares(residuals, np.zeros(n_x), loss='huber', f_scale=1.5,
@@ -246,13 +327,21 @@ def fit(arm, samples, t_wo, info, log=print, touches=None, plane=None, tip_offse
     params, vs = _unpack(sol.x, len(inits))
     if n_h:
         params['hysteresis'] = sol.x[n_b:n_b + 7]
+    if n_t:
+        params['tip_delta'] = sol.x[n_b + n_h:n_b + n_h + 3]
+        params['anchor_shift'] = sol.x[n_b + n_h + 3:n_b + n_h + 6]
     n_px = sum(len(obs) for _q, _i, obs in meas) * 2
     res = sol.fun[:n_px].reshape(-1, 2)
     stats = {'rms_px': float(np.sqrt(np.mean(np.sum(res ** 2, axis=1)))),
              'corners': int(len(res)), 'postures': len(samples), 'touches': len(touches)}
     log(f'{arm}: fit rms {stats["rms_px"]:.2f} px')
+    n_a = 3 * len(anchors)
+    if anchors:
+        ar = sol.fun[n_px:n_px + n_a].reshape(-1, 3) * ANCHOR_MM          # mm
+        stats['anchors'] = len(anchors)
+        stats['anchor_mm'] = float(np.sqrt(np.mean(np.sum(ar ** 2, axis=1))))
     if touches:
-        tr = sol.fun[n_px:n_px + len(touches)] * TOUCH_MM
+        tr = sol.fun[n_px + n_a:n_px + n_a + len(touches)] * TOUCH_MM
         stats['touch_rms_mm'] = float(np.sqrt(np.mean(tr ** 2)))
         stats['plane_offset_mm'] = float(sol.x[-1] * 1000)
     return ({kk: np.asarray(v, float) for kk, v in params.items()},
@@ -342,6 +431,8 @@ def tip_error_mm(arm, samples, params, boards, t_wo, info, tip_offset):
 # -- the saved model ------------------------------------------------------------
 
 def save_model(models):
+    """models: {arm: (params, boards, stats)}; an arm not in it keeps what
+    the file has."""
     data = {}
     for arm, (params, boards, stats) in models.items():
         data[arm] = plain({'base': params['base'].tolist(), 'offset': params['offset'].tolist(),
@@ -350,6 +441,8 @@ def save_model(models):
                            'geom': params['geom'].tolist(),
                            **({'hysteresis': params['hysteresis'].tolist()}
                               if 'hysteresis' in params else {}),
+                           **({kk: params[kk].tolist() for kk in ('tip_delta', 'anchor_shift')
+                               if kk in params}),
                            'pieces': [b.tolist() for b in boards],
                            **stats})
     data['when'] = datetime.datetime.now().isoformat(timespec='seconds')
@@ -381,9 +474,16 @@ class ArmModels:
             if arm in raw:
                 self.params[arm] = {kk: np.asarray(raw[arm][kk], float)
                                     for kk in ('base', 'offset', 'comply', 'backlash', 'geom',
-                                               'hysteresis')
+                                               'hysteresis', 'tip_delta', 'anchor_shift')
                                     if kk in raw[arm]}
         self.arms = {arm: Arm(arm) for arm in self.params}
+        # where each gripper piece sits on the hand (CAL ARMS): for reading
+        # the real tip off the pieces live (TOP DOWN, at the hover point)
+        # (only for the pieces as they are now: a model fitted with another
+        # layout -- the old flat pieces -- does not know where these faces are)
+        self.pieces = {arm: [np.asarray(b, float) for b in raw[arm]['pieces']]
+                       for arm in ('left', 'right') if arm in raw and 'pieces' in raw[arm]
+                       and len(raw[arm]['pieces']) == len(bd.pieces(arm))}
 
     def has(self, arm):
         return arm in self.params
@@ -399,7 +499,14 @@ class ArmModels:
             return np.zeros(3)
         a = self.arms[arm]
         tip = np.array([0.0, 0.0, tip_offset, 1.0])
-        return (a.tcp(q, self.params[arm], dirs) @ tip)[:3] - (a.tcp(q) @ tip)[:3]
+        delta = np.r_[self.params[arm].get('tip_delta', np.zeros(3)), 0.0]   # anchors
+        return ((a.tcp(q, self.params[arm], dirs) @ (tip + delta))[:3] + self.shift(arm)
+                - (a.tcp(q) @ tip)[:3])
+
+    def shift(self, arm):
+        """The world shift from the anchors (m): the arm model's tip plus this
+        is where the depth camera sees it."""
+        return self.params.get(arm, {}).get('anchor_shift', np.zeros(3))
 
     def command(self, arm, tcp, rot, seed, limits=None, dirs=None):
         """The hand_tcp pose (position, 3x3) to send the planner -- which
@@ -413,7 +520,10 @@ class ArmModels:
         a = self.arms[arm]
         want = np.eye(4)
         want[:3, :3] = rot
-        want[:3, 3] = tcp
+        # the tip off where the URDF has it on the hand (anchors): move the
+        # hand so that the real tip lands where the nominal one was aimed
+        want[:3, 3] = np.asarray(tcp, float) - np.asarray(rot) @ self.params[arm].get(
+            'tip_delta', np.zeros(3)) - self.shift(arm)
         q, err = a.ik(want, np.asarray(seed, float), self.params[arm], limits, dirs)
         if err > 1e-4:
             return None
