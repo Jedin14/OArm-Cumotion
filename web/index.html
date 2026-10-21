@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <title>OpenArm Control</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <!-- the camera: everything is clicked here -->
+    <main class="stage" id="stage">
+      <img id="video" class="video" alt="Head camera" draggable="false">
+      <div class="ripples" id="ripples" aria-hidden="true"></div>
+
+      <header class="chrome top">
+        <div class="chips">
+          <span class="chip state" id="armState" data-tone="idle">connecting</span>
+          <span class="chip" id="viewChip">LIVE</span>
+          <span class="chip subtle" id="approachChip">FRONT</span>
+          <span class="chip warn" id="haltChip" hidden>STOPPED</span>
+          <span class="chip subtle" id="clickChip" hidden>CLICK ONLY</span>
+        </div>
+        <div class="segmented" role="tablist" aria-label="Picture">
+          <button role="tab" data-action="view" data-value="live" id="viewLive">Live</button>
+          <button role="tab" data-action="view" data-value="captured" id="viewCaptured">Captured</button>
+        </div>
+        <button class="stop" data-action="stop" title="Stop all motion (Esc)">
+          <span class="stop-dot"></span>STOP
+        </button>
+      </header>
+
+      <footer class="chrome bottom">
+        <div class="status" id="status" aria-live="polite">Connecting to beast…</div>
+        <div class="detail" id="detail"></div>
+      </footer>
+
+      <!-- held touch: TEACH / ANCHOR nudges -->
+      <section class="sheet" id="teachSheet" aria-hidden="true" aria-label="Nudge the tip">
+        <div class="sheet-head">
+          <div>
+            <div class="sheet-title" id="teachTitle">Nudge the tip onto the spot</div>
+            <div class="sheet-sub" id="teachSub">2 mm a press · arrows, + / −, Enter saves</div>
+          </div>
+        </div>
+        <div class="nudge">
+          <div class="pad">
+            <button class="key up" data-action="up" aria-label="Up">↑</button>
+            <button class="key left" data-action="left" aria-label="Left">←</button>
+            <button class="key right" data-action="right" aria-label="Right">→</button>
+            <button class="key down" data-action="down" aria-label="Down">↓</button>
+          </div>
+          <div class="depth">
+            <button class="key" data-action="in" aria-label="In">In +</button>
+            <button class="key" data-action="out" aria-label="Out">Out −</button>
+          </div>
+          <div class="sheet-actions">
+            <button class="btn primary" data-action="save">Save</button>
+            <button class="btn" data-action="skip">Skip</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- CAL ARMS wall check / running calibration -->
+      <section class="sheet" id="calSheet" aria-hidden="true" aria-label="Calibration">
+        <div class="sheet-head">
+          <div>
+            <div class="sheet-title" id="calTitle">Calibrating</div>
+            <div class="sheet-sub" id="calSub">Keep the view clear</div>
+          </div>
+          <div class="sheet-actions">
+            <button class="btn primary" data-action="confirm" id="calConfirm">Confirm</button>
+            <button class="btn danger" data-action="abort">Abort</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- the controls -->
+    <aside class="panel">
+      <nav class="tabs" role="tablist" aria-label="Sections">
+        <button role="tab" class="tab" data-tab="pick" aria-selected="true">Pick</button>
+        <button role="tab" class="tab" data-tab="calibrate">Calibrate</button>
+        <button role="tab" class="tab" data-tab="system">System</button>
+        <span class="tab-indicator" id="tabIndicator"></span>
+      </nav>
+
+      <div class="panes">
+        <!-- PICK -->
+        <section class="pane" data-pane="pick">
+          <div class="group">
+            <div class="label">Arms</div>
+            <div class="segmented wide">
+              <button data-action="navigation" id="modeNav">Navigation <kbd>N</kbd></button>
+              <button data-action="pre_pick" id="modePick">Pre-pick <kbd>P</kbd></button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="label">Approach</div>
+            <div class="segmented wide">
+              <button data-action="topdown" data-when="front" id="apFront">Front</button>
+              <button data-action="topdown" data-when="top" id="apTop">Top down <kbd>D</kbd></button>
+            </div>
+          </div>
+
+          <div class="card target" id="targetCard">
+            <div class="card-row">
+              <span class="label">Target</span>
+              <span class="badge" id="targetBadge" data-tone="idle">none</span>
+            </div>
+            <div class="xyz" id="targetXyz">Click the picture, or detect a box</div>
+            <div class="why" id="targetWhy"></div>
+          </div>
+
+          <div class="actions">
+            <button class="btn primary big" data-action="move" id="btnMove">Move <kbd>M</kbd></button>
+            <button class="btn model" data-action="detect" id="btnDetect">Detect box <kbd>Space</kbd></button>
+            <button class="btn model" data-action="ready_to_pick">Auto pick</button>
+            <button class="btn" data-action="recapture">Recapture <kbd>R</kbd></button>
+            <button class="btn danger-soft" data-action="return" id="btnReturn" hidden>Return arm <kbd>B</kbd></button>
+          </div>
+
+          <div class="group">
+            <div class="label">Options</div>
+            <div class="toggles">
+              <button class="toggle" data-action="teach" id="tgTeach" aria-pressed="false">
+                <span class="knob"></span>Teach <kbd>T</kbd>
+              </button>
+              <button class="toggle" data-action="pieces" id="tgPieces" aria-pressed="false">
+                <span class="knob"></span>ArUco ext
+              </button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="label">Tools past the fingertips</div>
+            <div class="tool" data-arm="left">
+              <button class="toggle" data-action="tool" data-arm="left" aria-pressed="false">
+                <span class="knob"></span>Left
+              </button>
+              <div class="stepper">
+                <button data-action="tool" data-arm="left" data-step="-0.001" aria-label="Shorter">−</button>
+                <span class="len" id="lenLeft">0 mm</span>
+                <button data-action="tool" data-arm="left" data-step="0.001" aria-label="Longer">+</button>
+              </div>
+            </div>
+            <div class="tool" data-arm="right">
+              <button class="toggle" data-action="tool" data-arm="right" aria-pressed="false">
+                <span class="knob"></span>Right
+              </button>
+              <div class="stepper">
+                <button data-action="tool" data-arm="right" data-step="-0.001" aria-label="Shorter">−</button>
+                <span class="len" id="lenRight">0 mm</span>
+                <button data-action="tool" data-arm="right" data-step="0.001" aria-label="Longer">+</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- CALIBRATE -->
+        <section class="pane" data-pane="calibrate" hidden>
+          <div class="group">
+            <div class="card-row">
+              <div class="label">Live markers</div>
+              <button class="toggle small" data-action="markers" id="tgMarkers" aria-pressed="true">
+                <span class="knob"></span><kbd>K</kbd>
+              </button>
+            </div>
+            <div class="marker-ids" id="markerIds"><span class="muted">none in view</span></div>
+          </div>
+
+          <div class="card">
+            <div class="card-row">
+              <span class="title">Arm model</span>
+              <span class="muted small" id="modelWhen"></span>
+            </div>
+            <table class="models">
+              <thead><tr><th></th><th>Model</th><th>Fit</th><th>Anchors</th></tr></thead>
+              <tbody>
+                <tr><th>Left</th><td id="mLeftModel">–</td><td id="mLeftFit">–</td><td id="mLeftAnch">–</td></tr>
+                <tr><th>Right</th><td id="mRightModel">–</td><td id="mRightFit">–</td><td id="mRightAnch">–</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="group">
+            <div class="label">Arm calibration</div>
+            <div class="hint">Folded pieces on both grippers, marker 11 on the wall 50 cm ahead. About 35–40 min.</div>
+            <div class="actions two">
+              <button class="btn primary" data-action="cal_arms">Cal arms <kbd>F</kbd></button>
+              <button class="btn" data-action="overlay" id="btnOverlay">Overlay <kbd>O</kbd></button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="label">Tip anchors</div>
+            <div class="hint">Touch a point exactly and save it; 3–4 at different spots, then refit.</div>
+            <div class="actions two">
+              <button class="toggle" data-action="anchor" id="tgAnchor" aria-pressed="false">
+                <span class="knob"></span>Anchor <kbd>A</kbd>
+              </button>
+              <button class="btn" data-action="refit">Refit <kbd>E</kbd></button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="label">Camera pose</div>
+            <div class="hint">After the camera has moved. Apply writes the result.</div>
+            <div class="actions two">
+              <button class="btn" data-action="calibrate">Calibrate <kbd>C</kbd></button>
+              <button class="btn" data-action="apply" id="btnApply" disabled>Apply</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- SYSTEM -->
+        <section class="pane" data-pane="system" hidden>
+          <div class="card">
+            <div class="title">ROS interface</div>
+            <dl class="kv">
+              <dt>arm_state</dt><dd id="sysState">–</dd>
+              <dt>arm_action/status</dt><dd id="sysResult">–</dd>
+              <dt>pick_target</dt><dd id="sysTarget">–</dd>
+              <dt>camera</dt><dd id="sysCamera">–</dd>
+            </dl>
+            <pre class="cli">ros2 topic pub --once /arm_action std_msgs/msg/String "{data: ready_to_pick}"
+ros2 topic pub --once /arm_state/cmd std_msgs/msg/String "{data: pre_pick}"
+ros2 topic echo /arm_action/status</pre>
+          </div>
+          <div class="card">
+            <div class="title">Keys</div>
+            <div class="keys">
+              <span><kbd>M</kbd> move</span><span><kbd>Space</kbd> detect</span>
+              <span><kbd>R</kbd> recapture</span><span><kbd>D</kbd> top down</span>
+              <span><kbd>T</kbd> teach</span><span><kbd>B</kbd> return</span>
+              <span><kbd>N</kbd> navigation</span><span><kbd>P</kbd> pre-pick</span>
+              <span><kbd>F</kbd> cal arms</span><span><kbd>C</kbd> camera</span>
+              <span><kbd>O</kbd> overlay</span><span><kbd>K</kbd> markers</span>
+              <span><kbd>A</kbd> anchor</span><span><kbd>E</kbd> refit</span>
+              <span><kbd>L</kbd> live / captured</span><span><kbd>Esc</kbd> STOP</span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="log" id="logWrap">
+        <button class="log-head" id="logToggle" aria-expanded="true">
+          <span>Activity</span><span class="chev">⌄</span>
+        </button>
+        <ol class="log-list" id="log"></ol>
+      </div>
+    </aside>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="assertive"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

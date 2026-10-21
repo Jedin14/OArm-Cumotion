@@ -1,0 +1,8 @@
+# Take a frame now and find the box to pick.
+
+# "auto" (from the depth: a top facing up -> top, else front), "top" or "front"
+string approach
+---
+bool found
+string message            # why not, when not found
+PickTarget target

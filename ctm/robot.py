@@ -89,6 +89,10 @@ class ClickToMove(Node):
         super().__init__('click_to_move')
         self.args = args
         self.pieces_on = False          # calibrate.py: the calibration pieces in the planners
+        # STOP (web GUI, pick stack): cancels the goals running now and refuses
+        # new ones until resume() -- the arms hold where they are
+        self.halt = threading.Event()
+        self.active_goals = set()
         cb = ReentrantCallbackGroup()
 
         self.lock = threading.Lock()
@@ -1080,6 +1084,21 @@ class ClickToMove(Node):
         ok, _ = self.execute(robot, label, timeout=total + lead + 20.0)
         return ok
 
+    def stop_motion(self):
+        """STOP: cancel every running goal; nothing moves until resume()."""
+        self.halt.set()
+        for handle in list(self.active_goals):
+            try:
+                handle.cancel_goal_async()
+            except Exception:                        # noqa: BLE001 - finished meanwhile
+                pass
+        self.get_logger().error('STOP: motion cancelled; the arms hold where they are')
+
+    def resume(self):
+        if self.halt.is_set():
+            self.halt.clear()
+            self.get_logger().info('STOP cleared: moves allowed again')
+
     def execute(self, trajectory, label, timeout=60.0, watch=None):
         """Execute a planned trajectory through move_group. (ok, stopped)
 
@@ -1088,6 +1107,9 @@ class ClickToMove(Node):
         and (True, True) is returned. That is how a guarded move stops on
         contact.
         """
+        if self.halt.is_set():
+            self.get_logger().error(f'{label}: STOP is on - not moving')
+            return False, False
         if not self.execute_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().error('/execute_trajectory unavailable')
             return False, False
@@ -1096,11 +1118,23 @@ class ClickToMove(Node):
         if handle is None or not handle.accepted:
             self.get_logger().error(f'{label}: trajectory rejected')
             return False, False
+        self.active_goals.add(handle)
+        try:
+            return self._execute_wait(handle, label, timeout, watch)
+        finally:
+            self.active_goals.discard(handle)
+
+    def _execute_wait(self, handle, label, timeout, watch):
         future = handle.get_result_async()
         done = threading.Event()
         future.add_done_callback(lambda _f: done.set())
         deadline = time.monotonic() + timeout
         while not done.wait(0.01):
+            if self.halt.is_set():
+                self.wait(handle.cancel_goal_async(), 3.0)
+                done.wait(2.0)
+                self.get_logger().error(f'{label}: STOP')
+                return False, False
             if watch is not None and watch():
                 self.wait(handle.cancel_goal_async(), 3.0)
                 done.wait(2.0)
@@ -1419,13 +1453,22 @@ class ClickToMove(Node):
 
     def _send_until_planned(self, goal, label, attempts=None):
         for attempt in range(1, (attempts or self.args.attempts) + 1):
+            if self.halt.is_set():
+                self.get_logger().error(f'{label}: STOP is on - not moving')
+                return MoveItErrorCodes.FAILURE
             handle = self.wait(self.move_client.send_goal_async(goal), 15.0)
             if handle is None:
                 self.require_move_group()
             if handle is None or not handle.accepted:
                 self.get_logger().error(f'{label}: goal rejected by move_group')
                 return MoveItErrorCodes.FAILURE
-            result = self.wait_or_dead(handle.get_result_async(), self.args.motion_timeout)
+            self.active_goals.add(handle)
+            try:
+                result = self.wait_or_dead(handle.get_result_async(), self.args.motion_timeout)
+            finally:
+                self.active_goals.discard(handle)
+            if self.halt.is_set():
+                return MoveItErrorCodes.FAILURE
             if result is None:
                 handle.cancel_goal_async()
                 self.get_logger().error(f'{label}: timed out; goal cancelled')

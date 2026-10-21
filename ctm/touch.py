@@ -85,7 +85,7 @@ class TouchMixin:
                 plan, why = self.preplan(arm, aim, point, origin, start)
         except Exception as exc:                     # noqa: BLE001 - only a preview
             plan, why, aim, start = None, f'could not check ({exc})', None, None
-        check.update(ok=plan is not None, plan=plan, aim=aim, start=start,
+        check.update(ok=plan is not None, plan=plan, aim=aim, start=start, why=why,
                      time=time.monotonic())
         if self.check is not check or (self.busy and not in_job):
             return
@@ -726,7 +726,7 @@ class TouchMixin:
                         seen_by = 'arm model'
                     if tip is not None:
                         self.last_contact = {'arm': arm, 'tip': tip, 'aim': aim,
-                                             'axis': way, 'felt': touched}
+                                             'axis': way, 'felt': touched, 'how': how}
                         miss = aim - tip
                         along = float(miss @ way)
                         sideways = float(np.linalg.norm(miss - along * way))
