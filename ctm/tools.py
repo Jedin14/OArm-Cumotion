@@ -34,7 +34,7 @@ def load():
 def save(tools):
     with open(TOOLS_FILE, 'w') as handle:
         handle.write('# Tools past the fingertips, per arm (click_to_move tool buttons).\n'
-                     + yaml.safe_dump({arm: {'on': t['on'], 'length': round(t['length'], 4)}
+                     + yaml.safe_dump({arm: {'on': t['on'], 'length': round(t['length'], 5)}
                                        for arm, t in tools.items()}, sort_keys=False))
 
 

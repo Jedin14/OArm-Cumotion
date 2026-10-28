@@ -41,7 +41,7 @@
         <div class="sheet-head">
           <div>
             <div class="sheet-title" id="teachTitle">Nudge the tip onto the spot</div>
-            <div class="sheet-sub" id="teachSub">2 mm a press · arrows, + / −, Enter saves</div>
+            <div class="sheet-sub" id="teachSub">1 mm a press, Shift 5 mm · arrows, + / −, Enter saves</div>
           </div>
         </div>
         <div class="nudge">
@@ -98,6 +98,14 @@
           </div>
 
           <div class="group">
+            <div class="label">Gripper</div>
+            <div class="segmented wide">
+              <button data-action="pick_tool" data-value="vacuum" id="tlVacuum" title="Vacuum: the left arm picks every box; the right arm is never moved for a pick">Vacuum · left</button>
+              <button data-action="pick_tool" data-value="finger" id="tlFinger" title="Fingers: the right arm picks every box; the left arm is never moved for a pick">Finger · right</button>
+            </div>
+          </div>
+
+          <div class="group">
             <div class="label">Approach</div>
             <div class="segmented wide">
               <button data-action="topdown" data-when="front" id="apFront">Front</button>
@@ -112,12 +120,20 @@
             </div>
             <div class="xyz" id="targetXyz">Click the picture, or detect a box</div>
             <div class="why" id="targetWhy"></div>
+            <div class="why" id="targetBox"></div>
+          </div>
+
+          <div class="card result" id="resultCard" hidden>
+            <div class="card-row">
+              <span class="label">Last pick</span>
+              <span class="badge" id="resultBadge" data-tone="idle">–</span>
+            </div>
+            <div class="why" id="resultWhy"></div>
           </div>
 
           <div class="actions">
             <button class="btn primary big" data-action="move" id="btnMove">Move <kbd>M</kbd></button>
-            <button class="btn model" data-action="detect" id="btnDetect">Detect box <kbd>Space</kbd></button>
-            <button class="btn model" data-action="ready_to_pick">Auto pick</button>
+            <button class="btn model" data-action="detect" id="btnDetect" title="The box picker looks at 5 frames and shows every box it found and the one it will pick (FRONT or TOP); nothing moves until MOVE">Detect box <kbd>Space</kbd></button>
             <button class="btn" data-action="recapture">Recapture <kbd>R</kbd></button>
             <button class="btn danger-soft" data-action="return" id="btnReturn" hidden>Return arm <kbd>B</kbd></button>
           </div>
@@ -131,6 +147,29 @@
               <button class="toggle" data-action="pieces" id="tgPieces" aria-pressed="false">
                 <span class="knob"></span>ArUco ext
               </button>
+            </div>
+          </div>
+
+          <div class="card held">
+            <div class="card-row">
+              <span class="label">Held object</span>
+              <span class="badge" id="heldBadge" data-tone="idle">empty</span>
+            </div>
+            <div class="xyz" id="heldSize">No size on /beast_arm/held_object/size</div>
+            <div class="why">Attached to the tool at contact, so the way back keeps it clear; released at the drop.</div>
+            <div class="dims" id="dummyDims">
+              <label>H <input type="number" min="5" max="600" step="1" id="dimH" value="170"></label>
+              <span>×</span>
+              <label>W <input type="number" min="5" max="600" step="1" id="dimW" value="100"></label>
+              <span>×</span>
+              <label>D <input type="number" min="5" max="600" step="1" id="dimD" value="25"></label>
+              <span class="muted small">mm</span>
+            </div>
+            <div class="actions two">
+              <button class="toggle" data-action="dummy_size" id="tgDummy" aria-pressed="false">
+                <span class="knob"></span>Dummy size
+              </button>
+              <button class="btn" data-action="release" id="btnRelease" disabled>Release</button>
             </div>
           </div>
 
@@ -206,6 +245,34 @@
           </div>
 
           <div class="group">
+            <div class="label">Tool weight (gravity compensation)</div>
+            <div class="hint">Nothing on the cup, arm at pre-pick. Weigh tool: 16 still postures, the motors' torques give the real mass after joint 7 (~3 min). Apply weight writes it into the URDF; then restart run_launch_everything.sh.</div>
+            <div class="actions two">
+              <button class="btn" data-action="weigh_tool">Weigh tool</button>
+              <button class="btn" data-action="apply_weight">Apply weight</button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="label">Automatic calibration (marker box)</div>
+            <div class="hint">Print <a href="/sheets/calib_box_sheets.pdf" target="_blank">the box sheets</a> (glue on a 170×100×25 box) and <a href="/sheets/charuco_board.pdf" target="_blank">the board</a> at 100 %. 1: hold the board in view, Capture, move it, 3–5 times, Fit. 2: cup on the cross of face B, arm at pre-pick, Cal tip (~15 min, unattended).</div>
+            <div class="actions">
+              <button class="btn" data-action="depth_capture" id="btnDepthCap">Depth: capture</button>
+              <button class="btn" data-action="depth_fit" id="btnDepthFit">Depth: fit</button>
+              <button class="btn primary big" data-action="box_cal">Cal tip (box)</button>
+            </div>
+            <div class="hint" id="autoCalStatus"></div>
+          </div>
+
+          <div class="group">
+            <div class="label">Camera tip check</div>
+            <div class="hint">Measures where the camera sees the tool's tip, against the arm model. Every touch does this by itself before going in; this shows it on the picture (cyan: the tool's end, green: tip seen, orange: tip by the model).</div>
+            <div class="actions">
+              <button class="btn" data-action="tip_check">Tip check <kbd>I</kbd></button>
+            </div>
+          </div>
+
+          <div class="group">
             <div class="label">Camera pose</div>
             <div class="hint">After the camera has moved. Apply writes the result.</div>
             <div class="actions two">
@@ -221,13 +288,17 @@
             <div class="title">ROS interface</div>
             <dl class="kv">
               <dt>arm_state</dt><dd id="sysState">–</dd>
+              <dt>arm_action/phase</dt><dd id="sysPhase">–</dd>
               <dt>arm_action/status</dt><dd id="sysResult">–</dd>
+              <dt>held_object/state</dt><dd id="sysHeld">–</dd>
               <dt>pick_target</dt><dd id="sysTarget">–</dd>
               <dt>camera</dt><dd id="sysCamera">–</dd>
             </dl>
-            <pre class="cli">ros2 topic pub --once /arm_action std_msgs/msg/String "{data: ready_to_pick}"
-ros2 topic pub --once /arm_state/cmd std_msgs/msg/String "{data: pre_pick}"
-ros2 topic echo /arm_action/status</pre>
+            <pre class="cli">ros2 topic pub --once /beast_arm/arm_action std_msgs/msg/String "{data: ready_to_pick}"
+ros2 topic pub --once /beast_arm/arm_state/cmd std_msgs/msg/String "{data: pre_pick}"
+ros2 topic pub --once /beast_arm/held_object/size pick_interfaces/msg/ObjectSize "{height_mm: 170, width_mm: 100, depth_mm: 25}"
+ros2 topic pub --once /beast_arm/stop std_msgs/msg/Empty
+ros2 topic echo /beast_arm/status</pre>
           </div>
           <div class="card">
             <div class="title">Keys</div>
@@ -239,6 +310,7 @@ ros2 topic echo /arm_action/status</pre>
               <span><kbd>F</kbd> cal arms</span><span><kbd>C</kbd> camera</span>
               <span><kbd>O</kbd> overlay</span><span><kbd>K</kbd> markers</span>
               <span><kbd>A</kbd> anchor</span><span><kbd>E</kbd> refit</span>
+              <span><kbd>I</kbd> tip check</span>
               <span><kbd>L</kbd> live / captured</span><span><kbd>Esc</kbd> STOP</span>
             </div>
           </div>

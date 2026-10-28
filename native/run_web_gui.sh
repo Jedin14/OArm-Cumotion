@@ -3,7 +3,8 @@
 # WEB GUI: every arm tool in one browser page -- click a point, detect and
 # pick boxes, TEACH, tools, ARUCO EXT, the live ArUco markers, CAL ARMS,
 # camera CALIBRATE, OVERLAY, ANCHOR + REFIT, STOP -- plus the pick stack's
-# ROS topics (arm_state, arm_action, pick_target), and the box model.
+# ROS topics (all under /beast_arm: arm_state, arm_action, held_object, ...),
+# and the box model.
 #
 # Bring the robot up first, unchanged:
 #
@@ -21,6 +22,9 @@ WS_DIR="$(cd "${NATIVE_DIR}/.." && pwd)"
 
 # shellcheck disable=SC1091
 source "${NATIVE_DIR}/setup.bash" > /dev/null
+
+# every earlier instance of the pick tools stopped first (port 8080, GPU memory)
+"${NATIVE_DIR}/stop_pick_tools.sh" || exit 1
 
 # --click -> click:=true (the other arguments go to the launch file as they are)
 ARGS=()

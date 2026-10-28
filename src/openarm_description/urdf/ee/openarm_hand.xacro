@@ -11,7 +11,34 @@
     </xacro:unless>
 
 
-    <xacro:ee_link_with_sc name="hand" prefix="${ee_prefix}" ee_kinematics_link="${ee_kinematics_link}"/>
+    <!-- The LEFT gripper is a plain grey cylinder, 30 mm across, 138.15 mm from
+         the hand mount: 238.25 mm from joint 7, measured, to the working tip
+         (2026-10-26); no fingers. Its collision shape stops at 95.4 mm (the
+         old fingertips): the last 42.75 mm is the tool's collision piece
+         (tools.yaml, ctm/robot.py), which alone may touch at the contact. The
+         finger links and joints stay, without shapes, so the controllers and
+         planners keep the same joints. The right gripper is unchanged. -->
+    <xacro:if value="${arm_prefix == 'left_'}">
+      <link name="${ee_prefix}hand">
+        <visual name="${ee_prefix}hand_visual">
+          <origin rpy="0 0 0" xyz="0 0 0.069075"/>
+          <geometry>
+            <cylinder radius="0.015" length="0.13815"/>
+          </geometry>
+          <material name="grey"><color rgba="0.6 0.6 0.62 1.0"/></material>
+        </visual>
+        <collision name="${ee_prefix}hand_collision">
+          <origin rpy="0 0 0" xyz="0 0 0.0477"/>
+          <geometry>
+            <cylinder radius="0.015" length="0.0954"/>
+          </geometry>
+        </collision>
+        <xacro:ee-inertials name="hand" />
+      </link>
+    </xacro:if>
+    <xacro:unless value="${arm_prefix == 'left_'}">
+      <xacro:ee_link_with_sc name="hand" prefix="${ee_prefix}" ee_kinematics_link="${ee_kinematics_link}"/>
+    </xacro:unless>
     <!-- <link name="${ee_prefix}hand"/> -->
 
     <xacro:unless value="${connected_to == ''}">
@@ -32,6 +59,15 @@
       <child link="${ee_prefix}hand_tcp" />
     </joint>
 
+    <xacro:if value="${arm_prefix == 'left_'}">
+      <link name="${ee_prefix}left_finger">
+        <xacro:ee-inertials name="left_finger"/>
+      </link>
+      <link name="${ee_prefix}right_finger">
+        <xacro:ee-inertials name="right_finger"/>
+      </link>
+    </xacro:if>
+    <xacro:unless value="${arm_prefix == 'left_'}">
     <link name="${ee_prefix}left_finger">
       <visual name="${ee_prefix}left_finger_visual">
         <xacro:openarm-ee-kinematics-link config="${ee_kinematics_link}" name="left_finger" />
@@ -63,6 +99,7 @@
       </collision>
       <xacro:ee-inertials name="right_finger"/>
     </link>
+    </xacro:unless>
 
     <joint name="${ee_prefix}finger_joint1" type="prismatic">
       <parent link="${ee_prefix}hand" />

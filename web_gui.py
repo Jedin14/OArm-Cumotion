@@ -16,7 +16,7 @@ windows, and a web server for the page:
   POST /api/click        {x, y} in 0..1 of the picture: pick that point
   POST /api/action       {name, ...}: every button (see WebStack.actions)
 
-The box model is the /box_model/detect service: run_web_gui.sh starts
+The box model is the /beast_arm/box_model/detect service: run_web_gui.sh starts
 box_model_node.py beside it. --click: click-only, like click_to_move -- no
 model, no DETECT BOX / AUTO PICK (native/run_web_gui.sh --click).
 
@@ -42,8 +42,8 @@ from std_msgs.msg import String
 import calibrate as calib_app
 import click_to_move as ctm_app
 import pick_stack
-from ctm import armcal, board as bd
-from ctm.common import WS, decode_image
+from ctm import armcal, board as bd, calib_box as cb, depth_cal
+from ctm.common import TOOL_ARM, WS, decode_image
 from ctm.robot import ClickToMove
 from pick_interfaces.msg import PickTarget
 from pick_interfaces.srv import DetectTarget
@@ -62,9 +62,22 @@ class WebStack(pick_stack.PickStack):
         super().__init__(node)
         self.anchor_mode = False
         self.view = 'live'            # 'live' camera or the 'captured' frame
+        # the box picker's drawing of its last answer (box_model/image): shown in
+        # the captured view after DETECT BOX, until a click or a recapture
+        self.picker_image = None      # (BGR, monotonic time received)
+        self.picker_shown = None      # the drawing shown now, or None
+        self.check_shown = False      # ... and it is the pick check's (after a pick)
+        from rclpy.qos import DurabilityPolicy, QoSProfile
+        from sensor_msgs.msg import Image as RosImage
+        node.create_subscription(
+            RosImage, f'{node.args.ns.rstrip("/")}/box_model/image', self._on_picker_image,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.show_markers = True      # the live ArUco outlines + ids
         self.click_only = bool(node.args.click)   # --click: no box model
+        self.dummy = False            # publish a test size on held_object/size
+        node.create_timer(1.0, self._publish_dummy)
         self.box = None               # the last DETECT BOX result (PickTarget)
+        self.model_pick = None        # self.pick when it came from that result
         self.boxes = []               # every box of that frame (pixels)
         self.log = collections.deque(maxlen=80)
         self.error = False
@@ -101,10 +114,63 @@ class WebStack(pick_stack.PickStack):
             self.say('STOP: motion cancelled; the arms hold where they are. Any move clears it',
                      True)
             return True, 'stopped'
+        if name == 'tip_check':
+            # measures only (nothing moves): also while a touch is held
+            arm = data.get('arm') or (self.last_touch or {}).get('arm') or self.tip_arm()
+            if self.frame is None:
+                return False, 'Recapture first, with the arms at pre_pick (the background)'
+
+            def job():
+                r = self.measure_tip_now(arm)
+                if r is None or not r.get('ok'):
+                    self.say(f'TIP CHECK {arm}: {(r or {}).get("why", "no frame")}', True)
+                    return
+                self.say(f'TIP CHECK {arm}: the camera sees the tip {1000 * r["across_off"]:+.1f} mm '
+                         f'across the view and {1000 * r["other_off"]:+.1f} mm the other way '
+                         f'({r["other_from"]}) from where the arm model puts it; the tool seen '
+                         f'{1000 * r["width"]:.0f} mm wide')
+            threading.Thread(target=job, daemon=True).start()
+            return True, 'measuring'
+        if name == 'weigh_tool':
+            self.node.resume()
+            return self._start(lambda: self.weigh_tool(data.get('arm') or 'left'), 'WEIGH TOOL')
+        if name == 'apply_weight':
+            return self._start(self.apply_weight, 'APPLY WEIGHT')
+        if name == 'depth_capture':
+            return self._start(self.depth_capture, 'depth capture')
+        if name == 'depth_fit':
+            return self._start(self.depth_fit, 'depth fit')
+        if name == 'box_cal':
+            self.node.resume()
+            return self._start(lambda: self.calibrate_tip_box(data.get('arm') or 'left'),
+                               'CAL TIP')
+        if name == 'dummy_dims':
+            # height x width x depth, mm (the GUI's fields)
+            try:
+                dims = tuple(float(data[k]) for k in ('h', 'w', 'd'))
+            except (KeyError, TypeError, ValueError):
+                return False, 'height, width and depth in mm, please'
+            if not all(5.0 <= v <= 600.0 for v in dims):
+                return False, 'each size between 5 and 600 mm'
+            self.DUMMY_MM = dims
+            if self.dummy:
+                self._publish_dummy()
+            return True, 'dummy size {:.0f} x {:.0f} x {:.0f} mm'.format(*dims)
+        if name == 'dummy_size':
+            self.set_dummy(not self.dummy)
+            return True, 'dummy size ' + ('on' if self.dummy else 'off')
+        if name == 'release':
+            if not self.node.held:
+                return False, 'no arm holds a box'
+            if self.busy:
+                return False, 'not while an arm is moving'
+            self.release()
+            return True, 'released'
         if name in motion:
             self.node.resume()
         if self.teaching:
-            if name in ('left', 'right', 'up', 'down', 'in', 'out', 'save', 'skip'):
+            if name.rstrip('5') in ('left', 'right', 'up', 'down', 'in', 'out') or \
+                    name in ('save', 'skip'):
                 self.answer(name)
                 return True, name
             return False, 'a touch is held for TEACH / ANCHOR: nudge, SAVE or SKIP first'
@@ -115,6 +181,15 @@ class WebStack(pick_stack.PickStack):
             self.view = 'captured' if data.get('value') == 'captured' and self.frame is not None \
                 else 'live'
             return True, self.view
+        if name == 'pick_tool':
+            tool = data.get('value')
+            if tool not in TOOL_ARM:
+                return False, 'vacuum or finger?'
+            if self.busy:
+                return False, 'busy'
+            self.set_tool_mode(tool)
+            self.box = self.model_pick = None
+            return True, f'{tool}: the {TOOL_ARM[tool]} arm picks'
         if name == 'markers':
             self.show_markers = not self.show_markers
             return True, 'markers on' if self.show_markers else 'markers off'
@@ -173,11 +248,51 @@ class WebStack(pick_stack.PickStack):
             return True, name
         return False, f'unknown action {name}'
 
+    DUMMY_MM = (170.0, 100.0, 25.0)   # height x width x depth
+
+    def _publish_dummy(self):
+        if self.dummy:
+            from pick_interfaces.msg import ObjectSize
+            msg = ObjectSize(height_mm=self.DUMMY_MM[0], width_mm=self.DUMMY_MM[1],
+                             depth_mm=self.DUMMY_MM[2])
+            msg.header.frame_id = 'dummy'
+            msg.header.stamp = self.node.get_clock().now().to_msg()
+            self.size_pub.publish(msg)
+
+    def set_dummy(self, on):
+        from pick_interfaces.msg import ObjectSize
+        self.dummy = on
+        if on:
+            self._publish_dummy()
+            h, w, d = self.DUMMY_MM
+            self.say(f'DUMMY SIZE on: publishing {h:.0f} x {w:.0f} x {d:.0f} mm on '
+                     f'held_object/size every second; the next felt contact attaches it')
+        else:
+            size = self.node.object_size
+            if size is not None and size['source'] == 'dummy':
+                msg = ObjectSize()                   # zeros: no object
+                msg.header.frame_id = 'dummy'
+                self.size_pub.publish(msg)
+            self.say('DUMMY SIZE off')
+
     def _on_action(self, msg):
         if self.click_only and msg.data.strip().lower().startswith('ready_to_pick'):
             self.report('pick_failed: click-only mode (--click), no box model')
             return
         super()._on_action(msg)
+
+    def _depth_cal_text(self):
+        try:
+            import yaml
+            d = yaml.safe_load(open(depth_cal.FILE)) or {}
+            return f'{d.get("rms_after_mm")} mm rms ({d.get("placements")} placements)'
+        except (OSError, ValueError):
+            return None
+
+    def tip_arm(self):
+        """The arm with a tool on, else left."""
+        tools = self.node.args.tools
+        return next((a for a in ('left', 'right') if tools.get(a, {}).get('on')), 'left')
 
     def _start(self, work, label=None):
         if self.busy:
@@ -191,6 +306,9 @@ class WebStack(pick_stack.PickStack):
         """x, y in 0..1 of the picture shown."""
         if self.teaching or self.calibrating or self.calib_view is not None:
             return False, 'not now: finish the step in progress'
+        self.picker_shown = None                         # a point of your own now
+        self.check_shown = False
+        self.node.pick_box = None                        # (no measured face for it)
         if self.busy:
             return False, 'busy'
         self.node.resume()
@@ -223,24 +341,74 @@ class WebStack(pick_stack.PickStack):
 
     # -- DETECT BOX: the model, then the reach check (nothing moves) -----------------
 
+    def capture(self):
+        self.picker_shown = None                         # RECAPTURE: the camera again
+        self.check_shown = False
+        super().capture()
+
+    def finish_pick(self, arm):
+        """After the pick: the camera's check, then its picture -- the scene now,
+        the box's outline (red where it is gone), the verdict -- in the
+        captured view. A fresh capture under it, so the next click or DETECT
+        BOX works on the scene as it is now."""
+        asked = time.monotonic()
+        super().finish_pick(arm)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not (self.picker_image and
+                                                   self.picker_image[1] >= asked):
+            time.sleep(0.05)
+        if not (self.picker_image and self.picker_image[1] >= asked):
+            return                                       # no check ran: nothing new to show
+        shown = self.picker_image[0]
+        if self.last_touch is None:
+            self.capture()                               # the scene now (the arm is back)
+        self.pick = self.check = None
+        self.box = self.model_pick = None
+        self.picker_shown, self.check_shown = shown, True
+        self.view = 'captured'
+
+    def _on_picker_image(self, msg):
+        try:
+            self.picker_image = (decode_image(msg), time.monotonic())
+        except ValueError:
+            pass
+
     def detect_box(self):
+        """DETECT BOX: the box picker looks (5 frames), its drawing is shown --
+        every box, the one it chose, FRONT or TOP by its rules -- the pick is
+        planned; nothing moves until MOVE."""
         if self.mode != 'pick' and not self.ensure_pick_mode():
             return
         if not self.detect_client.wait_for_service(timeout_sec=3.0):
-            self.say(f'no box model ({self.node.args.model_service}) - is box_model_node.py '
+            self.say(f'no box model ({self.detect_client.srv_name}) - is box_model_node.py '
                      f'running?', True)
             return
-        self.say('DETECT BOX: the model is looking...')
+        self.say('DETECT BOX: the box picker is looking (5 frames)...')
+        asked = time.monotonic()
         answer = self.node.wait(self.detect_client.call_async(
-            DetectTarget.Request(approach='top' if self.top_down else self.node.args.approach)),
-            30.0)
+            DetectTarget.Request(approach='auto', tool=self.pick_tool)), 90.0)   # its rules decide
+        # its drawing (published just before the answer): shown either way
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not (self.picker_image and
+                                                   self.picker_image[1] >= asked):
+            time.sleep(0.05)
+        self.check_shown = False
+        self.picker_shown = self.picker_image[0] if (self.picker_image and
+                                                     self.picker_image[1] >= asked) else None
         if answer is None or not answer.found:
             self.box = None
+            self.pick = self.check = None
+            if self.picker_shown is not None:
+                self.view = 'captured'
             self.say('no box: ' + (answer.message if answer else 'the model did not answer'),
                      True)
             return
         self.box = self.target = answer.target
-        self.capture()
+        self.prepare_target(answer.target)              # the tool's arm, the box matched
+        self.target_pub.publish(answer.target)
+        shown = self.picker_shown
+        self.capture()                                   # (clears the drawing: put back)
+        self.picker_shown = shown
         if self.frame is None:
             return
         self.view = 'captured'
@@ -251,8 +419,36 @@ class WebStack(pick_stack.PickStack):
                                   t.v * h / float(t.image_height or h),
                                   world=np.array([t.position.x, t.position.y, t.position.z]))
         self.say(f'box: {answer.message}')
+        self.model_pick = self.pick
         if check is not None:
             self.check_pick(check, in_job=True)
+            ok = check.get('ok')
+            self.say(f'{t.approach.upper()} pick of the box shown - ' +
+                     ('press MOVE to pick it' if ok else
+                      f'cannot pick it: {check.get("why") or "not reachable"}'), not ok)
+
+    def move(self):
+        """MOVE: a detected box is picked as ready_to_pick does -- its box
+        attached at contact, then the camera's check (pick_result); a point of
+        your own is only touched."""
+        if self.pick is None or self.pick is not getattr(self, 'model_pick', None):
+            self.node.pick_box = None
+            return super().move()
+        _u, _v, point, arm, origin = self.pick
+        scene = self.frame
+
+        def job():
+            if not self.ensure_pick_mode():
+                return
+            self.activity = 'picking'
+            self.report('picking')
+            try:
+                self.touch(arm, point, origin, scene)
+                self.finish_pick(arm)
+            finally:
+                self.activity = None
+                self.model_pick = None                   # picked: detect again for the next
+        self.in_background(job)
 
     # -- the state, for the page -------------------------------------------------------
 
@@ -289,12 +485,27 @@ class WebStack(pick_stack.PickStack):
             'tools': {a: {'on': bool(v['on']), 'length': round(float(v['length']), 4)}
                       for a, v in self.node.args.tools.items()},
             'pick': pick, 'last_touch': self.last_touch is not None,
-            'target': ({'approach': t.approach, 'confidence': round(float(t.confidence), 2),
+            'target': ({'approach': t.approach, 'tool': t.tool, 'arm': t.arm,
+                        'confidence': round(float(t.confidence), 2),
                         'xyz': [round(t.position.x, 4), round(t.position.y, 4),
-                                round(t.position.z, 4)], 'boxes': int(t.num_boxes)}
+                                round(t.position.z, 4)], 'boxes': int(t.num_boxes),
+                        'face_mm': [round(float(v)) for v in t.face_mm],
+                        'box_mm': [round(float(v)) for v in t.box_mm]}
                        if t is not None else None),
+            'pick_tool': self.pick_tool, 'pick_result': self.pick_result,
             'models': models, 'model_when': raw.get('when'),
+            'depth_n': len(getattr(self, 'depth_samples', [])),
+            'depth_cal': self._depth_cal_text(),
+            'box_cal': ({k: (raw.get('left') or {}).get(k) for k in
+                         ('box_tips', 'box_holdout_mm', 'box_holdout_p90_mm')}
+                        if (raw.get('left') or {}).get('box_tips') else None),
             'camera': color is not None, 'click_only': self.click_only,
+            'phase': self.step, 'dummy': self.dummy, 'ns': self.ns,
+            'dummy_mm': [round(v, 1) for v in self.DUMMY_MM],
+            'held': {a: [round(1000 * v) for v in h['size']] for a, h in self.node.held.items()},
+            'object_size': ([round(1000 * v) for v in self.node.object_size['hwd']]
+                            if self.node.object_size else None),
+            'object_source': (self.node.object_size or {}).get('source'),
             'log': list(self.log)[-40:],
         }
 
@@ -313,6 +524,29 @@ class WebStack(pick_stack.PickStack):
                 cv2.drawMarker(img, (int(found[0]), int(found[1])), (0, 0, 255),
                                cv2.MARKER_CROSS, 18, 2)
             return img
+        if self.view == 'captured' and self.picker_shown is not None:
+            # the box picker's own drawing: every box, the face it chose
+            img = self.picker_shown.copy()
+            if self.frame is not None and img.shape[:2] != self.frame[0].shape[:2]:
+                img = cv2.resize(img, (self.frame[0].shape[1], self.frame[0].shape[0]))
+            h, w = img.shape[:2]
+            if self.check_shown:                         # the pick check's own picture
+                return img
+            t, ok = self.box, (self.check or {}).get('ok')
+            if self.pick:
+                u, v = int(self.pick[0]), int(self.pick[1])
+                colour = (90, 200, 60) if ok else (60, 60, 230) if ok is False else (0, 190, 255)
+                cv2.circle(img, (u, v), 14, colour, 2, cv2.LINE_AA)
+            if t is not None:
+                line = (f'{t.approach.upper()} pick - ' +
+                        ('reachable - press MOVE' if ok else 'NOT reachable' if ok is False
+                         else 'checking the reach...'))
+                cv2.rectangle(img, (0, h - 62), (w, h - 32), (0, 0, 0), -1)
+                cv2.putText(img, line, (10, h - 41), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (90, 200, 60) if ok else (60, 60, 230) if ok is False
+                            else (0, 190, 255), 2, cv2.LINE_AA)
+            self._draw_tip_seen(img)
+            return img
         if self.view == 'captured' and self.frame is not None:
             img = self.frame[0].copy()
             h, w = img.shape[:2]
@@ -320,7 +554,7 @@ class WebStack(pick_stack.PickStack):
                 bad = self.unreachable
                 img[bad] = (0.6 * img[bad] + 0.4 * np.array([40, 40, 200])).astype(np.uint8)
             t = self.box
-            if t is not None:
+            if t is not None and any(t.bbox):         # (the box picker gives a face, no box)
                 x1, y1, x2, y2 = (int(round(c)) for c in t.bbox)
                 cv2.rectangle(img, (x1, y1), (x2, y2), (80, 200, 80), 2)
             if self.pick:
@@ -341,9 +575,27 @@ class WebStack(pick_stack.PickStack):
                 np.full((480, 640, 3), 24, np.uint8)
             if color is not None and self.show_markers:
                 self._draw_markers(img)
+        self._draw_tip_seen(img)
         h, w = img.shape[:2]
         cv2.line(img, (w // 2, 0), (w // 2, h), (255, 255, 255), 1)
         return img
+
+    def _draw_tip_seen(self, img):
+        """The camera's last view of a tip, for 20 s: the tool's end region
+        (cyan), the tip it measured (green ring), the arm model's (orange +)."""
+        r = getattr(self, 'tip_seen', None)
+        if not r or time.monotonic() - r.get('when', 0) > 20.0:
+            return
+        h, w = img.shape[:2]
+        if r.get('end_px') is not None:
+            px = np.asarray(r['end_px'])
+            ok = (px[:, 0] >= 0) & (px[:, 0] < w) & (px[:, 1] >= 0) & (px[:, 1] < h)
+            img[px[ok, 1], px[ok, 0]] = (255, 220, 0)
+        if r.get('pred_px'):
+            cv2.drawMarker(img, tuple(int(v) for v in r['pred_px']), (0, 140, 255),
+                           cv2.MARKER_CROSS, 16, 2, cv2.LINE_AA)
+        if r.get('ok') and r.get('tip_px'):
+            cv2.circle(img, tuple(int(v) for v in r['tip_px']), 7, (90, 220, 60), 2, cv2.LINE_AA)
 
     def _draw_markers(self, img):
         """calibrate.py's live view: every marker outlined with its id and name
@@ -351,7 +603,7 @@ class WebStack(pick_stack.PickStack):
         now = time.monotonic()
         if now - self._found_at > MARKER_EVERY:
             corners, ids, _ = cv2.aruco.detectMarkers(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),
-                                                      bd.dictionary(), parameters=self.aruco)
+                                                      cb.dictionary(), parameters=self.aruco)
             self._found = (corners, ids)
             self._found_at = now
             self.seen = sorted(int(i) for i in ids.ravel()) if ids is not None else []
@@ -361,7 +613,7 @@ class WebStack(pick_stack.PickStack):
             size = float(np.mean([np.linalg.norm(c[k] - c[(k + 1) % 4]) for k in range(4)]))
             colour = (90, 200, 60) if size >= 20 else (0, 170, 255)
             cv2.polylines(img, [np.round(c).astype(np.int32)], True, colour, 2, cv2.LINE_AA)
-            label = f'{int(i)} {bd.name_of(int(i))}'.strip()
+            label = f'{int(i)} {bd.name_of(int(i)) or cb.name_of(int(i))}'.strip()
             x, y = int(c[:, 0].min()), max(14, int(c[:, 1].min()) - 6)
             cv2.putText(img, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3,
                         cv2.LINE_AA)
@@ -373,16 +625,29 @@ class WebStack(pick_stack.PickStack):
 
 def make_app(stack):
     from fastapi import FastAPI, Request
-    from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
 
     app = FastAPI(title='OpenArm')
     app.mount('/static', StaticFiles(directory=WEB_DIR), name='static')
 
+    @app.middleware('http')
+    async def fresh(request, call_next):
+        # the browser checks every file each load (an old cached app.js kept
+        # the DUMMY SIZE toggle disabled while an arm was busy, 2026-10-21)
+        response = await call_next(request)
+        if request.url.path.startswith('/static/'):
+            response.headers['Cache-Control'] = 'no-cache'
+        return response
+
     @app.get('/')
     def index():
-        return FileResponse(os.path.join(WEB_DIR, 'index.html'),
-                            headers={'Cache-Control': 'no-store'})
+        # the files' times as a version on their links: a changed file is a new URL
+        html = open(os.path.join(WEB_DIR, 'index.html')).read()
+        for name in ('style.css', 'app.js'):
+            stamp = int(os.path.getmtime(os.path.join(WEB_DIR, name)))
+            html = html.replace(f'/static/{name}"', f'/static/{name}?v={stamp}"')
+        return HTMLResponse(html, headers={'Cache-Control': 'no-store'})
 
     @app.get('/stream.mjpg')
     async def stream():
@@ -400,6 +665,16 @@ def make_app(stack):
                 return
         return StreamingResponse(frames(), media_type='multipart/x-mixed-replace; boundary=frame',
                                  headers={'Cache-Control': 'no-store'})
+
+    @app.get('/sheets/{name}')
+    def sheets(name: str):
+        """The printable calibration sheets, made fresh (print at 100 %)."""
+        from fastapi.responses import FileResponse, PlainTextResponse
+        made = {'calib_box_sheets.pdf': cb.write_box_sheets,
+                'charuco_board.pdf': cb.write_board_sheet}
+        if name not in made:
+            return PlainTextResponse('no such sheet', status_code=404)
+        return FileResponse(made[name](), media_type='application/pdf', filename=name)
 
     @app.get('/snapshot.jpg')
     def snapshot():

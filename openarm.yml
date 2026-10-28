@@ -330,32 +330,23 @@ robot_cfg:
         - center: [-0.04467, 0.00035, 0.02749]
           radius: 0.00500
       openarm_left_link7:
-        - center: [-0.02762, -0.00687, 0.04317]
-          radius: 0.00500
-        - center: [0.02142, -0.01873, 0.04490]
-          radius: 0.00500
-        - center: [-0.01938, -0.00002, 0.09450]
-          radius: 0.00500
-        - center: [0.01807, 0.02198, 0.07002]
-          radius: 0.00500
-        - center: [0.02407, 0.01520, 0.04441]
-          radius: 0.00500
-        - center: [0.02841, 0.00180, 0.09296]
-          radius: 0.00500
-        - center: [-0.00551, -0.02796, 0.09346]
-          radius: 0.00500
-        - center: [0.00129, 0.01733, 0.04050]
-          radius: 0.00500
-        - center: [-0.01050, 0.02647, 0.09009]
-          radius: 0.00500
-        - center: [-0.00685, -0.02850, 0.00108]
-          radius: 0.00500
-        - center: [-0.01000, -0.03273, 0.04653]
-          radius: 0.00500
-        - center: [-0.02204, 0.01802, 0.05831]
-          radius: 0.00500
-        - center: [0.01379, -0.01622, 0.09450]
-          radius: 0.00500
+        # the cylinder that replaces the left wrist shell: 30 mm across, joint 7 to the hand (2026-10-26)
+        - center: [0.0, 0.0, 0.0075]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0196]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0318]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0439]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0561]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0682]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0804]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0925]
+          radius: 0.01500
       openarm_right_link0:
         - center: [-0.02709, 0.00000, 0.02709]
           radius: 0.01355
@@ -551,62 +542,29 @@ robot_cfg:
         - center: [0.00497, -0.02802, 0.08006]
           radius: 0.00500
       openarm_left_hand:
-        - center: [0.01357, -0.02072, -0.00550]
-          radius: 0.00500
-        - center: [-0.00096, -0.03209, 0.01050]
-          radius: 0.00500
-        - center: [-0.00274, -0.07209, 0.01050]
-          radius: 0.00500
-        - center: [-0.00500, 0.01514, 0.01022]
-          radius: 0.00500
-        - center: [-0.00144, -0.04850, 0.00600]
-          radius: 0.00500
-        - center: [-0.00318, -0.01366, 0.01050]
-          radius: 0.00500
-        - center: [0.02046, 0.01857, -0.00250]
-          radius: 0.00500
-        - center: [-0.02187, 0.00561, -0.00250]
-          radius: 0.00500
-        - center: [-0.00454, 0.08406, 0.01038]
-          radius: 0.00500
-        - center: [-0.00394, 0.04195, 0.00600]
-          radius: 0.00500
+        # the grey cylinder that replaces the left gripper: 30 mm across, to the old fingertips (2026-10-26); no sphere past its end
+        - center: [0.0, 0.0, 0.0075]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0197]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0318]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0439]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0561]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0683]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.0804]
+          radius: 0.01500
       openarm_left_left_finger:
-        - center: [0.00980, 0.00472, 0.05232]
-          radius: 0.00500
-        - center: [-0.00177, 0.00455, 0.00458]
-          radius: 0.00500
-        - center: [0.00237, -0.00771, 0.07099]
-          radius: 0.00500
-        - center: [0.02040, 0.02231, 0.01494]
-          radius: 0.00500
-        - center: [-0.00570, 0.01056, 0.02793]
-          radius: 0.00500
-        - center: [0.02035, 0.02145, -0.01450]
-          radius: 0.00500
-        - center: [-0.01404, 0.00255, 0.05940]
-          radius: 0.00500
-        - center: [-0.02998, 0.02007, 0.00458]
-          radius: 0.00500
-        - center: [0.02182, 0.00653, 0.03087]
-          radius: 0.00500
+        # no finger on the left gripper (2026-10-26): one disabled sphere
+        - center: [0.0, 0.0, 0.0000]
+          radius: -10.00000
       openarm_left_right_finger:
-        - center: [0.01337, -0.00455, -0.01383]
-          radius: 0.00500
-        - center: [-0.00564, 0.00049, 0.07266]
-          radius: 0.00500
-        - center: [-0.02671, -0.01498, 0.00450]
-          radius: 0.00500
-        - center: [-0.01005, -0.00903, 0.04616]
-          radius: 0.00500
-        - center: [-0.00687, -0.02401, 0.00951]
-          radius: 0.00500
-        - center: [0.03048, -0.01221, 0.00497]
-          radius: 0.00500
-        - center: [-0.00746, -0.00545, 0.02595]
-          radius: 0.00500
-        - center: [0.00759, -0.00461, 0.05221]
-          radius: 0.00500
+        # no finger on the left gripper (2026-10-26): one disabled sphere
+        - center: [0.0, 0.0, 0.0000]
+          radius: -10.00000
       openarm_right_hand:
         - center: [-0.00781, 0.02416, -0.00550]
           radius: 0.00500
@@ -662,7 +620,7 @@ robot_cfg:
           radius: 0.00500
         - center: [-0.00657, -0.00455, 0.00570]
           radius: 0.00500
-    collision_link_names: ["openarm_body_link0", "openarm_left_link0", "openarm_left_link1", "openarm_left_link2", "openarm_left_link3", "openarm_left_link4", "openarm_left_link5", "openarm_left_link6", "openarm_left_link7", "openarm_right_link0", "openarm_right_link1", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7", "openarm_left_hand", "openarm_left_left_finger", "openarm_left_right_finger", "openarm_right_hand", "openarm_right_left_finger", "openarm_right_right_finger", "openarm_left_pieces", "openarm_right_pieces", "openarm_left_tool", "openarm_right_tool"]
+    collision_link_names: ["openarm_body_link0", "openarm_left_link0", "openarm_left_link1", "openarm_left_link2", "openarm_left_link3", "openarm_left_link4", "openarm_left_link5", "openarm_left_link6", "openarm_left_link7", "openarm_right_link0", "openarm_right_link1", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7", "openarm_left_hand", "openarm_left_left_finger", "openarm_left_right_finger", "openarm_right_hand", "openarm_right_left_finger", "openarm_right_right_finger", "openarm_left_pieces", "openarm_right_pieces", "openarm_left_tool", "openarm_right_tool", "openarm_left_held", "openarm_right_held"]
     # The calibration pieces folded round each gripper's rail (calibrate.py):
     # a link fixed to each hand with 14 spheres reserved, OFF here -- the
     # calibration switches them on at run time (planner_attach_object), the
@@ -673,7 +631,10 @@ robot_cfg:
       # the tool past the fingertips (tools.yaml), set by click_to_move at start
       openarm_left_tool: {parent_link_name: openarm_left_hand, link_name: openarm_left_tool, joint_name: openarm_left_tool_joint, joint_type: FIXED, fixed_transform: [0, 0, 0, 1, 0, 0, 0]}
       openarm_right_tool: {parent_link_name: openarm_right_hand, link_name: openarm_right_tool, joint_name: openarm_right_tool_joint, joint_type: FIXED, fixed_transform: [0, 0, 0, 1, 0, 0, 0]}
-    extra_collision_spheres: {openarm_left_pieces: 14, openarm_right_pieces: 14, openarm_left_tool: 4, openarm_right_tool: 4}
+      # the box held after a pick (/beast_arm/held_object/size), set by the pick stack
+      openarm_left_held: {parent_link_name: openarm_left_hand, link_name: openarm_left_held, joint_name: openarm_left_held_joint, joint_type: FIXED, fixed_transform: [0, 0, 0, 1, 0, 0, 0]}
+      openarm_right_held: {parent_link_name: openarm_right_hand, link_name: openarm_right_held, joint_name: openarm_right_held_joint, joint_type: FIXED, fixed_transform: [0, 0, 0, 1, 0, 0, 0]}
+    extra_collision_spheres: {openarm_left_pieces: 14, openarm_right_pieces: 14, openarm_left_tool: 4, openarm_right_tool: 4, openarm_left_held: 32, openarm_right_held: 32}
     # Pairs not checked against each other, taken from the
     # SRDF's own disable_collisions list plus URDF joint
     # adjacency. Joint adjacency alone is not enough -- it
@@ -686,9 +647,9 @@ robot_cfg:
       openarm_left_link2: ["openarm_body_link0", "openarm_left_hand", "openarm_left_left_finger", "openarm_left_link0", "openarm_left_link1", "openarm_left_link3", "openarm_left_link4", "openarm_left_link5", "openarm_left_link6", "openarm_left_link7", "openarm_left_right_finger", "openarm_right_link0", "openarm_right_link1", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7"]
       openarm_left_link3: ["openarm_body_link0", "openarm_left_hand", "openarm_left_left_finger", "openarm_left_link0", "openarm_left_link1", "openarm_left_link2", "openarm_left_link4", "openarm_left_link5", "openarm_left_link6", "openarm_left_link7", "openarm_left_right_finger", "openarm_right_link0", "openarm_right_link1", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4", "openarm_right_link5"]
       openarm_left_link4: ["openarm_left_hand", "openarm_left_left_finger", "openarm_left_link0", "openarm_left_link1", "openarm_left_link2", "openarm_left_link3", "openarm_left_link5", "openarm_left_link6", "openarm_left_link7", "openarm_left_right_finger", "openarm_right_link0", "openarm_right_link1", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4", "openarm_right_link5", "openarm_right_link6"]
-      openarm_left_link5: ["openarm_left_hand", "openarm_left_left_finger", "openarm_left_link1", "openarm_left_link2", "openarm_left_link3", "openarm_left_link4", "openarm_left_link6", "openarm_left_right_finger", "openarm_right_link1", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4"]
+      openarm_left_link5: ["openarm_left_hand", "openarm_left_left_finger", "openarm_left_link1", "openarm_left_link2", "openarm_left_link3", "openarm_left_link4", "openarm_left_link6", "openarm_left_right_finger", "openarm_right_link1", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4", "openarm_left_link7"]
       openarm_left_link6: ["openarm_left_hand", "openarm_left_left_finger", "openarm_left_link1", "openarm_left_link2", "openarm_left_link3", "openarm_left_link4", "openarm_left_link5", "openarm_left_link7", "openarm_left_right_finger", "openarm_right_link1", "openarm_right_link2", "openarm_right_link3", "openarm_right_link6"]
-      openarm_left_link7: ["openarm_left_hand", "openarm_left_left_finger", "openarm_left_link2", "openarm_left_link3", "openarm_left_link4", "openarm_left_link6", "openarm_left_right_finger", "openarm_right_link6"]
+      openarm_left_link7: ["openarm_left_hand", "openarm_left_left_finger", "openarm_left_link2", "openarm_left_link3", "openarm_left_link4", "openarm_left_link6", "openarm_left_right_finger", "openarm_right_link6", "openarm_left_link5"]
       openarm_right_link0: ["openarm_body_link0", "openarm_left_link0", "openarm_left_link1", "openarm_left_link2", "openarm_left_link3", "openarm_left_link4", "openarm_right_link1", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4"]
       openarm_right_link1: ["openarm_body_link0", "openarm_left_link0", "openarm_left_link1", "openarm_left_link2", "openarm_left_link3", "openarm_left_link4", "openarm_left_link5", "openarm_left_link6", "openarm_right_link0", "openarm_right_link2", "openarm_right_link3", "openarm_right_link4", "openarm_right_link5", "openarm_right_link6"]
       openarm_right_link2: ["openarm_body_link0", "openarm_left_link0", "openarm_left_link1", "openarm_left_link2", "openarm_left_link3", "openarm_left_link4", "openarm_left_link5", "openarm_left_link6", "openarm_right_left_finger", "openarm_right_link0", "openarm_right_link1", "openarm_right_link3", "openarm_right_link4", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7", "openarm_right_right_finger"]
@@ -707,11 +668,15 @@ robot_cfg:
       openarm_right_pieces: ["openarm_right_hand", "openarm_right_left_finger", "openarm_right_right_finger", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7"]
       openarm_left_tool: ["openarm_left_hand", "openarm_left_left_finger", "openarm_left_right_finger", "openarm_left_link5", "openarm_left_link6", "openarm_left_link7", "openarm_left_pieces"]
       openarm_right_tool: ["openarm_right_hand", "openarm_right_left_finger", "openarm_right_right_finger", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7", "openarm_right_pieces"]
+      openarm_left_held: ["openarm_left_hand", "openarm_left_left_finger", "openarm_left_right_finger", "openarm_left_link5", "openarm_left_link6", "openarm_left_link7", "openarm_left_pieces", "openarm_left_tool"]
+      openarm_right_held: ["openarm_right_hand", "openarm_right_left_finger", "openarm_right_right_finger", "openarm_right_link5", "openarm_right_link6", "openarm_right_link7", "openarm_right_pieces", "openarm_right_tool"]
     self_collision_buffer:
       openarm_left_pieces: 0.0
       openarm_right_pieces: 0.0
       openarm_left_tool: 0.0
       openarm_right_tool: 0.0
+      openarm_left_held: 0.0
+      openarm_right_held: 0.0
       openarm_body_link0: 0.002
       openarm_left_link0: 0.002
       openarm_left_link1: 0.002

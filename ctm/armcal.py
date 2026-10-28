@@ -223,7 +223,8 @@ def save_anchor(arm, q, point, tip_offset):
 
 
 def fit(arm, samples, t_wo, info, log=print, touches=None, plane=None, tip_offset=0.0354,
-        max_nfev=400, dirs=None, variant=None, anchors=None):
+        max_nfev=400, dirs=None, variant=None, anchors=None, tip_sigma=(0.003, 0.003, 0.010),
+        shift_sigma=0.05):
     """samples: [(q (7), {marker id: (4, 2) pixels})] -- the strip postures.
     touches: [q (7)] at contact with `plane` (unit normal n, d: n . p = d,
     world, from the depth camera), the tool tilted both ways.
@@ -275,8 +276,10 @@ def fit(arm, samples, t_wo, info, log=print, touches=None, plane=None, tip_offse
     # takes what the anchors cannot place -- pointing down it is vertical,
     # and the contact takes that up. Anchors in other turns (TOP DOWN) tell
     # the two apart.
+    # (the calibration box measures the tip itself: a looser tip prior, and
+    # no colour/depth shift -- all of it is the colour camera, 2026-10-26)
     sigma = np.r_[sigma, [prior['hysteresis']] * n_h,
-                  [0.003, 0.003, 0.010, 0.05, 0.05, 0.05][:n_t]]
+                  (list(tip_sigma) + [shift_sigma] * 3)[:n_t]]
     n_x = n_b + n_h + n_t + (1 if touches else 0)
     sigma_all = np.r_[sigma, [PLANE_SIGMA]] if touches else sigma
     dirs_all = np.asarray(dirs, float) if dirs is not None else None

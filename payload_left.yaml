@@ -1,0 +1,16 @@
+# WEIGH TOOL (ctm/payload.py): after joint 7, measured
+sign: -1.0
+rms_before_nm: 1.073644375204396
+rms_after_nm: 0.19438020406138687
+link7_mass_was: 0.4659771327380578
+hand_mass_was: 0.4220509068655427
+hand_com_was:
+- 0.0
+- 0.002
+- 0.03
+hand_mass: 0.24455542973022792
+hand_com:
+- 0.010142431851796434
+- 0.014573568800571451
+- -0.025359726849041243
+postures: 15

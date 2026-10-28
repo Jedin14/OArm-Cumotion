@@ -18,6 +18,9 @@ INFO_TOPIC = '/camera/camera/color/camera_info'
 
 
 BASE_FRAME = 'world'
+# the gripping tool fixes the arm (2026-10-28): the vacuum is on the left arm
+# only, the fingers on the right -- a vacuum pick never moves the right arm
+TOOL_ARM = {'vacuum': 'left', 'finger': 'right'}
 
 
 TCP_IN_HAND = 0.08     # hand -> hand_tcp along the hand's Z (openarm_hand_arguments.xacro)
@@ -48,7 +51,7 @@ CAM_ORG = os.path.join(WS, 'cam_org.txt')
 CALIBRATION_FILE = os.path.join(WS, 'camera_calibration.yaml')
 
 
-NUDGE = 0.002                   # one TEACH nudge, m
+NUDGE = 0.001                   # one TEACH / ANCHOR nudge, m (2 mm placed anchors no better than ~1 mm)
 
 
 OCTOMAP_NAME = '<octomap>'

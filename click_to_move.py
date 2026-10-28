@@ -110,15 +110,18 @@ from rclpy.executors import MultiThreadedExecutor
 
 from ctm import armcal
 from ctm.armcal_run import ArmCalMixin
+from ctm.boxcal_run import BoxCalMixin
+from ctm.payload import PayloadMixin
 from ctm.camera_calibration import CameraCalibrationMixin
 from ctm import tools as tl
-from ctm.common import BASE_FRAME, FONT, MoveGroupDown, WINDOW, decode_image
+from ctm.common import BASE_FRAME, FONT, TOOL_ARM, MoveGroupDown, WINDOW, decode_image
 from ctm.modes import ModesMixin, load_poses
 from ctm.robot import ClickToMove
 from ctm.touch import TouchMixin
 
 
-class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
+class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin, BoxCalMixin,
+          PayloadMixin):
     """The OpenCV window, and the worker threads that capture and move."""
 
     HINT = 'click a point   keys: m n p d b r t'
@@ -134,6 +137,7 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
         self.last_touch = None        # an arm that is out, and how to bring it back
         self.poses = load_poses()     # {arm: {navigation_state, pre_pick_state, drop_state}}
         self.mode = None              # 'navigation' / 'pick' / None (see ctm/modes.py)
+        self.pick_tool = node.args.pick_tool   # vacuum (left only) / finger (right only) / auto
         self.arm_models = armcal.ArmModels()   # CALIBRATE ARMS results, if any
         self.buttons = {}             # name -> (x0, y0, x1, y1) in window pixels
         self.status = 'capturing...'
@@ -148,9 +152,14 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
         self.calibrating = False
         self.overlay = None           # (pixels (N,2), agree (N,) bool): robot model on the image
         self.teach = False            # TEACH mode: hold each touch for nudges
+        self.tip_seen = None          # the camera's last view of a tip (ctm/tip_vision.py)
+        self.vision_miss = None
         self.top_down = node.args.top_down   # approach straight down instead of level
         self.teaching = False         # a touch is being taught right now
         self.abort = threading.Event()
+
+    def phase(self, step):
+        """The step running now ("left contact", ...): pick_stack.py publishes it."""
 
     def say(self, text, error=False):
         self.status = text
@@ -266,7 +275,11 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin):
             origin, z = m[:3, 3], float(np.linalg.norm(np.asarray(world) - m[:3, 3]))
         if world is not None:
             point = np.asarray(world, float)
-        if self.node.args.arm != 'auto':
+        if self.pick_tool in TOOL_ARM:
+            # the tool fixes the arm, wherever the point is: a vacuum pick is
+            # the left arm's, and the right arm never moves for it (2026-10-28)
+            arm = TOOL_ARM[self.pick_tool]
+        elif self.node.args.arm != 'auto':
             arm = self.node.args.arm
         else:
             arm = 'left' if u < bw / 2.0 else 'right'
@@ -611,9 +624,32 @@ def make_parser():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--arm', choices=['auto', 'left', 'right'], default='auto',
                         help='auto: left half of the frame -> left arm, right half -> right')
+    parser.add_argument('--pick-tool', choices=['auto', 'vacuum', 'finger'], default='auto',
+                        help='vacuum: every point is the left arm\'s, the right arm never moves '
+                             'for a pick; finger: the right arm\'s; auto: by --arm')
     parser.add_argument('--standoff', type=float, default=0.10,
-                        help='the tip first stops this far from the point (corrections '
+                        help='the farthest the tip first stops from the point (corrections '
                              'happen there), then moves in on one straight line, m')
+    parser.add_argument('--tip-vision', choices=['off', 'log', 'on'], default='log',
+                        help='the camera\'s check of the tip before going in (ctm/tip_vision.py:'
+                             ' the colour outline, plus depth where it has readings). log: '
+                             'measure, report and save only; on: also move the tip onto the '
+                             'line; off: not at all')
+    parser.add_argument('--tip-vision-max', type=float, default=0.03,
+                        help='the camera\'s view of the tip is trusted up to this far off the '
+                             'line in, m (more: a misreading, the arm model is used)')
+    parser.add_argument('--correction-room', type=float, default=0.025,
+                        help='before moving, the whole straight line in must still solve with '
+                             'its ends moved this far sideways (the corrections move it), m; '
+                             'plans with only 1 cm are a last resort, none: not moving')
+    parser.add_argument('--max-miss', type=float, default=0.010,
+                        help='the most the tip may still be off the target 5 cm short, after '
+                             'the corrections, and still go in, m')
+    parser.add_argument('--min-standoff', type=float, default=0.04,
+                        help='the nearest the straight line in may start from the point: the '
+                             'approach point is the farthest from --standoff / --top-standoff '
+                             'down to this that the arm reaches with the whole line in clear, '
+                             'm (3 cm of slow contact + 1 cm, so the cup can seat)')
     parser.add_argument('--top-standoff', type=float, default=0.12,
                         help='TOP DOWN: the tip flies (tool level) to this far above the top, '
                              'the wrist turns down there, then it goes straight down, m')

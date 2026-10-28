@@ -8,7 +8,9 @@ find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PickTarget.msg"
+  "msg/ObjectSize.msg"
   "srv/DetectTarget.srv"
+  "srv/CheckPick.srv"
   DEPENDENCIES std_msgs geometry_msgs
 )
 

@@ -25,3 +25,19 @@ float32[4] bbox           # x1 y1 x2 y2
 uint32 image_width
 uint32 image_height
 uint32 num_boxes          # every box the model saw in the frame
+
+# the gripping tool -- it also fixes the arm: "vacuum" -> "left", "finger" -> "right"
+# (arm above is always filled in to match it)
+string tool
+string TOOL_VACUUM = "vacuum"
+string TOOL_FINGER = "finger"
+
+# the face to grip as the camera measured it, world frame; zeros if not measured
+float32[2] face_mm                  # its long and short edge, mm
+geometry_msgs/Vector3 face_normal   # unit, out of the face (towards the camera)
+geometry_msgs/Vector3 face_long     # unit, along its long edge
+
+# the known box (held_object/size) matched to that face, as it will hang on the
+# tool: mm along face_long, across it, and into the box (along -face_normal).
+# zeros: no size known, or the face matched none of the box's faces
+float32[3] box_mm

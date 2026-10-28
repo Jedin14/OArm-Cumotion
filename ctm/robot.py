@@ -20,9 +20,9 @@ from moveit_msgs.msg import (AllowedCollisionEntry, AllowedCollisionMatrix,
                              AttachedCollisionObject, CollisionObject,
                              Constraints,
                              JointConstraint, MoveItErrorCodes, PlanningScene,
-                             PlanningSceneComponents, RobotTrajectory)
+                             PlanningSceneComponents, RobotState, RobotTrajectory)
 from moveit_msgs.srv import (ApplyPlanningScene, GetCartesianPath, GetPlanningScene,
-                             GetPositionFK, GetPositionIK)
+                             GetPositionFK, GetPositionIK, GetStateValidity)
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import GetParameters, SetParameters
 from rclpy.action import ActionClient
@@ -38,6 +38,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import Marker, MarkerArray
 
 import robot_camera_calibration as rcc
+from ctm import depth_cal
 from ctm import walls
 from ctm.common import (BASE_FRAME, COLOR_TOPIC, DEPTH_TOPIC, FINGERTIP_BEYOND_TCP,
                         HOME_JOINTS, INFO_TOPIC,
@@ -60,12 +61,12 @@ PIECES_SPHERES = [(0.0, float(y), z, 0.025) for y in np.linspace(-0.085, 0.085, 
 PIECES_SLOTS = 14                           # spheres reserved per pieces link in openarm.yml (unused: off)
 
 # The tool past the fingertips (tools.yaml: the left arm's vacuum cup), in the
-# planners as a cylinder 2.5 cm across from the fingertips to its end -- before
+# planners as a cylinder 3 cm across from the fingertips to its end -- before
 # 2026-10-16 the planners knew only the hand and fingers, so the last 2 cm
 # were never checked. MoveIt: a cylinder attached to the hand; cuMotion:
 # spheres on the reserved openarm_<arm>_tool link (openarm.yml), off with no tool.
 HAND_TCP_Z = 0.08                           # hand -> hand_tcp along z (openarm.urdf)
-TOOL_DIAMETER = 0.025
+TOOL_DIAMETER = 0.030                       # the left gripper is one 30 mm cylinder to its tip
 TOOL_SLOTS = 4                              # spheres reserved per tool link in openarm.yml
 
 
@@ -84,6 +85,67 @@ def tool_id(arm):
     return f'tool_{arm}'
 
 
+# The object in the gripper after a pick (its size from
+# /beast_arm/held_object/size): a box for MoveIt attached to the hand, and up
+# to HELD_SLOTS spheres on cuMotion's reserved openarm_<arm>_held link
+# (openarm.yml), so the way back keeps it clear of everything (2026-10-21).
+HELD_SLOTS = 32
+
+
+def held_id(arm):
+    return f'held_{arm}'
+
+
+def held_geometry(size_hwd, tip_offset, rot_tcp_world):
+    """Where a held box of size (height, width, depth) m sits on the tool:
+    (rotation 3x3 and centre in hand_tcp, extents along its axes, top pick?). It hangs
+    off the tip along the tool. Tool level (front pick): height stays vertical,
+    depth along the tool, width across. Tool down (top pick): height along
+    the tool; which way width and depth lie is not known, so both take the
+    larger of the two."""
+    h, w, d = (float(v) for v in size_hwd)
+    up = rot_tcp_world.T @ np.array([0.0, 0.0, 1.0])     # world up, in hand_tcp
+    z = np.array([0.0, 0.0, 1.0])
+    top = abs(up[2]) > 0.7
+    if top:                                              # tool vertical: top pick
+        rot = np.eye(3)
+        ext = np.array([max(w, d), max(w, d), h])
+    else:
+        hv = up - (up @ z) * z
+        hv /= np.linalg.norm(hv)
+        wv = np.cross(hv, z)
+        rot = np.column_stack((wv, hv, z))
+        ext = np.array([w, h, d])
+    centre = z * (tip_offset + ext[2] / 2.0)
+    return rot, centre, ext, top
+
+
+def held_spheres(rot, centre, ext):
+    """cuMotion's spheres for the box, in the HAND frame (hand_tcp is
+    HAND_TCP_Z along it): the box cut into cells, one sphere round each whole
+    cell -- the box is covered everywhere (a grid of spheres inside it left
+    gaps up to 33 mm), bulging a little. The cut with the smallest spheres
+    that fits HELD_SLOTS."""
+    ext = np.asarray(ext, float)
+    best = None
+    for nx in range(1, HELD_SLOTS + 1):
+        for ny in range(1, HELD_SLOTS // nx + 1):
+            nz = HELD_SLOTS // (nx * ny)
+            for n in ((nx, ny, k) for k in range(1, nz + 1)):
+                r = float(np.linalg.norm(ext / n)) / 2.0
+                if best is None or r < best[0] - 1e-9:
+                    best = (r, n)
+    r, n = best
+    axes = [(np.arange(k) + 0.5) / k * e - e / 2 for e, k in zip(ext, n)]
+    out = []
+    for a in axes[0]:
+        for b in axes[1]:
+            for c in axes[2]:
+                p = rot @ np.array([a, b, c]) + centre
+                out.append((float(p[0]), float(p[1]), float(p[2] + HAND_TCP_Z), float(r)))
+    return out
+
+
 class ClickToMove(Node):
     def __init__(self, args):
         super().__init__('click_to_move')
@@ -92,7 +154,12 @@ class ClickToMove(Node):
         # STOP (web GUI, pick stack): cancels the goals running now and refuses
         # new ones until resume() -- the arms hold where they are
         self.halt = threading.Event()
-        self.active_goals = set()
+        self.active_goals = {}          # id(handle) -> handle (goal handles are not hashable)
+        # the object size for the next pick (/beast_arm/held_object/size):
+        # (height, width, depth) m and who said so, or None; and what each
+        # arm holds now: {arm: {'size': (h, w, d), ...}}
+        self.object_size = None
+        self.held = {}
         cb = ReentrantCallbackGroup()
 
         self.lock = threading.Lock()
@@ -176,7 +243,7 @@ class ClickToMove(Node):
             time.sleep(0.02)
         return None
 
-    def averaged_depth(self, count, timeout=3.0):
+    def averaged_depth(self, count, timeout=3.0, raw=False):
         """Per-pixel median of the next `count` aligned depth frames, metres.
 
         One D455 frame is noisy by several mm at these ranges and has
@@ -205,7 +272,13 @@ class ClickToMove(Node):
             warnings.simplefilter('ignore', RuntimeWarning)   # all-NaN pixels
             depth = np.nanmedian(stack, axis=0)
         depth[valid.sum(axis=0) < (len(frames) + 1) // 2] = 0.0
-        return np.nan_to_num(depth, nan=0.0), frames[-1]
+        depth = np.nan_to_num(depth, nan=0.0)
+        with self.lock:
+            info = self.info
+        if info is not None and not raw:
+            # the depth check (ctm/depth_cal.py): depth made to agree with colour
+            depth = depth_cal.apply(depth, info)
+        return depth, frames[-1]
 
     def arm_efforts(self, arm):
         with self.lock:
@@ -482,7 +555,7 @@ class ClickToMove(Node):
         time.sleep(self.args.octomap_settle)
         return f'octomap rebuilt ({result.message})' if result else 'octomap refresh timed out'
 
-    def allow_grippers_in_octomap(self, touching=None):
+    def allow_grippers_in_octomap(self, touching=None, held_free=None):
         """What may touch <octomap>: the links that never move (stand, camera,
         arm bases) always; and the two fingers of the arm `touching`, only
         while it makes contact (fingers_touching()). Nothing else -- the
@@ -523,9 +596,14 @@ class ClickToMove(Node):
         static = ['openarm_body_link0', 'camera_link', 'openarm_left_link0',
                   'openarm_right_link0']
         fingers = ([f'openarm_{touching}_left_finger', f'openarm_{touching}_right_finger',
-                    tool_id(touching)] if touching else [])
-        # the tools too: checked like the gripper, free only at the contact
-        for name in (tool_id('left'), tool_id('right')):
+                    tool_id(touching), held_id(touching)] if touching else [])
+        # a held box leaving the spot it was picked from: the octomap still has
+        # it there until the next capture (held_leaving())
+        if held_free:
+            fingers.append(held_id(held_free))
+        # the tools and held boxes too: checked like the gripper, free only at
+        # the contact
+        for name in (tool_id('left'), tool_id('right'), held_id('left'), held_id('right')):
             if name not in index:
                 names.append(name)
                 for row in rows:
@@ -533,10 +611,13 @@ class ClickToMove(Node):
                 rows.append([False] * len(names))
                 index[name] = len(names) - 1
         for link in gripper_links('left') + gripper_links('right') + static + \
-                [tool_id('left'), tool_id('right')]:
+                [tool_id('left'), tool_id('right'), held_id('left'), held_id('right')]:
             if link in index:
                 allowed = link in static or link in fingers
                 rows[index[link]][octomap] = rows[octomap][index[link]] = allowed
+        for arm in ('left', 'right'):                # a box on the tool touches the tool
+            a, b = index[held_id(arm)], index[tool_id(arm)]
+            rows[a][b] = rows[b][a] = True
         updated = AllowedCollisionMatrix(entry_names=names)
         updated.entry_values = [AllowedCollisionEntry(enabled=row) for row in rows]
         scene = PlanningScene(is_diff=True, allowed_collision_matrix=updated)
@@ -561,6 +642,131 @@ class ClickToMove(Node):
             yield ok
         finally:
             self.allow_grippers_in_octomap(touching=None)
+
+    @contextlib.contextmanager
+    def held_leaving(self, arm):
+        """While inside: the box this arm holds may overlap the octomap -- the
+        straight way out of the spot it was picked from, where the map still
+        has it. Revoked on the way out, always."""
+        ok, message = self.allow_grippers_in_octomap(held_free=arm)
+        if not ok:
+            self.get_logger().warn(f'{arm} held box: {message}')
+        try:
+            yield ok
+        finally:
+            self.allow_grippers_in_octomap()
+
+    def attach_held(self, arm, size_hwd, tip_offset, exact=None):
+        """The box this arm just picked, in both planners. True if attached.
+        exact: (rotation, centre in hand_tcp, extents) when the box's pose on
+        the tool was measured (the calibration box), else from size_hwd."""
+        tcp = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+        if tcp is None:
+            self.get_logger().warn(f'{arm} held box: no tf for the tool; not attached')
+            return False
+        if exact is not None:
+            rot, centre, ext = (np.asarray(v, float) for v in exact)
+            top = False
+            if size_hwd is None:                        # (no size given: the extents)
+                size_hwd = tuple(float(v) for v in ext)
+        else:
+            rot, centre, ext, top = held_geometry(size_hwd, tip_offset, tcp[:3, :3])
+        scene = PlanningScene(is_diff=True)
+        scene.robot_state.is_diff = True
+        att = AttachedCollisionObject()
+        att.link_name = f'openarm_{arm}_hand'
+        att.touch_links = gripper_links(arm) + [f'openarm_{arm}_hand_tcp']
+        obj = att.object
+        obj.header.frame_id = f'openarm_{arm}_hand_tcp'
+        obj.id = held_id(arm)
+        obj.operation = CollisionObject.ADD
+        obj.primitives.append(SolidPrimitive(type=SolidPrimitive.BOX,
+                                             dimensions=[float(v) for v in ext]))
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = (float(v) for v in centre)
+        (pose.orientation.x, pose.orientation.y, pose.orientation.z,
+         pose.orientation.w) = quat_from_matrix(rot)
+        obj.primitive_poses.append(pose)
+        scene.robot_state.attached_collision_objects.append(att)
+        ok_moveit = False
+        if self.scene_apply.wait_for_service(timeout_sec=5.0):
+            applied = self.wait(self.scene_apply.call_async(
+                ApplyPlanningScene.Request(scene=scene)), 5.0)
+            ok_moveit = applied is not None and applied.success
+        ok_cumotion = self._held_cumotion(arm, held_spheres(rot, centre, ext))
+        self.held[arm] = {'size': tuple(float(v) for v in size_hwd), 'extents': ext.tolist(),
+                          'top': bool(top),
+                          'moveit': ok_moveit, 'cumotion': ok_cumotion}
+        self.get_logger().info(f'{arm} holds a {size_hwd[0] * 1000:.0f} x {size_hwd[1] * 1000:.0f}'
+                               f' x {size_hwd[2] * 1000:.0f} mm box (MoveIt {ok_moveit}, '
+                               f'cuMotion {ok_cumotion})')
+        return ok_moveit or ok_cumotion
+
+    def detach_held(self, arm=None):
+        """Released (at the drop pose, or asked): out of both planners."""
+        for a in ([arm] if arm else ['left', 'right']):
+            scene = PlanningScene(is_diff=True)
+            scene.robot_state.is_diff = True
+            att = AttachedCollisionObject()
+            att.link_name = f'openarm_{a}_hand'
+            att.object.id = held_id(a)
+            att.object.operation = CollisionObject.REMOVE
+            scene.robot_state.attached_collision_objects.append(att)
+            scene.world.collision_objects.append(CollisionObject(
+                id=held_id(a), operation=CollisionObject.REMOVE))
+            if self.scene_apply.wait_for_service(timeout_sec=3.0):
+                self.wait(self.scene_apply.call_async(ApplyPlanningScene.Request(scene=scene)),
+                          5.0)
+            if a in self.held or arm:
+                self._held_cumotion(a, [])
+            if self.held.pop(a, None) is not None:
+                self.get_logger().info(f'{a} released its box')
+
+    def _held_cumotion(self, arm, spheres):
+        from isaac_ros_cumotion_interfaces.action import UpdateLinkSpheres
+        if not hasattr(self, '_spheres_client'):
+            self._spheres_client = ActionClient(self, UpdateLinkSpheres, 'planner_attach_object')
+        if not self._spheres_client.wait_for_server(timeout_sec=10.0 if spheres else 3.0):
+            self.get_logger().warn(f'cuMotion planner_attach_object unavailable: {arm} held box '
+                                   f'not set')
+            return False
+        spheres = spheres[:HELD_SLOTS]
+        goal = UpdateLinkSpheres.Goal(
+            attach_object=bool(spheres), object_link_name=f'openarm_{arm}_held',
+            flattened_sphere_arr=[float(v) for sph in
+                                  (spheres + [(0.0, 0.0, 0.0, -10.0)]
+                                   * (HELD_SLOTS - len(spheres)))
+                                  for v in sph] if spheres else [])
+        handle = self.wait(self._spheres_client.send_goal_async(goal), 5.0)
+        if handle is None or not handle.accepted:
+            self.get_logger().warn(f'cuMotion refused the {arm} held box spheres')
+            return False
+        self.wait(handle.get_result_async(), 5.0)
+        return True
+
+    def path_is_clear(self, arm, trajectory, every=3):
+        """Is every `every`-th point of this trajectory clear of collisions in
+        the planning scene as it is now -- the held box included? (A way back
+        that is replayed rather than planned was checked without the box.)
+        None if move_group cannot say."""
+        if not hasattr(self, '_validity'):
+            self._validity = self.create_client(GetStateValidity, '/check_state_validity')
+        if not self._validity.wait_for_service(timeout_sec=3.0):
+            return None
+        jt = trajectory.joint_trajectory
+        points = list(jt.points)[::every] + list(jt.points)[-1:]
+        for p in points:
+            req = GetStateValidity.Request()
+            req.group_name = f'{arm}_arm'
+            req.robot_state = RobotState(is_diff=True)
+            req.robot_state.joint_state.name = list(jt.joint_names)
+            req.robot_state.joint_state.position = [float(v) for v in p.positions]
+            res = self.wait(self._validity.call_async(req), 3.0)
+            if res is None:
+                return None
+            if not res.valid:
+                return False
+        return True
 
     def refresh_walls(self, optical):
         """After a capture: walls in the planning scene where the camera cannot
@@ -685,6 +891,8 @@ class ClickToMove(Node):
         applied = self.wait(self.scene_apply.call_async(ApplyPlanningScene.Request(scene=scene)),
                             5.0)
         if applied is None or not applied.success:
+            if length <= 0.0:
+                return True          # removing a tool that was never there: nothing to do
             self.get_logger().warn(f'could not set the {arm} tool in the planning scene')
             return False
         return True
@@ -763,6 +971,8 @@ class ClickToMove(Node):
         applied = self.wait(self.scene_apply.call_async(ApplyPlanningScene.Request(scene=scene)),
                             5.0)
         if applied is None or not applied.success:
+            if not on:
+                return True          # removing pieces that were never there: nothing to do
             self.get_logger().warn('could not set the calibration pieces in the planning scene')
             return False
         return True
@@ -1087,7 +1297,7 @@ class ClickToMove(Node):
     def stop_motion(self):
         """STOP: cancel every running goal; nothing moves until resume()."""
         self.halt.set()
-        for handle in list(self.active_goals):
+        for handle in list(self.active_goals.values()):
             try:
                 handle.cancel_goal_async()
             except Exception:                        # noqa: BLE001 - finished meanwhile
@@ -1118,11 +1328,11 @@ class ClickToMove(Node):
         if handle is None or not handle.accepted:
             self.get_logger().error(f'{label}: trajectory rejected')
             return False, False
-        self.active_goals.add(handle)
+        self.active_goals[id(handle)] = handle
         try:
             return self._execute_wait(handle, label, timeout, watch)
         finally:
-            self.active_goals.discard(handle)
+            self.active_goals.pop(id(handle), None)
 
     def _execute_wait(self, handle, label, timeout, watch):
         future = handle.get_result_async()
@@ -1179,6 +1389,58 @@ class ClickToMove(Node):
         if not ok:
             return None
         return final if final is not None else self.arm_positions(arm)
+
+    def line_or_step(self, arm, position, quat, label, speed=None, max_step=0.25):
+        """line_move(); if the straight line does not fully solve (a wrist
+        limit part-way, at the edge of reach: "only 80 % of the straight line
+        solves", 2026-10-27), the same pose as one short joint step instead --
+        only if no joint moves more than `max_step` rad (then it stays close to
+        straight) and its path is clear. The joints it ends on, or None."""
+        done = self.line_move(arm, position, quat, label, speed=speed)
+        if done is not None:
+            return done
+        here = self.arm_positions(arm)
+        q = self.solve_ik(arm, position, quat, here) if here is not None else None
+        if q is None:
+            return None
+        self.get_logger().info(f'{label}: as a short joint step instead')
+        return self.joint_step(arm, q, f'{label} (step)', max_step=max_step)
+
+    def joint_step(self, arm, target, label, max_step=0.25, speed=0.2):
+        """Straight in joint space from where the arm is to `target`, smooth
+        (s-curve), if no joint moves more than `max_step` rad and every point
+        of it is clear of collisions. The target, or None."""
+        here = self.arm_positions(arm)
+        if here is None:
+            return None
+        here, target = np.asarray(here, float), np.asarray(target, float)
+        dq = target - here
+        big = float(np.max(np.abs(dq)))
+        if big > max_step:
+            self.get_logger().warn(f'{label}: {big:.2f} rad - too far for a joint step')
+            return None
+        total = max(0.6, 1.5 * big / speed)
+        n = max(3, int(math.ceil(big / 0.01)) + 1)
+        jt = JointTrajectory()
+        jt.joint_names = arm_joints(arm)
+        for k in range(n):
+            f = k / (n - 1)
+            s, ds = 3 * f * f - 2 * f ** 3, (6 * f - 6 * f * f) / total
+            p = JointTrajectoryPoint()
+            p.positions = [float(v) for v in here + dq * s]
+            p.velocities = [float(v) for v in dq * ds]
+            t = f * total
+            p.time_from_start.sec = int(t)
+            p.time_from_start.nanosec = int((t % 1.0) * 1e9)
+            jt.points.append(p)
+        robot = RobotTrajectory()
+        robot.joint_trajectory = jt
+        if self.path_is_clear(arm, robot, every=2) is not True:
+            self.get_logger().warn(f'{label}: the joint step is not clear (or cannot be '
+                                   f'checked)')
+            return None
+        ok, _ = self.execute(robot, label, timeout=total + 10.0)
+        return target if ok else None
 
     @staticmethod
     def turn_steps(tcp_a, quat_a, tcp_b, quat_b, step_deg=10.0):
@@ -1462,11 +1724,11 @@ class ClickToMove(Node):
             if handle is None or not handle.accepted:
                 self.get_logger().error(f'{label}: goal rejected by move_group')
                 return MoveItErrorCodes.FAILURE
-            self.active_goals.add(handle)
+            self.active_goals[id(handle)] = handle
             try:
                 result = self.wait_or_dead(handle.get_result_async(), self.args.motion_timeout)
             finally:
-                self.active_goals.discard(handle)
+                self.active_goals.pop(id(handle), None)
             if self.halt.is_set():
                 return MoveItErrorCodes.FAILURE
             if result is None:

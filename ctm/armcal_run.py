@@ -145,7 +145,7 @@ class ArmCalMixin:
         node, args = self.node, self.node.args
         self.say('CALIBRATE ARMS: clean frame (calibration pieces on, area clear except the board)...')
         self.capture()
-        if self.frame is None or not self.ensure_pick_mode():
+        if self.frame is None or not (self.mode == 'pick' or self.go_mode('pick')):
             return
         info, optical = self.frame[2], self.frame[3]
         t_wo = node.lookup(BASE_FRAME, optical)
@@ -670,7 +670,12 @@ class ArmCalMixin:
             self.say(f'{arm} arm: touching the wall marker\'s centre to confirm...')
             self.last_contact = None
             self.check = None
-            self.touch(arm, wall['centre'], t_wo[:3, 3], scene=self.frame)
+            # calibration, not a pick: both arms, whatever the pick tool
+            tool, self.pick_tool = getattr(self, 'pick_tool', 'auto'), 'auto'
+            try:
+                self.touch(arm, wall['centre'], t_wo[:3, 3], scene=self.frame)
+            finally:
+                self.pick_tool = tool
             c = self.last_contact
             if c is None:
                 out.append(f'{arm}: wall marker touch did not happen')

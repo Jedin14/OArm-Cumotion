@@ -60,6 +60,23 @@ def resolve(filename):
     return path.replace('file://', '')
 
 
+def primitive_mesh(geometry):
+    """A URDF cylinder / box / sphere as a trimesh, in its own frame; None
+    for anything else."""
+    import trimesh
+    if geometry is None:
+        return None
+    cyl, box, sph = (geometry.find(k) for k in ('cylinder', 'box', 'sphere'))
+    if cyl is not None:
+        return trimesh.creation.cylinder(radius=float(cyl.get('radius')),
+                                         height=float(cyl.get('length')), sections=48)
+    if box is not None:
+        return trimesh.creation.box(extents=[float(v) for v in box.get('size').split()])
+    if sph is not None:
+        return trimesh.creation.icosphere(subdivisions=3, radius=float(sph.get('radius')))
+    return None
+
+
 class RobotSurface:
     """Surface samples of each arm link's visual mesh, in that link's frame.
 
@@ -99,14 +116,20 @@ class RobotSurface:
                 pts, nrm = [], []
                 for visual in link.findall('visual'):
                     mesh = visual.find('geometry/mesh')
-                    if mesh is None:
-                        continue
-                    path = resolve(mesh.get('filename'))
-                    if path not in meshes:
-                        meshes[path] = trimesh.load(path, force='mesh')
-                    g = meshes[path].copy()
-                    scale = np.array([float(v) for v in (mesh.get('scale') or '1 1 1').split()])
-                    g.apply_scale(scale)             # a negative axis mirrors (right finger)
+                    if mesh is not None:
+                        path = resolve(mesh.get('filename'))
+                        if path not in meshes:
+                            meshes[path] = trimesh.load(path, force='mesh')
+                        g = meshes[path].copy()
+                        scale = np.array([float(v) for v in
+                                          (mesh.get('scale') or '1 1 1').split()])
+                        g.apply_scale(scale)         # a negative axis mirrors (right finger)
+                    else:
+                        # a plain shape (the left wrist is a cylinder since
+                        # 2026-10-26): skipped before, so it was not in the overlay
+                        g = primitive_mesh(visual.find('geometry'))
+                        if g is None:
+                            continue
                     g.apply_transform(origin_matrix(visual))
                     n = max(200, int(g.area * points_per_m2))
                     np.random.seed(int(rng.integers(1 << 30)))   # repeatable samples

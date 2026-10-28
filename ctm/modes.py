@@ -76,4 +76,6 @@ class ModesMixin:
         return ok
 
     def ensure_pick_mode(self):
+        """Both arms to pre_pick (a pose move: both arms, whatever the pick
+        tool -- only the pick itself is the tool's arm alone, ctm/touch.py)."""
         return self.mode == 'pick' or self.go_mode('pick')

@@ -1,0 +1,15 @@
+# After a pick, with the arm back out of the view: is the box gone from its place?
+# The box picker compares 3 new frames with the 5 it chose the box from, inside
+# the box's outline (depth, then colour), and checks its neighbours too.
+
+# what the gripper knows: "held", "empty", or "" (it can't tell -- the vacuum has no sensor)
+string holding
+---
+# 1 picked, 0 not picked, -1 can't tell (view blocked, camera moved, too little depth,
+# or nothing to check)
+int8 picked
+# success, missed, moved, dropped, wrong_box, blocked, camera_moved, unknown;
+# "" when there was nothing to check (no box chosen before)
+string outcome
+string message            # in words
+string verdict_json       # the check's whole verdict: gone / same / closer shares, disturbed boxes, ...

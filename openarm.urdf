@@ -220,17 +220,20 @@
     <limit effort="7" lower="-0.785398" upper="0.785398" velocity="20.943946"/>
   </joint>
   <link name="openarm_left_link7">
+    <!-- the wrist shell is replaced by a plain cylinder, 30 mm across, from
+         joint 7 to the hand mount (100.1 mm, unchanged); joint 7 still turns
+         it (2026-10-26). Same in openarm_arm.xacro. -->
     <visual name="openarm_left_link7_visual">
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 -0.0 -0.5585"/>
+      <origin rpy="0 0 0" xyz="0 0 0.05005"/>
       <geometry>
-        <mesh filename="package://openarm_description/meshes/arm/v10/visual/link7.dae" scale="0.001 -0.001 0.001"/>
+        <cylinder radius="0.015" length="0.1001"/>
       </geometry>
+      <material name="grey"><color rgba="0.6 0.6 0.62 1.0"/></material>
     </visual>
     <collision name="openarm_left_link7_collision">
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 -0.0 -0.5585"/>
+      <origin rpy="0 0 0" xyz="0 0 0.05005"/>
       <geometry>
-        <mesh filename="package://openarm_description/meshes/arm/v10/collision/link7_symp.stl" scale="0.001 -0.001 0.001"/>
-        <!-- <mesh filename="package://openarm_description/meshes/arm/${arm_type}/collision/${name}.stl" scale="0.001 0.001 0.001" /> -->
+        <cylinder radius="0.015" length="0.1001"/>
       </geometry>
     </collision>
     <inertial>
@@ -717,16 +720,21 @@
     </joint>
   </ros2_control>
   <link name="openarm_left_hand">
+    <!-- a plain grey cylinder, 30 mm across, 138.15 mm from the hand mount =
+         238.25 mm from joint 7 to the working tip (2026-10-26); no fingers.
+         Collision stops at 95.4 mm: the last 42.75 mm is the tool's collision
+         piece, which alone may touch at the contact. Same in openarm_hand.xacro. -->
     <visual name="openarm_left_hand_visual">
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 -0.6585"/>
+      <origin rpy="0 0 0" xyz="0 0 0.069075"/>
       <geometry>
-        <mesh filename="package://openarm_description/meshes/ee/openarm_hand/visual/hand.dae" scale="0.001 0.001 0.001"/>
+        <cylinder radius="0.015" length="0.13815"/>
       </geometry>
+      <material name="grey"><color rgba="0.6 0.6 0.62 1.0"/></material>
     </visual>
     <collision name="openarm_left_hand_collision">
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 -0.6585"/>
+      <origin rpy="0 0 0" xyz="0 0 0.0477"/>
       <geometry>
-        <mesh filename="package://openarm_description/meshes/ee/openarm_hand/collision/hand.stl" scale="0.001 0.001 0.001"/>
+        <cylinder radius="0.015" length="0.0954"/>
       </geometry>
     </collision>
     <inertial>
@@ -750,18 +758,7 @@
     <child link="openarm_left_hand_tcp"/>
   </joint>
   <link name="openarm_left_left_finger">
-    <visual name="openarm_left_left_finger_visual">
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 -0.05 -0.673001"/>
-      <geometry>
-        <mesh filename="package://openarm_description/meshes/ee/openarm_hand/visual/finger.dae" scale="0.001 0.001 0.001"/>
-      </geometry>
-    </visual>
-    <collision name="openarm_left_left_finger_collision">
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 -0.05 -0.673001"/>
-      <geometry>
-        <mesh filename="package://openarm_description/meshes/ee/openarm_hand/collision/finger.stl" scale="0.001 0.001 0.001"/>
-      </geometry>
-    </collision>
+    <!-- no finger on the left gripper (2026-10-26): no shape -->
     <inertial>
       <origin rpy="0 0 0" xyz="0.0064528 0.01702 0.0219685"/>
       <mass value="0.03602545343277134"/>
@@ -769,18 +766,7 @@
     </inertial>
   </link>
   <link name="openarm_left_right_finger">
-    <visual name="openarm_left_right_finger_visual">
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.05 -0.673001"/>
-      <geometry>
-        <mesh filename="package://openarm_description/meshes/ee/openarm_hand/visual/finger.dae" scale="0.001 -0.001 0.001"/>
-      </geometry>
-    </visual>
-    <collision name="openarm_left_right_finger_collision">
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.05 -0.673001"/>
-      <geometry>
-        <mesh filename="package://openarm_description/meshes/ee/openarm_hand/collision/finger.stl" scale="0.001 -0.001 0.001"/>
-      </geometry>
-    </collision>
+    <!-- no finger on the left gripper (2026-10-26): no shape -->
     <inertial>
       <origin rpy="0 0 0" xyz="0.0064528 -0.01702 0.0219685"/>
       <mass value="0.03602545343277134"/>

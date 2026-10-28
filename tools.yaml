@@ -1,7 +1,7 @@
 # Tools past the fingertips, per arm (click_to_move tool buttons).
 left:
   'on': true
-  length: 0.02
+  length: 0.04275
 right:
   'on': false
   length: 0.02

@@ -2,6 +2,8 @@
 
 # "auto" (from the depth: a top facing up -> top, else front), "top" or "front"
 string approach
+# "vacuum" (left arm) or "finger" (right arm); "" = the model node's default
+string tool
 ---
 bool found
 string message            # why not, when not found

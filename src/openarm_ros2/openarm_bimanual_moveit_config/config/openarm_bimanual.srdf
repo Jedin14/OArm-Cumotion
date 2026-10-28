@@ -318,4 +318,9 @@
     <!-- The D455 is mounted on the stand (see cam_org.txt), so the two always
          touch. The camera stays a real obstacle for every arm link. -->
     <disable_collisions link1="camera_link" link2="openarm_body_link0" reason="Adjacent"/>
+    <!-- The left wrist is a plain 30 mm cylinder from joint 7 (2026-10-26): at
+         pre_pick (joint 6 39 deg, joint 7 -83 deg) the model cylinder runs
+         through link5 within 37 mm of joint 7, where the real part does not.
+         They meet only at the joint: not checked against each other. -->
+    <disable_collisions link1="openarm_left_link5" link2="openarm_left_link7" reason="User"/>
 </robot>

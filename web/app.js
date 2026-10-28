@@ -3,9 +3,10 @@
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const ALWAYS = new Set(['stop', 'markers', 'view', 'save', 'skip', 'up', 'down', 'left',
+const ALWAYS = new Set(['stop', 'markers', 'view', 'dummy_size', 'tip_check', 'abort', 'save', 'skip', 'up', 'down', 'left',
   'right', 'in', 'out', 'confirm', 'abort']);
 let S = null;                 // the last state from beast
+const NUDGES = ['left', 'right', 'up', 'down', 'in', 'out'];
 let lastLog = 0;
 
 // -- talking to beast -----------------------------------------------------------
@@ -68,7 +69,12 @@ document.addEventListener('click', (e) => {
   const b = e.target.closest('[data-action]');
   if (!b || b.disabled) return;
   const name = b.dataset.action;
+  if (e.shiftKey && NUDGES.includes(name)) return act(name + '5');   // Shift-click: 5 mm
   if (name === 'view') return act('view', { value: b.dataset.value });
+  if (name === 'pick_tool') {
+    if (S && S.pick_tool === b.dataset.value) return;
+    return act('pick_tool', { value: b.dataset.value });
+  }
   if (name === 'tool') {
     return act('tool', { arm: b.dataset.arm, step: b.dataset.step ? Number(b.dataset.step) : 0 });
   }
@@ -140,17 +146,20 @@ $('logToggle').addEventListener('click', () => {
 
 document.addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey || e.target.closest('input, textarea')) return;
+  // a held key repeats: only the nudges may (holding I took 26 tip checks)
+  if (e.repeat && !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', '+', '=', '-'].includes(e.key)) return;
   if (e.key === 'Escape') { e.preventDefault(); return act('stop'); }
   if (S && S.teaching) {
     const k = { ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down',
       '+': 'in', '=': 'in', '-': 'out', Enter: 'save', Backspace: 'skip' }[e.key];
-    if (k) { e.preventDefault(); act(k); }
+    // Shift: 5 mm instead of 1 (not for save / skip)
+    if (k) { e.preventDefault(); act(e.shiftKey && NUDGES.includes(k) ? k + '5' : k); }
     return;
   }
   if (S && S.confirming && (e.key === 'Enter' || e.key === 'y')) return act('confirm');
   const map = { m: 'move', ' ': S && S.click_only ? null : 'detect', r: 'recapture', t: 'teach', b: 'return',
     n: 'navigation', p: 'pre_pick', f: 'cal_arms', c: 'calibrate', o: 'overlay',
-    k: 'markers', a: 'anchor', e: 'refit' };
+    k: 'markers', a: 'anchor', e: 'refit', i: 'tip_check' };
   const key = e.key.toLowerCase();
   if (key === 'd') { e.preventDefault(); return act('topdown'); }
   if (key === 'l') {
@@ -200,15 +209,33 @@ function render(s) {
   setText($('calTitle'), s.confirming ? 'Is the outline on marker 11?' : 'Calibrating');
   setText($('calSub'), s.confirming ? 'Confirm and the arms start; nothing has moved yet'
     : (s.status || 'Keep the view clear') + ' · Abort stops after the current move');
-  setText($('teachSub'), `${s.status ? s.status + ' · ' : ''}2 mm a press · arrows, + / −, Enter saves`);
+  setText($('teachSub'), `${s.status ? s.status + ' · ' : ''}1 mm a press, Shift 5 mm · arrows, + / −, Enter saves`);
 
   // pick
   setPressed($('modeNav'), s.mode === 'navigation');
   setPressed($('modePick'), s.mode === 'pick');
   setPressed($('apFront'), !s.top_down);
   setPressed($('apTop'), s.top_down);
-  const badge = $('targetBadge');
+  setPressed($('tlVacuum'), s.pick_tool === 'vacuum');
+  setPressed($('tlFinger'), s.pick_tool === 'finger');
+  // the box: the face the picker measured, matched to the known size
   const p = s.pick;
+  const tg = s.target;
+  const face = tg && tg.face_mm && tg.face_mm[0] ? tg.face_mm : null;
+  const box = tg && tg.box_mm && tg.box_mm[0] ? tg.box_mm : null;
+  setText($('targetBox'), !face || !p ? '' : `${tg.tool} · ${tg.arm} arm · ${tg.approach} face ${face[0]} × ${face[1]} mm`
+    + (box ? ` = the ${box[0]} × ${box[1]} face, ${box[2]} mm deep` : s.object_size ? ' · no face of the box size matches' : ''));
+  // the last pick: the camera's check
+  const r = s.pick_result;
+  $('resultCard').hidden = !r;
+  if (r) {
+    const rb = $('resultBadge');
+    const rt = r.picked === true ? 'ok' : r.picked === false ? 'bad' : 'edge';
+    setText(rb, r.picked === true ? 'picked' : r.picked === false ? `not picked · ${r.outcome}` : `can't tell · ${r.outcome || '?'}`);
+    rb.dataset.tone = rt;
+    setText($('resultWhy'), `${r.arm} arm · ${r.contact ? 'contact felt' : 'no contact'} · ${r.message || ''} · ${r.time}`);
+  }
+  const badge = $('targetBadge');
   if (!p) {
     setText(badge, 'none'); badge.dataset.tone = 'idle';
     setText($('targetXyz'), s.click_only ? 'Click the picture to pick a point'
@@ -232,6 +259,24 @@ function render(s) {
     setText($(arm === 'left' ? 'lenLeft' : 'lenRight'), t.on ? `${Math.round(t.length * 1000)} mm` : 'off');
   }
 
+  // held object
+  const heldArms = Object.keys(s.held || {});
+  const hb = $('heldBadge');
+  setText(hb, heldArms.length ? `${heldArms.join(' + ')} holding` : 'empty');
+  hb.dataset.tone = heldArms.length ? 'busy' : 'idle';
+  const sz = heldArms.length ? s.held[heldArms[0]] : s.object_size;
+  setText($('heldSize'), sz ? `${heldArms.length ? 'Holding' : 'Next pick'}: ${sz[0]} × ${sz[1]} × ${sz[2]} mm`
+    + (s.object_source && !heldArms.length ? ` · ${s.object_source}` : '')
+    : `No size on ${s.ns}/held_object/size`);
+  setPressed($('tgDummy'), s.dummy);
+  // the size fields follow the server, except the one being typed in
+  if (s.dummy_mm) {
+    [['dimH', 0], ['dimW', 1], ['dimD', 2]].forEach(([id, i]) => {
+      const el = $(id);
+      if (document.activeElement !== el && Number(el.value) !== s.dummy_mm[i]) el.value = s.dummy_mm[i];
+    });
+  }
+
   // calibrate
   setPressed($('tgMarkers'), s.show_markers);
   setPressed($('tgAnchor'), s.anchor_mode);
@@ -249,12 +294,17 @@ function render(s) {
     setText($(pre + 'Anch'), m.anchors + (m.anchor_mm ? ` · ${fmt(m.anchor_mm, 1)} mm` : ''));
   }
   setText($('modelWhen'), s.model_when ? String(s.model_when).replace('T', ' ') : '');
+  setText($('btnDepthCap'), `Depth: capture${s.depth_n ? ` (${s.depth_n})` : ''}`);
+  setText($('autoCalStatus'), [s.depth_cal ? `Depth agrees with colour to ${s.depth_cal}.` : 'No depth check yet.',
+    s.box_cal ? `Cal tip: ${Math.round(s.box_cal.box_holdout_mm * 10) / 10} mm mean on unseen postures (90 % under ${Math.round(s.box_cal.box_holdout_p90_mm * 10) / 10} mm), ${s.box_cal.box_tips} tips.` : 'No Cal tip yet.'].join(' '));
   $('btnApply').disabled = !s.calibration_ready || s.busy;
 
   // system
   setText($('sysState'), s.arm_state);
+  setText($('sysPhase'), s.phase || 'idle');
+  setText($('sysHeld'), heldArms.length ? heldArms.map((a) => `${a} ${s.held[a].join('x')} mm`).join(', ') : 'none');
   setText($('sysResult'), s.result || '–');
-  setText($('sysTarget'), s.target ? `${s.target.approach} · ${xyz(s.target.xyz)} · ${s.target.confidence}` : '–');
+  setText($('sysTarget'), s.target ? `${s.target.tool} · ${s.target.arm} · ${s.target.approach} · ${xyz(s.target.xyz)} · ${s.target.confidence}` : '–');
   setText($('sysCamera'), s.camera ? 'streaming' : 'no frames');
 
   // busy: only what is safe stays live
@@ -266,6 +316,7 @@ function render(s) {
     if (b.disabled !== off) b.disabled = off;
   });
   if (!s.busy && !s.teaching && !s.calibrating) move.disabled = !p || p.ok === false;
+  $('btnRelease').disabled = !heldArms.length || s.busy;
 
   // activity
   const list = $('log');
@@ -281,5 +332,11 @@ function render(s) {
   }
   while (list.children.length > 120) list.lastChild.remove();
 }
+
+// the dummy size: sent when a field is changed (Enter or leaving it)
+['dimH', 'dimW', 'dimD'].forEach((id) => $(id).addEventListener('change', () => {
+  act('dummy_dims', { h: $('dimH').value, w: $('dimW').value, d: $('dimD').value })
+    .then((j) => { if (j && j.ok) toast(j.message); });
+}));
 
 connect();

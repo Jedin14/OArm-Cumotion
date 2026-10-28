@@ -83,6 +83,7 @@ class Arm:
             link = joints[link].find('parent').get('link')
         chain.reverse()
         self.steps, self.masses, self.coms, self.names = [], [], [], []
+        self.links = [j.find('child').get('link') for j in chain]     # each step's child
         for j in chain:
             axis = None
             if j.get('type') in ('revolute', 'continuous'):
