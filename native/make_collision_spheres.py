@@ -108,7 +108,7 @@ def adjacency(urdf, srdf=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--urdf', default=os.path.join(WS, 'openarm.urdf'))
+    ap.add_argument('--urdf', default=os.path.join(WS, 'robot', 'openarm.urdf'))
     ap.add_argument('--srdf', default=os.path.join(
         WS, 'src', 'openarm_ros2', 'openarm_bimanual_moveit_config', 'config',
         'openarm_bimanual.srdf'))

@@ -172,6 +172,19 @@ fi
 # --- 5. ROS middleware ------------------------------------------------------
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
+# Visible to any PC on the network with default ROS 2 settings (domain 0, not
+# localhost-only), as the user asked (2026-10-29, again 2026-11-02). Anything on
+# that network can then also publish to them (arm_action, ...).
+# BEAST_ROS_LOCALHOST_ONLY=1 before sourcing keeps everything on this machine.
+# A terminal that has not sourced this file keeps ~/.bashrc's domain and sees
+# none of the robot's topics when that is not 0, so say so.
+if [[ "${ROS_DOMAIN_ID:-0}" != "0" ]]; then
+    echo "note: this terminal was on ROS domain ${ROS_DOMAIN_ID} (~/.bashrc); the robot uses 0."
+    echo "      Terminals that do not source native/setup.bash need: export ROS_DOMAIN_ID=0"
+fi
+export ROS_LOCALHOST_ONLY="${BEAST_ROS_LOCALHOST_ONLY:-0}"
+export ROS_DOMAIN_ID=0
+
 # The container exported FASTRTPS_DEFAULT_PROFILES_FILE=rtps_udp_profile.xml,
 # which sets useBuiltinTransports=false and forces UDPv4 only. That profile is a
 # container workaround: it exists so DDS does not try to use the shared-memory

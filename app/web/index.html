@@ -12,6 +12,12 @@
     <!-- the camera: everything is clicked here -->
     <main class="stage" id="stage">
       <img id="video" class="video" alt="Head camera" draggable="false">
+      <!-- what the box picker found / the pick check, drawn over the picture -->
+      <svg id="scene" class="scene" aria-hidden="true"></svg>
+      <div class="verdict" id="verdict" role="status" aria-live="polite">
+        <span class="verdict-icon" id="verdictIcon"></span>
+        <span class="verdict-text"><strong id="verdictTitle"></strong><span id="verdictWhy"></span></span>
+      </div>
       <div class="ripples" id="ripples" aria-hidden="true"></div>
 
       <header class="chrome top">
@@ -82,6 +88,7 @@
       <nav class="tabs" role="tablist" aria-label="Sections">
         <button role="tab" class="tab" data-tab="pick" aria-selected="true">Pick</button>
         <button role="tab" class="tab" data-tab="calibrate">Calibrate</button>
+        <button role="tab" class="tab" data-tab="advanced">Advanced</button>
         <button role="tab" class="tab" data-tab="system">System</button>
         <span class="tab-indicator" id="tabIndicator"></span>
       </nav>
@@ -105,7 +112,7 @@
             </div>
           </div>
 
-          <div class="group">
+          <div class="group click-only" id="grpApproach">
             <div class="label">Approach</div>
             <div class="segmented wide">
               <button data-action="topdown" data-when="front" id="apFront">Front</button>
@@ -118,7 +125,7 @@
               <span class="label">Target</span>
               <span class="badge" id="targetBadge" data-tone="idle">none</span>
             </div>
-            <div class="xyz" id="targetXyz">Click the picture, or detect a box</div>
+            <div class="xyz" id="targetXyz">Detect a box: the model picks it, FRONT or TOP</div>
             <div class="why" id="targetWhy"></div>
             <div class="why" id="targetBox"></div>
           </div>
@@ -132,13 +139,13 @@
           </div>
 
           <div class="actions">
-            <button class="btn primary big" data-action="move" id="btnMove">Move <kbd>M</kbd></button>
+            <button class="btn primary big" data-action="move" id="btnMove"><span id="moveLabel">Move</span> <kbd>M</kbd></button>
             <button class="btn model" data-action="detect" id="btnDetect" title="The box picker looks at 5 frames and shows every box it found and the one it will pick (FRONT or TOP); nothing moves until MOVE">Detect box <kbd>Space</kbd></button>
             <button class="btn" data-action="recapture">Recapture <kbd>R</kbd></button>
             <button class="btn danger-soft" data-action="return" id="btnReturn" hidden>Return arm <kbd>B</kbd></button>
           </div>
 
-          <div class="group">
+          <div class="group click-only" id="grpOptions">
             <div class="label">Options</div>
             <div class="toggles">
               <button class="toggle" data-action="teach" id="tgTeach" aria-pressed="false">
@@ -149,6 +156,7 @@
               </button>
             </div>
           </div>
+
 
           <div class="card held">
             <div class="card-row">
@@ -255,12 +263,18 @@
 
           <div class="group">
             <div class="label">Automatic calibration (marker box)</div>
-            <div class="hint">Print <a href="/sheets/calib_box_sheets.pdf" target="_blank">the box sheets</a> (glue on a 170×100×25 box) and <a href="/sheets/charuco_board.pdf" target="_blank">the board</a> at 100 %. 1: hold the board in view, Capture, move it, 3–5 times, Fit. 2: cup on the cross of face B, arm at pre-pick, Cal tip (~15 min, unattended).</div>
+            <div class="hint">Print <a href="/sheets/calib_box_sheets.pdf" target="_blank">the box sheets</a> at 100 % and glue them on a 170×100×25 box. Cup on the cross of face B, vacuum on, arm at pre-pick: <b>Auto calibrate</b> (~15 min, unattended). The arm shows the box to the camera in level and top-down postures; the camera's markers give the tip and, on the same faces, the depth camera's error. Arm model and depth correction are saved only if they are better than now.</div>
             <div class="actions">
-              <button class="btn" data-action="depth_capture" id="btnDepthCap">Depth: capture</button>
-              <button class="btn" data-action="depth_fit" id="btnDepthFit">Depth: fit</button>
-              <button class="btn primary big" data-action="box_cal">Cal tip (box)</button>
+              <button class="btn primary big" data-action="box_cal">Auto calibrate (box)</button>
             </div>
+            <details class="hint">
+              <summary>Depth with the ChArUco board instead</summary>
+              Print <a href="/sheets/charuco_board.pdf" target="_blank">the board</a> at 100 %; hold it in view, Capture, move it, 3–5 times, Fit.
+              <div class="actions two">
+                <button class="btn" data-action="depth_capture" id="btnDepthCap">Depth: capture</button>
+                <button class="btn" data-action="depth_fit" id="btnDepthFit">Depth: fit</button>
+              </div>
+            </details>
             <div class="hint" id="autoCalStatus"></div>
           </div>
 
@@ -283,6 +297,39 @@
         </section>
 
         <!-- SYSTEM -->
+        <section class="pane" data-pane="advanced" hidden>
+          <div class="group">
+            <div class="hint">For testing: a point you type instead of the box model's. Normal picking uses Detect box on the Pick tab.</div>
+          </div>
+
+          <div class="card advanced" id="advanced">
+            <div class="label">Move to coordinates</div>
+            <div class="why">Camera coordinates, metres: the colour camera's frame, as the box picker gives
+              them (x right, y down, z forward). Checked first; MOVE picks it.</div>
+            <div class="dims">
+              <label>X <input type="number" step="0.001" id="mX" placeholder="0.000"></label>
+              <label>Y <input type="number" step="0.001" id="mY" placeholder="0.000"></label>
+              <label>Z <input type="number" step="0.001" min="0.15" max="2" id="mZ" placeholder="0.450"></label>
+              <span class="muted small">m</span>
+            </div>
+            <div class="actions two">
+              <div class="segmented" role="radiogroup" aria-label="Approach">
+                <button type="button" class="local" data-approach="front" id="mFront" aria-pressed="true">Front</button>
+                <button type="button" class="local" data-approach="top" id="mTop" aria-pressed="false">Top</button>
+              </div>
+              <div class="segmented" role="radiogroup" aria-label="Arm">
+                <button type="button" class="local" data-marm="left" id="mLeft" aria-pressed="true" title="Left arm: the vacuum">Left</button>
+                <button type="button" class="local" data-marm="right" id="mRight" aria-pressed="false" title="Right arm: the fingers">Right</button>
+              </div>
+            </div>
+            <button class="btn" data-action="manual_target" id="btnManual">Check target</button>
+          </div>
+
+          <div class="actions">
+            <button class="btn primary big" data-action="move" id="btnMove2">Move <kbd>M</kbd></button>
+          </div>
+        </section>
+
         <section class="pane" data-pane="system" hidden>
           <div class="card">
             <div class="title">ROS interface</div>

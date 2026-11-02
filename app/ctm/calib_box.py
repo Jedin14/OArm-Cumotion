@@ -19,7 +19,7 @@ THE BOARD: an A4 ChArUco board (DICT_5X5_100, 7 x 5 squares of 36 mm): the
 colour image gives its exact pose, the depth image its surface -- the depth
 check (ctm/depth_cal.py).
 
-    python3 -m ctm.calib_box        writes calib_box_sheets.pdf and charuco_board.pdf
+    python3 -m ctm.calib_box        writes docs/sheets/calib_box_sheets.pdf and charuco_board.pdf
 """
 
 import os
@@ -27,13 +27,13 @@ import os
 import cv2
 import numpy as np
 
-from ctm.common import WS
+from ctm.common import SHEETS_DIR
 
 SIZE = (0.170, 0.100, 0.025)                 # m: x, y, z
 TIP_IN_BOX = np.array([0.0, 0.0, -SIZE[2] / 2])   # the crosshair on face B
 FIRST_ID = 100
-BOX_SHEETS = os.path.join(WS, 'calib_box_sheets.pdf')
-BOARD_SHEET = os.path.join(WS, 'charuco_board.pdf')
+BOX_SHEETS = os.path.join(SHEETS_DIR, 'calib_box_sheets.pdf')
+BOARD_SHEET = os.path.join(SHEETS_DIR, 'charuco_board.pdf')
 
 # faces: name -> (outward normal n, panel right r, panel down d, centre); d x r = n
 _X, _Y, _Z = np.eye(3)
@@ -186,6 +186,14 @@ def refine_geometry(views, k, d, log=print):
     poses = [poses[i] for i in use]
     if len(views) < 5 or not faces:
         return {}, float('nan'), float('nan')
+    # Face B (the cross: the tip) fixes the box frame. Seen in too few views,
+    # moving the other faces together is the same as moving the box: nothing
+    # improves and the cross slides (C and E "moved" 4.1 mm 2.4 deg together,
+    # 1.29 -> 1.29 px, 2026-10-30) -- then the box stays as drawn.
+    with_b = sum(any(MARKERS[i][0] == 'B' for i in v) for v in views)
+    if with_b < 3:
+        log(f'box geometry: face B in only {with_b} of {len(views)} views - kept as drawn')
+        return {}, float('nan'), float('nan')
     nf = len(faces)
     x0 = np.zeros(6 * nf + 6 * len(views))
     for j, p in enumerate(poses):
@@ -220,6 +228,13 @@ def refine_geometry(views, k, d, log=print):
     after = sol.fun[:n_px]
     rms = lambda r: float(np.sqrt(np.mean(np.sum(r.reshape(-1, 2) ** 2, axis=1))))
     g = geometry(sol.x)
+    if rms(after) > 0.9 * rms(before):
+        # no better: the faces only moved where moving them changes nothing
+        # (C and E 4.1 mm 2.4 deg together, 1.29 -> 1.29 px, 2026-10-30) --
+        # and that slides the cross. As drawn, then.
+        log(f'box geometry: {len(views)} views, faces {"".join(faces)}: {rms(before):.2f} -> '
+            f'{rms(after):.2f} px - no better; kept as drawn')
+        return {}, rms(before), rms(before)
     log(f'box geometry: {len(views)} views, faces {"".join(faces)}: {rms(before):.2f} -> '
         f'{rms(after):.2f} px; ' + ', '.join(f'{f} moved {1000 * np.linalg.norm(m[:3, 3]):.1f} mm '
                                          f'{np.degrees(np.linalg.norm(cv2.Rodrigues(m[:3, :3])[0])):.1f} deg'

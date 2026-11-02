@@ -22,8 +22,11 @@ from launch.actions import (
     DeclareLaunchArgument,
     TimerAction,
     OpaqueFunction,
+    LogInfo,
+    RegisterEventHandler,
 )
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
 from launch.substitutions import (
     LaunchConfiguration,
     PathJoinSubstitution,
@@ -135,13 +138,40 @@ def controller_spawner(context: LaunchContext, robot_controller):
     else:
         raise ValueError(f"Unknown robot_controller: {robot_controller_str}")
 
-    return [
-        Node(
+    # ONE spawner for every controller, one after the other: two or three
+    # spawners started at the same moment sometimes hung for good on their
+    # first service call (both launches of 2026-10-29: the arm trajectory
+    # controllers never loaded, so no arm could move). Timeouts turn a hung
+    # call into a failed spawner, which is started again (up to 2 more times).
+    names = ["joint_state_broadcaster", left, right,
+             "left_gripper_controller", "right_gripper_controller"]
+    tries = {"n": 0}
+
+    def make():
+        return Node(
             package="controller_manager",
             executable="spawner",
-            arguments=[left, right, "-c", "/controller_manager"],
+            arguments=names + ["-c", "/controller_manager",
+                               "--controller-manager-timeout", "60",
+                               "--service-call-timeout", "15"],
         )
-    ]
+
+    def on_exit(event, _context):
+        if event.returncode == 0:
+            return []
+        if tries["n"] >= 2:
+            return [LogInfo(msg="controller spawner failed 3 times - the arms cannot move; "
+                                "check the CAN buses and restart")]
+        tries["n"] += 1
+        again = make()
+        return [LogInfo(msg=f"controller spawner failed (exit {event.returncode}) - "
+                            f"trying again ({tries['n']}/2)"),
+                TimerAction(period=2.0, actions=[
+                    again, RegisterEventHandler(OnProcessExit(target_action=again,
+                                                              on_exit=on_exit))])]
+
+    first = make()
+    return [first, RegisterEventHandler(OnProcessExit(target_action=first, on_exit=on_exit))]
 
 
 def generate_launch_description():
@@ -223,27 +253,11 @@ def generate_launch_description():
         ],
     )
 
-    jsb_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=["joint_state_broadcaster",
-                   "--controller-manager", "/controller_manager"],
-    )
-
     controller_spawner_func = OpaqueFunction(
         function=controller_spawner, args=[robot_controller])
 
-    gripper_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=["left_gripper_controller",
-                   "right_gripper_controller", "-c", "/controller_manager"],
-    )
-
-    delayed_jsb = TimerAction(period=2.0, actions=[jsb_spawner])
     delayed_arm_ctrl = TimerAction(
         period=1.0, actions=[controller_spawner_func])
-    delayed_gripper = TimerAction(period=1.0, actions=[gripper_spawner])
 
     moveit_config = (
         MoveItConfigsBuilder("openarm", package_name="openarm_bimanual_moveit_config")
@@ -318,9 +332,7 @@ def generate_launch_description():
         declared_arguments
         + [
             robot_nodes_spawner_func,
-            delayed_jsb,
-            delayed_arm_ctrl,
-            delayed_gripper,
+            delayed_arm_ctrl,          # (every controller, the broadcaster first)
             run_move_group_node,
             rviz_node,
         ]

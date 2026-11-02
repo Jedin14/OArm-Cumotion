@@ -37,18 +37,22 @@ SCREW_FRAME = 'camera_bottom_screw_frame'      # what the URDF origin positions
 WINDOW = 'click to move'
 
 
-WS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Where things live (sorted 2026-10-31):
+APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # app/: this code, web/, launch/
+WS = os.path.dirname(APP_DIR)                        # the workspace
+ROBOT_DIR = os.path.join(WS, 'robot')                # the robot stack: openarm.yml, openarm.urdf, poses
+CALIB_DIR = os.path.join(WS, 'calibration')          # what the calibrations and the GUI write, the picks read
+SAMPLES_DIR = os.path.join(CALIB_DIR, 'armcal_samples')     # the raw recordings they fit
+OLD_DIR = os.path.join(WS, 'old_version')            # superseded files, kept
+BACKUP_DIR = os.path.join(OLD_DIR, 'calibration_backups')   # a model before it was replaced
+SHEETS_DIR = os.path.join(WS, 'docs', 'sheets')      # the printable marker sheets
 
 
 URDF_XACRO = os.path.join(WS, 'src/openarm_description/urdf/robot/v10.urdf.xacro')
-
-
-CAM_ORG = os.path.join(WS, 'cam_org.txt')
-
-
-
-
-CALIBRATION_FILE = os.path.join(WS, 'camera_calibration.yaml')
+OPENARM_URDF = os.path.join(ROBOT_DIR, 'openarm.urdf')
+OPENARM_YML = os.path.join(ROBOT_DIR, 'openarm.yml')
+CAM_ORG = os.path.join(CALIB_DIR, 'cam_org.txt')
+CALIBRATION_FILE = os.path.join(CALIB_DIR, 'camera_calibration.yaml')
 
 
 NUDGE = 0.001                   # one TEACH / ANCHOR nudge, m (2 mm placed anchors no better than ~1 mm)

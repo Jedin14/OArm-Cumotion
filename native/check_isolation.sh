@@ -2,14 +2,15 @@
 #
 # Prove that the project's Python stacks do not overlap with the system's.
 #
-#   ./check_isolation.sh
+#   native/check_isolation.sh
 #
 # This workspace runs three mutually incompatible Python stacks on one machine:
 #
 #   native/venv   numpy 1.26.4, torch 2.7.0+cu128   -- the ABI cuRobo's prebuilt
 #                                                      CUDA kernels are linked
 #                                                      against. Not negotiable.
-#   VLM/.venv     numpy 2.2.6,  torch 2.14 +cu130   -- what PaliGemma needs.
+#   box_picker/src/.venv  Python 3.11, numpy 2.4, torch 2.11 +cu128 -- the SAM 3.1
+#                 box picker (set up by box_picker/src/setup.sh).
 #   the host      numpy 1.21.5 (apt) and 2.2.6 (~/.local), torch 2.12+cu130
 #
 # Mixing any two of them produces either a numpy ABI error on import or a
@@ -21,9 +22,9 @@
 #
 set -uo pipefail
 
-WS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"     # this script is in native/
 NATIVE_VENV="${WS_DIR}/native/venv/bin/python3"
-VLM_VENV="${WS_DIR}/VLM/.venv/bin/python"
+PICKER_VENV="${WS_DIR}/box_picker/src/.venv/bin/python"
 
 bad=0
 note() { printf '   %-7s %s\n' "$1" "$2"; }
@@ -39,7 +40,7 @@ probe() {
     echo "-- ${label}"
 
     if [[ ! -x "${py}" ]]; then
-        note MISSING "${py} does not exist -- run ./install.sh"
+        note MISSING "${py} does not exist -- run native/install.sh"
         bad=1
         return
     fi
@@ -80,7 +81,9 @@ def check(name, want):
 check("numpy", want_np)
 check("torch", want_torch)
 
-leaks = [p for p in sys.path if "/.local/" in p]
+# the user site (~/.local/lib/pythonX.Y) leaks; a uv-managed interpreter living
+# under ~/.local/share/uv (the box picker's) is its own stdlib, not a leak
+leaks = [p for p in sys.path if "/.local/lib/python" in p]
 if leaks:
     print(f"   FAIL    ~/.local is on sys.path: {leaks[0]}")
     bad = 1
@@ -107,14 +110,14 @@ echo "  python stack isolation"
 echo "==================================================================="
 
 probe "native/venv   (cuMotion / cuRobo / MoveIt)" "${NATIVE_VENV}" "1.26.4" "2.7.0"
-probe "VLM/.venv     (PaliGemma detector)"         "${VLM_VENV}"    "2.2"    "2.14"
+probe "box_picker/src/.venv (SAM 3.1 box picker)"   "${PICKER_VENV}" "2.4"    "2.11"
 
 # --- the two stacks must not be the same stack -----------------------------
 echo
 echo "-- cross-check"
-if [[ -x "${NATIVE_VENV}" && -x "${VLM_VENV}" ]]; then
+if [[ -x "${NATIVE_VENV}" && -x "${PICKER_VENV}" ]]; then
     n_np="$(PYTHONNOUSERSITE=1 PYTHONPATH= "${NATIVE_VENV}" -c 'import numpy;print(numpy.__version__)' 2>/dev/null)"
-    v_np="$(PYTHONNOUSERSITE=1 PYTHONPATH= "${VLM_VENV}" -c 'import numpy;print(numpy.__version__)' 2>/dev/null)"
+    v_np="$(PYTHONNOUSERSITE=1 PYTHONPATH= "${PICKER_VENV}" -c 'import numpy;print(numpy.__version__)' 2>/dev/null)"
     if [[ -n "${n_np}" && -n "${v_np}" && "${n_np}" != "${v_np}" ]]; then
         note ok "the two venvs carry different numpy (${n_np} vs ${v_np}), as intended"
     else
@@ -128,7 +131,7 @@ echo
 echo "-- host cleanliness"
 if [[ -d /usr/lib/python3/dist-packages ]]; then
     strays=""
-    for pkg in curobo warp transformers paligemma; do
+    for pkg in curobo warp transformers sam3; do
         [[ -e "/usr/lib/python3/dist-packages/${pkg}" ]] && strays+="${pkg} "
     done
     if [[ -n "${strays}" ]]; then
@@ -143,7 +146,7 @@ fi
 if [[ -d "${WS_DIR}/native/root/opt/ros/humble" ]]; then
     note ok "ROS overlay is private (native/root), host /opt/ros/humble untouched"
 elif [[ -d "${WS_DIR}/native" ]]; then
-    note note "native/root not built yet -- run ./install.sh --native-only"
+    note note "native/root not built yet -- run native/install.sh"
 fi
 
 echo

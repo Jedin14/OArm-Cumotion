@@ -6,21 +6,24 @@ directory box_picker/src; it imports the picker unchanged. Same protocol as
 pick_server.py -- "pick" / "quit" on stdin, one JSON line per answer on
 stdout -- and each answer also carries:
 
-    overlay   the picker's own drawing of its decision (every box outlined, the
-              faces tinted by kind, the chosen face in red), written to the
-              --overlay file (one file, overwritten each time)
-    boxes     each box: its outline's bounding box (pixels), the pick face's
-              kind and size, whether it is the target, and why not
+    overlay   the frame the answer is about, clean (nothing drawn: the GUI draws
+              the boxes itself), written to the --overlay file (overwritten each time)
+    boxes     each box: its outline's bounding box and polygon (pixels), the pick
+              face's kind, size and corners (pixels), whether it is the target,
+              and why not
+    size      [width, height] of that frame
     face      the target face in 3D (camera frame): normal (out of the face),
               long (unit, along its long edge), size_mm (long, short)
 
 and one more request, the picker's own pick check (pick_check.py, as
 pick_loop.py uses it):
 
+    pick ux uy uz        the same, with the up direction (colour camera frame) of now
     check [held|empty]   after the pick, with the arm out of the view: 3 new
               frames against the 5 of the last "pick", inside the target's
               outline -> {"check": verdict, "picked": true / false / null,
-              "message", "overlay"} (null: can't tell -- blocked, camera moved)
+              "message", "title", "why", "outline" (the target's polygon),
+              "overlay" (the newest frame, clean)} (null: can't tell)
 
     .venv/bin/python ../../box_picker_server.py --pitch -4.5 --ros --overlay /tmp/x.jpg
 """
@@ -69,14 +72,29 @@ def check(pc, picked_of, cam, before, words, args):
     real_stdout, sys.stdout = sys.stdout, sys.stderr
     try:
         verdict = pc.check(before, after, holding)
-        img = pc.big_result(pc.draw(before, after, verdict), verdict)
-        cv2.imwrite(args.overlay, img)
+        cv2.imwrite(args.overlay, after[-1][0])          # clean: the GUI draws
     finally:
         sys.stdout = real_stdout
     title, why, _colour = pc.RESULT[verdict["outcome"]]
     return {"check": verdict, "picked": picked_of.get(verdict["outcome"]),
-            "message": f"{title}: {why}", "overlay": args.overlay,
+            "message": f"{title}: {why}", "title": title, "why": why,
+            "outline": outline(before.target), "overlay": args.overlay,
+            "size": [int(after[-1][0].shape[1]), int(after[-1][0].shape[0])],
             "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def outline(mask):
+    """A box's outline for the GUI, as the model gives it: the contour of its
+    mask (largest part, pixels), unchanged in shape -- only straight runs
+    merged (under 1 px), to keep the message small."""
+    if mask is None or not mask.any():
+        return None
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    c = cv2.approxPolyDP(max(contours, key=cv2.contourArea), 0.8, True)
+    return [[int(p[0][0]), int(p[0][1])] for p in c]
 
 
 def main():
@@ -114,19 +132,31 @@ def main():
             if cmd != "pick":
                 reply({"error": f"unknown request {cmd!r}: use pick, check or quit"})
                 continue
+            # "pick ux uy uz": the up direction now (colour camera frame), from the
+            # camera's accelerometer -- else the one from --pitch
+            up_now = up
+            if len(words) == 4:
+                try:
+                    v = np.array([float(x) for x in words[1:4]])
+                    if np.linalg.norm(v) > 0.5:
+                        up_now = v / np.linalg.norm(v)
+                except ValueError:
+                    pass
             t0 = time.time()
             for _ in range(args.skip):
                 cam.read()
             frames = [cam.read() for _ in range(args.frames)]
             sys.stdout = sys.stderr
             try:
-                result = detector.detect_frames(frames, cam.intr, up)
+                result = detector.detect_frames(frames, cam.intr, up_now)
                 before = pc.remember(detector, frames, result)
                 boxes, overlay, face = [], None, None
                 if detector.last is not None:
                     points, found, target = detector.last
                     for i, b in enumerate(found):
                         why = []
+                        face_px = (b.pick.corners_px if b.pick is not None and
+                                   b.pick.corners_px is not None else None)
                         if getattr(b, "blocked_by", None):
                             why.append("a box on it")
                         if getattr(b, "hidden_by", None):
@@ -134,20 +164,35 @@ def main():
                         if not b.pick:
                             why.append("no front or top face to grip")
                         boxes.append({"bbox": [int(v) for v in b.bbox],
+                                      "poly": outline(b.mask),
+                                      "face": ([[round(float(u), 1), round(float(v), 1)] for u, v in face_px]
+                                               if face_px is not None else None),
                                       "kind": b.pick.kind if b.pick else None,
                                       "size_mm": [round(float(v)) for v in b.pick.size_mm] if b.pick else None,
                                       "target": i == target, "why_not": why})
                     if target is not None and found[target].pick is not None:
                         face = face_axes(found[target].pick, cam.intr)
-                    img = detector.annotate(frames[detector.best_frame or 0][0])
+                    img = frames[detector.best_frame or 0][0]   # clean: the GUI draws
                     cv2.imwrite(args.overlay, img)
                     overlay = args.overlay
+                    # the frame the target came from, with its depth: to measure a
+                    # miss afterwards (one file, overwritten; ~1 MB)
+                    try:
+                        bf = frames[detector.best_frame or 0]
+                        np.savez_compressed(os.path.splitext(args.overlay)[0] + "_last.npz",
+                                            color=bf[0], depth=bf[1].astype(np.float32),
+                                            intr=np.array([cam.intr.fx, cam.intr.fy,
+                                                           cam.intr.cx, cam.intr.cy]),
+                                            result=json.dumps(result))
+                    except Exception:                    # noqa: BLE001 - only a record
+                        pass
                 elif frames:
                     cv2.imwrite(args.overlay, frames[-1][0])
                     overlay = args.overlay
             finally:
                 sys.stdout = real_stdout
-            reply({"target": result, "boxes": boxes, "face": face, "overlay": overlay,
+            size = [int(frames[0][0].shape[1]), int(frames[0][0].shape[0])] if frames else None
+            reply({"target": result, "boxes": boxes, "face": face, "overlay": overlay, "size": size,
                    "time": time.strftime("%Y-%m-%d %H:%M:%S"), "seconds": round(time.time() - t0, 2)})
     finally:
         cam.close()

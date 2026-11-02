@@ -14,11 +14,14 @@ import numpy as np
 
 TOL_MM = 15.0        # a face edge may be off by this much ...
 TOL_SHARE = 0.12     # ... or this share of its length, whichever is larger
+LOOSE_MM, LOOSE_SHARE = 30.0, 0.30   # a top seen at a shallow angle: its far edge stretches
 
 
-def match(size_hwd_mm, face_mm):
+def match(size_hwd_mm, face_mm, loose=False):
     """(along the long edge, across it, along the tool) mm and the worst edge
-    error mm, or (None, error) when no face of the box fits."""
+    error mm, or (None, error) when no face of the box fits. loose: a top face
+    seen at a shallow angle (read 120 mm for 100, 2026-10-29)."""
+    tol_mm, tol_share = (LOOSE_MM, LOOSE_SHARE) if loose else (TOL_MM, TOL_SHARE)
     long_, short = sorted((float(v) for v in face_mm), reverse=True)
     if long_ <= 0 or short <= 0:
         return None, None
@@ -28,8 +31,8 @@ def match(size_hwd_mm, face_mm):
         if a < b:
             continue
         err = max(abs(long_ - a), abs(short - b))
-        ok = abs(long_ - a) <= max(TOL_MM, TOL_SHARE * a) and \
-            abs(short - b) <= max(TOL_MM, TOL_SHARE * b)
+        ok = abs(long_ - a) <= max(tol_mm, tol_share * a) and \
+            abs(short - b) <= max(tol_mm, tol_share * b)
         if best is None or (ok, -err) > (best[0], -best[2]):
             best = (ok, (a, b, c), err)
     ok, dims, err = best

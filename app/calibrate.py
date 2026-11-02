@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """CALIBRATE: everything that calibrates the robot, in one window, apart from
-the everyday tools (click_to_move.py, auto_box.py).
+the everyday tools (click_to_move.py, the web GUI).
 
     native/run_calibrate.sh           (or: source native/setup.bash; python3 calibrate.py)
 
@@ -25,7 +25,7 @@ id and what it is (green: big enough to read well, orange: small):
 
 Here the calibration pieces folded round each gripper's rail are in the
 planners (they stick out ~4 cm past the rail's ends and towards the
-fingers); click_to_move.py and auto_box.py take them out again.
+fingers); click_to_move.py and the web GUI take them out again.
 """
 
 import threading
@@ -36,7 +36,7 @@ import numpy as np
 
 import click_to_move as ctm_app
 from ctm import armcal, board as bd
-from ctm.common import FONT, WS, decode_image
+from ctm.common import FONT, SAMPLES_DIR, decode_image
 
 
 class CalibrateApp(ctm_app.App):
@@ -92,8 +92,7 @@ class CalibrateApp(ctm_app.App):
         report, results = [], {}
         for arm in ('right', 'left'):
             anchors = armcal.load_anchors(arm)
-            files = sorted(f for f in glob.glob(os.path.join(WS, 'armcal_samples',
-                                                             f'{arm}_2*.npz')))
+            files = sorted(glob.glob(os.path.join(SAMPLES_DIR, f'{arm}_2*.npz')))
             if len(anchors) < 2 or not files:
                 report.append(f'{arm}: ' + ('fewer than 2 anchors' if len(anchors) < 2
                                             else 'no CAL ARMS recordings') + ' - not refitted')

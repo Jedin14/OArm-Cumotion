@@ -8,9 +8,11 @@ tools.yaml so it survives restarts; changed in the window (tool buttons,
 
 import yaml
 
-from ctm.common import FINGERTIP_BEYOND_TCP, TOOL_EXTENSION, WS
+import os
 
-TOOLS_FILE = f'{WS}/tools.yaml'
+from ctm.common import CALIB_DIR, FINGERTIP_BEYOND_TCP, TOOL_EXTENSION
+
+TOOLS_FILE = os.path.join(CALIB_DIR, 'tools.yaml')
 STEP = 0.001                    # m: one key press
 MAX_LENGTH = 0.15               # m
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PICK STACK: the arms as a ROS 2 module -- the same planning, touch and
-drop sequence as click_to_move.py / auto_box.py, driven by topics, with or
+drop sequence as click_to_move.py, driven by topics, with or
 without a window.
 
     native/run_pick_stack.sh          (the robot stack must be up: run_launch_everything.sh)
@@ -31,6 +31,17 @@ The interface -- everything under /beast_arm (--ns):
                        no_target: <why>, pick_failed: <why>,
                        pick_unverified: <why> (touched, but the camera could not
                        tell -- arm in view, camera moved)
+  base_adjust          pick_interfaces/BaseAdjust, out (not latched: never a stale
+                       order) -- after --adjust-after (2) picks in a row that did not
+                       take the same box, or when it is out of reach from here: how
+                       far the robot should move SIDEWAYS (direction left / right /
+                       none, distance_m, left_m; never forward or a turn) so the box
+                       lines up with the picking arm's sweet spot (--sweet-spot). The
+                       arms do nothing more on their own: after the move,
+                       ready_to_pick again
+  vacuum               std_msgs/Bool, out, latched -- what the vacuum should be: on
+                       just before the cup goes in, off at the drop pose (switched by
+                       hand for now; the valve will follow this)
   pick_result          std_msgs/String, out, latched -- each pick's outcome, JSON:
                        {picked: true/false/null, outcome (success, missed, moved,
                        dropped, wrong_box, blocked, camera_moved, unknown,
@@ -82,15 +93,15 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.utilities import remove_ros_args
-from std_msgs.msg import Empty, String
+from std_msgs.msg import Bool, Empty, String
 from std_srvs.srv import Trigger
 
-from pick_interfaces.msg import ObjectSize, PickTarget
+from pick_interfaces.msg import BaseAdjust, ObjectSize, PickTarget
 from pick_interfaces.srv import CheckPick, DetectTarget
 
 import click_to_move as ctm_app
 from ctm import box_match
-from ctm.common import FONT, TOOL_ARM, decode_image
+from ctm.common import BASE_FRAME, FONT, TOOL_ARM, decode_image
 from ctm.robot import ClickToMove
 
 WINDOW = 'pick stack'
@@ -110,8 +121,10 @@ class PickStack(ctm_app.App):
         self.result = ''              # the last arm_action/status
         self.step = 'idle'            # the last arm_action/phase
         self._held_said = None
+        self.next_hint = 'Waiting for ready_to_pick.'
         self.pick_result = None       # the last pick's outcome (pick_result)
         self.node.pick_box = None     # the matched box for the next contact (ctm/touch.py)
+        self.node.pick_face_mm = None  # ... and its face's short side, mm
         self._status_said = None
         ns = args.ns.rstrip('/')
         self.ns = ns
@@ -129,6 +142,10 @@ class PickStack(ctm_app.App):
         self.log_pub = pub(String, 'log')
         self.target_pub = pub(PickTarget, 'pick_target')
         self.result_pub = pub(String, 'pick_result', latched)
+        self.base_pub = pub(BaseAdjust, 'base_adjust')   # (volatile: no stale orders)
+        self.vacuum_pub = pub(Bool, 'vacuum', latched)    # for the valve, when it is wired
+        self.vacuum_on = False
+        self.fails = {'xyz': None, 'outcomes': []}     # failed picks in a row, one box
         self.size_pub = pub(ObjectSize, 'held_object/size', latched)    # the GUI's dummy size
         sub(String, 'arm_state/cmd', self._on_state_cmd)
         sub(String, 'arm_action', self._on_action)
@@ -150,6 +167,17 @@ class PickStack(ctm_app.App):
     def say(self, text, error=False):
         super().say(text, error)
         self.log_pub.publish(String(data=text))
+
+    def vacuum(self, arm, on):
+        """<ns>/vacuum (std_msgs/Bool, latched): on before the cup goes in, off
+        at the drop. Switched by hand for now -- this is what the valve will
+        follow."""
+        if arm != TOOL_ARM['vacuum']:
+            return                                       # (the finger arm has no vacuum)
+        if bool(on) != self.vacuum_on:
+            self.vacuum_on = bool(on)
+            self.vacuum_pub.publish(Bool(data=self.vacuum_on))
+            self.node.get_logger().info(f'vacuum: {"on" if on else "off"} ({arm} arm)')
 
     def phase(self, step):
         """arm_action/phase: the step running now (the touch code calls it)."""
@@ -196,6 +224,7 @@ class PickStack(ctm_app.App):
             'busy': self.busy, 'halted': self.node.halt.is_set(), 'result': self.result,
             'top_down': self.top_down, 'pick': pick,
             'pick_tool': self.pick_tool, 'tool_arm': TOOL_ARM.get(self.pick_tool),
+            'vacuum': self.vacuum_on,
             'pick_result': self.pick_result,
             'held': {a: {'size_mm': [round(1000 * v) for v in h['size']], 'top': h['top']}
                      for a, h in self.node.held.items()},
@@ -253,14 +282,16 @@ class PickStack(ctm_app.App):
 
     def _on_state_cmd(self, msg):
         cmd = msg.data.strip().lower()
-        if cmd in ('navigation', 'pre_pick', 'return'):
-            self.node.resume()
+        if cmd in ('navigation', 'pre_pick', 'return') and not self.busy:
+            self.node.resume()                       # (a refused command must not undo STOP)
         if cmd == 'status':
             self.publish_state()
         elif cmd in ('navigation', 'pre_pick'):
-            self.go_to(cmd)
+            if not self.go_to(cmd):
+                self.report('busy')
         elif cmd == 'return':
-            self.run(self._return, 'returning')
+            if not self.run(self._return, 'returning'):
+                self.report('busy')
         else:
             self.say(f'arm_state/cmd: unknown "{msg.data}" (navigation, pre_pick, return, '
                      f'status)', True)
@@ -273,14 +304,14 @@ class PickStack(ctm_app.App):
             self.abort.set()
             self.report('stopped')
             return
-        if words and words[0] == 'ready_to_pick':
-            self.node.resume()
+        if words and words[0] == 'ready_to_pick' and not self.busy:
+            self.node.resume()                       # (a refused command must not undo STOP)
         if not words or words[0] != 'ready_to_pick':
             # (our own results, if arm_action/status is set to arm_action itself)
             if words and words[0].rstrip(':') not in (
                     'busy', 'detecting', 'target_found', 'picking', 'checking',
                     'pick_complete', 'pick_unverified', 'no_target', 'pick_failed',
-                    'stopped'):
+                    'retrying', 'stopped'):
                 self.say(f'arm_action: unknown "{msg.data}" (ready_to_pick '
                          f'[top|front|auto] [vacuum|finger])', True)
             return
@@ -323,8 +354,7 @@ class PickStack(ctm_app.App):
             finally:
                 self.activity = None
                 self.phase('idle')
-        self.in_background(job)
-        return True
+        return self.in_background(job)
 
     def go_to(self, state):
         mode = 'pick' if state == 'pre_pick' else 'navigation'
@@ -334,7 +364,7 @@ class PickStack(ctm_app.App):
                 return
             self.phase(f'both to_{state}')
             self.go_mode(mode)
-        self.run(job, MOVING[mode])
+        return self.run(job, MOVING[mode])
 
     def _return(self):
         self.return_to_start()
@@ -342,22 +372,48 @@ class PickStack(ctm_app.App):
     # -- the pick ---------------------------------------------------------------
 
     def ready_to_pick(self, approach):
-        try:
-            self._ready_to_pick(approach)
-        except Exception as exc:                     # noqa: BLE001 - reported, not raised
-            self.say(f'pick: {exc}', True)
-            self.report(f'pick_failed: {exc}')
+        """The pick, and again by itself while it fails: look again, pick
+        again -- until it is taken, or --adjust-after failures on the box have
+        asked the wheels to move (base_adjust), or STOP."""
+        tries = max(1, int(getattr(self.node.args, 'adjust_after', 2) or 1))
+        self.abort.clear()                               # a new command: STOP is past
+        for attempt in range(1, tries + 1):
+            self.pick_result = None
+            self.final_attempt = attempt == tries        # earlier ones say "retrying"
+            try:
+                self._ready_to_pick(approach)
+            except Exception as exc:                 # noqa: BLE001 - reported, not raised
+                self.say(f'pick: {exc}', True)
+                self.report(f'pick_failed: {exc}')
+                return
+            r = self.pick_result or {}
+            if r.get('picked') is not False or r.get('base_adjust') or \
+                    r.get('outcome') == 'arm_out' or self.abort.is_set() or \
+                    self.node.halt.is_set() or self.last_touch is not None:
+                return
+            if attempt < tries:
+                self.say(f'not picked ({r.get("outcome")}) - looking again and picking again '
+                         f'by itself ({attempt + 1}/{tries})')
+        self.final_attempt = True
 
     def _ready_to_pick(self, approach):
         if self.last_touch is not None:
             self.report('pick_failed: an arm is still out from the last pick - send '
                         'arm_state/cmd "return"')
             return
+        if TOOL_ARM.get(self.pick_tool) in self.node.held:
+            self.report('pick_failed: the arm still holds the last box - take it off the cup, '
+                        'then held_object/release')
+            return
+        if self.halted():
+            self.report('stopped')
+            return
         if self.mode != 'pick':
             self.activity = 'moving_to_pre_pick'
             self.phase('both to_pre_pick')
             if not self.go_mode('pick'):
-                self.report('pick_failed: could not reach pre_pick')
+                self.report('stopped' if self.halted() else
+                            'pick_failed: could not reach pre_pick')
                 return
         # the model's frame: both arms at pre_pick, out of the view
         self.activity = 'detecting'
@@ -367,7 +423,11 @@ class PickStack(ctm_app.App):
                         f'is box_model_node.py running?)')
             return
         request = DetectTarget.Request(approach=approach, tool=self.pick_tool)
+        # the octomap's frame meanwhile: the same still scene (~2 s saved)
+        captured = threading.Thread(target=self.capture, daemon=True)
+        captured.start()
         answer = self.node.wait(self.detect_client.call_async(request), 30.0)
+        captured.join()
         if answer is None:
             self.report('pick_failed: the model did not answer in 30 s')
             return
@@ -381,8 +441,7 @@ class PickStack(ctm_app.App):
         self.target_pub.publish(target)
         self.report('target_found')
 
-        # the octomap from the same still scene, then the point and its check
-        self.capture()
+        # the point (on the frame captured meanwhile) and its check
         if self.frame is None:
             self.report('pick_failed: no camera frame for the octomap')
             return
@@ -397,8 +456,16 @@ class PickStack(ctm_app.App):
             self.report('pick_failed: no depth at the target')
             return
         self.check_pick(check, in_job=True)      # (the tool's arm: select_point)
+        if self.halted():
+            self.report('stopped')
+            return
         if not check.get('ok'):
-            self.report(f'pick_failed: {check.get("why") or "not reachable"}')
+            why = check.get('why') or 'not reachable'
+            # the wheels only when it is the robot's place (reach, edge, camera
+            # too near) -- not for a check that failed (move_group down, ...)
+            adjust = self.unreachable_adjust(why) if check.get('not_here') else None
+            self.report(f'pick_failed: {why}' + (
+                f'; base_adjust requested: {self.adjust_text(adjust)}' if adjust else ''))
             return
         self.activity = 'picking'
         self.report('picking')
@@ -428,6 +495,9 @@ class PickStack(ctm_app.App):
                      f'arm\'s', True)
         target.tool, target.arm = tool, arm
         self.node.pick_box = None
+        # the face's short side: the cup must stay on it (ctm/touch.py)
+        sides = [float(v) for v in target.face_mm if v > 0]
+        self.node.pick_face_mm = min(sides) if sides else None
         target.box_mm = [0.0, 0.0, 0.0]
         size = self.node.object_size
         face = [float(v) for v in target.face_mm]
@@ -437,7 +507,7 @@ class PickStack(ctm_app.App):
                          'tool\'s direction', True)
             return
         known = [1000.0 * v for v in size['hwd']]
-        box, err = box_match.match(known, face)
+        box, err = box_match.match(known, face, loose=target.approach == PickTarget.APPROACH_TOP)
         k = ' x '.join(f'{v:.0f}' for v in known)
         if box is None:
             self.say(f'the face seen ({face[0]:.0f} x {face[1]:.0f} mm) is no face of the '
@@ -450,18 +520,115 @@ class PickStack(ctm_app.App):
         self.say(f'face seen {face[0]:.0f} x {face[1]:.0f} mm = the {box[0]:.0f} x '
                  f'{box[1]:.0f} face of the {k} mm box ({err:.0f} mm off): {box[2]:.0f} mm '
                  f'deep along the tool')
+        if target.approach == PickTarget.APPROACH_TOP:
+            self._top_from_near_edge(target, face, box)
+        elif self._narrow_front_to_top(target, face, box):
+            self.node.pick_box = {'long': np.array([target.face_long.x, target.face_long.y,
+                                                    target.face_long.z]),
+                                  'box_mm': tuple(float(v) for v in target.box_mm)}
 
-    def verify_pick(self):
+    def _narrow_front_to_top(self, target, face, box):
+        """FRONT on a narrow face (a flat box: 169 x 30 mm for the 25 mm cup) of a box
+        with nothing on it -- the picker grips the larger of the faces it SEES, and
+        from ~10 cm above the stack it hardly sees the tops (2026-10-29) -- becomes
+        TOP, when the matched box's top is wide: its centre is the front face's
+        centre (seen head-on: accurate) raised half the box's height and moved
+        back half its depth. True if it did."""
+        args = self.node.args
+        if not getattr(args, 'prefer_top', True):
+            return False
+        height, depth = box[1], box[2]                   # across the front face, into the box
+        if min(face) > getattr(args, 'narrow_face_mm', 45.0) or depth < 60.0:
+            return False
+        n = np.array([target.face_normal.x, target.face_normal.y, target.face_normal.z])
+        along = np.array([target.face_long.x, target.face_long.y, target.face_long.z])
+        up = np.array([0.0, 0.0, 1.0])
+        if np.linalg.norm(n) < 0.5 or abs(n @ up) > 0.5 or abs(along @ up) > 0.5:
+            return False                                 # not an upright front of a flat box
+        back = -(n - (n @ up) * up)
+        back /= np.linalg.norm(back)
+        p = np.array([target.position.x, target.position.y, target.position.z])
+        top = p + up * (height / 2000.0) + back * (depth / 2000.0)
+        target.position.x, target.position.y, target.position.z = (float(v) for v in top)
+        target.approach = PickTarget.APPROACH_TOP
+        target.face_normal.x, target.face_normal.y, target.face_normal.z = 0.0, 0.0, 1.0
+        target.face_mm = [float(box[0]), float(depth)]
+        target.box_mm = [float(box[0]), float(depth), float(height)]   # on the cup: top down
+        self.node.pick_face_mm = float(min(box[0], depth))
+        self._project_target(target)
+        self.say(f'the {min(face):.0f} mm front is too narrow for the cup and nothing is on the '
+                 f'box: picking its {box[0]:.0f} x {depth:.0f} mm TOP instead (from the front face '
+                 f'and the box size)')
+        return True
+
+    def _project_target(self, target):
+        """target.u, v: its position in the colour image (the ring the GUI draws)."""
+        if self.frame is None:
+            return
+        _bgr, _depth, info, frame_id = self.frame
+        m = self.node.lookup(frame_id, BASE_FRAME)
+        if m is None or info is None:
+            return
+        q = m[:3, :3] @ np.array([target.position.x, target.position.y, target.position.z]) + m[:3, 3]
+        if q[2] <= 0:
+            return
+        k = np.asarray(info.k, float).reshape(3, 3)
+        target.u, target.v = float(k[0, 0] * q[0] / q[2] + k[0, 2]), float(k[1, 1] * q[1] / q[2] + k[1, 2])
+
+    def _top_from_near_edge(self, target, face, box):
+        """A top face is seen at a shallow angle (the camera ~10 cm above the box
+        tops, ~14 deg): one pixel is 4-5 mm along the view, the FAR edge blurs
+        into the box behind, and the picker returns the frame that saw the most
+        of it -- the top read 120 mm deep for a 100 mm box and the cup went to
+        its far end (2026-10-29). The NEAR edge is sharp: with the box's real
+        size known, the centre is half the real depth in from it -- the target
+        moves toward the camera by half what the face was seen too long."""
+        cam = self.node.lookup(BASE_FRAME, 'camera_link')
+        if cam is None:
+            return
+        p = np.array([target.position.x, target.position.y, target.position.z])
+        view = p - cam[:3, 3]
+        view[2] = 0.0
+        if np.linalg.norm(view) < 1e-6:
+            return
+        view /= np.linalg.norm(view)
+        n = np.array([target.face_normal.x, target.face_normal.y, target.face_normal.z])
+        along = np.array([target.face_long.x, target.face_long.y, target.face_long.z])
+        across = np.cross(n, along)
+        if np.linalg.norm(across) < 1e-6:
+            return
+        across /= np.linalg.norm(across)
+        seen = sorted(face, reverse=True)                    # (long, short) as measured
+        # the face's edge that runs along the camera's view: its length is the one
+        # the far edge stretches
+        if abs(along @ view) >= abs(across @ view):
+            axis, measured, real = along, seen[0], box[0]
+        else:
+            axis, measured, real = across, seen[1], box[1]
+        excess = measured - real
+        if not 3.0 < excess <= 40.0:
+            return                                           # as measured (or not trusted)
+        shift = -np.sign(axis @ view) * axis * (excess / 2000.0)   # toward the camera
+        p = p + shift
+        target.position.x, target.position.y, target.position.z = (float(v) for v in p)
+        self.say(f'top seen {excess:.0f} mm longer than the box along the camera\'s view (its '
+                 f'far edge blurs at this angle): aiming {excess / 2:.0f} mm nearer, at the '
+                 f'real centre')
+
+    def verify_pick(self, holding=''):
         """The box picker's check, the arm out of the view: (picked, outcome,
-        message, verdict) -- picked None when it cannot tell or is not served."""
+        message, verdict) -- picked None when it cannot tell or is not served.
+        holding: 'held' / 'empty' from the joint torques after the press, or ''."""
         if not self.check_client.wait_for_service(timeout_sec=2.0):
             return None, 'no_check', f'no check ({self.check_client.srv_name} not served)', None
         for attempt in range(2):
             time.sleep(0.5 if attempt == 0 else 1.5)     # the arm still; then once more
             answer = self.node.wait(self.check_client.call_async(
-                CheckPick.Request(holding='')), 25.0)
-            if answer is None:
-                return None, 'no_check', 'the check did not answer', None
+                CheckPick.Request(holding=holding)), 25.0)
+            if answer is None:                           # served but silent: can't tell
+                return None, 'check_timeout', 'the camera check did not answer', None
+            if not answer.outcome:                       # the picker is down, or nothing to check
+                return None, 'no_check', answer.message, None
             picked = {1: True, 0: False}.get(answer.picked)
             if picked is not None or answer.outcome != 'blocked':
                 break
@@ -470,6 +637,91 @@ class PickStack(ctm_app.App):
         except ValueError:
             verdict = None
         return picked, answer.outcome, answer.message, verdict
+
+    def count_failure(self, result):
+        """Failed picks in a row on one box (within 5 cm); at --adjust-after of
+        them, the base move on base_adjust (returned as a dict, the count
+        reset). A success, or another box, starts the count again."""
+        after = int(getattr(self.node.args, 'adjust_after', 2) or 0)
+        xyz = result.get('xyz')
+        if result.get('picked') is not False or xyz is None or after <= 0:
+            if result.get('picked') is True:
+                self.fails = {'xyz': None, 'outcomes': []}
+            return None                                  # (can't tell: not counted)
+        same = self.fails['xyz'] is not None and np.linalg.norm(
+            np.subtract(xyz, self.fails['xyz'])) <= 0.05
+        outcomes = (self.fails['outcomes'] if same else []) + [result.get('outcome') or '?']
+        self.fails = {'xyz': list(xyz), 'outcomes': outcomes}
+        if len(outcomes) < after:
+            self.say(f'pick failed {len(outcomes)} time(s) on this box - at {after}, the base '
+                     f'is asked to move (base_adjust)')
+            return None
+        self.fails = {'xyz': None, 'outcomes': []}
+        return self.request_base_adjust(result, outcomes)
+
+    def unreachable_adjust(self, why):
+        """The arm cannot pick the box from here at all (the reach check, from
+        every approach point down to 1 cm): ask the wheels at once -- no pick
+        will ever fail on it to count. The base_adjust dict, also in
+        pick_result."""
+        if self.pick is None or int(getattr(self.node.args, 'adjust_after', 2) or 0) <= 0:
+            return None
+        t = self.target
+        result = {'xyz': [float(v) for v in self.pick[2]], 'arm': self.pick[3],
+                  'tool': self.pick_tool, 'approach': t.approach if t is not None else None,
+                  'picked': False, 'outcome': 'unreachable', 'message': why,
+                  'time': time.strftime('%Y-%m-%d %H:%M:%S')}
+        adjust = self.request_base_adjust(result, ['unreachable'])
+        result['base_adjust'] = adjust
+        self.pick_result = result
+        self.result_pub.publish(String(data=json.dumps(result, default=str)))
+        return adjust
+
+    def request_base_adjust(self, result, outcomes):
+        """base_adjust: how far the base should move SIDEWAYS -- left or right
+        only, never forward, back or a turn (2026-11-02) -- so the box lines up
+        across the robot with the arm's sweet spot: left_m = box y - sweet y
+        (the robot moving left by d moves the box d to the right in its frame).
+        Under 1 cm: "none" -- sideways cannot help (the box is too near or too
+        far). The dict goes into pick_result."""
+        args = self.node.args
+        p = np.asarray(result['xyz'], float)
+        sweet = np.asarray(args.sweet_spot, float)
+        left = float(p[1] - sweet[1])
+        direction = 'none' if abs(left) < 0.01 else ('left' if left > 0 else 'right')
+        if direction == 'none':
+            left = 0.0
+        msg = BaseAdjust()
+        msg.header.frame_id = BASE_FRAME
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.direction, msg.distance_m, msg.left_m = direction, abs(left), left
+        msg.target.x, msg.target.y, msg.target.z = (float(v) for v in p)
+        msg.goal.x, msg.goal.y, msg.goal.z = float(sweet[0]), float(sweet[1]), float(p[2])
+        msg.arm, msg.tool = result.get('arm') or '', result.get('tool') or ''
+        msg.approach = result.get('approach') or ''
+        msg.failures = len(outcomes)
+        msg.reason = ', '.join(outcomes)
+        self.base_pub.publish(msg)
+        adjust = {'direction': direction, 'distance_m': round(abs(left), 3),
+                  'left_m': round(left, 3), 'failures': len(outcomes), 'reason': msg.reason,
+                  'goal': [round(float(v), 3) for v in sweet]}
+        why = ('the arm cannot reach this box from here' if outcomes == ['unreachable'] else
+               f'{len(outcomes)} picks in a row did not take this box ({msg.reason})')
+        if direction == 'none':
+            self.say(f'{why}: base_adjust sent - none: the box is already lined up sideways, and '
+                     f'moving left or right cannot help (it is {p[0]:.2f} m out, '
+                     f'{p[2]:.2f} m up; the arm works best {sweet[0]:.2f} m out)', True)
+        else:
+            self.say(f'{why}: base_adjust sent - move {direction} {abs(left):.3f} m; detect '
+                     f'the box again once the base has moved', True)
+        return adjust
+
+    @staticmethod
+    def adjust_text(adjust):
+        """base_adjust, as said in a status: "move left 0.100 m" / "none ..."."""
+        if adjust['direction'] == 'none':
+            return 'none (already lined up sideways; left or right cannot help)'
+        return f'move {adjust["direction"]} {adjust["distance_m"]:.3f} m'
 
     def finish_pick(self, arm):
         """After touch(): arm_action/status and pick_result from the contact
@@ -485,6 +737,12 @@ class PickStack(ctm_app.App):
         if self.last_touch is not None:
             result.update(outcome='arm_out', message=f'the {arm} arm did not get back')
             status = f'pick_failed: the {arm} arm did not get back - send arm_state/cmd "return"'
+        elif not getattr(self, 'touch_moved', True):
+            # refused before the arm moved (STOP, a box still held, no plan):
+            # not a failed pick -- not counted, not retried, no base move
+            stopped = self.halted()
+            result.update(outcome='stopped' if stopped else 'not_started', message=self.status)
+            status = 'stopped' if stopped else f'pick_failed: not started - {self.status}'
         elif contact is None:
             result.update(picked=False, outcome='no_contact', message=self.status)
             status = f'pick_failed: the {arm} arm did not reach the box ({self.status})'
@@ -492,22 +750,34 @@ class PickStack(ctm_app.App):
             self.activity = 'checking'
             self.report('checking')
             self.phase(f'{arm} check')
-            picked, outcome, message, verdict = self.verify_pick()
+            held = contact.get('held')
+            result.update(held=held, held_g=contact.get('held_g'))
+            picked, outcome, message, verdict = self.verify_pick(
+                {True: 'held', False: 'empty'}.get(held, ''))
             result.update(picked=picked, outcome=outcome, message=message, verdict=verdict)
             if picked is True:
                 status = 'pick_complete'
             elif picked is False:
                 status = f'pick_failed: {outcome} - {message}'
-            elif outcome == 'no_check':                  # no camera check: the contact says
-                result['picked'] = felt
-                result['outcome'] = 'success' if felt else 'no_contact'
-                status = 'pick_complete' if felt else \
-                    f'pick_failed: {contact.get("how", "no contact felt")}'
+            elif outcome == 'no_check':                  # no camera check: contact + weight
+                ok = felt and held is not False
+                result['picked'] = ok
+                result['outcome'] = 'success' if ok else 'no_contact' if not felt else 'empty'
+                status = 'pick_complete' if ok else \
+                    f'pick_failed: {contact.get("how", "no contact felt") if not felt else "nothing on the cup"}'
             else:
                 status = f'pick_unverified: {outcome} - {message}'
             self.say(f'pick check: {message}', picked is False)
+        adjust = self.count_failure(result)
+        if adjust is not None:
+            result['base_adjust'] = adjust
+            status += f'; base_adjust requested: {self.adjust_text(adjust)}'
+        if result.get('picked') is False and not result.get('base_adjust') and \
+                not getattr(self, 'final_attempt', True):
+            status = f'retrying: {result.get("outcome")}'  # not the end: another attempt follows
         self.pick_result = result
         self.node.pick_box = None                        # (used: the next target's own)
+        self.node.pick_face_mm = None
         self.result_pub.publish(String(data=json.dumps(result, default=str)))
         self.report(status)
 
@@ -572,7 +842,14 @@ def make_parser():
     parser.add_argument('--model-service', default=None,
                         help='the model: a pick_interfaces/DetectTarget service; default '
                              '<ns>/box_model/detect')
-    parser.set_defaults(drop_hold=1.0, pick_tool='vacuum')
+    parser.add_argument('--adjust-after', type=int, default=2,
+                        help='failed picks in a row on one box before base_adjust asks the '
+                             'wheels to move the robot (0: never)')
+    parser.add_argument('--sweet-spot', type=float, nargs=2, default=[0.45, 0.10],
+                        metavar=('X', 'Y'),
+                        help='where the picking arm works best, robot frame m (x forward, y '
+                             'left): base_adjust brings the box there')
+    parser.set_defaults(drop_hold=1.0, pick_tool='vacuum', edge='adjust')
     return parser
 
 

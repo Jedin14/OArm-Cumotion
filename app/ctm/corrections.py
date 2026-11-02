@@ -14,11 +14,11 @@ import os
 import numpy as np
 import yaml
 
-from ctm.common import WS, plain
+from ctm.common import CALIB_DIR, plain
 
 
 # Taught touch corrections (TEACH): per arm, the nudge a touch needed at a point.
-CORRECTIONS_FILE = os.path.join(WS, 'touch_corrections.yaml')
+CORRECTIONS_FILE = os.path.join(CALIB_DIR, 'touch_corrections.yaml')
 
 
 CORRECTION_RADIUS = 0.15        # samples further than this from a point are ignored, m

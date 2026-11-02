@@ -13,11 +13,11 @@ native/bootstrap.sh
 ```
 
 This builds the native environment only. To set up the whole workspace — this
-plus the VLM detector's separate venv, with a preflight and an isolation check —
+with a preflight and an isolation check (the box picker's venv: box_picker/src/setup.sh) —
 use the top-level installer instead:
 
 ```bash
-./install.sh
+native/install.sh
 ```
 
 Then, once per machine (needs root, see [The one system change](#the-one-system-change)):
@@ -72,8 +72,8 @@ package is ever installed system-wide; `extract_debs.sh` unpacks them with
 ### The one system change
 
 `/workspaces/isaac_ros-dev` must exist as a symlink to this workspace. 96 files
-here hardcode the container's mount point — `openarm.yml`, `openarm.urdf` (mesh
-paths), `launch_everything.launch.py`, `isaac_ros_cumotion_params.yaml` and more.
+here hardcode the container's mount point — `robot/openarm.yml`, `robot/openarm.urdf` (mesh
+paths), `robot/launch_everything.launch.py`, `isaac_ros_cumotion_params.yaml` and more.
 One symlink makes all of them work unchanged, and keeps the workspace usable from
 inside the container too. It is a single symlink and one empty directory; nothing
 is installed.

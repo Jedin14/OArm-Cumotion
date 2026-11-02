@@ -70,11 +70,21 @@ def generate_launch_description():
     # old high, tilted mount saw the table from further off, which is why
     # 848x480 was fine for the VLM. Go back to 848x480x15 only for work that
     # is all beyond ~0.5 m: it is more precise at range.
+    # 640x480 (2026-10-29): three times the depth points of 424x240, for the box
+    # picker -- a box top seen at a shallow angle got too few points at 424x240
+    # and lost to the box's front -- still measuring from ~0.34 m. Use
+    # depth_profile:=424x240x15 for work nearer than that.
+    # off: with it on, the camera node hung at start (2026-10-29); the box picker
+    # then takes the camera's tilt from the TF
+    declare_accel = DeclareLaunchArgument(
+        'accel', default_value='false',
+        description='the D455 accelerometer (the box picker\'s up direction); the camera '
+                    'node hung at start with it on')
     declare_depth_profile = DeclareLaunchArgument(
         'depth_profile',
-        default_value='424x240x15',
+        default_value='640x480x15',
         description='D455 depth stream WxHxFPS. Lower resolution = shorter '
-                    'minimum range (424x240: ~0.2 m, 848x480: ~0.45 m).'
+                    'minimum range (424x240: ~0.2 m, 640x480: ~0.34 m, 848x480: ~0.45 m).'
     )
     declare_boot_pre_pick = DeclareLaunchArgument(
         'boot_pre_pick',
@@ -113,9 +123,9 @@ def generate_launch_description():
         executable='cumotion_goal_set_planner_node',
         name='cumotion_planner',
         parameters=[{
-            'robot': '/workspaces/isaac_ros-dev/openarm.yml',
-            'robot_file': '/workspaces/isaac_ros-dev/openarm.yml',
-            'robot_filepath': '/workspaces/isaac_ros-dev/openarm.yml',
+            'robot': '/workspaces/isaac_ros-dev/robot/openarm.yml',
+            'robot_file': '/workspaces/isaac_ros-dev/robot/openarm.yml',
+            'robot_filepath': '/workspaces/isaac_ros-dev/robot/openarm.yml',
             'tool_frame': tool_frame,
             'collision_activation_distance': collision_distance,
         }],
@@ -153,10 +163,11 @@ def generate_launch_description():
         declare_collision_distance,
         declare_boot_pre_pick,
         declare_depth_profile,
+        declare_accel,
         demo_launch,
         cumotion_node,
         ExecuteProcess(
-            cmd=['python3', '/workspaces/isaac_ros-dev/boot_pre_pick.py'],
+            cmd=['python3', '/workspaces/isaac_ros-dev/robot/boot_pre_pick.py'],
             output='screen',
             additional_env={'PYTHONUNBUFFERED': '1'},
             condition=IfCondition(LaunchConfiguration('boot_pre_pick')),
@@ -181,9 +192,10 @@ def generate_launch_description():
 
     # 3. Add the RealSense Camera Node
     #
-    # Colour and depth-to-colour alignment are on because VLM/vlm_detector_node.py
-    # needs them: it cannot open the D455 itself while this driver holds it, so it
-    # subscribes to /camera/camera/color/image_raw and
+    # Colour and depth-to-colour alignment are on because the box picker (via
+    # box_picker/src/ros_bridge.py) and the pick stack need them: they cannot open
+    # the D455 themselves while this driver holds it, so they subscribe to
+    # /camera/camera/color/image_raw and
     # /camera/camera/aligned_depth_to_color/image_raw instead. The aligned depth
     # follows the colour resolution, so /camera/camera/color/camera_info is the
     # one set of intrinsics that describes both.
@@ -208,6 +220,10 @@ def generate_launch_description():
             'pointcloud.enable': 'false',
             'align_depth.enable': 'true',
             'enable_color': 'true',
+            # the D455's accelerometer: the true "up" for the box picker (box_model_node).
+            # From the TF the picker was told the camera looked 4.5 deg up; the scene
+            # showed ~4.7 deg down, the boxes' tops lost to their fronts (2026-10-29)
+            'enable_accel': LaunchConfiguration('accel'),
         }
 
         realsense_node_live = IncludeLaunchDescription(
@@ -225,7 +241,7 @@ def generate_launch_description():
         ], condition=IfCondition(is_static))
         
         octomap_gater = ExecuteProcess(
-            cmd=['python3', '/workspaces/isaac_ros-dev/octomap_gater.py'],
+            cmd=['python3', '/workspaces/isaac_ros-dev/robot/octomap_gater.py'],
             output='screen',
             condition=IfCondition(is_static)
         )

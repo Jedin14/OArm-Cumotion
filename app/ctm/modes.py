@@ -12,9 +12,9 @@ import os
 import numpy as np
 import yaml
 
-from ctm.common import WS
+from ctm.common import ROBOT_DIR
 
-POSE_FILE = os.path.join(WS, 'pick_place_states_{arm}.yaml')
+POSE_FILE = os.path.join(ROBOT_DIR, 'pick_place_states_{arm}.yaml')
 MODE_POSE = {'navigation': 'navigation_state', 'pick': 'pre_pick_state'}
 AT_POSE = 0.05                  # rad: an arm this close to a pose is "at" it
 
@@ -72,7 +72,7 @@ class ModesMixin:
                 ok = False
         self.mode = mode if ok else self.detect_mode()
         if ok:
-            self.say(f'{mode} mode' + (': click a point, then MOVE' if mode == 'pick' else ''))
+            self.say(f'{mode} mode' + (f': {self.next_hint}' if mode == 'pick' else ''))
         return ok
 
     def ensure_pick_mode(self):

@@ -24,7 +24,8 @@ import numpy as np
 
 import robot_camera_calibration as rcc
 from ctm import armcal, calib_box as cb, depth_cal
-from ctm.common import BASE_FRAME, WS, decode_image, quat_from_matrix, tool_frame_along
+from ctm.common import (BACKUP_DIR, BASE_FRAME, SAMPLES_DIR, decode_image, quat_from_matrix,
+                        tool_frame_along)
 from ctm.kinematics import Arm, directions
 
 BOX_POSTURES = 60
@@ -33,6 +34,19 @@ BOX_MINUTES = 15
 BOX_RMS_RAW_PX = 3.0        # a box pose worse than this, as built (before refining), not kept
 BOX_RMS_PX = 0.8            # after refining the box's geometry: worse is not used
 HOLDOUT = 0.2
+MIN_BOX_MARKERS = 3         # a reading needs this many box markers seen (two leave the tilt loose)
+DEPTH_OK = 0.004            # a depth correction is saved only if it leaves this little (m rms)
+
+
+def _keep_px(rms):
+    """How far off its markers (px) a box reading may be and still be kept:
+    1.5x the run's typical one, at least BOX_RMS_PX, at most BOX_RMS_RAW_PX
+    (small markers seen at a slant read 1.2-1.4 px: a fixed 0.8 kept 7 of 39,
+    2026-10-30)."""
+    rms = [r for r in rms if np.isfinite(r)]
+    if not rms:
+        return BOX_RMS_PX
+    return float(min(BOX_RMS_RAW_PX, max(BOX_RMS_PX, 1.5 * np.median(rms))))
 
 
 class BoxCalMixin:
@@ -105,8 +119,9 @@ class BoxCalMixin:
         world_box = t_wo @ cam_box
         tcp = node.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
         q = np.mean(np.array(qs), axis=0)
-        self.calib_view = (imgs[-1], None, None, None)
+        self.calib_last = {'when': time.monotonic(), 'n': n, 'rms': rms}   # (the live view)
         return {'tip': (world_box @ np.r_[cb.TIP_IN_BOX, 1.0])[:3], 'q': q, 'rms': rms, 'n': n,
+                'cam_box': cam_box,
                 'seen': {int(i): np.asarray(c).tolist() for i, c in seen.items()},
                 't_wo': t_wo.tolist(), 'k': list(info.k), 'd': list(info.d),
                 'box_in_tcp': np.linalg.inv(tcp) @ world_box if tcp is not None else None}
@@ -174,7 +189,9 @@ class BoxCalMixin:
                                                   np.array([cb.SIZE[0], cb.SIZE[0], cb.SIZE[2]])))
         self.abort.clear()
         self.calibrating = True
+        self.calib_live = True                           # the GUI: live camera, markers outlined
         anchors = None
+        self.box_depth = []                              # depth vs markers, per posture
         try:
             self.capture()
             if self.frame is None:
@@ -204,9 +221,12 @@ class BoxCalMixin:
             anchors = None
         finally:
             self.calibrating = False
+            self.calib_live = False
             self.calib_view = None
             self._back_to_pre_pick(arm)
             node.detach_held(arm)
+        if self.box_depth:
+            self._fit_depth_from_box()
         if not anchors:
             return
         self._fit_box(arm, anchors)
@@ -251,7 +271,7 @@ class BoxCalMixin:
         node = self.node
         start = self.pose(arm, 'pre_pick_state') or node.arm_positions(arm)
         rng = np.random.default_rng(3)
-        cands, where = [], []
+        cands, where, kinds = [], [], []
         self.say('CAL TIP: choosing postures where the camera sees the box...')
         for tip, axis, roll in self._front_poses(arm, t_wo, info, rng):
             if self.abort.is_set():
@@ -265,17 +285,30 @@ class BoxCalMixin:
             if sol is not None and self.box_visible(arm, sol, box_in_tcp) >= 4:
                 cands.append(np.array(sol))
                 where.append(np.r_[np.asarray(tip) / 0.05, np.asarray(axis) / 0.35])
+                kinds.append('top' if np.asarray(axis)[2] < -0.6 else 'front')
         if len(cands) < 10:
             self.say(f'CAL TIP: only {len(cands)} postures show the box - not enough', True)
             return None
-        # the most spread out, visited nearest-first (as CAL ARMS)
+        # the most spread out of each kind -- as many top-down postures as level
+        # ones where the camera sees the box: top picks ran on a model fitted to
+        # front postures only (2026-10-29) -- visited nearest-first (as CAL ARMS)
         feats = np.hstack([np.array(cands) / 0.5, np.array(where)])
-        chosen = [0]
-        dist = np.linalg.norm(feats - feats[0], axis=1)
-        while len(chosen) < min(BOX_POSTURES, len(cands)):
-            nxt = int(np.argmax(dist))
-            chosen.append(nxt)
-            dist = np.minimum(dist, np.linalg.norm(feats - feats[nxt], axis=1))
+        chosen = []
+        for kind in ('front', 'top'):
+            idx = [i for i, k in enumerate(kinds) if k == kind]
+            quota = BOX_POSTURES - len(chosen) if kind == 'top' else BOX_POSTURES // 2
+            if not idx or quota <= 0:
+                continue
+            pick = [idx[0]]
+            dist = np.linalg.norm(feats[idx] - feats[idx[0]], axis=1)
+            while len(pick) < min(quota, len(idx)):
+                nxt = int(np.argmax(dist))
+                pick.append(idx[nxt])
+                dist = np.minimum(dist, np.linalg.norm(feats[idx] - feats[idx[nxt]], axis=1))
+            chosen += pick
+        self.say(f'CAL TIP: {sum(kinds[i] == "front" for i in chosen)} level and '
+                 f'{sum(kinds[i] == "top" for i in chosen)} top-down postures '
+                 f'(of {len(cands)} that show the box)')
         order, here, left = [], np.array(start), set(chosen)
         while left:
             nxt = min(left, key=lambda i: np.linalg.norm(cands[i] - here))
@@ -309,7 +342,19 @@ class BoxCalMixin:
             time.sleep(0.2)
             m = self.measure_box(arm, t_wo, info)
             if m is not None:
+                # the depth camera on the same marker faces: its error against
+                # the markers' own geometry (the depth check, no board)
+                # (a side measurement: whatever goes wrong here, the run goes on)
+                try:
+                    depth, _last = node.averaged_depth(4, timeout=2.0, raw=True)
+                    got = self._box_depth_samples(m['cam_box'], m['seen'], depth, info) \
+                        if depth is not None else None
+                    if got is not None:
+                        self.box_depth.append(got)
+                except Exception as exc:                 # noqa: BLE001
+                    node.get_logger().warn(f'CAL TIP: depth on the box not read ({exc})')
                 anchors.append({'arm': arm, 'q': m['q'].tolist(), 'point': m['tip'].tolist(),
+                                'kind': kinds[i],
                                 'tip_offset': float(node.args.tip_offsets[arm]),
                                 'rms': m['rms'], 'n': m['n'], 'seen': m['seen'],
                                 't_wo': m['t_wo'], 'k': m['k'], 'd': m['d'],
@@ -317,42 +362,107 @@ class BoxCalMixin:
                                          else np.zeros(7)).tolist()})
         return anchors
 
+    @staticmethod
+    def _box_depth_samples(cam_box, seen, depth, info):
+        """(x, y, z_measured, z_true) on each face of the box with markers seen:
+        the face's plane from the box's pose (the markers), the depth inside
+        the seen markers' outline. None if too few readings."""
+        cam_box = np.asarray(cam_box, float)
+        out = []
+        by_face = {}
+        for i, c in seen.items():
+            if int(i) in cb.MARKERS:
+                by_face.setdefault(cb.MARKERS[int(i)][0], []).append(np.asarray(c, float))
+        for face, corners in by_face.items():
+            n, _r, _d, centre = cb.FACES[face]
+            plane = np.eye(4)
+            plane[:3, 2] = cam_box[:3, :3] @ n
+            plane[:3, 3] = (cam_box @ np.r_[centre, 1.0])[:3]
+            got = depth_cal.samples_from(plane, depth, info, np.vstack(corners), shrink=0.1)
+            if got is not None and len(got):
+                out.append(got)
+        return np.vstack(out) if out else None
+
+    def _fit_depth_from_box(self):
+        """The depth correction from the box's faces (all postures): saved only
+        if it makes the depth error clearly smaller."""
+        samples = [s for s in self.box_depth if s is not None and len(s)]
+        points = int(sum(len(s) for s in samples))
+        if len(samples) < 6 or points < 2000:
+            self.say(f'CAL TIP: depth - only {len(samples)} postures with depth on the box '
+                     f'({points} points): depth correction not changed')
+            return
+        # each posture's points round its own median (strip edges, the board
+        # behind): out beyond 3 MADs
+        clean = []
+        for smp in samples:
+            r = smp[:, 3] - smp[:, 2]
+            mad = float(np.median(np.abs(r - np.median(r)))) + 1e-4
+            clean.append(smp[np.abs(r - np.median(r)) < 3.0 * 1.4826 * mad])
+        samples = [c for c in clean if len(c) > 50]
+        coef, before, after = depth_cal.fit(samples)
+        # a correction that still leaves the depth this far off from the markers
+        # explains nothing reliably (11.0 -> 8.8 mm with a 3 % scale was saved and
+        # had to be taken back, 2026-10-30)
+        if after > DEPTH_OK or after >= 0.85 * before:
+            self.say(f'CAL TIP: depth NOT changed: {1000 * before:.1f} mm rms against the '
+                     f'markers, a correction leaves {1000 * after:.1f} (must be under '
+                     f'{1000 * DEPTH_OK:.0f} mm and clearly better)')
+            return
+        depth_cal.save(coef, before, after, len(samples), points)
+        self.say(f'CAL TIP: depth corrected: {1000 * before:.1f} -> {1000 * after:.1f} mm rms '
+                 f'({len(samples)} postures, {points} points on the box)')
+
     def _refine_box(self, anchors):
         """The box's real geometry from all the readings at once (calib_box.
         refine_geometry), then each reading's tip again with it; readings
         that still do not fit (> BOX_RMS_PX) are dropped."""
-        with_px = [a for a in anchors if a.get('seen')]
+        with_px = [a for a in anchors if a.get('seen') and a.get('k') is not None]
         if len(with_px) < 5:
-            return [a for a in anchors if a['rms'] <= BOX_RMS_PX]
+            # nothing to refine with (readings saved before the pixels were):
+            # judged as measured
+            return [a for a in anchors if a['rms'] <= _keep_px([a['rms'] for a in anchors])
+                    and a.get('n', MIN_BOX_MARKERS) >= MIN_BOX_MARKERS]
         k, d = with_px[0]['k'], with_px[0]['d']
         views = [{int(i): np.asarray(c) for i, c in a['seen'].items()} for a in with_px]
         geom, before, after = cb.refine_geometry(views, k, d, log=self.node.get_logger().info)
+        # at least 3 markers: two small ones on one face fit their pixels as
+        # well (1.8 px) but leave the tilt loose -- one such reading put the
+        # tip 76 mm off the arm model, another 30 mm (2026-10-30)
+        poses = [cb.box_pose_with(v, k, d, geom) for v in views]
+        poses = [g if g is not None and g[2] >= MIN_BOX_MARKERS else None for g in poses]
+        limit = _keep_px([g[1] for g in poses if g is not None])
         out = []
-        for a, v in zip(with_px, views):
-            got = cb.box_pose_with(v, k, d, geom)
-            if got is None or got[1] > BOX_RMS_PX:
+        for a, got in zip(with_px, poses):
+            if got is None or got[1] > limit:
                 continue
             cam_box, rms, _n = got
             world_box = np.asarray(a['t_wo']) @ cam_box
             out.append(dict(a, point=(world_box @ np.r_[cb.TIP_IN_BOX, 1.0])[:3].tolist(),
                             rms=rms))
-        self.say(f'CAL TIP: the box as built: its markers fit {after:.2f} px (as drawn: '
-                 f'{before:.2f}); {len(out)} of {len(anchors)} readings kept')
+        if geom:
+            self.say(f'CAL TIP: the box as built: its markers fit {after:.2f} px (as drawn: '
+                     f'{before:.2f}); {len(out)} of {len(anchors)} readings kept (up to '
+                     f'{limit:.2f} px)')
+        else:
+            self.say(f'CAL TIP: the box as drawn (refining its faces did not fit better, or '
+                     f'its cross side was seen too rarely); {len(out)} of {len(anchors)} '
+                     f'readings kept (up to {limit:.2f} px)')
         return out
 
     def _fit_box(self, arm, anchors):
         """The arm model fitted to the measured tips (+ the CAL ARMS recordings
         for the arm), 20 % held out first for an honest error in mm."""
         node = self.node
-        os.makedirs(os.path.join(WS, 'armcal_samples'), exist_ok=True)
+        os.makedirs(SAMPLES_DIR, exist_ok=True)
         stamp = time.strftime('%Y-%m-%dT%H-%M-%S')
-        np.save(os.path.join(WS, 'armcal_samples', f'{arm}_box_{stamp}.npy'),
+        np.save(os.path.join(SAMPLES_DIR, f'{arm}_box_{stamp}.npy'),
                 np.array(anchors, dtype=object), allow_pickle=True)
         anchors = self._refine_box(anchors)
         if len(anchors) < 10:
             self.say(f'CAL TIP: only {len(anchors)} good box readings - not enough to fit', True)
             return
-        files = sorted(glob.glob(os.path.join(WS, 'armcal_samples', f'{arm}_2*.npz')))
+        files = sorted(glob.glob(os.path.join(SAMPLES_DIR, f'{arm}_2*.npz')))
         if not files:
             self.say('CAL TIP: no CAL ARMS recordings for this arm - run CAL ARMS once', True)
             return
@@ -387,8 +497,18 @@ class BoxCalMixin:
         held, train = [anchors[i] for i in idx[:n_hold]], [anchors[i] for i in idx[n_hold:]]
         p_t, _b, _s = armcal.fit(arm, samples, z['t_wo'], info, dirs=dirs, anchors=train, **kw)
         e_hold = tip_err(p_t, held) * 1000
-        before = tip_err(self.arm_models.params[arm], anchors) * 1000 \
+        old_hold = tip_err(self.arm_models.params[arm], held) * 1000 \
             if self.arm_models.has(arm) else None
+        by_kind = {k: e_hold[[j for j, h in enumerate(held) if h.get('kind') == k]]
+                   for k in ('front', 'top')}
+        kinds_txt = ', '.join(f'{k} {np.mean(v):.1f} mm ({len(v)})' for k, v in by_kind.items()
+                              if len(v))
+        if old_hold is not None and np.mean(e_hold) >= np.mean(old_hold):
+            self.detail = (f'CAL TIP {arm}: NOT saved - on postures not used in the fit the new '
+                           f'model is {np.mean(e_hold):.1f} mm off, the current one '
+                           f'{np.mean(old_hold):.1f} mm' + (f' ({kinds_txt})' if kinds_txt else ''))
+            self.say(f'{self.detail}. Take the box off the cup.', True)
+            return
         p, b, st = armcal.fit(arm, samples, z['t_wo'], info, dirs=dirs, anchors=anchors, **kw)
         e_all = tip_err(p, anchors) * 1000
         st.update(model=variant, dropped=dropped, holdout_px=float('nan'),
@@ -396,12 +516,16 @@ class BoxCalMixin:
                   box_holdout_p90_mm=float(np.percentile(e_hold, 90)),
                   box_fit_mm=float(np.mean(e_all)))
         import shutil
-        if os.path.exists(armcal.MODEL_FILE):            # the model before, kept
-            shutil.copy(armcal.MODEL_FILE, armcal.MODEL_FILE.replace('.yaml', f'.before_boxcal_{stamp}.yaml'))
+        if os.path.exists(armcal.MODEL_FILE):            # the model before, kept in old_version/
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            shutil.copy(armcal.MODEL_FILE, os.path.join(
+                BACKUP_DIR, os.path.basename(armcal.MODEL_FILE).replace(
+                    '.yaml', f'.before_boxcal_{stamp}.yaml')))
         armcal.save_model({arm: (p, b, st)})
         self.arm_models = armcal.ArmModels()
         self.detail = (f'CAL TIP {arm}: tip error on postures NOT used in the fit: mean '
                        f'{np.mean(e_hold):.1f} mm, 90 % under {np.percentile(e_hold, 90):.1f} mm, '
-                       f'max {np.max(e_hold):.1f}' + (f' (the old model: mean {np.mean(before):.1f} '
-                                                     f'mm)' if before is not None else ''))
+                       f'max {np.max(e_hold):.1f}' + (f' - {kinds_txt}' if kinds_txt else '')
+                       + (f' (the old model on the same postures: {np.mean(old_hold):.1f} mm)'
+                          if old_hold is not None else ''))
         self.say(f'CAL TIP: saved. {self.detail}. Take the box off the cup.')

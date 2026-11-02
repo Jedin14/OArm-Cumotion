@@ -33,7 +33,7 @@ import xml.etree.ElementTree as ET
 import cv2
 import numpy as np
 
-WS = os.path.dirname(os.path.abspath(__file__))
+WS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the workspace (this is in app/)
 CACHE_DIR = os.path.join(WS, 'native', 'cache')
 
 

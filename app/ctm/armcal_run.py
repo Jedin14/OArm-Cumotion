@@ -32,10 +32,10 @@ import robot_camera_calibration as rcc
 from cv2 import FONT_HERSHEY_SIMPLEX as FONT_CV
 from ctm import armcal, board as bd
 from ctm.kinematics import directions
-from ctm.common import (BASE_FRAME, WS, decode_image, pixel_ray, quat_from_matrix, rot_about,
+from ctm.common import (BASE_FRAME, SAMPLES_DIR, decode_image, pixel_ray, quat_from_matrix, rot_about,
                         tool_frame_along)
 
-WALL_ID = 11                    # the reference marker on the wall (docs/gripper_markers.pdf)
+WALL_ID = 11                    # the reference marker on the wall (docs/sheets/gripper_markers.pdf)
 WALL_MARKER = 0.050             # m: its black square (64 mm card)
 WALL_X = 0.50                   # m: the wall is this far in front of the robot (world x)
 POSTURES = 100                  # per arm, spread over everywhere the camera sees and it reaches
@@ -461,10 +461,10 @@ class ArmCalMixin:
 
     def _save_samples(self, arm, samples, t_wo, info, dirs=None):
         """The raw measurements, so a fit can be redone and looked into offline:
-        armcal_samples/<arm>_<time>.npz (joints, marker pixels, camera)."""
+        calibration/armcal_samples/<arm>_<time>.npz (joints, marker pixels, camera)."""
         import datetime
         import os
-        folder = os.path.join(WS, 'armcal_samples')
+        folder = SAMPLES_DIR
         os.makedirs(folder, exist_ok=True)
         stamp = datetime.datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
         ids = sorted({i for _q, px in samples for i in px})
@@ -476,23 +476,6 @@ class ArmCalMixin:
                  ids=np.array(ids), pixels=pix, t_wo=t_wo, k=np.array(info.k, float),
                  d=np.array(info.d, float), size=np.array([info.width, info.height]),
                  dirs=np.zeros((len(samples), 7)) if dirs is None else np.asarray(dirs))
-
-    def _holdout_px(self, arm, held, params, boards, t_wo, info):
-        model = armcal.Arm(arm)
-        k = np.array(info.k, float).reshape(3, 3)
-        d = np.array(info.d, float) if len(info.d) else np.zeros(5)
-        t_ow = np.linalg.inv(t_wo)
-        c3 = bd.corners_3d(arm)
-        errs = []
-        for q, px in held:
-            tcp = model.tcp(q, params)
-            for i, c in px.items():
-                t_board = tcp @ boards[bd.piece_of(arm, i)]
-                w = c3[i] @ t_board[:3, :3].T + t_board[:3, 3]
-                cam = w @ t_ow[:3, :3].T + t_ow[:3, 3]
-                p, _ = cv2.projectPoints(cam.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), k, d)
-                errs += list(np.linalg.norm(p.reshape(-1, 2) - c, axis=1))
-        return float(np.sqrt(np.mean(np.square(errs)))) if errs else float('nan')
 
     def _back_to_pre_pick(self, arm):
         """Bring `arm` to pre_pick and check it got there (within 0.1 rad on
@@ -672,10 +655,12 @@ class ArmCalMixin:
             self.check = None
             # calibration, not a pick: both arms, whatever the pick tool
             tool, self.pick_tool = getattr(self, 'pick_tool', 'auto'), 'auto'
+            edge, self.node.args.edge = getattr(self.node.args, 'edge', 'try'), 'try'
             try:
                 self.touch(arm, wall['centre'], t_wo[:3, 3], scene=self.frame)
             finally:
                 self.pick_tool = tool
+                self.node.args.edge = edge
             c = self.last_contact
             if c is None:
                 out.append(f'{arm}: wall marker touch did not happen')

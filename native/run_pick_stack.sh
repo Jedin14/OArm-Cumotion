@@ -26,4 +26,4 @@ source "${NATIVE_DIR}/setup.bash" > /dev/null
 # every earlier instance of the pick tools stopped first (port 8080, GPU memory)
 "${NATIVE_DIR}/stop_pick_tools.sh" || exit 1
 
-exec ros2 launch "${WS_DIR}/launch/pick_stack.launch.py" "$@"
+exec ros2 launch "${WS_DIR}/app/launch/pick_stack.launch.py" "$@"

@@ -302,7 +302,7 @@ class CumotionActionServer(Node):
             with open(self.__robot_file) as handle:
                 urdf_path = yaml.safe_load(handle)['robot_cfg']['kinematics']['urdf_path']
         except Exception:                            # noqa: BLE001
-            urdf_path = '/workspaces/isaac_ros-dev/openarm.urdf'
+            urdf_path = '/workspaces/isaac_ros-dev/robot/openarm.urdf'
         self._static = scene_world.StaticObstacles(urdf_path, self.get_logger())
         self._octomap = scene_world.OctomapCache()
         self._shadowed = scene_world.ShadowedMap()

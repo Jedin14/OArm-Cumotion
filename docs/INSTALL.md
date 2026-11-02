@@ -1,7 +1,7 @@
 # Installation
 
 Setting up the 7DOF-OArm workspace on a machine. For what to *run* once it is
-installed, see [README.md](README.md).
+installed, see [README.md](../README.md) and [detailed_run.md](detailed_run.md).
 
 - [Requirements](#requirements)
 - [Install](#install)
@@ -33,16 +33,15 @@ the NVIDIA driver.
 ## Install
 
 ```bash
-./install.sh                 # everything (native cuMotion stack + VLM)
-./install.sh --native-only   # skip the VLM detector environment
-./install.sh --vlm-only      # only the VLM detector environment
-./install.sh --check         # verify an existing install, change nothing
+native/install.sh                  # the native cuMotion + MoveIt stack
+native/install.sh --check          # verify an existing install, change nothing
+cd box_picker/src && ./setup.sh    # the box picker's own environment (SAM 3.1), once
 ```
 
-It runs the preflight above, then [`native/bootstrap.sh`](native/bootstrap.sh)
-(deb overlay, venv, workspace build, cuRobo kernel warm-up) and
-[`VLM/bootstrap.sh`](VLM/bootstrap.sh) (the detector's venv), then the isolation
-check. Expect the native half to take a while — it downloads ~360 MB of debs and
+It runs the preflight above, then [`native/bootstrap.sh`](../native/bootstrap.sh)
+(deb overlay, venv, workspace build, cuRobo kernel warm-up), then the isolation
+check. The box picker's venv is made by its own
+[`box_picker/src/setup.sh`](../box_picker/src/setup.sh) (uv, Python 3.11). Expect the native half to take a while — it downloads ~360 MB of debs and
 builds the workspace from source.
 
 Every step is idempotent, so re-running after editing a `requirements.txt` is
@@ -57,22 +56,22 @@ or a silently wrong torch:
 | Stack | numpy | torch | Why it is pinned there |
 | --- | --- | --- | --- |
 | `native/venv` | 1.26.4 | 2.7.0+cu128 | the ABI cuRobo's prebuilt CUDA kernels are linked against |
-| `VLM/.venv` | 2.2.6 | 2.14 nightly +cu130 | what PaliGemma / `transformers` needs |
+| `box_picker/src/.venv` (Python 3.11) | 2.4.6 | 2.11.0+cu128 | what SAM 3.1 (the box picker) needs |
 | the host | 1.21.5 (apt), 2.2.6 (`~/.local`) | 2.12+cu130 | not used by this project at all |
 
 The separation is enforced, not just documented:
 
-- **Nothing is installed system-wide.** `install.sh` never runs `apt install` and
+- **Nothing is installed system-wide.** `native/install.sh` never runs `apt install` and
   never writes to `/usr`, `/opt` or `/usr/local`. The ROS packages the host is
   missing are downloaded as debs and unpacked into `native/root`, a private
   prefix — the host's `/opt/ros/humble` is used read-only as the underlay.
 - **The host's `~/.local` is invisible.** `PYTHONNOUSERSITE=1` is exported by
   both runtime wrappers and set for every `pip`/`uv` call, in both directions.
-- **The two venvs never share an interpreter.**
-  [`VLM/run_in_vlm_env.sh`](VLM/run_in_vlm_env.sh) scrubs `PYTHONPATH` and
-  `LD_LIBRARY_PATH` before launching the detector, because a `PYTHONPATH` set by
-  `native/setup.bash` would otherwise beat the venv's own `site-packages` and
-  hand PaliGemma the wrong numpy.
+- **The two venvs never share an interpreter.** `box_model_node.py` starts the
+  box picker with `PYTHONPATH`, `PYTHONHOME`, `LD_LIBRARY_PATH` and the ROS
+  prefix variables removed, because a `PYTHONPATH` set by `native/setup.bash`
+  would otherwise beat the venv's own `site-packages` and hand SAM the wrong
+  numpy.
 
 ### How the two kinds of dependency are handled
 
@@ -86,13 +85,16 @@ cases work at once:
 | ROS core, deliberately shared | `rclpy`, generated message modules | the host's `/opt/ros/humble` |
 | Not pip-installable | `curobo`, the cuMotion nodes, `librealsense2` | the deb overlay in `native/root` |
 
-`VLM/.venv` is built the opposite way — **no** `--system-site-packages` — because
-PaliGemma's numpy 2.2.6 must not see anything else. It reaches ROS over DDS only.
+`box_picker/src/.venv` is built the opposite way — **no** system site-packages —
+because its numpy 2.4 must not see anything else. It never imports ROS: the
+camera frames reach it from `box_picker/src/ros_bridge.py` (run with the ROS
+Python 3.10) over TCP `127.0.0.1:50555`, and it answers `box_model_node.py` on
+its stdin/stdout.
 
 ### Verifying it
 
 ```bash
-./check_isolation.sh
+native/check_isolation.sh
 ```
 
 Checks that each venv resolves `numpy` and `torch` to its own pinned copies from
@@ -140,7 +142,7 @@ sudo ip link set can0 type can bitrate 1000000 dbitrate 5000000 fd on
 sudo ip link set can0 up
 ```
 
-`install.sh` prints the symlink command rather than running it.
+`native/install.sh` prints the symlink command rather than running it.
 
 ## Portability
 
@@ -153,7 +155,7 @@ Still specific to this rig:
 | --- | --- |
 | **x86_64 + Ubuntu 22.04 + ROS Humble** | `native/setup.bash` and `extract_debs.sh` hardcode `x86_64-linux-gnu`; `fetch_debs.sh` pins the `jammy` archives. No Jetson/ARM, no 24.04. |
 | **The `/workspaces/isaac_ros-dev` path** | 16 files reference it; the symlink absorbs that, but the absolute paths in the docs are this machine's. |
-| **The robot itself** | the 14-DOF bimanual URDF, the D455 mount measured in `cam_org.txt`, and `can0`/`can1`. That calibration does not transfer. |
+| **The robot itself** | the 14-DOF bimanual URDF, the D455 mount measured in `calibration/cam_org.txt`, and `can0`/`can1`. That calibration does not transfer. |
 
 So this installs unattended on another x86_64 Ubuntu 22.04 + `ros-humble-desktop`
 machine with a CUDA ≥ 12.8 GPU. Other platforms need work beyond the installer —
@@ -164,13 +166,13 @@ cannot target `compute_120`, which is the reason `native/` exists at all.
 
 | Symptom | Cause |
 | --- | --- |
-| numpy ABI error, or an unexpected torch version | run `./check_isolation.sh` first — it is the most common cause and the check is instant |
+| numpy ABI error, or an unexpected torch version | run `native/check_isolation.sh` first — it is the most common cause and the check is instant |
 | preflight fails on `cuda toolkit` | no `nvcc` ≥ 12.8 under `/usr/local/`; the detected versions are listed |
 | preflight fails on `gpu arch` | `nvidia-smi` cannot report `compute_cap` — usually a broken driver, check `nvidia-smi -L` |
 | a MoveIt plugin silently does not load | `source native/setup.bash && native/verify_overlay.sh` — catches overlay libraries that install fine but fail to `dlopen` |
 | `freeglut failed to open display` | no `DISPLAY`; use `python3 native/tests/test_move_group_planners.py` for a headless check |
-| the detector fails at model load | `google/paligemma-3b-pt-224` is a **gated** HuggingFace model — accept the licence and log in with `huggingface-cli login` |
+| the box picker fails at model load | see `native/logs/box_picker.log`; the SAM 3.1 weights come from `$SAM31_CHECKPOINT`, else HuggingFace (`facebook/sam3.1`) |
 
 For deeper detail on the native environment — exactly what it touches, how the
 overlay is assembled, and the two GPU-specific bugs it works around — see
-[native/README.md](native/README.md).
+[native/README.md](../native/README.md).

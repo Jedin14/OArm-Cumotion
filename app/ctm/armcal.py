@@ -31,10 +31,10 @@ import numpy as np
 import yaml
 
 from ctm import board as bd
-from ctm.common import WS, plain
+from ctm.common import CALIB_DIR, plain
 from ctm.kinematics import Arm, rotvec, tcp_batch
 
-MODEL_FILE = os.path.join(WS, 'arm_model.yaml')
+MODEL_FILE = os.path.join(CALIB_DIR, 'arm_model.yaml')
 PRIOR_WEIGHT = float(os.environ.get('ARMCAL_PRIOR_WEIGHT', '0.4'))
 TOUCH_MM = 2.0                  # a touch's contact depth: this many mm count as one pixel (its noise is ~2x a corner's)
 PLANE_SIGMA = 0.01              # m: depth camera bias + contact push, taken up by the fit
@@ -182,21 +182,8 @@ def _board_pose(v, init):
     return m
 
 
-def predict(arm_model, x, q, t_ow, k, d, ids, inits):
-    """Pixels where the model puts these marker corners (N*4, 2)."""
-    params, vs = _unpack(x, len(inits))
-    tcp = arm_model.tcp(q, params)
-    pieces = [tcp @ _board_pose(v, init) for v, init in zip(vs, inits)]
-    c3 = bd.corners_3d(arm_model.arm)
-    world = np.concatenate([c3[i] @ pieces[bd.piece_of(arm_model.arm, i)][:3, :3].T
-                            + pieces[bd.piece_of(arm_model.arm, i)][:3, 3] for i in ids])
-    cam = world @ t_ow[:3, :3].T + t_ow[:3, 3]
-    px, _ = cv2.projectPoints(cam.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), k, d)
-    return px.reshape(-1, 2)
-
-
 ANCHOR_MM = 1.0                 # an anchor's tip: this many mm count as one corner pixel
-ANCHORS_FILE = os.path.join(WS, 'armcal_anchors.yaml')
+ANCHORS_FILE = os.path.join(CALIB_DIR, 'armcal_anchors.yaml')
 
 
 def load_anchors(arm=None):
@@ -399,36 +386,6 @@ def drop_outliers(arm, samples, params, boards, t_wo, info):
     err = posture_px(arm, samples, params, boards, t_wo, info)
     bad = err > max(3.0, 3.0 * float(np.median(err)))
     return [s_ for s_, b in zip(samples, bad) if not b], int(bad.sum()), ~bad
-
-
-def tip_error_mm(arm, samples, params, boards, t_wo, info, tip_offset):
-    """For held-out samples: how far the model (and the plain URDF) put the
-    tip from where the pieces say it is, in mm (median, max) -- per posture
-    the best-seen piece's pose solved, with the model's placement of it."""
-    model = Arm(arm)
-    k = np.array(info.k, float).reshape(3, 3)
-    d = np.array(info.d, float) if len(info.d) else np.zeros(5)
-    c3 = bd.corners_3d(arm)
-    tip_tcp = np.array([0.0, 0.0, tip_offset, 1.0])
-    out = {'model': [], 'urdf': []}
-    for q, px in samples:
-        by_piece = {}
-        for i in px:
-            by_piece.setdefault(bd.piece_of(arm, i), []).append(i)
-        p_k, ids = max(by_piece.items(), key=lambda kv: len(kv[1]))
-        ok, rv, tv = cv2.solvePnP(np.concatenate([c3[i] for i in ids]),
-                                  np.concatenate([px[i] for i in ids]), k, d)
-        if not ok:
-            continue
-        cam_board = np.eye(4)
-        cam_board[:3, :3] = cv2.Rodrigues(rv)[0]
-        cam_board[:3, 3] = tv.ravel()
-        real_tcp = t_wo @ cam_board @ np.linalg.inv(boards[p_k])
-        real_tip = (real_tcp @ tip_tcp)[:3]
-        for name, p in (('model', params), ('urdf', None)):
-            out[name].append(1000 * np.linalg.norm((model.tcp(q, p) @ tip_tcp)[:3] - real_tip))
-    return {n: (float(np.median(v)), float(np.max(v))) if v else (None, None)
-            for n, v in out.items()}
 
 
 # -- the saved model ------------------------------------------------------------

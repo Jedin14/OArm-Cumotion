@@ -25,4 +25,4 @@ if [[ -z "${DISPLAY:-}" ]]; then
     exit 1
 fi
 
-exec python3 "${WS_DIR}/calibrate.py" "$@"
+exec python3 "${WS_DIR}/app/calibrate.py" "$@"

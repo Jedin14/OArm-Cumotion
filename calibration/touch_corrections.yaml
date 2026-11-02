@@ -1,3 +1,16 @@
-# Touch corrections (click_to_move.py TEACH): where the fingertip had to be
-# aimed, relative to a point, to land on it. Taught on top of the arm model.
-samples: []
+# Touch corrections (click_to_move.py TEACH): where the
+# fingertip had to be aimed, relative to a point, to land on it.
+samples:
+- arm: left
+  point:
+  - 0.3571
+  - 0.1697
+  - 0.4359
+  correction:
+  - 0.0139
+  - 0.0213
+  - 0.0
+  source: teach
+  mode: level
+  when: '2026-10-28T16:00:46'
+  model: '2026-10-27T11:58:04'

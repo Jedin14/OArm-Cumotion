@@ -137,6 +137,7 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin, BoxCalMix
         self.last_touch = None        # an arm that is out, and how to bring it back
         self.poses = load_poses()     # {arm: {navigation_state, pre_pick_state, drop_state}}
         self.mode = None              # 'navigation' / 'pick' / None (see ctm/modes.py)
+        self.next_hint = 'Click a point, then MOVE.'   # what to do next (the GUI: detect a box)
         self.pick_tool = node.args.pick_tool   # vacuum (left only) / finger (right only) / auto
         self.arm_models = armcal.ArmModels()   # CALIBRATE ARMS results, if any
         self.buttons = {}             # name -> (x0, y0, x1, y1) in window pixels
@@ -157,6 +158,7 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin, BoxCalMix
         self.top_down = node.args.top_down   # approach straight down instead of level
         self.teaching = False         # a touch is being taught right now
         self.abort = threading.Event()
+        self._job_lock = threading.Lock()
 
     def phase(self, step):
         """The step running now ("left contact", ...): pick_stack.py publishes it."""
@@ -172,9 +174,11 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin, BoxCalMix
             self.node.get_logger().info(text)
 
     def in_background(self, work):
-        if self.busy:
-            return
-        self.busy = True
+        """work() in a thread, one job at a time. False if one runs already."""
+        with self._job_lock:                         # (GUI and ROS threads both start jobs)
+            if self.busy:
+                return False
+            self.busy = True
 
         def run():
             try:
@@ -188,7 +192,13 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin, BoxCalMix
             finally:
                 self.busy = False
                 self.calib_view = None
+                self.phase('idle')
         threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def halted(self):
+        """STOP was pressed (or ABORT): a job checks this between its steps."""
+        return self.abort.is_set() or self.node.halt.is_set()
 
     def capture(self):
         """Take a frame and rebuild the octomap from the same moment."""
@@ -222,7 +232,7 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin, BoxCalMix
         message = self.node.rebuild_octomap()
         n = self.node.refresh_walls(self.frame[3])
         self.say(f'{message}' + ('' if n is None else f'; walls around the picture ({n})')
-                 + '. Click a point, then MOVE.')
+                 + f'. {self.next_hint}')
 
     # -- input ----------------------------------------------------------------
 
@@ -630,7 +640,7 @@ def make_parser():
     parser.add_argument('--standoff', type=float, default=0.10,
                         help='the farthest the tip first stops from the point (corrections '
                              'happen there), then moves in on one straight line, m')
-    parser.add_argument('--tip-vision', choices=['off', 'log', 'on'], default='log',
+    parser.add_argument('--tip-vision', choices=['off', 'log', 'on'], default='off',
                         help='the camera\'s check of the tip before going in (ctm/tip_vision.py:'
                              ' the colour outline, plus depth where it has readings). log: '
                              'measure, report and save only; on: also move the tip onto the '
@@ -649,7 +659,9 @@ def make_parser():
                         help='the nearest the straight line in may start from the point: the '
                              'approach point is the farthest from --standoff / --top-standoff '
                              'down to this that the arm reaches with the whole line in clear, '
-                             'm (3 cm of slow contact + 1 cm, so the cup can seat)')
+                             'm. Under 3 cm (only when nothing further out works) the tool may be '
+                             'near the box: the flight there is checked with the tool counted up '
+                             'to its last 30 %%')
     parser.add_argument('--top-standoff', type=float, default=0.12,
                         help='TOP DOWN: the tip flies (tool level) to this far above the top, '
                              'the wrist turns down there, then it goes straight down, m')
@@ -672,14 +684,15 @@ def make_parser():
                              'fingertips meet at one point. Off by default: the gripper is '
                              'never commanded, and the point is aimed midway between the '
                              'fingertips')
-    parser.add_argument('--hold', type=float, default=2.0, help='seconds to stay touching')
+    parser.add_argument('--hold', type=float, default=0.8,
+                        help='seconds to stay touching (the vacuum seals in well under 1 s)')
     parser.add_argument('--top-down', action='store_true',
                         help='start with TOP DOWN on: approach straight down from --standoff '
                              'above the point (objects lying flat) instead of level')
     parser.add_argument('--drop-hold', type=float, default=1.0,
                         help='after a touch: seconds at drop_state before pre_pick '
                              '(negative: skip the drop pose, return straight to pre_pick)')
-    parser.add_argument('--fast-line-speed', type=float, default=0.06,
+    parser.add_argument('--fast-line-speed', type=float, default=0.08,
                         help='tool speed for the straight line in (to 1 cm short) and out, m/s')
     parser.add_argument('--contact-speed', type=float, default=0.015,
                         help='tool speed for the last, guarded centimetre, m/s')
@@ -701,6 +714,38 @@ def make_parser():
                         help='fingertip error at the approach worth correcting, m')
     parser.add_argument('--corrections', type=int, default=1,
                         help='correction moves at the approach point, at most')
+    parser.add_argument('--plan-budget', type=float, default=30.0,
+                        help='seconds the reach check may search; nothing by then: not from '
+                             'here (the pick stack then asks the wheels: base_adjust)')
+    parser.add_argument('--edge', choices=['try', 'adjust'], default='try',
+                        help='a point reachable only at the edge of reach (no room to correct '
+                             'the tool): try it, or count it as not reachable from here '
+                             '(adjust: the pick stack asks the wheels to move)')
+    parser.add_argument('--prefer-top', action=argparse.BooleanOptionalAction, default=True,
+                        help='a FRONT target on a face narrower than --narrow-face-mm, of a box '
+                             'with nothing on it and a wide top (box size known), is picked from '
+                             'the TOP instead')
+    parser.add_argument('--narrow-face-mm', type=float, default=45.0,
+                        help='front faces narrower than this (short side, mm) prefer the top')
+    parser.add_argument('--edge-face-mm', type=float, default=25.0,
+                        help='an edge-of-reach plan (no room to correct) is still flown when the '
+                             'face to grip is at least this wide (short side, mm). 25: the cup fits '
+                             'on it -- the user asked to pick a 28 mm face there rather than move the '
+                             'base (2026-10-30); the arm still goes in only within --max-miss of it')
+    parser.add_argument('--min-depth', type=float, default=0.35,
+                        help='nearer to the camera than this (m), its depth is not trusted: '
+                             'not picked from here')
+    parser.add_argument('--press-retries', type=int, default=2,
+                        help='presses again, 5 mm deeper and 0.5 s longer, when the joint '
+                             'torques show nothing on the cup after a press')
+    parser.add_argument('--held-min-g', type=float, default=30.0,
+                        help='weight on the cup (from the joint torques, held still before '
+                             'and after the press) that counts as holding the box, g')
+    parser.add_argument('--short-corrections', type=int, default=3,
+                        help='correction moves 5 cm short of the box, at most (each ~1.5 s)')
+    parser.add_argument('--short-tolerance', type=float, default=0.004,
+                        help='fingertip error 5 cm short worth another correction, m (the '
+                             '25 mm cup centred within 4 mm still seals)')
     parser.add_argument('--no-auto-apply', action='store_true',
                         help='CALIBRATE stops at the result; APPLY writes it')
     parser.add_argument('--calib-points-per-arm', type=int, default=6,
@@ -713,6 +758,13 @@ def make_parser():
                         help='velocity and acceleration scaling for the long moves, 0..1')
     parser.add_argument('--touch-velocity', type=float, default=0.1,
                         help='scaling for the retreat when the straight line out fails')
+    parser.add_argument('--held-velocity', type=float, default=0.4,
+                        help='velocity scaling (acceleration: its square) for the moves with the '
+                             'box maybe on the cup, until the drop: at 1.0 the yank swung it into '
+                             'the boxes beside it (2026-10-30)')
+    parser.add_argument('--held-line-speed', type=float, default=0.03,
+                        help='tool speed for the straight lines out with the box maybe on the '
+                             'cup, m/s (--fast-line-speed otherwise)')
     parser.add_argument('--planning-time', type=float, default=5.0)
     parser.add_argument('--attempts', type=int, default=3,
                         help='cuMotion resends per goal on PLANNING_FAILED')

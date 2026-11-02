@@ -42,7 +42,8 @@ from ctm import depth_cal
 from ctm import walls
 from ctm.common import (BASE_FRAME, COLOR_TOPIC, DEPTH_TOPIC, FINGERTIP_BEYOND_TCP,
                         HOME_JOINTS, INFO_TOPIC,
-                        MoveGroupDown, OCTOMAP_NAME, RETRYABLE, SCREW_FRAME, WS, arm_joints,
+                        MoveGroupDown, OCTOMAP_NAME, RETRYABLE, SCREW_FRAME, WS, APP_DIR,
+                        OPENARM_URDF, OPENARM_YML, arm_joints,
                         decode_image, gripper_links, matrix_from_quat, pixel_ray,
                         quat_from_matrix, rot_about, tool_frame_along)
 
@@ -146,6 +147,21 @@ def held_spheres(rot, centre, ext):
     return out
 
 
+TIMED_OUT = object()      # move_group did not answer (not "no solution": never cached)
+EARLY_CONTACT_M = 0.03    # a contact this far before the measured surface is not one
+BLOCKED_LAG_M = 0.02      # the command this far ahead and the arm never got going: blocked
+START_MOVE_M = 0.003      # ... nor before the arm is rolling: moved this far, and seen
+                          # advancing (the start-up stall winds the torque up like a push)
+# Contact needs the tip STUCK: under STUCK_M of progress over the last STUCK_S
+# while the command runs on. The arm stick-slips along a slow line -- pauses
+# of 0.1-0.2 s, joint torques swinging 0.7-1.1 Nm in free air -- and a torque
+# rise alone (or an 80 ms stall) read as contact 3-7 mm into EVERY press since
+# 2026-10-28, the cup 2.5 cm above the box. Rolling free it never gained under
+# 1.8 mm in 0.3 s (2.2 mm in 0.35 s; 9 press traces, 2026-10-28..30).
+STUCK_S = 0.35
+STUCK_M = 0.001
+
+
 class ClickToMove(Node):
     def __init__(self, args):
         super().__init__('click_to_move')
@@ -154,7 +170,14 @@ class ClickToMove(Node):
         # STOP (web GUI, pick stack): cancels the goals running now and refuses
         # new ones until resume() -- the arms hold where they are
         self.halt = threading.Event()
-        self.active_goals = {}          # id(handle) -> handle (goal handles are not hashable)
+        self.active_goals = {}          # id(handle) -> (handle, arms) (handles are not hashable)
+        self._acm_lock = threading.RLock()  # the collision matrix: read, change, write back
+        # straight to each arm's trajectory controller: the one way to stop a
+        # move at once (move_group's ExecuteTrajectory cancel did nothing -- a
+        # contact move ran 4.7 s past the felt contact, 2026-10-28)
+        self.hold_pubs = {arm: self.create_publisher(
+            JointTrajectory, f'/{arm}_joint_trajectory_controller/joint_trajectory', 10)
+            for arm in ('left', 'right')}
         # the object size for the next pick (/beast_arm/held_object/size):
         # (height, width, depth) m and who said so, or None; and what each
         # arm holds now: {arm: {'size': (h, w, d), ...}}
@@ -297,7 +320,7 @@ class ClickToMove(Node):
     def _retract_configs(self):
         """cuRobo's retract_config from openarm.yml, per arm: a good IK seed."""
         try:
-            with open(os.path.join(WS, 'openarm.yml')) as handle:
+            with open(OPENARM_YML) as handle:
                 cspace = yaml.safe_load(handle)['robot_cfg']['kinematics']['cspace']
             table = dict(zip(cspace['joint_names'], cspace['retract_config']))
             return {arm: [table[n] for n in arm_joints(arm)] for arm in ('left', 'right')}
@@ -345,7 +368,7 @@ class ClickToMove(Node):
         if not hasattr(self, '_limits'):
             self._limits = {}
             try:
-                with open(os.path.join(WS, 'openarm.urdf')) as handle:
+                with open(OPENARM_URDF) as handle:
                     urdf = handle.read()
                 for a in ('left', 'right'):
                     lim = []
@@ -498,16 +521,26 @@ class ClickToMove(Node):
             return None
         return future.result()
 
-    def wait_or_dead(self, future, timeout):
+    def wait_or_dead(self, future, timeout, handle=None, arms=()):
         """wait(), but checking every 5 s that move_group is still there, so
-        a crash mid-goal is reported in seconds rather than after `timeout`."""
+        a crash mid-goal is reported in seconds rather than after `timeout`;
+        and, for a goal that moves `arms`, STOP every 50 ms (held at the
+        controllers: move_group's cancel does not stop the arm)."""
         done = threading.Event()
         future.add_done_callback(lambda _f: done.set())
         deadline = time.monotonic() + timeout
-        while not done.wait(5.0):
-            if time.monotonic() > deadline:
+        alive_at = time.monotonic() + 5.0
+        while not done.wait(0.05):
+            if handle is not None and self.halt.is_set():
+                self._hold_until_done(handle, done, arms)
                 return None
-            self.require_move_group()
+            if time.monotonic() > deadline:
+                if handle is not None:
+                    self._hold_until_done(handle, done, arms, seconds=0.5)
+                return None
+            if time.monotonic() > alive_at:
+                alive_at = time.monotonic() + 5.0
+                self.require_move_group()
         return future.result()
 
     def publish_marker(self, point):
@@ -568,6 +601,13 @@ class ClickToMove(Node):
         disable_collisions entry from the SRDF (see pick_place_orchestrator's
         current_acm).
         """
+        with self._acm_lock:                         # one read-modify-write at a time
+            return self._allow_grippers_in_octomap(touching, held_free)
+
+    def _allow_grippers_in_octomap(self, touching=None, held_free=None):
+        if touching is None:                         # an outer fingers_touching() holds
+            touching = next((a for a, n in self.__dict__.get('_touch_hold', {}).items()
+                             if n > 0), None)
         if not (self.scene_query.wait_for_service(timeout_sec=5.0)
                 and self.scene_apply.wait_for_service(timeout_sec=5.0)):
             return False, 'planning scene services unavailable; gripper not exempted'
@@ -634,14 +674,21 @@ class ClickToMove(Node):
     @contextlib.contextmanager
     def fingers_touching(self, arm):
         """While inside: this arm's two fingers may touch the octomap (the last
-        few cm onto the clicked surface). Revoked on the way out, always."""
-        ok, message = self.allow_grippers_in_octomap(touching=arm)
-        if not ok:
-            self.get_logger().warn(f'{arm} fingers: {message}')
+        few cm onto the clicked surface). Revoked on the way out, always --
+        but not while an outer one still holds (nested: an approach point
+        closer than NEAR keeps the tool exempt for the whole touch)."""
+        hold = self.__dict__.setdefault('_touch_hold', {})
+        with self._acm_lock:
+            hold[arm] = hold.get(arm, 0) + 1
         try:
+            ok, message = self.allow_grippers_in_octomap(touching=arm)
+            if not ok:
+                self.get_logger().warn(f'{arm} fingers: {message}')
             yield ok
         finally:
-            self.allow_grippers_in_octomap(touching=None)
+            with self._acm_lock:
+                hold[arm] -= 1
+            self._revoke()
 
     @contextlib.contextmanager
     def held_leaving(self, arm):
@@ -654,7 +701,21 @@ class ClickToMove(Node):
         try:
             yield ok
         finally:
-            self.allow_grippers_in_octomap()
+            self._revoke()
+
+    def _revoke(self):
+        """Back to the octomap checks as they were before an exemption (an
+        outer one still held stays). Retried: a revoke move_group missed left
+        the tool exempt for every later plan (2026-10-28 review)."""
+        for attempt in range(3):
+            ok, message = self.allow_grippers_in_octomap()
+            if ok:
+                return True
+            time.sleep(0.3)
+        self.get_logger().error(f'the octomap exemption could not be switched off ({message}): '
+                                f'plans may let the tool through the map - restart if it '
+                                f'persists')
+        return False
 
     def attach_held(self, arm, size_hwd, tip_offset, exact=None):
         """The box this arm just picked, in both planners. True if attached.
@@ -1075,7 +1136,49 @@ class ClickToMove(Node):
         time.sleep(0.15)                 # robot_state_publisher's tf catches up
         return worst
 
+    @contextlib.contextmanager
+    def planning_cache(self):
+        """While inside (a reach check, nothing moving, the scene fixed): the
+        same IK or straight-line question is asked of move_group once -- the
+        line in, the contact and the correction room repeat for every
+        approach point. Yields the stats: {kind: [calls, asked, seconds]}."""
+        self._plan_cache, self._plan_stats = {}, {}
+        self._plan_owner = threading.get_ident()     # only this thread's questions
+        try:
+            yield self._plan_stats
+        finally:
+            self._plan_cache = self._plan_stats = self._plan_owner = None
+
+    def _cached(self, kind, key, ask):
+        """ask() once per key inside planning_cache(); timed either way."""
+        cache, stats = getattr(self, '_plan_cache', None), getattr(self, '_plan_stats', None)
+        if cache is None or stats is None or \
+                getattr(self, '_plan_owner', None) != threading.get_ident():
+            got = ask()
+            return None if got is TIMED_OUT else got
+        held = tuple(sorted(a for a, n in self.__dict__.get('_touch_hold', {}).items()
+                            if n > 0))                   # what may touch the octomap
+        key = (kind, held) + key
+        rec = stats.setdefault(kind, [0, 0, 0.0])
+        rec[0] += 1
+        if key in cache:
+            return cache[key]
+        t0 = time.monotonic()
+        got = ask()
+        rec[1] += 1
+        rec[2] += time.monotonic() - t0
+        if got is TIMED_OUT:                         # move_group busy: ask again next time
+            return None
+        cache[key] = got
+        return got
+
     def solve_ik(self, arm, position, quat, seed):
+        r = lambda v, d: tuple(np.round(np.asarray(v, float).ravel(), d))
+        got = self._cached('ik', (arm, r(position, 4), r(quat, 4), r(seed, 3)),
+                           lambda: self._solve_ik(arm, position, quat, seed))
+        return list(got) if got is not None else None
+
+    def _solve_ik(self, arm, position, quat, seed):
         req = GetPositionIK.Request()
         ik = req.ik_request
         ik.group_name = f'{arm}_arm'
@@ -1093,7 +1196,7 @@ class ClickToMove(Node):
         result = self.wait(self.ik_client.call_async(req), 3.0)
         if result is None:
             self.require_move_group()
-            return None
+            return TIMED_OUT
         if result.error_code.val != MoveItErrorCodes.SUCCESS:
             return None
         found = dict(zip(result.solution.joint_state.name,
@@ -1163,7 +1266,7 @@ class ClickToMove(Node):
         if not hasattr(self, '_td'):
             self._td = None
             try:
-                raw = dict(np.load(os.path.join(WS, 'ctm', 'topdown_seeds.npz')))
+                raw = dict(np.load(os.path.join(APP_DIR, 'ctm', 'topdown_seeds.npz')))
                 for arm in ('left', 'right'):
                     if f'{arm}_yaw' in raw:          # the tool x axis's heading per entry
                         raw[f'{arm}_turn'] = np.array([
@@ -1176,6 +1279,17 @@ class ClickToMove(Node):
         return self._td
 
     def cartesian_plan(self, arm, position, quat, start_joints=None, check=True, via=None):
+        r = lambda v, d: None if v is None else tuple(np.round(np.asarray(v, float).ravel(), d))
+        key = (arm, r(position, 4), r(quat, 4), r(start_joints, 3), check,
+               tuple((r(p, 4), r(q, 4)) for p, q in (via or [])))
+        if start_joints is None:                     # from where the arm is: not cacheable
+            got = self._cartesian_plan(arm, position, quat, start_joints, check, via)
+            return (0.0, None, None) if got is TIMED_OUT else got
+        got = self._cached('line', key, lambda: self._cartesian_plan(
+            arm, position, quat, start_joints, check, via))
+        return (0.0, None, None) if got is None else got
+
+    def _cartesian_plan(self, arm, position, quat, start_joints=None, check=True, via=None):
         """Straight line of hand_tcp to `position`, planned, not moved.
 
         From where the arm is, or from `start_joints` (so a whole touch can
@@ -1214,7 +1328,7 @@ class ClickToMove(Node):
         result = self.wait(self.cartesian_client.call_async(req), 10.0)
         if result is None:
             self.require_move_group()
-            return 0.0, None, None
+            return TIMED_OUT
         if result.error_code.val != MoveItErrorCodes.SUCCESS:
             return 0.0, None, None
         trajectory = result.solution
@@ -1253,9 +1367,10 @@ class ClickToMove(Node):
             point.accelerations = [a * scale * scale for a in point.accelerations]
         return wanted
 
-    def retrace(self, arm, trajectory, label):
+    def retrace(self, arm, trajectory, label, scale=1.0):
         """Fly a planned trajectory backwards from where the arm is now: a
-        short lead-in onto its last point, then the same path in reverse.
+        short lead-in onto its last point, then the same path in reverse --
+        `scale` times as fast (velocities x scale, accelerations x scale^2).
         The way back is then the way in -- already checked, and nothing to
         plan (cuMotion's optimiser can fail the reverse of a move it just
         planned, near the edge of reach: 3/3 in simulation, 2026-10-07).
@@ -1274,18 +1389,20 @@ class ClickToMove(Node):
         if gap > 0.4:                # TEACH nudges can move it ~0.3 rad off the path
             return False
         lead = max(0.3, gap / 0.3) if gap > 0.002 else 0.0     # <= 0.3 rad/s onto the path
-        total = seconds(jt.points[-1])
+        scale = min(1.0, max(0.05, float(scale)))
+        total = seconds(jt.points[-1]) / scale
         out = JointTrajectory()
         out.joint_names = names
         if lead:
             out.points.append(JointTrajectoryPoint(positions=[float(v) for v in now],
                                                    velocities=[0.0] * len(names)))
         for k, p in enumerate(reversed(jt.points)):
-            t = lead + total - seconds(p)
+            t = lead + total - seconds(p) / scale
             q = JointTrajectoryPoint()
             q.positions = [float(v) for v in (now if (k == 0 and not lead) else p.positions)]
-            q.velocities = [-float(v) for v in p.velocities] if p.velocities else []
-            q.accelerations = [float(v) for v in p.accelerations] if p.accelerations else []
+            q.velocities = [-float(v) * scale for v in p.velocities] if p.velocities else []
+            q.accelerations = ([float(v) * scale * scale for v in p.accelerations]
+                               if p.accelerations else [])
             q.time_from_start.sec = int(t)
             q.time_from_start.nanosec = int((t % 1.0) * 1e9)
             out.points.append(q)
@@ -1294,10 +1411,78 @@ class ClickToMove(Node):
         ok, _ = self.execute(robot, label, timeout=total + lead + 20.0)
         return ok
 
+    def still_torque(self, arm, settle=0.5, window=0.4):
+        """The arm held still: let it settle `settle` s, then its joints and the
+        mean (and noise of the mean) of its torques over `window` s. None if no
+        /joint_states."""
+        self.settle(arm, None, timeout=settle)
+        qs, es = [], []
+        t_end = time.monotonic() + window
+        while time.monotonic() < t_end:
+            q, e = self.arm_positions(arm), self.arm_efforts(arm)
+            if q is not None and e is not None:
+                qs.append(q)
+                es.append(e)
+            time.sleep(0.01)
+        if len(es) < 5:
+            return None
+        es = np.array(es)
+        return {'q': np.mean(qs, axis=0), 'tau': es.mean(0),
+                'noise': es.std(0) / np.sqrt(len(es)) + 0.01}
+
+    def held_grams(self, arm, before, after, centre):
+        """What the tool holds, from the torques held still at the same spot
+        before and after the press: (grams, +- grams). The box's weight at
+        `centre` (world) loads the shoulder and elbow (joints 1-4, the long
+        levers) by (unit-mass torque x m); the arm's own gravity at the two
+        slightly different postures is taken out with the URDF. The torques
+        oppose gravity (sign measured by WEIGH TOOL, 2026-10-27)."""
+        from ctm.kinematics import Arm, G
+        kin = self._kin.get(arm) if hasattr(self, '_kin') else None
+        if kin is None:
+            self._kin = getattr(self, '_kin', {})
+            kin = self._kin[arm] = Arm(arm)
+        q = np.asarray(after['q'], float)
+        _frames, joints = kin.frames(q)
+        unit = np.array([axis @ np.cross(np.asarray(centre) - origin, G)
+                         for origin, axis in joints])            # N m per kg
+        own = kin.gravity_torque(q) - kin.gravity_torque(np.asarray(before['q'], float))
+        d = (after['tau'] - before['tau']) + own                 # the box's share
+        j = slice(0, 4)
+        nn = float(unit[j] @ unit[j])
+        if nn < 1e-6:
+            return None, None
+        m = -float(d[j] @ unit[j]) / nn
+        noise = float(np.sqrt(np.sum(unit[j] ** 2 * (after['noise'][j] ** 2 +
+                                                     before['noise'][j] ** 2))) / nn)
+        return 1000.0 * m, 1000.0 * noise
+
+    def hold_here(self, arm):
+        """Stop `arm` now: its controller is sent one point, where the joints
+        are, which replaces whatever trajectory it runs. True if sent."""
+        here = self.arm_positions(arm)
+        if here is None:
+            return False
+        jt = JointTrajectory()
+        jt.joint_names = arm_joints(arm)
+        p = JointTrajectoryPoint()
+        p.positions = [float(v) for v in here]
+        p.velocities = [0.0] * len(here)
+        p.time_from_start.nanosec = 50_000_000       # 50 ms: from where it is, so no jump
+        jt.points.append(p)
+        self.hold_pubs[arm].publish(jt)
+        return True
+
     def stop_motion(self):
-        """STOP: cancel every running goal; nothing moves until resume()."""
+        """STOP: both arms held where they are (at their controllers), every
+        running goal cancelled; nothing moves until resume()."""
         self.halt.set()
-        for handle in list(self.active_goals.values()):
+        goals = list(self.active_goals.values())
+        # only the arms that are moving: holding an idle arm where it sags to
+        # would lower it (2026-10-28 review)
+        for arm in sorted({a for _h, arms in goals for a in arms}):
+            self.hold_here(arm)
+        for handle, _arms in goals:
             try:
                 handle.cancel_goal_async()
             except Exception:                        # noqa: BLE001 - finished meanwhile
@@ -1328,37 +1513,57 @@ class ClickToMove(Node):
         if handle is None or not handle.accepted:
             self.get_logger().error(f'{label}: trajectory rejected')
             return False, False
-        self.active_goals[id(handle)] = handle
+        names = list(trajectory.joint_trajectory.joint_names)
+        arms = [a for a in ('left', 'right') if any(f'_{a}_' in n for n in names)]
+        self.active_goals[id(handle)] = (handle, arms)
         try:
-            return self._execute_wait(handle, label, timeout, watch)
+            return self._execute_wait(handle, label, timeout, watch, arms)
         finally:
             self.active_goals.pop(id(handle), None)
 
-    def _execute_wait(self, handle, label, timeout, watch):
+    def _execute_wait(self, handle, label, timeout, watch, arms=()):
         future = handle.get_result_async()
         done = threading.Event()
         future.add_done_callback(lambda _f: done.set())
         deadline = time.monotonic() + timeout
         while not done.wait(0.01):
             if self.halt.is_set():
-                self.wait(handle.cancel_goal_async(), 3.0)
-                done.wait(2.0)
+                self._hold_until_done(handle, done, arms)
                 self.get_logger().error(f'{label}: STOP')
                 return False, False
-            if watch is not None and watch():
-                self.wait(handle.cancel_goal_async(), 3.0)
-                done.wait(2.0)
+            try:
+                hit = watch is not None and watch()
+            except Exception:                        # noqa: BLE001 - never leave it moving
+                self._hold_until_done(handle, done, arms, seconds=0.5)
+                raise
+            if hit:
+                # held at the controller at once; move_group's goal then ends
+                # (its cancel alone never stopped the arm)
+                self._hold_until_done(handle, done, arms, seconds=0.5)
                 return True, True
             if time.monotonic() > deadline:
-                handle.cancel_goal_async()
+                self._hold_until_done(handle, done, arms, seconds=0.5)
+                self.get_logger().error(f'{label}: timed out; held and cancelled')
                 self.require_move_group()
-                self.get_logger().error(f'{label}: timed out; cancelled')
                 return False, False
         code = future.result().result.error_code.val
         if code != MoveItErrorCodes.SUCCESS:
             self.get_logger().error(f'{label}: execution failed, code {code}')
             return False, False
         return True, False
+
+    def _hold_until_done(self, handle, done, arms, seconds=2.0):
+        """Hold `arms` at their controllers and cancel the goal -- re-sending the
+        hold every 50 ms until move_group's goal ends (or `seconds`): a hold
+        sent before move_group has passed the trajectory on would be replaced
+        by it (2026-10-28 review)."""
+        handle.cancel_goal_async()
+        t_end = time.monotonic() + seconds
+        while True:
+            for arm in arms:
+                self.hold_here(arm)
+            if done.wait(0.05) or time.monotonic() > t_end:
+                return
 
     def line_move(self, arm, position, quat, label, speed=None, check=True, via=None,
                   length=None):
@@ -1463,9 +1668,10 @@ class ClickToMove(Node):
         """Straight line towards `position`, slow, stopping on contact.
 
         Contact is a joint torque rising by more than --contact-torque (and
-        6x its resting noise) against half a second before, for 30 ms, AND
-        the tool stalled: under 0.5 mm of progress in 0.12 s while the
-        command still moves on. Whatever happens, a joint torque rising by
+        6x its resting noise) against 0.3 s before, for 20 ms, AND the tool
+        stuck: under STUCK_M of progress in STUCK_S while the command still
+        moves on -- with the vacuum tool too (a torque rise alone stopped
+        every press 3-7 mm in, 2026-10-28..30). Whatever happens, a joint torque rising by
         --max-touch-torque against half a second before (after the first
         0.8 s) stops it. Torque alone
         was not enough: in a TOP DOWN posture the left
@@ -1513,14 +1719,20 @@ class ClickToMove(Node):
             length = fraction * length
         # A tool on (the rubber vacuum extension) squashes: the tip keeps
         # creeping on contact, so "stopped advancing" shows late and the push
-        # builds. With a tool: slower, a lower limit, and contact on the
-        # torque rise alone.
+        # builds. With a tool: slower and a lower torque limit near the
+        # surface, which ends the press. (Contact on the torque rise alone,
+        # as it was, fired on the arm's stick-slip 3-7 mm in, 2026-10-30.)
         soft = bool(getattr(args, 'tools', {}).get(arm, {}).get('on'))
         max_torque = min(args.max_touch_torque, args.soft_tool_torque) if soft \
             else args.max_touch_torque
         wanted = self.retime(trajectory, length,
                              min(args.contact_speed, 0.01) if soft else args.contact_speed)
         watch = None
+        if args.contact_torque > 0 and len(samples) < 10:
+            # no torques to watch: no contact, and no torque limit either -- do
+            # not push blind into a box
+            self.get_logger().error(f'{label}: no joint torques to watch - not moving in')
+            return None, False
         if args.contact_torque > 0 and len(samples) >= 10:
             base = np.array(samples)
             noise = base.std(0)
@@ -1533,31 +1745,57 @@ class ClickToMove(Node):
                                0.8 * max_torque)
             history = collections.deque([(time.monotonic(), e) for e in samples])
             p0 = m[:3, 3] if m is not None else None
-            way = ((np.asarray(position) - p0) / max(length, 1e-6)) if p0 is not None else None
+            # the unit direction of the line (length may have been cut to the
+            # part that solves: dividing by it made progress read 1/fraction high)
+            way = None
+            if p0 is not None:
+                d = np.asarray(position, float) - p0
+                way = d / max(float(np.linalg.norm(d)), 1e-6)
             track = collections.deque()                 # (time, progress along the line)
+            slow = collections.deque()                  # the same over STUCK_S
             t0 = time.monotonic()
+            # where the surface is along the line (needed: up to it, +3 mm). A
+            # contact counts only within EARLY_CONTACT_M of it: as the slow line
+            # starts, the arm lags its command (no progress) and its controller
+            # pushes to catch up -- that read as contact 0.4 s in, 3 cm out,
+            # every pick (2026-10-28; hidden while move_group's cancel did not
+            # stop the arm and it went on to the box anyway)
+            surface = (needed - 0.003) if needed is not None else max(
+                0.0, length - args.past_contact)
+            trace = []                                  # (s, mm in, torque rise per joint)
+            rolling = {'on': False}                     # the arm has got going
             count = {'contact': 0, 'cap': 0}
 
-            def stalled():
+            def stuck():
+                """True when the tip is blocked: rolling, under STUCK_M of
+                progress over the last STUCK_S, the command running on. (An
+                80 ms stall was the test before: the arm stick-slips, pausing
+                0.1-0.2 s in free air -- 2026-10-30.)"""
                 if p0 is None:
                     return True                         # cannot tell: torque decides
                 now = time.monotonic()
                 tcp = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
                 if tcp is None:
                     return True
-                track.append((now, float((tcp[:3, 3] - p0) @ way)))
-                # 0.12 s, not 0.2: every 0.1 s of waiting for the stall to show
-                # is ~0.4 Nm more push on the surface (simulated, 2026-10-13)
-                # 0.08 s: wall contacts show on the elbow (joint 4) at 0.33-0.46 Nm
-                # by then (robot logs, 2026-10-15); each 0.04 s waited is ~0.6 mm
-                # more push at contact speed
+                progress = float((tcp[:3, 3] - p0) @ way)
+                track.append((now, progress))
+                slow.append((now, progress))
+                # rolling is told over 80 ms; stuck over STUCK_S (slow[0]: the
+                # newest sample at least STUCK_S old)
                 while track and now - track[0][0] > 0.08:
                     track.popleft()
-                if now - t0 < 0.3 or len(track) < 3:
+                while len(slow) > 1 and now - slow[1][0] >= STUCK_S:
+                    slow.popleft()
+                # rolling: past the start-up stall -- moved START_MOVE_M and, over
+                # the last 80 ms, advancing at a third of the contact speed or more
+                if not rolling['on'] and len(track) >= 3 and track[-1][1] >= START_MOVE_M and \
+                        (track[-1][1] - track[0][1]) >= 0.33 * (length / wanted) * \
+                        (track[-1][0] - track[0][0]):
+                    rolling['on'] = True
+                if not rolling['on'] or now - slow[0][0] < STUCK_S - 0.02:
                     return False                        # still getting going
                 commanded = min(1.0, (now - t0) / wanted) * length
-                moved = track[-1][1] - track[0][1]
-                return moved < 0.0005 and commanded - track[-1][1] > 0.0015
+                return progress - slow[0][1] < STUCK_M and commanded - progress > 0.002
 
             def past(seconds):
                 """The torques `seconds` ago (the oldest kept if not that old)."""
@@ -1569,7 +1807,7 @@ class ClickToMove(Node):
 
             def watch():
                 e = self.arm_efforts(arm)
-                is_stalled = stalled()
+                is_stuck = stuck()
                 if e is None:
                     return False
                 now = time.monotonic()
@@ -1585,29 +1823,86 @@ class ClickToMove(Node):
                 # above the box (2026-10-14); at contact speed it is still >2 cm
                 # out then
                 big = np.abs(e - past(0.5)) if now - t0 >= 0.8 else np.zeros_like(e)
-                count['cap'] = count['cap'] + 1 if np.any(big > max_torque) else 0
+                # the tool's soft limit only where it can be pressed: near the
+                # surface. Further out the arm, at rest, needs more than 1 Nm to
+                # get going at contact speed -- that stopped every pick 3 cm short
+                # with the tip not yet moving (2026-10-28); the arm's own limit
+                # still holds there
+                progress = track[-1][1] if track else 0.0
+                # armed: rolling, and within EARLY_CONTACT_M of the measured surface
+                # (or past it) -- a torque rise then is the press of a contact
+                near = p0 is None or (rolling['on'] and progress >= surface - EARLY_CONTACT_M)
+                # never got going while the command ran BLOCKED_LAG_M ahead: blocked
+                # (a box nearer than measured; the start-up stall lags ~1 cm at most)
+                commanded = min(1.0, (now - t0) / wanted) * length
+                if p0 is not None and not rolling['on'] and commanded - progress > BLOCKED_LAG_M:
+                    self.get_logger().info(
+                        f'{label}: contact (blocked: {1000 * commanded:.0f} mm commanded, '
+                        f'{1000 * progress:.0f} mm moved)')
+                    return True
+                cap = max_torque if near else args.max_touch_torque
+                trace.append((round(now - t0, 3), round(1000 * progress, 1),
+                              [round(float(v), 2) for v in e - past(0.5)]))
+                count['cap'] = count['cap'] + 1 if np.any(big > cap) else 0
                 if count['cap'] >= 2:
                     j = int(np.argmax(big))
                     self.get_logger().warn(
                         f'{label}: stopped at the torque limit ({names[j]} '
-                        f'{big[j]:.2f} Nm, max {max_torque:.1f})')
+                        f'{big[j]:.2f} Nm, max {cap:.1f}, {1000 * progress:.0f} of '
+                        f'{1000 * surface:.0f} mm in)')
                     return True
-                # contact: blocked (no progress) and a torque rising against 0.3 s ago
+                # contact: stuck (no progress over STUCK_S) and a torque rising
+                # against 0.3 s ago, near the surface only (the hard limit above
+                # holds everywhere). Stuck for the vacuum tool too: its rubber
+                # creeps on as it squashes, and the soft limit above ends that
+                # press; a torque rise alone fired on the arm's stick-slip
                 rise = np.abs(e - past(0.3))
+                if p0 is not None and not near:
+                    count['contact'] = 0
+                    return False
                 count['contact'] = count['contact'] + 1 if np.any(rise > limit) else 0
-                if (count['contact'] >= 2 or noise.max() > 1.0) and (is_stalled or (
-                        soft and count['contact'] >= 2 and now - t0 >= 0.8)):
+                if (count['contact'] >= 2 or noise.max() > 1.0) and is_stuck:
                     j = int(np.argmax(rise / limit))
-                    self.get_logger().info(f'{label}: contact ({names[j]} {rise[j]:+.2f} Nm '
-                                           f'in 0.3 s, stopped advancing)')
+                    self.get_logger().info(
+                        f'{label}: contact ({names[j]} {rise[j]:+.2f} Nm in 0.3 s, stuck '
+                        f'{1000 * progress:.0f} of {1000 * surface:.0f} mm in)')
                     return True
                 return False
         ok, stopped = self.execute(trajectory, label, timeout=wanted + 20.0, watch=watch)
+        if watch is not None:
+            self._save_trace(label, stopped, surface, trace)
         if not ok:
             return None, False
         return (self.arm_positions(arm) if stopped else final), stopped
 
+    def _save_trace(self, label, stopped, surface, trace):
+        """Each guarded line's progress and torques, every 10 ms, to
+        native/logs/guarded_lines.jsonl (the last 50 lines kept)."""
+        import json
+        path = os.path.join(WS, 'native', 'logs', 'guarded_lines.jsonl')
+        try:
+            old = open(path).read().splitlines()[-49:] if os.path.exists(path) else []
+            rec = {'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'label': label,
+                   'stopped': bool(stopped), 'surface_mm': round(1000 * surface, 1),
+                   'trace': trace}
+            with open(path, 'w') as f:
+                f.write('\n'.join(old + [json.dumps(rec)]) + '\n')
+        except (OSError, ValueError):
+            pass
+
     def plan_joints(self, arm, positions, velocity=None, tries=2):
+        stats = getattr(self, '_plan_stats', None)
+        t0 = time.monotonic()
+        try:
+            return self._plan_joints(arm, positions, velocity, tries)
+        finally:
+            if stats is not None:
+                rec = stats.setdefault('path', [0, 0, 0.0])
+                rec[0] += 1
+                rec[1] += 1
+                rec[2] += time.monotonic() - t0
+
+    def _plan_joints(self, arm, positions, velocity=None, tries=2):
         """A plan to `positions`, not executed: (code, trajectory).
 
         cuMotion, retried once (its optimiser starts from random seeds). A
@@ -1724,9 +2019,11 @@ class ClickToMove(Node):
             if handle is None or not handle.accepted:
                 self.get_logger().error(f'{label}: goal rejected by move_group')
                 return MoveItErrorCodes.FAILURE
-            self.active_goals[id(handle)] = handle
+            arms = [a for a in ('left', 'right') if goal.request.group_name.startswith(a)]
+            self.active_goals[id(handle)] = (handle, arms)
             try:
-                result = self.wait_or_dead(handle.get_result_async(), self.args.motion_timeout)
+                result = self.wait_or_dead(handle.get_result_async(), self.args.motion_timeout,
+                                           handle=handle, arms=arms)
             finally:
                 self.active_goals.pop(id(handle), None)
             if self.halt.is_set():

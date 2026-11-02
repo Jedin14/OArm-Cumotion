@@ -2,10 +2,10 @@
 #
 # One-command install for the 7DOF-OArm workspace.
 #
-#   ./install.sh                 # everything (native cuMotion stack + VLM)
-#   ./install.sh --native-only   # skip the VLM detector environment
-#   ./install.sh --vlm-only      # only the VLM detector environment
-#   ./install.sh --check         # verify an existing install, change nothing
+#   native/install.sh            # the native cuMotion + MoveIt stack
+#   native/install.sh --check    # verify an existing install, change nothing
+#
+# The box picker (SAM 3.1) has its own environment: box_picker/src/setup.sh.
 #
 # What this does NOT do, by design:
 #
@@ -23,16 +23,13 @@
 #
 set -euo pipefail
 
-WS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"     # this script is in native/
 cd "${WS_DIR}"
 
 DO_NATIVE=1
-DO_VLM=1
 CHECK_ONLY=0
 
 case "${1:-}" in
-    --native-only) DO_VLM=0 ;;
-    --vlm-only)    DO_NATIVE=0 ;;
     --check)       CHECK_ONLY=1 ;;
     "")            ;;
     -h|--help)     sed -n '2,/^[^#]/p' "${BASH_SOURCE[0]}" \
@@ -182,7 +179,7 @@ if [[ ${fail} -ne 0 ]]; then
 fi
 
 if [[ ${CHECK_ONLY} -eq 1 ]]; then
-    exec "${WS_DIR}/check_isolation.sh"
+    exec "${WS_DIR}/native/check_isolation.sh"
 fi
 
 # --- native stack -----------------------------------------------------------
@@ -191,15 +188,9 @@ if [[ ${DO_NATIVE} -eq 1 ]]; then
     ./native/bootstrap.sh
 fi
 
-# --- VLM stack --------------------------------------------------------------
-if [[ ${DO_VLM} -eq 1 ]]; then
-    banner "VLM detector environment  (VLM/.venv)"
-    ./VLM/bootstrap.sh
-fi
-
 # --- isolation proof --------------------------------------------------------
 banner "isolation check"
-./check_isolation.sh || true
+./native/check_isolation.sh || true
 
 # --- what is left for the operator -----------------------------------------
 banner "install complete"
@@ -230,6 +221,12 @@ cat <<'EOF'
     sudo ip link set can0 type can bitrate 1000000 dbitrate 5000000 fd on
     sudo ip link set can0 up
 
-  See README.md for the rest.
+  The box picker (the SAM 3.1 model the web GUI's Detect box uses) has its
+  own environment, set up once:
+
+    cd box_picker/src && ./setup.sh
+
+  Then: native/run_web_gui.sh, and open http://<this machine>:8080.
+  See README.md and docs/detailed_run.md for the rest.
 
 EOF

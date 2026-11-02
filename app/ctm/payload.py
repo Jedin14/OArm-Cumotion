@@ -32,12 +32,14 @@ import time
 import numpy as np
 import yaml
 
-from ctm.common import BASE_FRAME, WS, quat_from_matrix, tool_frame_along
+from ctm.common import (BACKUP_DIR, BASE_FRAME, CALIB_DIR, OPENARM_URDF, SAMPLES_DIR, WS,
+                        quat_from_matrix,
+                        tool_frame_along)
 from ctm.kinematics import G, Arm, frames_batch, gravity_torque_batch
 
-FILE = os.path.join(WS, 'payload_{arm}.yaml')
+FILE = os.path.join(CALIB_DIR, 'payload_{arm}.yaml')
 XACRO = os.path.join(WS, 'src/openarm_description/urdf/ee/openarm_hand.xacro')
-URDF = os.path.join(WS, 'openarm.urdf')
+URDF = OPENARM_URDF
 POSES = 16
 
 
@@ -115,9 +117,15 @@ def apply(arm, result, rebuild=True):
     if not 0.05 < mass < 3.0:
         return f'not written: {mass:.2f} kg is not plausible - weigh again'
     stamp = time.strftime('%Y%m%d-%H%M%S')
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+
+    def backup(path, text):                          # the file as it was, in old_version/
+        with open(os.path.join(BACKUP_DIR, f'{os.path.basename(path)}.before_weigh_{stamp}'),
+                  'w') as handle:
+            handle.write(text)
     # openarm.urdf: the left hand's and fingers' <inertial> blocks
     s = open(URDF).read()
-    open(URDF + f'.before_weigh_{stamp}', 'w').write(s)
+    backup(URDF, s)
     for link, m, c in ((f'openarm_{arm}_hand', mass, com),
                        (f'openarm_{arm}_link7', 0.001, (0, 0, 0.05)),
                        (f'openarm_{arm}_left_finger', 0.001, (0, 0, 0)),
@@ -132,7 +140,7 @@ def apply(arm, result, rebuild=True):
     open(URDF, 'w').write(s)
     # the xacro: the left hand (explicit), the left fingers (tiny)
     x = open(XACRO).read()
-    open(XACRO + f'.before_weigh_{stamp}', 'w').write(x)
+    backup(XACRO, x)
     left = x.index("<xacro:if value=\"${arm_prefix == 'left_'}\">")
     hand_end = x.index('</link>', left)
     seg = x[left:hand_end]
@@ -148,7 +156,7 @@ def apply(arm, result, rebuild=True):
     # link7 (left): its mass is in the hand's now (one body after joint 7)
     arm_xacro = os.path.join(WS, 'src/openarm_description/urdf/arm/openarm_arm.xacro')
     ax = open(arm_xacro).read()
-    open(arm_xacro + f'.before_weigh_{stamp}', 'w').write(ax)
+    backup(arm_xacro, ax)
     l7 = ax.index('<link name="${prefix}link7">')
     l7e = ax.index('</link>', l7)
     ax = ax[:l7] + re.sub(r'<xacro:openarm-inertials name="link7"[^>]*/>|<inertial>.*?</inertial>',
@@ -229,8 +237,8 @@ class PayloadMixin:
         if len(qs) < 8:
             self.say(f'WEIGH TOOL: only {len(qs)} postures measured - not enough', True)
             return
-        np.savez(os.path.join(WS, 'armcal_samples',
-                              f'{arm}_weigh_{time.strftime("%Y-%m-%dT%H-%M-%S")}.npz'),
+        os.makedirs(SAMPLES_DIR, exist_ok=True)
+        np.savez(os.path.join(SAMPLES_DIR, f'{arm}_weigh_{time.strftime("%Y-%m-%dT%H-%M-%S")}.npz'),
                  q=np.array(qs), tau=np.array(taus))
         result = fit(arm, qs, taus)
         with open(FILE.format(arm=arm), 'w') as handle:

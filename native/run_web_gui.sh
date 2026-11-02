@@ -32,4 +32,9 @@ for a in "$@"; do
     if [[ "${a}" == "--click" ]]; then ARGS+=("click:=true"); else ARGS+=("${a}"); fi
 done
 
-exec ros2 launch "${WS_DIR}/launch/web_gui.launch.py" "${ARGS[@]}"
+# FastDDS shared-memory files left by ROS processes that are gone (a crash, a
+# Ctrl-C escalated to SIGKILL): a broken leftover port makes every new node that
+# draws it deaf (2026-10-29). Only files no live process uses are removed.
+"${NATIVE_DIR}/clean_dds_shm.sh" || true
+
+exec ros2 launch "${WS_DIR}/app/launch/web_gui.launch.py" "${ARGS[@]}"

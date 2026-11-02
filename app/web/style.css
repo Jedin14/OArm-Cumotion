@@ -72,9 +72,15 @@ kbd {
   position: relative; overflow: hidden;
   background: #000;
   display: grid; place-items: center;
-  cursor: crosshair;
+  cursor: default;
 }
+.stage.pickable { cursor: crosshair; }   /* --click, or ANCHOR: a click picks a point */
+.group[hidden] { display: none; }
 .video {
+  /* pinned to the stage's box, as the scene's SVG is: the whole picture fits
+     (a grid row sized by its content let it overflow and be cropped, and the
+     drawn boxes then sat off it, 2026-10-28) */
+  position: absolute; inset: 0;
   width: 100%; height: 100%; object-fit: contain;
   user-select: none; -webkit-user-drag: none;
 }
@@ -206,7 +212,7 @@ kbd {
 /* -- the panel ---------------------------------------------------------------- */
 
 .tabs {
-  position: relative; display: grid; grid-template-columns: repeat(3, 1fr);
+  position: relative; display: grid; grid-template-columns: repeat(4, 1fr);
   margin: 12px; padding: 3px;
   background: var(--raised-2); border-radius: 10px;
 }
@@ -219,7 +225,7 @@ kbd {
 .tab[aria-selected="true"] { color: var(--text); }
 .tab-indicator {
   position: absolute; top: 3px; bottom: 3px; left: 3px;
-  width: calc((100% - 6px) / 3);
+  width: calc((100% - 6px) / 4);
   background: var(--raised); border-radius: 8px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
   transition: transform 250ms var(--ease-out);
@@ -287,6 +293,7 @@ kbd {
 .btn.primary kbd { background: rgba(255, 255, 255, 0.2); color: #fff; }
 .btn.primary[data-tone="ok"] { background: var(--good); }
 .btn.primary[data-tone="bad"] { background: color-mix(in srgb, var(--bad) 75%, #000); }
+.btn.primary[data-tone="retry"] { background: var(--warn); color: #1a1200; }
 .btn.danger { background: var(--bad); border-color: transparent; color: #fff; }
 .btn.danger-soft { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); grid-column: 1 / -1; }
 
@@ -417,3 +424,92 @@ kbd {
 @media (prefers-contrast: more) {
   :root { --line: rgba(255, 255, 255, 0.25); --line-strong: rgba(255, 255, 255, 0.4); }
 }
+
+/* -- the box picker's scene, drawn over the picture ---------------------------- */
+
+.scene {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  pointer-events: none; overflow: visible;
+  opacity: 0; transition: opacity 220ms var(--ease-out);
+}
+.scene.on { opacity: 1; }
+.scene .halo {
+  fill: none; stroke: rgba(0, 0, 0, 0.4); stroke-width: 3.5;
+  vector-effect: non-scaling-stroke; stroke-linejoin: round;
+}
+/* the model's own outlines, in its yellow */
+.scene .box {
+  fill: none; stroke: #ffe600;
+  stroke-width: 1.5; vector-effect: non-scaling-stroke; stroke-linejoin: round;
+}
+.scene .box.chosen { stroke-width: 2.25; }
+.scene .target {
+  fill: rgba(59, 130, 246, 0.10); stroke: var(--accent);
+  stroke-width: 2; vector-effect: non-scaling-stroke; stroke-linejoin: round;
+}
+.scene .face {
+  fill: rgba(59, 130, 246, 0.30); stroke: var(--accent);
+  stroke-width: 2.5; vector-effect: non-scaling-stroke; stroke-linejoin: round;
+}
+.scene [data-tone="ok"].target { stroke: var(--good); fill: rgba(52, 199, 89, 0.10); }
+.scene [data-tone="ok"].face { stroke: var(--good); fill: rgba(52, 199, 89, 0.30); }
+.scene [data-tone="bad"].target { stroke: var(--bad); fill: rgba(255, 69, 58, 0.10); }
+.scene [data-tone="bad"].face { stroke: var(--bad); fill: rgba(255, 69, 58, 0.28); }
+.scene .ring { fill: none; stroke: #fff; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.scene .dot { fill: #fff; }
+.scene .pulse {
+  fill: none; stroke: #fff; stroke-width: 1.5; vector-effect: non-scaling-stroke;
+  transform-box: fill-box; transform-origin: center;
+  animation: scene-pulse 1.8s var(--ease-out) infinite;
+}
+@keyframes scene-pulse { from { transform: scale(1); opacity: 0.7; } to { transform: scale(2.4); opacity: 0; } }
+.scene .tag rect { fill: rgba(14, 15, 18, 0.78); stroke: rgba(255, 255, 255, 0.12); vector-effect: non-scaling-stroke; }
+.scene .tag text { fill: #fff; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.scene .tag .t1 { font-weight: 600; letter-spacing: 0.02em; }
+.scene .tag .t2 { fill: var(--text-2); }
+.scene .tag .t2[data-tone="ok"] { fill: #6fe08e; }
+.scene .tag .t2[data-tone="bad"] { fill: #ff8a82; }
+.scene .tag .t2[data-tone="busy"] { fill: #ffc266; }
+/* after the pick: where the box was */
+.scene .gone { fill: rgba(52, 199, 89, 0.12); stroke: var(--good); stroke-width: 2;
+  stroke-dasharray: 6 5; vector-effect: non-scaling-stroke; }
+.scene .still { fill: rgba(255, 69, 58, 0.16); stroke: var(--bad); stroke-width: 2;
+  vector-effect: non-scaling-stroke; }
+.scene .unsure { fill: rgba(255, 159, 10, 0.12); stroke: var(--warn); stroke-width: 2;
+  stroke-dasharray: 2 4; vector-effect: non-scaling-stroke; }
+.scene .knocked { fill: none; stroke: var(--warn); stroke-width: 2; vector-effect: non-scaling-stroke; }
+
+.verdict {
+  position: absolute; left: 50%; top: 68px;
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 16px 10px 12px;
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(20px) saturate(180%); backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid var(--glass-line); border-radius: 14px; box-shadow: var(--shadow);
+  pointer-events: none;
+  opacity: 0; transform: translate(-50%, -6px) scale(0.98);
+  transition: opacity 220ms var(--ease-out), transform 220ms var(--ease-out);
+}
+.verdict.on { opacity: 1; transform: translate(-50%, 0) scale(1); }
+.verdict-icon {
+  width: 28px; height: 28px; border-radius: 50%; flex: none;
+  display: grid; place-items: center; font-weight: 700; font-size: 0.95rem; color: #0b0c0e;
+  background: var(--text-3);
+}
+.verdict[data-tone="ok"] .verdict-icon { background: var(--good); }
+.verdict[data-tone="bad"] .verdict-icon { background: var(--bad); color: #fff; }
+.verdict[data-tone="edge"] .verdict-icon { background: var(--warn); }
+.verdict-text { display: flex; flex-direction: column; line-height: 1.25; }
+.verdict-text strong { font-size: 0.95rem; font-weight: 600; }
+.verdict-text span { font-size: 0.8rem; color: var(--text-2); }
+
+@media (prefers-reduced-motion: reduce) {
+  .scene .pulse { animation: none; opacity: 0; }
+  .scene, .verdict { transition: none; }
+}
+@media (max-width: 560px) { .verdict { top: 56px; max-width: calc(100% - 32px); } }
+
+/* ADVANCED: type a target */
+.card.advanced > * + * { margin-top: 10px; }
+.card.advanced .dims input { width: 6.5em; }
+.segmented .local[aria-pressed="true"] { background: var(--raised-2); color: var(--text); }

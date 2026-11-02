@@ -1,0 +1,10 @@
+# Depth correction from the ChArUco board (ctm/depth_cal.py):
+# z_true = z * (1 + a) + b + c * x + e * y
+a: -0.03039759030826081
+b: 0.006490148495487023
+c: 0.002463490424661508
+e: 0.0002545559211398808
+rms_before_mm: 11.02
+rms_after_mm: 8.77
+placements: 37
+points: 113511

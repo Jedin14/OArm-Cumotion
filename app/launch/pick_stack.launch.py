@@ -17,13 +17,14 @@ from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 
-WS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # app/: the scripts, on PYTHONPATH
+WS = os.path.dirname(APP)                          # the workspace: the working directory
 
 
 def generate_launch_description():
     gui, approach, model, tool = (LaunchConfiguration(n) for n in
                                   ('gui', 'approach', 'model', 'pick_tool'))
-    env = {'PYTHONPATH': WS + os.pathsep + os.environ.get('PYTHONPATH', ''),
+    env = {'PYTHONPATH': APP + os.pathsep + os.environ.get('PYTHONPATH', ''),
            'PYTHONUNBUFFERED': '1'}
     return LaunchDescription([
         DeclareLaunchArgument('gui', default_value='auto',
@@ -36,12 +37,12 @@ def generate_launch_description():
                               description='start box_model_node.py (false: another node '
                                           'serves /beast_arm/box_model/detect)'),
         ExecuteProcess(
-            cmd=['python3', os.path.join(WS, 'box_model_node.py'), '--ros-args',
+            cmd=['python3', os.path.join(APP, 'box_model_node.py'), '--ros-args',
                  '-p', ['approach:=', approach], '-p', ['tool:=', tool]],
             cwd=WS, additional_env=env, output='screen', name='box_model',
             condition=IfCondition(model)),
         ExecuteProcess(
-            cmd=['python3', os.path.join(WS, 'pick_stack.py'), '--gui', gui,
+            cmd=['python3', os.path.join(APP, 'pick_stack.py'), '--gui', gui,
                  '--approach', approach, '--pick-tool', tool],
             cwd=WS, additional_env=env, output='screen', name='pick_stack'),
     ])

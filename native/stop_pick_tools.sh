@@ -9,7 +9,7 @@
 #
 # Stopped: the web GUI, the pick stack, the box model node and the box
 # picker it runs (pick_server.py, ros_bridge.py), the OpenCV tools
-# (click_to_move, auto_box, calibrate), and the "ros2 launch" of the GUI /
+# (click_to_move, calibrate), and the "ros2 launch" of the GUI /
 # pick stack. NOT touched: the robot (run_launch_everything: MoveIt, cuMotion,
 # the camera, the motors).
 #
@@ -27,7 +27,6 @@ PATTERNS=(
     'box_picker_server.py'
     'ros_bridge.py'
     'click_to_move.py'
-    'auto_box.py'
     'calibrate.py'
 )
 

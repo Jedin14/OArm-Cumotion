@@ -17,9 +17,9 @@ import os
 import numpy as np
 import yaml
 
-from ctm.common import WS
+from ctm.common import CALIB_DIR
 
-FILE = os.path.join(WS, 'depth_correction.yaml')
+FILE = os.path.join(CALIB_DIR, 'depth_correction.yaml')
 _cache = {'mtime': None, 'coef': None}
 
 

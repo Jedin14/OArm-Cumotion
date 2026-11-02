@@ -71,7 +71,8 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 
-WS = os.path.dirname(os.path.realpath(__file__))
+WS = os.path.dirname(os.path.realpath(__file__))     # robot/: the pose files live here
+ROOT = os.path.dirname(WS)                         # the workspace
 LEGACY_FILE = os.path.join(WS, 'pick_place_states.yaml')
 
 # Which joints change sign when a pose is reflected to the other arm, as
@@ -224,7 +225,7 @@ class StateRecorder(Node):
         """Generate the description locally, for when the robot is not up."""
         import subprocess
         xacro_file = os.path.join(
-            WS, 'src/openarm_description/urdf/robot/v10.urdf.xacro')
+            ROOT, 'src/openarm_description/urdf/robot/v10.urdf.xacro')
         if not os.path.exists(xacro_file):
             return None
         try:

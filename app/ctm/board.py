@@ -23,7 +23,7 @@ Marker ids (4x4, the 100-marker set; its first 50 are the old set, so the
 wall marker 11 is the same): left gripper 12-47, right gripper 48-83, six
 per face.
 
-    python3 -m ctm.board --sheet      # writes gripper_boards.pdf to print
+    python3 -m ctm.board --sheet      # writes docs/sheets/gripper_boards.pdf to print
     python3 -m ctm.board --live       # camera view: every marker it sees, with its id
 """
 
@@ -33,7 +33,7 @@ import os
 import cv2
 import numpy as np
 
-from ctm.common import WS
+from ctm.common import SHEETS_DIR
 
 MARKERS = (3, 2)                # per face: along the rail, across it
 MARKER = 0.020                  # m
@@ -43,7 +43,7 @@ FACES = ('top', 'back', 'bottom')                   # a piece's faces, top to bo
 FIRST = {'left': (12, 18, 24, 30, 36, 42), 'right': (48, 54, 60, 66, 72, 78)}
 RAIL_Y = 0.055                  # m: a piece's centre this far either side of the hand's middle (nominal)
 CUT = (0.075, 0.050)            # m: one face, white border included
-SHEET = os.path.join(WS, 'gripper_boards.pdf')
+SHEET = os.path.join(SHEETS_DIR, 'gripper_boards.pdf')
 SIZE = (MARKERS[0] * MARKER + (MARKERS[0] - 1) * GAP, MARKERS[1] * MARKER + (MARKERS[1] - 1) * GAP)
 PER_PIECE = MARKERS[0] * MARKERS[1]
 

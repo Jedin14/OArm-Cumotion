@@ -27,13 +27,12 @@ follows from the chain with those angles and mountings, behind the base
 correction. With all of them zero this is exactly the URDF.
 """
 
-import os
 import re
 import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from ctm.common import WS
+from ctm.common import OPENARM_URDF
 
 G = np.array([0.0, 0.0, -9.81])
 BACKLASH_TORQUE = 0.5           # N m: the play is taken up by about this much torque
@@ -73,7 +72,7 @@ class Arm:
 
     def __init__(self, arm, urdf_path=None):
         self.arm = arm
-        root = ET.parse(urdf_path or os.path.join(WS, 'openarm.urdf')).getroot()
+        root = ET.parse(urdf_path or OPENARM_URDF).getroot()
         joints = {j.find('child').get('link'): j for j in root.findall('joint')}
         links = {l.get('name'): l for l in root.findall('link')}
         chain = []
@@ -300,7 +299,3 @@ def directions(before, after, still=0.005):
     out[np.abs(step) < still] = 0.0
     return out
 
-
-def zero_params():
-    return {'base': np.zeros(6), 'offset': np.zeros(7), 'comply': np.zeros(7),
-            'backlash': np.zeros(7), 'geom': np.zeros((7, 6))}

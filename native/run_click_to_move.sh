@@ -26,4 +26,4 @@ if [[ -z "${DISPLAY:-}" ]]; then
     exit 1
 fi
 
-exec python3 "${WS_DIR}/click_to_move.py" "$@"
+exec python3 "${WS_DIR}/app/click_to_move.py" "$@"

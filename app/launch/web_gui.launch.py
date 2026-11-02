@@ -16,16 +16,17 @@ from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 
-WS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # app/: the scripts, on PYTHONPATH
+WS = os.path.dirname(APP)                          # the workspace: the working directory
 
 
 def generate_launch_description():
     host, port, approach, model, click, tool = (LaunchConfiguration(n) for n in
                                                 ('host', 'port', 'approach', 'model', 'click',
                                                  'pick_tool'))
-    gui = ['python3', os.path.join(WS, 'web_gui.py'), '--host', host, '--port', port,
+    gui = ['python3', os.path.join(APP, 'web_gui.py'), '--host', host, '--port', port,
            '--approach', approach, '--pick-tool', tool]
-    env = {'PYTHONPATH': WS + os.pathsep + os.environ.get('PYTHONPATH', ''),
+    env = {'PYTHONPATH': APP + os.pathsep + os.environ.get('PYTHONPATH', ''),
            'PYTHONUNBUFFERED': '1'}
     return LaunchDescription([
         DeclareLaunchArgument('host', default_value='0.0.0.0',
@@ -40,7 +41,7 @@ def generate_launch_description():
         DeclareLaunchArgument('click', default_value='false',
                               description='click-only, like click_to_move: no box model'),
         ExecuteProcess(
-            cmd=['python3', os.path.join(WS, 'box_model_node.py'), '--ros-args',
+            cmd=['python3', os.path.join(APP, 'box_model_node.py'), '--ros-args',
                  '-p', ['approach:=', approach], '-p', ['tool:=', tool]],
             cwd=WS, additional_env=env, output='screen', name='box_model',
             condition=IfCondition(PythonExpression(

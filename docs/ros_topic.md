@@ -29,13 +29,16 @@ All names below are relative to `/beast_arm` (change it with `--ns`). "Latched" 
 | `held_object/release` | topic | `std_msgs/Empty` | in | depth 10 | Take the held box out of the planners now |
 | `pick_target` | topic | `pick_interfaces/PickTarget` | out | depth 10 | The target of the current pick: coordinates, approach, tool, arm, the matched box |
 | `pick_result` | topic | `std_msgs/String` (JSON) | out | latched | Each pick's outcome: picked true / false / null, from the camera's check |
+| `base_adjust` | topic | `pick_interfaces/BaseAdjust` | out | depth 10, not latched | When the box cannot be picked from here (out of reach, only at the edge of reach, too near the camera), or after 2 failed picks in a row on it: how the wheels should move the robot |
+| `vacuum` | topic | `std_msgs/Bool` | out | latched | What the vacuum should be: on just before the cup goes in, off at the drop pose. Switched by hand for now; the valve will follow this |
 | `status` | topic | `std_msgs/String` (JSON) | out | latched | Everything above as one JSON object, on change and every 1 s |
 | `log` | topic | `std_msgs/String` | out | depth 10 | Every human-readable message, as the GUI shows it |
 | `box_model/detect` | service | `pick_interfaces/DetectTarget` | request | - | Served by the box model; called by the pick stack |
 | `box_model/target` | topic | `pick_interfaces/PickTarget` | out | depth 10 | Every detection the model makes |
 | `box_model/check` | service | `pick_interfaces/CheckPick` | request | - | After a pick: is the box gone? Called by the pick stack |
 | `box_model/check_result` | topic | `std_msgs/String` (JSON) | out | latched | Every check's answer |
-| `box_model/image` | topic | `sensor_msgs/Image` | out | latched | The picker's drawing of each answer (every box, the chosen face) and of each check |
+| `box_model/image` | topic | `sensor_msgs/Image` | out | latched | The frame of each answer and of each check, clean (nothing drawn) |
+| `box_model/scene` | topic | `std_msgs/String` (JSON) | out | latched | What that frame shows, for a GUI to draw: every box's outline and face, the target, or the check's outline and verdict |
 
 ### 1.0 Tool and arm
 
@@ -97,8 +100,25 @@ A command that arrives while another job runs is refused with `busy` on `arm_act
 | `stopped` | STOP was received |
 | `no_target: <reason>` | Nothing to pick in the frame |
 | `pick_failed: <reason>` | Unreachable, no contact, stopped short, did not get back, or the camera says the box was not taken (`missed`, `moved`, `dropped`, `wrong_box`). The reason says which |
+| `retrying: <outcome>` | Not taken; the stack looks again and picks again by itself (not the end of the command) |
 
-Every `ready_to_pick` ends in exactly one of `pick_complete`, `pick_unverified: ...`, `no_target: ...` or `pick_failed: ...` (or `stopped`).
+Every `ready_to_pick` ends in exactly one of `pick_complete`, `pick_unverified: ...`, `no_target: ...` or `pick_failed: ...` (or `stopped`). A pick that fails and will be tried again by itself reports the non-terminal `retrying: <outcome>` instead; only the last attempt's result is terminal. STOP is checked between every step (pre_pick, detection, reach check, touch) and ends the job with `stopped`. A command sent while a job runs is answered `busy` (also `arm_state/cmd`) and does not clear a STOP.
+
+### 1.4b `base_adjust` (out)
+
+Straight away when the reach check finds no way to pick the box from where the robot stands (`reason: unreachable`): every approach point from 10 cm down to 4 cm tried within `--plan-budget` (30 s; the search stops at the first workable path); or only at the edge of the arm's reach, where there is no room to correct the tool (corrections there diverged and knocked a neighbouring box over); or the box nearer the camera than `--min-depth` (0.35 m), where its depth is not reliable. And after `--adjust-after` (default 2) picks in a row that did not take the same box (`picked: false`; can't-tell results are not counted), the stack publishes one `pick_interfaces/BaseAdjust`. It says how far the robot should move **sideways only — left or right, never forward, back or a turn** — so the box lines up across the robot with the picking arm's sweet spot (`--sweet-spot` y, 0.10 m for the left arm): the move is the box's y minus that. The arms do nothing more on their own; after the base has moved, send `ready_to_pick` again (or Detect box in the GUI). The count resets after a request, a success, or a pick on another box.
+
+| Field | Meaning |
+| --- | --- |
+| `header.frame_id` | `world` = the robot body: x forward, y left |
+| `direction` | `left`, `right`, or `none`: the box is already lined up sideways (within 1 cm), and moving left or right cannot help — it is too near or too far |
+| `distance_m` | How far to move that way, m (0 for `none`) |
+| `left_m` | The same as one signed number: + left, − right |
+| `target`, `goal` | The box now, and where the arm wants it (only `goal.y` matters for the move) |
+| `arm`, `tool`, `approach` | `left` / `vacuum`, `front` / `top` |
+| `failures`, `reason` | How many picks failed and their outcomes, e.g. `missed, moved` |
+
+Drive straight sideways by `distance_m` towards `direction` (a base that cannot strafe: turn 90°, drive, turn back). The topic is not latched, so a restarted wheel node never acts on an old request. The same request is in `pick_result.base_adjust`, and the failing pick's status ends with `; base_adjust requested: ...`.
 
 ### 1.4a `pick_result` (out, JSON)
 
@@ -106,7 +126,7 @@ Latched. One object for each pick (also a GUI Move after Detect box):
 
 ```json
 {"picked": true, "outcome": "success", "message": "PICK SUCCESS: the box is gone from its place",
- "contact": true, "tool": "vacuum", "arm": "left", "approach": "front",
+ "contact": true, "held": true, "held_g": 96.0, "tool": "vacuum", "arm": "left", "approach": "front",
  "xyz": [0.512, 0.104, 0.231], "box_mm": [170, 100, 25], "time": "2026-10-28 14:02:11",
  "verdict": {"outcome": "success", "gone": 0.94, "same": 0.03, "closer": 0.0, "disturbed": [], "...": "..."}}
 ```
@@ -123,8 +143,18 @@ Latched. One object for each pick (also a GUI Move after Detect box):
 | `null` | `camera_moved` | The scene does not line up with before |
 | `null` | `unknown` | Too little depth on the target to say |
 | `null` | `arm_out` | The arm did not get back; send `return` |
+| `false` | `empty` | No camera check available, and the joint torques show nothing on the cup |
+| `false` | `unreachable` | Not pickable from where the robot stands (see `base_adjust`) |
+| `null` | `not_started` | Refused before the arm moved (no plan now, a box still on the cup); not counted, not retried |
+| `null` | `stopped` | STOP before the arm moved |
+| `null` | `check_timeout` | The camera check did not answer: `pick_unverified` |
+| `true`/`false` | (no `verdict`) | The camera check is not served or the picker is down: contact and weight decide |
 
 The check needs the arm out of the view and the camera where it was, which holds after the arm returns to pre_pick.
+
+`held` / `held_g`: whether the cup came away with the box, from the joint torques. The arm holds still at 3 cm short of the box before the press and again after it, arriving the same way both times, and the difference in the shoulder and elbow torques is the box's weight. `held` is null when the torques were too unsteady to tell. It is passed to the camera check, so a box that left its place but is not on the cup reads `dropped`. When nothing is on the cup, the arm presses again from there, 5 mm deeper and 0.5 s longer, up to `--press-retries` (2) times.
+
+A pick that still fails is tried again automatically: the camera looks, then the same box is picked again, or it is detected again if it moved. This goes on until `--adjust-after` (2) failures on the box, which sends `base_adjust`. STOP ends it.
 
 ### 1.5 `arm_action/phase` (out)
 
@@ -291,6 +321,8 @@ ros2 topic pub --once /beast_arm/arm_action std_msgs/msg/String "{data: ready_to
 
 # did it work? (the camera's check)
 ros2 topic echo /beast_arm/pick_result --full-length
+# what the wheels should do after 2 failed picks on one box
+ros2 topic echo /beast_arm/base_adjust
 
 # the size of the box to pick (mm), before the pick
 ros2 topic pub --once /beast_arm/held_object/size pick_interfaces/msg/ObjectSize \
@@ -334,6 +366,16 @@ A typical sequence from another system:
 | `gui` (pick stack only) | `auto`, `on`, `off` | `auto` | Status window; `auto` only with a display |
 | `approach` | `auto`, `top`, `front` | `auto` | Default approach for `ready_to_pick` |
 | `pick_tool` (`--pick-tool`) | `vacuum`, `finger` | `vacuum` | The tool, and so the arm: vacuum = left only, finger = right only |
+| `--adjust-after` (script) | number | `2` | Failed picks in a row on one box before `base_adjust` (0: never); the picks before it are retried automatically |
+| `--press-retries` (script) | number | `2` | Presses again (deeper, longer) when the torques show nothing on the cup |
+| `--plan-budget` (script) | s | `30` | How long the reach check may search (it stops at the first workable path); nothing found by then: not from here (`base_adjust`) |
+| `--edge` (script) | `try`, `adjust` | `adjust` (pick stack, GUI) | A box reachable only at the edge of reach: try it anyway, or ask the wheels to move |
+| `--prefer-top` / `--no-prefer-top` (script) | flag | on | A FRONT target on a face narrower than `--narrow-face-mm` (a flat box's 25 mm side), of a box with nothing on it whose top is wide (box size known), is picked from the TOP: its centre from the front face and the box size |
+| `--narrow-face-mm` (script) | mm | `45` | Front faces narrower than this prefer the top |
+| `--edge-face-mm` (script) | mm | `25` | With `adjust`, an edge-of-reach plan is still tried when the face's short side is at least this wide (25: the cup fits on it); the allowed miss before pressing then grows with the face, up to 25 mm |
+| `--min-depth` (script) | m | `0.35` | Boxes nearer the camera than this are not picked from here (`base_adjust`) |
+| `--held-min-g` (script) | g | `30` | Weight on the cup that counts as holding the box |
+| `--sweet-spot X Y` (script) | m | `0.45 0.10` | Where the picking arm works best; `base_adjust` brings the box there |
 | `model` | `true`, `false` | `true` | Start `box_model_node.py` |
 | `click` (web GUI; `--click` on the script) | `true`, `false` | `false` | Click-only: no box model |
 | `host`, `port` (web GUI) | address, number | `0.0.0.0`, `8080` | Where the page listens |
@@ -382,4 +424,4 @@ cuMotion reserves sphere links for the optional collision shapes (in `openarm.ym
 
 - The pick stack's node is named `click_to_move` in `ros2 node list`.
 - No login: anyone who can open the web GUI or publish on these topics can move the arms.
-- The OpenCV tools (`click_to_move.py`, `auto_box.py`, `calibrate.py`) do not offer this interface; only `run_web_gui.sh` and `run_pick_stack.sh` do.
+- The OpenCV tools (`click_to_move.py`, `calibrate.py`) do not offer this interface; only `run_web_gui.sh` and `run_pick_stack.sh` do.

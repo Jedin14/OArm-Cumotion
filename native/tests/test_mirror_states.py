@@ -33,8 +33,9 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 WS = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-if WS not in sys.path:
-    sys.path.insert(0, WS)
+ROBOT = os.path.join(WS, 'robot')                  # record_states.py and the pose files
+if ROBOT not in sys.path:
+    sys.path.insert(0, ROBOT)
 
 XACRO = os.path.join(WS, 'src/openarm_description/urdf/robot/v10.urdf.xacro')
 
@@ -185,7 +186,7 @@ class FakePlayNode:
 def play_args(arm='left'):
     return types.SimpleNamespace(arm=arm, pipeline='cumotion', speed=0.15,
                                  dwell=0.0, yes=True, plan_attempts=3,
-                                 file='pick_place_states_left.yaml')
+                                 file=os.path.join(ROBOT, 'pick_place_states_left.yaml'))
 
 
 def check_play(rs):

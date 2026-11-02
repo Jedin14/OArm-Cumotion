@@ -29,7 +29,7 @@ const act = (name, extra = {}) => post('/api/action', { name, ...extra });
 
 function connect() {
   const es = new EventSource('/api/events');
-  es.onmessage = (e) => { S = JSON.parse(e.data); render(S); };
+  es.onmessage = (e) => { S = JSON.parse(e.data); render(S); renderScene(S); };
   es.onerror = () => {
     $('status').textContent = 'Lost the connection to beast; retrying…';
     $('status').classList.add('error');
@@ -71,6 +71,13 @@ document.addEventListener('click', (e) => {
   const name = b.dataset.action;
   if (e.shiftKey && NUDGES.includes(name)) return act(name + '5');   // Shift-click: 5 mm
   if (name === 'view') return act('view', { value: b.dataset.value });
+  if (name === 'manual_target') {
+    const val = (id) => $(id).value.trim();
+    const xyzT = { x: val('mX'), y: val('mY'), z: val('mZ') };
+    try { localStorage.setItem('manualTarget', JSON.stringify({ ...xyzT, approach: manualApproach, arm: manualArm })); } catch (_) {}
+    const arm = manualArm || (S && S.pick_tool === 'finger' ? 'right' : 'left');
+    return act('manual_target', { ...xyzT, approach: manualApproach, arm });
+  }
   if (name === 'pick_tool') {
     if (S && S.pick_tool === b.dataset.value) return;
     return act('pick_tool', { value: b.dataset.value });
@@ -99,6 +106,7 @@ function imageRect() {
 
 $('stage').addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || e.target.closest('.chrome, .sheet')) return;
+  if (S && !S.click_only && !S.anchor_mode) return;   // the model picks the point
   const r = imageRect();
   const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
   if (x < 0 || x > 1 || y < 0 || y > 1) return;
@@ -134,7 +142,7 @@ tabs.forEach((t) => t.addEventListener('click', () => selectTab(t.dataset.tab)))
   const asked = new URLSearchParams(location.search).get('tab');
   let saved = null;
   try { saved = localStorage.getItem('tab'); } catch (_) { /* private window */ }
-  selectTab(['pick', 'calibrate', 'system'].includes(asked) ? asked : saved || 'pick');
+  selectTab(['pick', 'calibrate', 'advanced', 'system'].includes(asked) ? asked : saved || 'pick');
 }
 
 $('logToggle').addEventListener('click', () => {
@@ -157,11 +165,15 @@ document.addEventListener('keydown', (e) => {
     return;
   }
   if (S && S.confirming && (e.key === 'Enter' || e.key === 'y')) return act('confirm');
-  const map = { m: 'move', ' ': S && S.click_only ? null : 'detect', r: 'recapture', t: 'teach', b: 'return',
+  const map = { m: 'move', ' ': S && S.click_only ? null : 'detect', r: 'recapture',
+    t: S && S.click_only ? 'teach' : null, b: 'return',
     n: 'navigation', p: 'pre_pick', f: 'cal_arms', c: 'calibrate', o: 'overlay',
     k: 'markers', a: 'anchor', e: 'refit', i: 'tip_check' };
   const key = e.key.toLowerCase();
-  if (key === 'd') { e.preventDefault(); return act('topdown'); }
+  if (key === 'd') {                    // FRONT / TOP: the model decides, unless --click
+    if (S && S.click_only) { e.preventDefault(); act('topdown'); }
+    return;
+  }
   if (key === 'l') {
     return act('view', { value: S && S.view === 'live' ? 'captured' : 'live' });
   }
@@ -188,6 +200,8 @@ function render(s) {
   $('haltChip').hidden = !s.halted;
   $('clickChip').hidden = !s.click_only;
   document.querySelectorAll('.btn.model').forEach((b) => { b.hidden = s.click_only; });
+  document.querySelectorAll('.click-only').forEach((g) => { g.hidden = !s.click_only; });
+  $('stage').classList.toggle('pickable', !!(s.click_only || s.anchor_mode));
   document.querySelector('[data-action="recapture"]').style.gridColumn = s.click_only ? '1 / -1' : '';
   $('viewLive').setAttribute('aria-selected', s.view === 'live');
   $('viewCaptured').setAttribute('aria-selected', s.view === 'captured');
@@ -217,6 +231,10 @@ function render(s) {
   setPressed($('apFront'), !s.top_down);
   setPressed($('apTop'), s.top_down);
   setPressed($('tlVacuum'), s.pick_tool === 'vacuum');
+  if (manualArm === null) {             // the typed target's arm follows the gripper
+    $('mLeft').setAttribute('aria-pressed', s.pick_tool !== 'finger');
+    $('mRight').setAttribute('aria-pressed', s.pick_tool === 'finger');
+  }
   setPressed($('tlFinger'), s.pick_tool === 'finger');
   // the box: the face the picker measured, matched to the known size
   const p = s.pick;
@@ -233,13 +251,18 @@ function render(s) {
     const rt = r.picked === true ? 'ok' : r.picked === false ? 'bad' : 'edge';
     setText(rb, r.picked === true ? 'picked' : r.picked === false ? `not picked · ${r.outcome}` : `can't tell · ${r.outcome || '?'}`);
     rb.dataset.tone = rt;
-    setText($('resultWhy'), `${r.arm} arm · ${r.contact ? 'contact felt' : 'no contact'} · ${r.message || ''} · ${r.time}`);
+    const ba = r.base_adjust;
+    const weight = r.held === true ? ` · on the cup (${Math.round(r.held_g)} g)` : r.held === false ? ' · nothing on the cup' : '';
+    setText($('resultWhy'), `${r.arm} arm · ${r.contact ? 'contact felt' : 'no contact'}${weight} · ${r.message || ''} · ${r.time}`
+      + (ba ? ` · BASE ADJUST sent (${ba.reason}): ` + (ba.direction === 'none'
+        ? 'none - already lined up sideways, left or right cannot help'
+        : `move ${ba.direction} ${Number(ba.distance_m).toFixed(3)} m - detect again after the move`) : ''));
   }
   const badge = $('targetBadge');
   if (!p) {
     setText(badge, 'none'); badge.dataset.tone = 'idle';
     setText($('targetXyz'), s.click_only ? 'Click the picture to pick a point'
-      : 'Click the picture, or detect a box');
+      : 'Detect a box: the model picks it, FRONT or TOP');
     setText($('targetWhy'), '');
   } else {
     const tone = p.ok === null ? 'busy' : !p.ok ? 'bad' : p.edge ? 'edge' : 'ok';
@@ -249,7 +272,11 @@ function render(s) {
     setText($('targetWhy'), p.ok === false ? (p.why || '') : (p.label ? `plan: ${p.label}` : ''));
   }
   const move = $('btnMove');
-  move.dataset.tone = !p ? '' : p.ok === false ? 'bad' : p.ok ? 'ok' : '';
+  // after a pick that did not take its box: MOVE = TRY AGAIN (looks again, picks that box)
+  const retry = !!s.retry && !p;
+  setText($('moveLabel'), retry ? 'Try again' : 'Move');
+  move.title = retry ? `The last pick did not take the box (${s.retry}): look again and pick it` : '';
+  move.dataset.tone = retry ? 'retry' : !p ? '' : p.ok === false ? 'bad' : p.ok ? 'ok' : '';
   $('btnReturn').hidden = !s.last_touch;
   setPressed($('tgTeach'), s.teach && !s.anchor_mode);
   setPressed($('tgPieces'), s.pieces_on);
@@ -315,7 +342,9 @@ function render(s) {
       && !(name === 'topdown' && !s.busy);
     if (b.disabled !== off) b.disabled = off;
   });
-  if (!s.busy && !s.teaching && !s.calibrating) move.disabled = !p || p.ok === false;
+  if (!s.busy && !s.teaching && !s.calibrating) move.disabled = !retry && (!p || p.ok === false);
+  $('btnMove2').disabled = move.disabled;             // (the Advanced tab's MOVE: the same)
+  $('btnMove2').dataset.tone = move.dataset.tone || '';
   $('btnRelease').disabled = !heldArms.length || s.busy;
 
   // activity
@@ -340,3 +369,144 @@ function render(s) {
 }));
 
 connect();
+
+// -- the box picker's scene, drawn over the picture -----------------------------
+// The picture is clean; what the picker found (every box, the face it chose,
+// the pick point) and the pick check's verdict are vector graphics on top, in
+// the picture's own pixels (viewBox), so they line up at any size.
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const VERDICT = {
+  success: ['ok', '✓', 'Picked', 'The box is gone from its place'],
+  missed: ['bad', '✕', 'Not picked', 'The box is still there'],
+  moved: ['bad', '!', 'Box moved', 'Pushed, tipped or pulled part way'],
+  dropped: ['bad', '✕', 'Dropped', 'It left its place but was not held'],
+  wrong_box: ['bad', '!', 'Wrong box', 'A neighbour was taken instead'],
+  blocked: ['edge', '?', "Can't tell", 'Something was in view'],
+  camera_moved: ['edge', '?', "Can't tell", 'The camera moved'],
+  unknown: ['edge', '?', "Can't tell", 'Too little depth on the box'],
+};
+let sceneKey = '';
+
+function el(name, attrs, parent) {
+  const n = document.createElementNS(SVG_NS, name);
+  for (const [k, v] of Object.entries(attrs || {})) n.setAttribute(k, v);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+const pathOf = (pts) => pts && pts.length > 2 ? 'M' + pts.map((p) => p.join(' ')).join('L') + 'Z' : '';
+
+function renderScene(s) {
+  const svg = $('scene');
+  const sc = s.scene;
+  const scale = svg.getBoundingClientRect().width / ((sc && sc.size && sc.size[0]) || 640);
+  const p = s.pick;
+  const key = JSON.stringify([sc && sc.time, p && [p.uv, p.ok, p.edge], s.target && s.target.box_mm,
+    Math.round(scale * 100)]);
+  if (key === sceneKey) return;
+  sceneKey = key;
+  svg.replaceChildren();
+  const verdict = $('verdict');
+  if (!sc) {
+    svg.classList.remove('on');
+    verdict.classList.remove('on');
+    return;
+  }
+  const [w, h] = sc.size || [640, 480];
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');   // as the picture: object-fit contain
+  const px = (n) => n / Math.max(scale, 0.01);                 // screen pixels -> picture pixels
+
+  if (sc.kind === 'check') {
+    const v = VERDICT[sc.outcome] || ['edge', '?', sc.title || 'Checked', sc.why || ''];
+    const cls = sc.picked === true ? 'gone' : sc.picked === false ? 'still' : 'unsure';
+    if (sc.outline) {
+      el('path', { d: pathOf(sc.outline), class: 'halo' }, svg);
+      el('path', { d: pathOf(sc.outline), class: cls }, svg);
+    }
+    for (const d of sc.disturbed || []) el('circle', { cx: d.u, cy: d.v, r: px(9), class: 'knocked' }, svg);
+    verdict.dataset.tone = v[0];
+    setText($('verdictIcon'), v[1]);
+    setText($('verdictTitle'), v[2]);
+    setText($('verdictWhy'), (sc.disturbed || []).length ? `${v[3]} · a neighbour changed too` : v[3]);
+    verdict.classList.add('on');
+    svg.classList.add('on');
+    return;
+  }
+
+  verdict.classList.remove('on');
+  const tone = !p ? '' : p.ok === false ? 'bad' : p.ok ? 'ok' : '';
+  let target = null;
+  // every box exactly as the model outlined it (its mask), in yellow
+  for (const b of sc.boxes || []) {
+    if (b.target) target = b;
+    if (!b.poly) continue;
+    el('path', { d: pathOf(b.poly), class: 'halo' }, svg);              // shows on white boxes too
+    el('path', { d: pathOf(b.poly), class: 'box' + (b.target ? ' chosen' : '') }, svg);
+  }
+  // the chosen box: the face to grip
+  if (target && target.face) {
+    el('path', { d: pathOf(target.face), class: 'face', 'data-tone': tone }, svg);
+  }
+  const uv = p && p.uv ? p.uv : sc.target ? [sc.target.u, sc.target.v] : null;
+  if (!uv) { svg.classList.add('on'); return; }
+  const [u, v] = uv;
+  el('circle', { cx: u, cy: v, r: px(9), class: 'pulse' }, svg);
+  el('circle', { cx: u, cy: v, r: px(9), class: 'ring' }, svg);
+  el('circle', { cx: u, cy: v, r: px(2.5), class: 'dot' }, svg);
+
+  // the tag: what and how, next to the point (flipped to stay inside the picture)
+  const t = sc.target || {};
+  const box = s.target && s.target.box_mm && s.target.box_mm[0] ? s.target.box_mm : null;
+  const face = t.size_mm ? `${t.size_mm[0]} × ${t.size_mm[1]} mm` : '';
+  const line1 = `${(t.approach || 'front').toUpperCase()}${face ? '  ·  ' + face : ''}`;
+  const line2 = !p ? `${t.agreeing ?? '?'}/${t.frames ?? '?'} frames agree`
+    : p.ok === null ? 'Checking the reach…' : p.ok === false ? 'Not reachable'
+    : (box ? `${box[0]} × ${box[1]} × ${box[2]} box · ` : '') + 'Press Move';
+  const g = el('g', { class: 'tag' }, svg);
+  const rect = el('rect', { rx: px(9) }, g);
+  const a = el('text', { class: 't1', 'font-size': px(12.5) }, g);
+  a.textContent = line1;
+  const b2 = el('text', { class: 't2', 'font-size': px(11.5), 'data-tone': p ? (p.ok === null ? 'busy' : tone) : '' }, g);
+  b2.textContent = line2;
+  const pad = px(10);
+  const tw = Math.max(a.getComputedTextLength(), b2.getComputedTextLength()) + 2 * pad;
+  const th = px(44);
+  let x = u + px(18), y = v - th / 2;
+  if (x + tw > w - px(4)) x = u - px(18) - tw;
+  y = Math.min(Math.max(y, px(4)), h - th - px(4));
+  rect.setAttribute('x', x); rect.setAttribute('y', y);
+  rect.setAttribute('width', tw); rect.setAttribute('height', th);
+  a.setAttribute('x', x + pad); a.setAttribute('y', y + px(18));
+  b2.setAttribute('x', x + pad); b2.setAttribute('y', y + px(35));
+  svg.classList.add('on');
+}
+window.addEventListener('resize', () => { if (S) renderScene(S); });
+
+// -- ADVANCED: a target typed in camera coordinates ------------------------------
+let manualApproach = 'front';
+let manualArm = null;                    // null: the arm of the gripper chosen above
+function setManualArm(a) {
+  manualArm = a === 'right' ? 'right' : 'left';
+  $('mLeft').setAttribute('aria-pressed', manualArm === 'left');
+  $('mRight').setAttribute('aria-pressed', manualArm === 'right');
+}
+document.querySelectorAll('[data-marm]').forEach((b) => {
+  b.addEventListener('click', () => setManualArm(b.dataset.marm));
+});
+function setManualApproach(a) {
+  manualApproach = a === 'top' ? 'top' : 'front';
+  $('mFront').setAttribute('aria-pressed', manualApproach === 'front');
+  $('mTop').setAttribute('aria-pressed', manualApproach === 'top');
+}
+document.querySelectorAll('[data-approach]').forEach((b) => {
+  b.addEventListener('click', () => setManualApproach(b.dataset.approach));
+});
+try {                                    // the last typed target, in this browser
+  const last = JSON.parse(localStorage.getItem('manualTarget') || 'null');
+  if (last) {
+    $('mX').value = last.x ?? ''; $('mY').value = last.y ?? ''; $('mZ').value = last.z ?? '';
+    setManualApproach(last.approach);
+    if (last.arm) setManualArm(last.arm);
+  }
+} catch (_) {}

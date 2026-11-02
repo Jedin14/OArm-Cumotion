@@ -23,6 +23,17 @@ from ctm.corrections import learned_correction, save_correction
 # fingers, this arm only) may touch the octomap; everything before it is
 # checked for every link.
 NEAR = 0.03
+REWEIGH = 0.01    # after the press: back off this far past NEAR, then onto it (to weigh)
+# A press that stopped this far before the measured surface did not reach the
+# box: its weighing is not believed and it presses again. The weighing read
+# 46-119 g "on the cup" with the cup 2.5 cm above the box -- each pick then
+# MISSED by the camera (2026-10-29/30).
+PRESS_SHORT_M = 0.015
+# A press that ran to the end of its line without contact and ended this far
+# above the surface did not reach it either: pressed again, further
+ENDED_SHORT_M = 0.005
+CLOSE_FREE = 0.3  # an approach point nearer than NEAR: the last share of the flight there
+                  # may have the tool near the box (the rest is checked with it counted)
 # The re-aim and the corrections happen this far short of the surface; from
 # there in it is one straight line (the user asked for 5 cm, 2026-10-13).
 CORRECT_AT = 0.05
@@ -32,6 +43,11 @@ CORRECT_AT = 0.05
 # 26 mm beside a box (2026-10-14).
 MAX_LEFT = 0.010
 
+
+
+def cm(x):
+    """m as cm for the messages: 0.025 -> "2.5", 0.1 -> "10"."""
+    return f'{100 * x:.1f}'.rstrip('0').rstrip('.')
 
 class TouchMixin:
     """Part of click_to_move.App; uses self.node, self.frame, self.say..."""
@@ -88,11 +104,15 @@ class TouchMixin:
                 node.ensure_grippers_in_octomap()
                 aim = self.aim_for(arm, point)[0]
                 start = node.arm_positions(arm)
-                plan, why = self.preplan(arm, aim, point, origin, start)
+                plan, why = self._checked_plan(arm, aim, point, origin, start)
         except Exception as exc:                     # noqa: BLE001 - only a preview
             plan, why, aim, start = None, f'could not check ({exc})', None, None
+            check['error'] = True
+        # not pickable from where the robot stands (a base move helps), as
+        # against a check that failed (move_group down, an error)
         check.update(ok=plan is not None, plan=plan, aim=aim, start=start, why=why,
-                     time=time.monotonic())
+                     time=time.monotonic(),
+                     not_here=plan is None and not check.get('error'))
         if self.check is not check or (self.busy and not in_job):
             return
         if plan is not None:
@@ -101,6 +121,35 @@ class TouchMixin:
                      + ' - press MOVE')
         else:
             self.say(f'{check["where"]}: the {arm} arm cannot touch it -- {why}', True)
+
+    def _checked_plan(self, arm, aim, point, origin, start):
+        """preplan, and what makes a pick not worth trying from here: the box
+        too near the camera to trust its depth (at 0.29 m it was 2.6 cm nearer
+        than measured, and the cup was driven into it, 2026-10-28), or only an
+        edge-of-reach plan (no room to correct: 16-28 mm off, the corrections
+        diverged, a neighbour was knocked over -- the robot should move
+        instead, base_adjust). (plan, why)"""
+        args = self.node.args
+        dist = float(np.linalg.norm(np.asarray(point, float) - np.asarray(origin, float)))
+        if dist < getattr(args, 'min_depth', 0.0):
+            return None, (f'only {dist:.2f} m from the camera - its depth is not reliable '
+                          f'under {args.min_depth:.2f} m')
+        plan, why = self.preplan(arm, aim, point, origin, start)
+        if plan is not None and plan['edge'] and getattr(args, 'edge', 'try') == 'adjust' \
+                and not self._edge_ok():
+            face = getattr(self.node, 'pick_face_mm', None)
+            return None, ('at the edge of the arm\'s reach (no room there to correct the tool, '
+                          'and corrections diverge)'
+                          + (f' - and the {face:.0f} mm face is too narrow to risk it'
+                             if face else ''))
+        return plan, why
+
+    def _edge_ok(self):
+        """An edge-of-reach plan is worth flying: the face is wide enough that the
+        cup stays on it even 30 mm off (16-28 mm off on a 30 mm face knocked a
+        stack, 2026-10-29; a 179 x 122 mm top was refused for nothing)."""
+        face = getattr(self.node, 'pick_face_mm', None)
+        return bool(face) and face >= getattr(self.node.args, 'edge_face_mm', 60.0)
 
     def move(self):
         """The MOVE button: touch the selected point with its arm."""
@@ -116,7 +165,8 @@ class TouchMixin:
     # -- the touch ------------------------------------------------------------
 
     def correct_to(self, arm, tcp_goal, axis, quat, label, expected, offset=None,
-                   corrections=None, too_far=0.04, settle=None, gain=1.0):
+                   corrections=None, too_far=0.04, settle=None, gain=1.0, tolerance=None,
+                   along=None):
         """Settle on `expected` joints, measure the fingertip, and fly out the
         error. Returns the offset that had to be added to the command (world,
         m) and the error left over (m).
@@ -132,6 +182,7 @@ class TouchMixin:
         offset = np.zeros(3) if offset is None else np.array(offset, dtype=float)
         best = None                                  # (residual, offset, joints)
         corrections = args.corrections if corrections is None else corrections
+        tolerance = args.tolerance if tolerance is None else tolerance
         for attempt in range(corrections + 1):
             t0 = time.monotonic()
             joint_err = node.settle(arm, expected, timeout=settle)
@@ -140,6 +191,14 @@ class TouchMixin:
             if tip is None:
                 break
             error = wanted - tip
+            if along is not None:
+                # only sideways to the way in: along it the slow contact finds the
+                # surface anyway. Top down, most of the 3-D error was the arm's
+                # vertical sag; correcting it spent the move on height and, at the
+                # edge of reach, did not solve (2026-10-29: 24-28 mm off, the
+                # correction "only 44-70 % of the straight line")
+                way_u = np.asarray(along, float) / np.linalg.norm(along)
+                error = error - (error @ way_u) * way_u
             residual = float(np.linalg.norm(error))
             self.node.get_logger().info(
                 f'{label}: settled in {waited:.1f} s, joints {1000 * (joint_err or 0):.1f} mrad '
@@ -147,11 +206,12 @@ class TouchMixin:
             if best is not None and residual > best[0]:
                 self.say(f'{arm} arm: correction made it worse ({1000 * best[0]:.1f} -> '
                          f'{1000 * residual:.1f} mm); going back')
-                node.line_or_step(arm, tcp_goal + best[1], quat, f'{arm} back')
+                if node.line_or_step(arm, tcp_goal + best[1], quat, f'{arm} back') is None:
+                    return offset, residual              # still where it is now
                 node.settle(arm, best[2])
                 return best[1], best[0]
             best = (residual, offset.copy(), expected)
-            if residual <= args.tolerance or attempt == corrections:
+            if residual <= tolerance or attempt == corrections:
                 break
             if residual > too_far:
                 self.say(f'{arm} arm: {1000 * residual:.0f} mm off at {label} -- too far '
@@ -219,9 +279,13 @@ class TouchMixin:
         finally:
             self.teaching = False
 
-    def _line_room(self, arm, approach, contact, way, quat, seed, near_d, room):
+    def _line_room(self, arm, approach, contact, way, quat, seed, near_d, room, beyond=None):
         """Does the straight line in (approach -> NEAR short) still solve, in
-        full, with both ends moved `room` sideways -- each of 4 ways?"""
+        full, with both ends moved `room` sideways -- each of 4 ways? With
+        `beyond`: the press from there too (to `beyond` past the surface, the
+        fingers allowed to touch) -- it is pressed from the corrected NEAR,
+        and at the edge of reach that line failed where the planned one did
+        not (2026-10-30)."""
         node = self.node
         side = np.cross(way, [0.0, 0.0, 1.0])
         if np.linalg.norm(side) < 1e-6:
@@ -232,11 +296,50 @@ class TouchMixin:
             q = node.solve_ik(arm, approach + room * d, quat, seed)
             if q is None:
                 return False
-            fraction, _t, _f = node.cartesian_plan(arm, contact + room * d - way * near_d, quat,
-                                                   start_joints=q)
-            if fraction < 0.98:
+            fraction, _t, near_q = node.cartesian_plan(arm, contact + room * d - way * near_d,
+                                                       quat, start_joints=q)
+            if fraction < 0.98 or near_q is None:
                 return False
+            if beyond is not None:
+                with node.fingers_touching(arm):
+                    fraction, _t, _f = node.cartesian_plan(arm, contact + room * d + way * beyond,
+                                                           quat, start_joints=near_q)
+                if fraction < 0.98:
+                    return False
         return True
+
+    def _press_line(self, arm, contact, way, past, offset, quat, needed):
+        """Where to press: (target, where the surface is taken to be), or None.
+
+        `past` beyond the contact with the corrections' offset, if the straight
+        line there from where the arm is solves at least to the surface; else
+        less far past, then with half and with none of the offset. Checked
+        from the planned NEAR only, the line failed from the corrected one at
+        the edge of reach -- "only 55 % of the line solves", no press at all
+        (2026-10-30). The arm's fingers must be allowed to touch (the caller)."""
+        node = self.node
+        tcp = node.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+        if tcp is None:
+            return None
+        pasts = list(dict.fromkeys((past, min(past, 0.01), min(past, 0.003))))
+        for scale in (1.0, 0.5, 0.0):
+            if scale < 1.0 and np.linalg.norm(offset) < 0.002:
+                break                                    # no offset to leave out
+            base = contact + offset * scale
+            for p in pasts:
+                target = base + way * p
+                fraction, _t, _f = node.cartesian_plan(arm, target, quat)
+                if fraction >= 0.98 or \
+                        fraction * float(np.linalg.norm(target - tcp[:3, 3])) >= needed:
+                    if scale < 1.0 or p < past:
+                        self.say(f'{arm} arm: the press line solves only '
+                                 + (f'{1000 * p:.0f} mm past the surface' if p < past else '')
+                                 + (' and ' if p < past and scale < 1.0 else '')
+                                 + (f'with {100 * scale:.0f}% of the correction ('
+                                    f'{1000 * np.linalg.norm(offset):.0f} mm)'
+                                    if scale < 1.0 else '') + ' - pressing so')
+                    return target, base
+        return None
 
     def _room_to_correct(self, arm, tcp, axis, quat, seed, room=0.01):
         """Can the arm still reach `tcp` moved `room` sideways, every way?
@@ -267,14 +370,32 @@ class TouchMixin:
     def _solve_standoff(self, arm, aim, label, axis, quat, way, contact, standoff, start, tally):
         """Up to 3 arm postures that reach the approach point `standoff` short
         of the contact AND from which the straight line in (fully checked)
-        and the contact line both solve. [] if none: counted in `tally`."""
+        and the contact line both solve. [] if none: counted in `tally`.
+        Nearer than NEAR (down to 1 cm, when nothing further out works): the
+        tool may be near the box there, so it is exempt from the octomap while
+        these are solved; no straight line in (it is there already) and no
+        room to correct -- an edge plan, flown checked as _plan_close says."""
+        if standoff <= NEAR + 1e-6:
+            with self.node.fingers_touching(arm):
+                return self._solve_standoff_at(arm, aim, label, axis, quat, way, contact,
+                                               standoff, start, tally, close=True)
+        return self._solve_standoff_at(arm, aim, label, axis, quat, way, contact, standoff,
+                                       start, tally)
+
+    def _solve_standoff_at(self, arm, aim, label, axis, quat, way, contact, standoff, start,
+                           tally, close=False):
         node, args = self.node, self.node.args
         approach = node.tcp_for_tip(aim - way * standoff, axis, arm)
         if self.top_down:
             # Can the arm point this way there at all? (fast, all postures;
             # KDL from a few seeds missed most of them -- 2026-10-14)
-            seeds = node.fast_ik(arm, approach, quat, start)
+            seeds = self._fast_ik(arm, approach, quat, start)
         else:
+            # the same quick question first: a pose no posture reaches costs
+            # each seed's whole IK timeout (the reach check took 72 s, 2026-10-28)
+            if not self._fast_ik(arm, approach, quat, start, want=1):
+                tally['ik'] += 1
+                return []
             seeds = node.seeds(arm, start, approach, quat)
         near_d = min(NEAR, standoff)
         out, found = [], []
@@ -293,9 +414,7 @@ class TouchMixin:
                 # tool NEAR short of the surface -- and where the URDF puts those
                 # joints, which is what the planner gets (sag out of the tilt
                 # as well as the position). Re-taken at contact (_touch).
-                cmd = self.arm_models.command(arm, contact - way * near_d,
-                                              matrix_from_quat(*quat), near_q,
-                                              node.joint_limits(arm), directions(above, near_q))
+                cmd = self._model_command(arm, contact - way * near_d, quat, near_q, above)
                 if cmd is None:
                     continue
                 delta = cmd[0] - (contact - way * near_d)
@@ -310,13 +429,19 @@ class TouchMixin:
             # The line in, fully checked -- every link, the gripper too -- to
             # NEAR short of the surface; then the contact, where only this
             # arm's tip may touch the map. It aims past the surface; at the
-            # edge of reach 3 mm past is enough (it stops on contact anyway).
-            fraction, _t, near_joints = node.cartesian_plan(arm, con_c - way * near_d, quat_c,
-                                                            start_joints=above)
-            if fraction < 0.98 or near_joints is None:
-                continue
+            # edge of reach 1 cm past, at least 3 mm (it stops on contact
+            # anyway -- but the arm lags ~8 mm there: a line 3 mm past ended
+            # 5 mm above the box, 2026-10-30).
+            if close:                                    # at NEAR already: no line in
+                near_joints = above
+            else:
+                fraction, _t, near_joints = node.cartesian_plan(arm, con_c - way * near_d,
+                                                                quat_c, start_joints=above)
+                if fraction < 0.98 or near_joints is None:
+                    continue
             with node.fingers_touching(arm):
-                for beyond in (args.past_contact, min(args.past_contact, 0.003)):
+                for beyond in dict.fromkeys((args.past_contact, min(args.past_contact, 0.01),
+                                             min(args.past_contact, 0.003))):
                     fraction, _t, _f = node.cartesian_plan(arm, con_c + way * beyond, quat_c,
                                                            start_joints=near_joints)
                     if fraction >= 0.98:
@@ -328,12 +453,21 @@ class TouchMixin:
             # they moved it ~3 cm, and the checked line then failed part-way
             # at the edge of reach (2026-10-27). 1 cm only: an edge plan, used
             # if nothing better; not even that: not used at all.
-            room = self._line_room(arm, app_c, con_c, way, quat_c, above, near_d,
-                                   args.correction_room)
-            room_min = room or self._line_room(arm, app_c, con_c, way, quat_c, above, near_d,
-                                               0.01)
-            if not room_min:
-                continue
+            if close:
+                # no line in from here: room = the IK still solves with the
+                # approach point moved sideways (the tool may be near the box)
+                room = self._room_to_correct(arm, app_c, axis, quat_c, above,
+                                             room=args.correction_room)
+                if not room and not self._room_to_correct(arm, app_c, axis, quat_c, above,
+                                                          room=0.01):
+                    continue
+            else:
+                room = self._line_room(arm, app_c, con_c, way, quat_c, above, near_d,
+                                       args.correction_room, beyond=beyond)
+                room_min = room or self._line_room(arm, app_c, con_c, way, quat_c, above,
+                                                   near_d, 0.01)
+                if not room_min:
+                    continue
             # joint travel, plus a penalty for a joint near its limit (no room
             # there for a correction); a nearer approach point costs a little
             # (less room to correct out there)
@@ -354,6 +488,77 @@ class TouchMixin:
             tally['line' if found else 'ik'] += 1
         return out
 
+    def _plan_close(self, arm, plan):
+        """The flight to an approach point nearer than NEAR: planned with the
+        tool exempt from the octomap (it ends near the box), then checked
+        again with the tool counted -- all but the last CLOSE_FREE of it, the
+        part closing in on the box -- so it cannot sweep through the others.
+        The trajectory, or None."""
+        node = self.node
+        with node.fingers_touching(arm):
+            _code, traj = node.plan_joints(arm, plan['above'])
+        if traj is None:
+            return None
+        import copy
+        head = copy.deepcopy(traj)
+        pts = head.joint_trajectory.points
+        keep = max(2, int(len(pts) * (1.0 - CLOSE_FREE)))
+        head.joint_trajectory.points = pts[:keep]
+        clear = node.path_is_clear(arm, head, every=2)
+        if clear is not True:
+            self.node.get_logger().warn(
+                f'{arm} arm: the flight to {cm(plan["standoff"])} cm from the box passes '
+                f'through something before it closes in - not used')
+            return None
+        self.node.get_logger().info(
+            f'{arm} arm: a way to {cm(plan["standoff"])} cm in front of the box (checked with the '
+            f'tool counted up to the last {100 * CLOSE_FREE:.0f} % of it)')
+        return traj
+
+    def _fast_ik(self, arm, tcp, quat, start, want=3):
+        """node.fast_ik, timed and remembered within a reach check."""
+        node = self.node
+        r = lambda v, d: tuple(np.round(np.asarray(v, float).ravel(), d))
+        return node._cached('fast_ik', (arm, r(tcp, 4), r(quat, 4), r(start, 3), want),
+                            lambda: node.fast_ik(arm, tcp, quat, start, want=want))
+
+    def _model_command(self, arm, tcp, quat, near_q, above):
+        """arm_models.command (an optimisation: the joints that put the real
+        tool at tcp), remembered within a reach check -- the same for every
+        approach point."""
+        node = self.node
+        r = lambda v, d: tuple(np.round(np.asarray(v, float).ravel(), d))
+        return node._cached('model', (arm, r(tcp, 4), r(quat, 4), r(near_q, 2),
+                                      r(directions(above, near_q), 0)),
+                            lambda: self.arm_models.command(
+                                arm, tcp, matrix_from_quat(*quat), near_q,
+                                node.joint_limits(arm), directions(above, near_q)))
+
+    def _finish_first(self, arm, aim, origin, found, ring, tally, edge, late, start):
+        """The first of `found` (one candidate's postures, best first) whose way
+        there plans -- or, blocked, the first nearer approach point that does.
+        None if none (postures with no room to correct go to `edge`)."""
+        for g in found:
+            if late():
+                return None
+            set_aside = len(edge)
+            plan = self._finish_plan(arm, aim, origin, g, ring, tally, edge)
+            if plan is not None:
+                return plan
+            if len(edge) > set_aside:
+                continue                                 # only no room (edge), not blocked
+            for standoff in g['nearer']:                 # the way there blocked: nearer
+                if late():
+                    return None
+                more = self._solve_standoff(arm, aim, g['label'], g['axis'], g['quat0'],
+                                            g['way'], g['contact0'], standoff, start, tally)
+                if more:
+                    plan = self._finish_plan(arm, aim, origin, more[0], ring, tally, edge)
+                    if plan is not None:
+                        return plan
+                    break
+        return None
+
     def _finish_plan(self, arm, aim, origin, g, ring, tally, edge):
         """A posture that passed _solve_standoff: (TOP DOWN) the level way up
         there, then the planned path to it. The plan, or None (a plan with
@@ -372,20 +577,40 @@ class TouchMixin:
             if plan['level'] is None:
                 tally['line'] += 1
                 return None
-        if not g['room'] and not (self.top_down and ring == 0):
+        if not g['room'] and not (self.top_down and ring == 0) and not self._edge_ok():
             edge.append(dict(plan, edge=True))       # only if nothing better
             return None
         # (TOP DOWN: straight down at the edge of reach beats a lean -- the cup
         # seals best flat; if it cannot be corrected to MAX_LEFT, it does not go in)
         plan['edge'] = not g['room']
-        _code, plan['trajectory'] = node.plan_joints(
-            arm, plan['level']['joints'] if plan['level'] else g['above'])
+        if g['standoff'] <= NEAR + 1e-6 and not plan['level']:
+            plan['trajectory'] = self._plan_close(arm, plan)     # ends near the box
+        else:
+            _code, plan['trajectory'] = node.plan_joints(
+                arm, plan['level']['joints'] if plan['level'] else g['above'])
         if plan['trajectory'] is not None:
             return plan
         tally['path'] += 1
         return None
 
     def preplan(self, arm, aim, point, origin, start):
+        """_preplan, with every IK and straight-line question asked once
+        (node.planning_cache) and where its time went in the log."""
+        t0 = time.monotonic()
+        self._cmd_cache = {}
+        with self.node.planning_cache() as stats:
+            try:
+                return self._preplan(arm, aim, point, origin, start)
+            finally:
+                names = {'fast_ik': 'quick reach', 'ik': 'IK', 'line': 'straight lines',
+                         'path': 'path planning', 'model': 'arm model'}
+                parts = ', '.join(f'{names.get(k, k)} {v[1]}' + (f'/{v[0]}' if v[0] != v[1] else '')
+                                  + f' in {v[2]:.1f} s' for k, v in stats.items())
+                self.node.get_logger().info(f'{arm} reach check: {time.monotonic() - t0:.1f} s '
+                                            f'({parts}; asked/needed)')
+                self._cmd_cache = None
+
+    def _preplan(self, arm, aim, point, origin, start):
         """Plan the whole touch before anything moves. (plan, reason)
 
         For each candidate approach (front rings, then rolls by joint travel):
@@ -405,19 +630,36 @@ class TouchMixin:
                               f'can reach')
         tally = {'ik': 0, 'path': 0, 'line': 0}
         edge = []                    # plans with no room for corrections, if that is all
+        # a budget: nothing found by then means not from here (each failure that
+        # ran to the end took 70-90 s, 2026-10-28) -- base_adjust says where to go
+        deadline = time.monotonic() + getattr(args, 'plan_budget', 1e9)
+        cut = [False]                                # the search stopped before its end
+
+        def late():
+            if time.monotonic() > deadline:
+                cut[0] = True
+            return cut[0]
         rings = {}
         for cand in node.candidates(point, origin, top_down=self.top_down, arm=arm):
             rings.setdefault(cand[3], []).append(cand)
         standoffs = self._standoffs()
         for ring in sorted(rings):
-            solved = []
+            if late():
+                break
             for label, axis, quat, _ring in rings[ring]:
+                if late():
+                    break
                 # The way the tip travels in: along the tool, or in TOP DOWN
                 # straight down whatever the tool's lean -- coming in along a
                 # leaned tool (20 deg: the wrist cannot point straight down
                 # ~45 cm out) caught the box's near edge (2026-10-14).
                 way = np.array([0.0, 0.0, -1.0]) if self.top_down else axis
                 contact = node.tcp_for_tip(aim - way * args.touch_offset, axis, arm)
+                # no posture puts the tool NEAR short of it this way: no approach
+                # point helps -- skip them all (fast, local; no IK timeouts)
+                if not self._fast_ik(arm, contact - way * NEAR, quat, start, want=1):
+                    tally['ik'] += 1
+                    continue
                 # The approach point: as far out as works -- the arm gets there,
                 # the whole straight line in AND the contact solve from there --
                 # down to --min-standoff (room for the cup to seat). One fixed
@@ -429,28 +671,32 @@ class TouchMixin:
                     if got:
                         for g in got:
                             g['nearer'] = standoffs[k + 1:]
-                        solved.extend(got)
                         break
-            solved.sort(key=lambda g: g['cost'])
-            for g in solved:
-                plan = self._finish_plan(arm, aim, origin, g, ring, tally, edge)
+                # the first that flies: done (a whole ring searched first took up
+                # to 30 s before anything was tried, 2026-10-29)
+                got = sorted(got or [], key=lambda g: (not g['room'], g['cost']))
+                plan = self._finish_first(arm, aim, origin, got, ring, tally, edge, late, start)
                 if plan is not None:
                     return plan, None
-                # the way to that approach point is blocked: one nearer try
-                for standoff in g['nearer']:
-                    more = self._solve_standoff(arm, aim, g['label'], g['axis'], g['quat0'],
-                                                g['way'], g['contact0'], standoff, start, tally)
-                    if more:
-                        plan = self._finish_plan(arm, aim, origin, more[0], ring, tally, edge)
-                        if plan is not None:
-                            return plan, None
-                        break
+        edge.sort(key=lambda p: -p['standoff'])          # the furthest out first
+        if edge and getattr(args, 'edge', 'try') == 'adjust':
+            return edge[0], None         # not flown (_checked_plan: the robot moves instead)
         for plan in edge:
-            _code, plan['trajectory'] = node.plan_joints(arm, plan['above'])
+            if late():
+                break
+            if plan['level']:                            # TOP DOWN: level, then turn up there
+                _code, plan['trajectory'] = node.plan_joints(arm, plan['level']['joints'])
+            elif plan['standoff'] <= NEAR + 1e-6:
+                plan['trajectory'] = self._plan_close(arm, plan)
+            else:
+                _code, plan['trajectory'] = node.plan_joints(arm, plan['above'])
             if plan['trajectory'] is not None:
                 return plan, None
             tally['path'] += 1
         how = 'from above' if self.top_down else 'from the front'
+        if cut[0]:
+            return None, (f'no way to pick it {how} found in {args.plan_budget:.0f} s '
+                          f'(--plan-budget) - not from here')
         if self.top_down and args.tools[arm]['on'] and tally['path'] == 0:
             return None, (f'the wrist cannot point the tool down there, even leaned up to '
                           f'{min(args.vacuum_lean, 30):.0f} deg -- use the front approach')
@@ -637,6 +883,40 @@ class TouchMixin:
                 return {'joints': q, 'tcp': tcp, 'quat': quat, 'via': via}
         return None
 
+    def vacuum(self, arm, on):
+        """The vacuum: on before the cup goes in, off at the drop. Switched by
+        hand for now; the pick stack publishes it (<ns>/vacuum) for the valve."""
+        return None
+
+    def _weigh_held(self, arm, still_in, weigh_at):
+        """After a press, held still where `still_in` was measured: is the box
+        on the cup? True / False, or None if it cannot tell. Recorded in
+        self.last_contact (held, held_g) for the pick check."""
+        node, args = self.node, self.node.args
+        verdict, grams, err = None, None, None
+        after = node.still_torque(arm) if (still_in is not None and weigh_at) else None
+        tip = node.fingertip(arm)
+        tcp = node.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+        if after is not None and tip is not None and tcp is not None:
+            depth = node.held[arm]['extents'][2] if arm in node.held else 0.025
+            grams, err = node.held_grams(arm, still_in, after, tip + tcp[:3, 2] * depth / 2.0)
+        min_g = getattr(args, 'held_min_g', 30.0)
+        if grams is None:
+            self.say(f'{arm} arm: could not weigh what the cup holds - the camera will tell')
+        elif err > min_g:
+            self.say(f'{arm} arm: the torques are too unsteady to weigh the box '
+                     f'({grams:+.0f} +- {err:.0f} g) - the camera will tell')
+        else:
+            verdict = grams >= min_g
+            self.say(f'{arm} arm: ' + (f'the box is on the cup ({grams:.0f} +- {err:.0f} g)'
+                                       if verdict else
+                                       f'nothing on the cup ({grams:+.0f} +- {err:.0f} g)'),
+                     not verdict)
+        if self.last_contact is not None:
+            self.last_contact.update(held=verdict,
+                                     held_g=None if grams is None else round(grams, 1))
+        return verdict
+
     def touch(self, arm, point, origin, scene=None):
         """Touch `point` with `arm`, then always try to bring the arm back --
         also when something failed part-way (an arm left out at the board,
@@ -649,54 +929,102 @@ class TouchMixin:
             return
         self.last_touch = None
         self.last_contact = None
+        self.touch_moved = False                     # set once the arm leaves (finish_pick)
+        if self.node.halt.is_set():
+            self.say(f'{arm} arm: STOP is on - not moving', True)
+            return
+        # an approach point nearer than NEAR keeps the tool exempt from the
+        # octomap for the whole touch (entered by _touch), until it is back
+        self._exempt = contextlib.ExitStack()
         try:
             self._touch(arm, point, origin, scene)
         except Exception as exc:                     # noqa: BLE001 - shown in the window
             self.say(f'{arm} arm: touch failed ({exc}); bringing it back', True)
         finally:
-            if self.last_touch is not None:
-                self.return_to_start()
+            try:
+                if self.last_touch is not None:
+                    self.return_to_start()
+            finally:
+                self._exempt.close()
+                if self.last_touch is None and arm not in self.node.held:
+                    self.vacuum(arm, False)              # home, nothing on the cup
+
+    def _carry(self, lt, holding):
+        """(line speed m/s, joint velocity scaling or None) for the moves out:
+        gentle while the box may be on the cup -- held, or pressed at all (it
+        is held only when the box size is known; the vacuum grips without it).
+        Full speed and acceleration yanked a held box into the boxes beside
+        it (2026-10-30)."""
+        args = self.node.args
+        if holding or lt.get('pressed'):
+            return (min(args.fast_line_speed, getattr(args, 'held_line_speed', 0.03)),
+                    min(args.velocity, getattr(args, 'held_velocity', 0.4)))
+        return args.fast_line_speed, None
 
     def return_to_start(self):
         """Back out along the tool axis (if near the surface), let the joints
         settle, then retrace the approach path to the starting posture --
         planning a way back only if that is not possible. Also the RETURN
         button (b). True once the arm is back."""
-        node, args = self.node, self.node.args
+        node = self.node
         lt = self.last_touch
         if lt is None:
             self.say('nothing to return from: no arm is out')
             return True
         arm = lt['arm']
         holding = bool(lt.get('held')) and arm in node.held
+        line_speed, _velocity = self._carry(lt, holding)
+        # an approach point nearer than NEAR: the tool is near the box until it
+        # is out -- exempt from the octomap till then (also on a later RETURN),
+        # and not after: the way home and the held box are checked as usual
+        close = lt.get('standoff', 1.0) <= NEAR + 1e-6
         if not lt['out']:
             self.phase(f'{arm} back_out')
             self.say(f'{arm} arm: backing straight out')
-            if not lt.get('near_out') and 'out_short' in lt:
-                with node.fingers_touching(arm):     # still at the surface
-                    if node.line_move(arm, lt['out_short'], lt['quat'], f'{arm} off the surface',
-                                      speed=args.fast_line_speed) is not None:
-                        lt['near_out'] = True
-            # a held box leaves the spot it came from straight along the tool,
-            # where the octomap still has it: free of the map until it is out
-            with (node.held_leaving(arm) if holding else contextlib.nullcontext()):
-                self._back_out(arm, lt, holding)
+            with (node.fingers_touching(arm) if close else contextlib.nullcontext()):
+                if not lt.get('near_out') and 'out_short' in lt:
+                    with node.fingers_touching(arm):     # still at the surface
+                        if node.line_move(arm, lt['out_short'], lt['quat'],
+                                          f'{arm} off the surface',
+                                          speed=line_speed) is not None:
+                            lt['near_out'] = True
+                # a held box leaves the spot it came from straight along the tool,
+                # where the octomap still has it: free of the map until it is out
+                with (node.held_leaving(arm) if holding else contextlib.nullcontext()):
+                    self._back_out(arm, lt, holding)
+                    if close:                        # on out to CORRECT_AT: clear of the box
+                        node.line_move(arm, lt['out_to'] - lt['way'] * max(
+                            0.0, CORRECT_AT - lt['standoff']), lt['quat'],
+                            f'{arm} clear of the box', speed=line_speed)
+            if holding:
+                # the camera map still has the box where it was: with it on the
+                # tool, every plan home started "in collision" and the arm stayed
+                # out (2026-10-29). Taken again now, the arm and the held box are
+                # masked out of it and the old spot is empty.
+                self.say(f'{arm} arm: box lifted - the camera map again, without the box in '
+                         f'its old spot')
+                node.rebuild_octomap()
             lt['out'] = True
+        exempt = getattr(self, '_exempt', None)
+        if exempt is not None:
+            exempt.close()                           # (the close approach's: the tool counted again)
         self._return_rest(arm, lt, holding)
         return self.last_touch is None
 
     def _back_out(self, arm, lt, holding):
-        node, args = self.node, self.node.args
+        node = self.node
+        line_speed, velocity = self._carry(lt, holding)
         if node.line_move(arm, lt['out_to'], lt['quat'], f'{arm} out',
-                          speed=args.fast_line_speed) is None:
+                          speed=line_speed) is None:
             # MoveIt may see this pose as colliding (TEACH nudges once put
             # the left forearm against the camera model): then every checked
             # move fails. The way out is the line it came in on, unchecked.
             self.say(f'{arm} arm: backing out along the way in (model says this pose '
                      f'touches something)')
             if node.line_move(arm, lt['out_to'], lt['quat'], f'{arm} out (unchecked)',
-                              speed=args.fast_line_speed, check=False) is None:
-                node.move_joints(arm, lt['above'], f'{arm} retreat', via_home=False)
+                              speed=line_speed, check=False) is None:
+                node.move_joints(arm, lt['above'], f'{arm} retreat', velocity=velocity,
+                                 via_home=False)
         if holding:
             # all of the box out of its old spot: the tool backed off the
             # contact by at least the box's length along it, plus 3 cm
@@ -708,7 +1036,7 @@ class TouchMixin:
                 self.say(f'{arm} arm: lifting the box clear ({100 * along:.0f} cm off the '
                          f'contact)')
                 if node.line_move(arm, clear, lt['quat'], f'{arm} box clear',
-                                  speed=args.fast_line_speed) is None:
+                                  speed=line_speed) is None:
                     self.say(f'{arm} arm: could not take the box further out along the '
                              f'tool; the planners may see it in its old spot', True)
 
@@ -716,6 +1044,8 @@ class TouchMixin:
         """From out at the approach: level again (TOP DOWN), back to pre_pick,
         the drop, pre_pick. Clears self.last_touch once back."""
         node, args = self.node, self.node.args
+        _line_speed, velocity = self._carry(lt, holding)
+        slow = velocity or 1.0                       # the retrace: as much slower
         node.settle(arm, lt['above'], timeout=1.5)   # plans must start from where it is
         lvl = lt.get('level')
         if lvl is not None and lt.get('turned'):
@@ -723,10 +1053,17 @@ class TouchMixin:
             # (level) way it came
             self.phase(f'{arm} turn_level')
             self.say(f'{arm} arm: turning the tool level')
-            if node.line_move(arm, lvl['tcp'], lvl['quat'], f'{arm} turn level', speed=0.02,
-                              via=[(p, q) for p, q in reversed(lvl['via'])],
-                              length=0.05) is None:
-                node.move_joints(arm, lvl['joints'], f'{arm} turn level', via_home=False)
+            turn = lambda: (node.line_move(arm, lvl['tcp'], lvl['quat'], f'{arm} turn level',
+                                           speed=0.02,
+                                           via=[(p, q) for p, q in reversed(lvl['via'])],
+                                           length=0.05) is not None
+                            or node.move_joints(arm, lvl['joints'], f'{arm} turn level',
+                                                velocity=velocity, via_home=False))
+            if not turn() and holding:
+                # up here, above the stack: the held box may pass through the map
+                self.say(f'{arm} arm: turning level with the box let through the camera map')
+                with node.held_leaving(arm):
+                    turn()
             lt['turned'] = False
             node.settle(arm, lvl['joints'], timeout=1.5)
         # Back to pre_pick the way it came (retrace; planned if that fails) ...
@@ -736,22 +1073,35 @@ class TouchMixin:
         clear = node.path_is_clear(arm, lt['trajectory']) if holding else True
         if clear:
             self.say(f'{arm} arm: returning the way it came')
-            back = node.retrace(arm, lt['trajectory'], f'{arm} return')
+            back = node.retrace(arm, lt['trajectory'], f'{arm} return', scale=slow)
         else:
             self.say(f'{arm} arm: the way in is too tight with the box - planning a way back')
             back = False
         if not back:
             node.settle(arm, lt['start'], timeout=1.0)
-            back = node.move_joints(arm, lt['start'], f'{arm} return', via_home=False)
+            back = node.move_joints(arm, lt['start'], f'{arm} return', velocity=velocity,
+                                    via_home=False)
+        if not back and holding:
+            # never left out with a box: the way it came in, backwards (the arm's
+            # path is known clear; the box rises away from where it was)
+            self.say(f'{arm} arm: no planned way home with the box - retracing the way in',
+                     True)
+            with node.held_leaving(arm):
+                back = node.retrace(arm, lt['trajectory'], f'{arm} return (retrace)',
+                                    scale=slow) or \
+                    node.move_joints(arm, lt['start'], f'{arm} return', velocity=velocity,
+                                     via_home=False)
         # ... then straight on to the drop pose, hold, and back to pre_pick.
         drop = self.pose(arm, 'drop_state') if args.drop_hold >= 0 else None
         if back and drop is not None and not lt.get('dropped'):
             lt['dropped'] = True                     # once per touch, also after a RETURN
             self.phase(f'{arm} to_drop')
             self.say(f'{arm} arm: to the drop pose')
-            if node.move_joints(arm, drop, f'{arm} to drop', via_home=False):
+            if node.move_joints(arm, drop, f'{arm} to drop', velocity=velocity,
+                                via_home=False):
                 self.phase(f'{arm} drop')
                 self.say(f'{arm} arm: at the drop pose; holding {args.drop_hold:g} s')
+                self.vacuum(arm, False)                  # let go of the box
                 time.sleep(args.drop_hold)
                 if arm in node.held:
                     node.detach_held(arm)
@@ -801,11 +1151,13 @@ class TouchMixin:
             if (check is not None and check.get('plan') is not None
                     and check['pick'][2] is point and np.allclose(check['aim'], aim)
                     and time.monotonic() - check['time'] < 300.0
-                    and np.max(np.abs(np.array(check['start']) - np.array(start))) < 0.003):
-                plan, why = check['plan'], None          # checked on the click; nothing moved
+                    and np.max(np.abs(np.array(check['start']) - np.array(start))) < 0.02):
+                # checked on the click; the arm has not moved (it creeps a few mrad
+                # at rest: with 3 mrad the 72 s check was done twice, 2026-10-28)
+                plan, why = check['plan'], None
             else:
                 self.say(f'{arm} arm: checking the whole touch before moving...')
-                plan, why = self.preplan(arm, aim, point, origin, start)
+                plan, why = self._checked_plan(arm, aim, point, origin, start)
         if plan is None:
             self.say(f'{arm} arm: not moving -- {why}.', True)
             return
@@ -820,10 +1172,19 @@ class TouchMixin:
                  + ('; AT THE EDGE OF REACH - a correction may not fit' if plan['edge']
                     else ''))
 
+        if standoff <= NEAR + 1e-6:
+            # starting nearer than NEAR: near the box from the start -- the tool
+            # may touch the octomap for the corrections and the way in and out
+            self._exempt.enter_context(node.fingers_touching(arm))
+            self.say(f'{arm} arm: no approach from further out works - flying to '
+                     f'{cm(standoff)} cm in front of the box (that way checked with the tool '
+                     f'counted up to its last {100 * CLOSE_FREE:.0f} %), then in')
         # From here on the arm is out: touch() brings it back whatever happens.
+        self.touch_moved = True
         self.last_touch = {'arm': arm, 'trajectory': plan['trajectory'], 'start': start,
                            'above': plan['above'], 'quat': quat, 'out_to': approach,
-                           'out': True, 'level': plan.get('level')}
+                           'out': True, 'level': plan.get('level'),
+                           'standoff': standoff, 'way': np.array(way, float)}
         self.phase(f'{arm} approach')
         ok, _ = node.execute(plan['trajectory'], f'{arm} approach')
         if not ok:
@@ -862,7 +1223,7 @@ class TouchMixin:
             offset, off_at_approach = self.correct_to(
                 arm, approach, axis, quat, 'the approach', plan['above'], offset,
                 corrections=max(args.corrections, 2) if self.top_down else None,
-                too_far=0.06 if self.top_down else 0.04)
+                too_far=0.06 if self.top_down else 0.04, along=way)
 
         # The camera's check (any approach): where it sees the tip against the
         # line in, moved onto it. Without a view of the tip, TOP DOWN reads the
@@ -885,17 +1246,24 @@ class TouchMixin:
         self.last_touch['out'] = False
         self.last_touch['out_short'] = stop + offset
         ends, touched = None, False
+        why_not = None                               # the step that did not go, for the message
         # In to CORRECT_AT short of the surface, every link checked (the gripper too).
         self.phase(f'{arm} in')
         near = node.line_or_step(arm, stop + offset, quat, f'{arm} in',
                               speed=args.fast_line_speed)
+        if near is None:
+            # never got in: the way out must not start with a move TOWARD the
+            # box (to out_short), the tool exempt
+            self.last_touch['near_out'] = True
+            why_not = f'the straight line in to {cm(correct_d)} cm short did not solve'
         if near is not None and self.arm_models.has(arm) and not seen_fix:
             # The arm model's correction where the contact really happens: the
             # plan took it NEAR short, and gravity's sag changes over the last
             # cm (2-7 mm, simulated 2026-10-12). Re-aim there and slide the
             # line sideways before going in (the tilt stays as planned).
             raw, level = plan['contact_raw']
-            q_c = node.solve_ik(arm, contact, quat, near)
+            with node.fingers_touching(arm):          # (the tool is AT the surface there)
+                q_c = node.solve_ik(arm, contact, quat, near)
             cmd = (self.arm_models.command(arm, raw, matrix_from_quat(*level), q_c,
                                            node.joint_limits(arm), directions(near, q_c))
                    if q_c is not None else None)
@@ -919,13 +1287,15 @@ class TouchMixin:
             # with 2 the left arm (rubber tool) still ended 10-17 mm off -- each
             # correction took out only about half (robot, 2026-10-13).
             offset, left = self.correct_to(
-                arm, stop, axis, quat, f'{correct_d * 100:.0f} cm short', near, offset,
-                corrections=6, too_far=0.05, settle=max(args.settle_time, 3.0), gain=0.6)
+                arm, stop, axis, quat, f'{cm(correct_d)} cm short', near, offset,
+                corrections=getattr(args, 'short_corrections', 6), too_far=0.05,
+                settle=max(args.settle_time, 3.0), gain=0.6, tolerance=getattr(args, 'short_tolerance', None),
+                along=way)
             self.last_touch['out_short'] = stop + offset
             # the camera once more, right before the straight line in: what it
             # sees replaces the joints' idea of how far off the tip still is
             cam = self._tip_vision_fix(arm, aim - way * correct_d, way, stop + offset, quat,
-                                       f'{correct_d * 100:.0f} cm short')
+                                       f'{cm(correct_d)} cm short')
             if cam is not None:
                 offset = offset + cam
                 self.last_touch['out_short'] = stop + offset
@@ -935,42 +1305,99 @@ class TouchMixin:
             # of reach arrived 26 mm off, its correction did not solve, and it
             # went down anyway -- beside the box, pushing the others aside
             # (2026-10-14). The paths were checked for where it was sent.
-            if left is None or left > getattr(args, 'max_miss', MAX_LEFT):
-                self.say(f'{arm} arm: still {1000 * (left or 0):.0f} mm off the target '
-                         f'{correct_d * 100:.0f} cm short and it cannot be corrected (edge '
-                         f'of reach?) - not going in; coming back', True)
+            # how far off may still go in: --max-miss, or on a wide face as much as
+            # keeps the whole 25 mm cup on it with 5 mm to spare (at most 25 mm)
+            face = getattr(node, 'pick_face_mm', None)
+            allowed = getattr(args, 'max_miss', MAX_LEFT)
+            if face:
+                allowed = max(allowed, min(0.025, face / 2000.0 - 0.0175))
+            if left is None or left > allowed:
+                self.say(f'{arm} arm: ' + (f'still {1000 * left:.0f} mm off the target '
+                                           f'{cm(correct_d)} cm short and it cannot be '
+                                           f'corrected (edge of reach?)' if left is not None else
+                                           f'could not measure where the tip is '
+                                           f'{cm(correct_d)} cm short')
+                         + ' - not going in; coming back', True)
                 return
             # then straight on, no more sideways moves, to NEAR short
-            near = node.line_or_step(arm, short + offset, quat, f'{arm} in to {near_d * 100:.0f} cm',
+            near = node.line_or_step(arm, short + offset, quat, f'{arm} in to {cm(near_d)} cm',
                                   speed=args.fast_line_speed)
+            if near is None:
+                # The straight line to NEAR did not solve: with the tool counted
+                # against the octomap that close to the box, the line to 3 cm
+                # short solved only 80 % and the step was "not clear" (2026-10-28).
+                # Then the same NEAR point, the tool allowed near the box (as for
+                # the contact), slowly, straight along the tool. Never nearer: with
+                # the depth or the aim a little off, 1 cm was in the box -- it was
+                # driven 1.6 cm into one and knocked a stack (2026-10-28/29).
+                for gap in (near_d,):
+                    self.say(f'{arm} arm: no straight line to {cm(near_d)} cm short - going to '
+                             f'{cm(gap)} cm in front of the box, the tool allowed near it, '
+                             f'then in')
+                    with node.fingers_touching(arm):
+                        near = node.line_or_step(arm, contact - way * gap + offset, quat,
+                                                 f'{arm} in to {cm(gap)} cm', speed=0.03)
+                    if near is not None:
+                        near_d, short = gap, contact - way * gap
+                        break
+                else:
+                    why_not = (f'no straight line in from {cm(correct_d)} cm short, not even with '
+                               f'the tool allowed near the box')
             if near is not None:
+                # once more right above it, sideways only: the line in from
+                # CORRECT_AT added 4-7 mm (top down, 2026-10-29). Two tries at most.
+                offset, _left = self.correct_to(
+                    arm, short, axis, quat, f'{cm(near_d)} cm short', near, offset,
+                    corrections=2, too_far=0.03, settle=1.5, gain=0.6,
+                    tolerance=getattr(args, 'short_tolerance', None), along=way)
                 self.last_touch['out_short'] = short + offset
-        if near is not None:
+        presses, deeper = 0, 0.0
+        short_by = None                                  # the last press: how far short it stopped
+        while near is not None:
+            at_surface = False                           # this press reached the measured surface
             # The last NEAR, on the same line: only now may this arm's fingers
             # touch the octomap -- slowly, stopping when it feels the surface,
-            # so the depth comes from the object itself.
+            # so the depth comes from the object itself. First the torques held
+            # still here: after the press they say whether the box came along.
+            still_in = node.still_torque(arm)
+            self.vacuum(arm, True)                       # sucking before it touches
             self.phase(f'{arm} contact')
             with node.fingers_touching(arm):
-                ends, touched = node.guarded_line(
-                    arm, contact + way * plan['beyond'] + offset, quat, f'{arm} contact',
-                    needed=near_d + 0.003)
+                press = self._press_line(arm, contact, way, plan['beyond'] + deeper, offset,
+                                         quat, near_d + 0.003)
+                ends, touched, short_by = None, False, None
+                if press is None:
+                    why_not = ('the press line onto the box does not solve from where the arm '
+                               'is - not even 3 mm past the surface, nor without the correction')
+                else:
+                    target, surface_at = press
+                    ends, touched = node.guarded_line(arm, target, quat, f'{arm} contact',
+                                                      needed=near_d + 0.003)
                 if ends is not None:
                     held = time.monotonic()
+                    self.last_touch['pressed'] = True    # the box may be on the cup: out gently
                     node.settle(arm, ends, timeout=0.1)
                     how = 'felt the surface' if touched else 'no contact felt'
                     # Stopped well short of the measured surface: not a touch
                     # (a false stop once left the cup 2.4 cm above the box,
-                    # reported as "felt the surface", 2026-10-14)
+                    # reported as "felt the surface", 2026-10-14; 2.6 cm, every
+                    # press, 2026-10-30). Nor a line that ended above it: the
+                    # arm lags ~8 mm at the edge of reach, and a line 3 mm past
+                    # the surface left the cup 5 mm above the box (2026-10-30)
                     tcp_now = node.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
-                    if touched and tcp_now is not None:
-                        short_by = float((contact + offset - tcp_now[:3, 3]) @ way)
-                        if short_by > 0.015:
+                    if tcp_now is not None:
+                        short_by = float((surface_at - tcp_now[:3, 3]) @ way)
+                    if touched and short_by is not None:
+                        at_surface = short_by <= PRESS_SHORT_M
+                        if not at_surface:
                             how = (f'STOPPED {100 * short_by:.1f} cm before the surface - '
                                    f'not touching')
                             self.say(f'{arm} arm: stopped {100 * short_by:.1f} cm before the '
                                      f'measured surface', True)
+                    elif short_by is not None and short_by > ENDED_SHORT_M:
+                        how = f'no contact felt - the line ended {1000 * short_by:.0f} mm above the surface'
                     self.phase(f'{arm} holding')
-                    self.say(f'{arm} arm: touching ({how}); holding {args.hold:.0f} s')
+                    self.say(f'{arm} arm: touching ({how}); holding {args.hold:.1f} s')
                     # the box is on the tool now: its size goes into the planners,
                     # so the way back keeps it clear of everything (2026-10-21)
                     size = node.object_size
@@ -1004,8 +1431,13 @@ class TouchMixin:
                         miss = aim - tip
                         along = float(miss @ way)
                         sideways = float(np.linalg.norm(miss - along * way))
+                        self.last_contact['sideways'] = sideways
+                        # which way, in the world (tip minus target, square to the
+                        # tool): "the y axis was wrong" needs the axis (2026-10-30)
+                        side = 1000.0 * (along * way - miss)
                         self.detail = (f'last touch: {how}; tip {1000 * sideways:.1f} mm from the click '
-                                       f'sideways ({seen_by})'
+                                       f'sideways (x {side[0]:+.0f} y {side[1]:+.0f} '
+                                       f'z {side[2]:+.0f} mm, {seen_by})'
                                        + (f', {1000 * off_at_approach:.1f} mm off at the approach'
                                           if off_at_approach is not None else '')
                                        + f'; {held - t0:.1f} s to touch')
@@ -1016,15 +1448,79 @@ class TouchMixin:
                                          here[:3, 3] if here is not None else contact + offset,
                                          scene)
                     else:
-                        time.sleep(max(0.0, args.hold - (time.monotonic() - held)))
+                        time.sleep(max(0.0, args.hold + 0.5 * presses - (time.monotonic() - held)))
                 self.phase(f'{arm} off_surface')
-                # back off the surface the way it came, fingers still allowed
-                if node.line_move(arm, short + offset, quat, f'{arm} off the surface',
-                                  speed=args.fast_line_speed) is not None:
+                # back off the surface the way it came, fingers still allowed --
+                # REWEIGH past NEAR, then onto it again: arriving the way it
+                # did on the way in, the joints' friction is the same, and
+                # the torques compare (the box's weight)
+                weigh_at = None
+                # (gently: the box may be on the cup, the others right beside it)
+                if node.line_move(arm, short - way * REWEIGH + offset, quat,
+                                  f'{arm} off the surface',
+                                  speed=self._carry(self.last_touch, False)[0]) is not None:
                     self.last_touch['near_out'] = True
-        if ends is None:
-            self.say(f'{arm} arm: no straight line in; could not touch', True)
+                    if node.line_move(arm, short + offset, quat, f'{arm} to weigh',
+                                      speed=0.03) is not None:
+                        weigh_at = True
+            # Did the box come along? Its weight in the shoulder and elbow,
+            # held still at NEAR before and after (2026-10-28). Nothing on the
+            # cup: press again from here, deeper and longer, before giving up.
+            if ends is None or self.teach:
+                if ends is None and presses:
+                    self.say(f'{arm} arm: could not press again from here', True)
+                break
+            # (no contact felt too: the box may be further than measured -- the
+            # next press goes 5 mm deeper)
+            on_cup = self._weigh_held(arm, still_in, weigh_at)
+            # stopped short of the box: whatever the weighing says, it did not
+            # get there (its friction alone read 46-119 g, 2026-10-29/30)
+            stopped_short = touched and short_by is not None and not at_surface
+            # the line ran out above the surface (no contact): press further
+            ended_short = not touched and short_by is not None and short_by > ENDED_SHORT_M
+            stopped_short = stopped_short or ended_short
+            if stopped_short and self.last_contact is not None:
+                self.last_contact['held'] = None         # not believed: the camera tells
+            if not stopped_short and (on_cup is None or on_cup is True):
+                break                                    # held, or can't tell: on
+            # Not again where it would push the boxes around: the cup beside the
+            # face (16-21 mm off a 30 mm face, deeper each time, knocked a stack
+            # over, 2026-10-29), or something pushing up on it (-224 g there)
+            lc = self.last_contact or {}
+            face = getattr(node, 'pick_face_mm', None)
+            if face and lc.get('sideways') is not None and lc['sideways'] > face / 2000.0:
+                self.say(f'{arm} arm: the cup pressed {1000 * lc["sideways"]:.0f} mm from the '
+                         f'centre of the {face:.0f} mm face - beside it; not pressing again', True)
+                break
+            # (front only: top down at the edge the arm's lag biases the weighing --
+            # -57..-89 g with the cup 3 cm above the box, 2026-10-29)
+            if not self.top_down and lc.get('held_g') is not None and lc['held_g'] < -60.0:
+                self.say(f'{arm} arm: something pushes up on the cup ({lc["held_g"]:.0f} g) - '
+                         f'not the box face; not pressing again', True)
+                break
+            if presses >= getattr(args, 'press_retries', 2):
+                self.say(f'{arm} arm: ' + (f'still {100 * short_by:.1f} cm above the measured '
+                                           f'surface' if stopped_short else
+                                           'still nothing on the cup')
+                         + f' after {presses + 1} presses', True)
+                break
+            presses += 1
+            # ended above the surface: as much deeper as it was short, and 5 mm
+            more = max(0.005, short_by + 0.005) if ended_short else 0.005
+            deeper += more
+            self.say(f'{arm} arm: ' + (f'the line ended {1000 * short_by:.0f} mm above the surface'
+                                       if ended_short else
+                                       f'stopped {100 * short_by:.1f} cm short of the box'
+                                       if stopped_short else 'nothing on the cup')
+                     + f' - pressing again, {1000 * more:.0f} mm deeper and {0.5 * presses:.1f} s '
+                       f'longer ({presses}/{getattr(args, "press_retries", 2)})')
+            if arm in node.held:
+                node.detach_held(arm)
+                self.last_touch['held'] = False
+        if ends is None and presses == 0:
+            self.say(f'{arm} arm: could not touch -- '
+                     f'{why_not or "the slow line onto the box did not solve (edge of reach?)"}',
+                     True)
         self.last_touch['out_to'] = approach + offset
         if self.return_to_start() and ends is not None:
-            self.say(f'{arm} arm: done in {time.monotonic() - t0:.1f} s. Click the next point '
-                     f'and press MOVE.')
+            self.say(f'{arm} arm: done in {time.monotonic() - t0:.1f} s. {self.next_hint}')

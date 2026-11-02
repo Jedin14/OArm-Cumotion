@@ -20,9 +20,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ctm.common import WS, quat_from_matrix, tool_frame_along  # noqa: E402
+from ctm.common import APP_DIR, OPENARM_URDF, quat_from_matrix, tool_frame_along  # noqa: E402
 
-OUT = os.path.join(WS, 'ctm', 'topdown_seeds.npz')
+OUT = os.path.join(APP_DIR, 'ctm', 'topdown_seeds.npz')
 YAWS = (0, 90, -90, 180, 45, -45, 135, -135)
 
 
@@ -34,7 +34,7 @@ def main():
     tensor = TensorDeviceType()
     data = {}
     for arm in ('left', 'right'):
-        rc = RobotConfig.from_basic(os.path.join(WS, 'openarm.urdf'), 'world',
+        rc = RobotConfig.from_basic(OPENARM_URDF, 'world',
                                     f'openarm_{arm}_hand_tcp', tensor)
         ik = IKSolver(IKSolverConfig.load_from_robot_config(
             rc, None, num_seeds=200, self_collision_check=False, use_cuda_graph=False,
