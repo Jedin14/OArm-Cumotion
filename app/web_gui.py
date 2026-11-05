@@ -53,6 +53,31 @@ MARKER_EVERY = 0.15            # s between marker detections (every frame kept 2
 FPS = 15
 
 
+class _LookAgain(Exception):
+    """PICK ALL's look-ahead gives up: the touch ended first, STOP, or the arm
+    would not stay out of the picture -- the next box is found after the
+    touch instead."""
+
+
+def view_hits(centres, radii, t_wo, info, margin_px=0.0, near=0.05):
+    """Which spheres (world centres, radii, m) reach into the camera's picture:
+    its view (a pinhole on info.k), the picture widened by margin_px on every
+    side -- each sphere not wholly outside any of the four sides, nor behind
+    `near` m. (bool array; a little generous at the corners.) t_wo: world <-
+    optical frame (x right, y down, z forward)."""
+    k = np.asarray(info.k, float).reshape(3, 3)
+    fx, fy, cx, cy = k[0, 0], k[1, 1], k[0, 2], k[1, 2]
+    u0, v0 = -margin_px, -margin_px
+    u1, v1 = float(info.width) + margin_px, float(info.height) + margin_px
+    p = (np.asarray(centres, float).reshape(-1, 3) - t_wo[:3, 3]) @ t_wo[:3, :3]
+    r = np.asarray(radii, float).reshape(-1)
+    # u >= u0  <=>  fx x + (cx - u0) z >= 0, and so on: the four sides as planes
+    sides = np.array([[fx, 0.0, cx - u0], [-fx, 0.0, u1 - cx],
+                      [0.0, fy, cy - v0], [0.0, -fy, v1 - cy]])
+    dist = (p @ sides.T) / np.linalg.norm(sides, axis=1)
+    return np.all(dist >= -r[:, None], axis=1) & (p[:, 2] >= near - r)
+
+
 class WebStack(pick_stack.PickStack):
     """The pick stack's ROS interface plus every window tool, for the page."""
 
@@ -78,6 +103,23 @@ class WebStack(pick_stack.PickStack):
         node.create_subscription(
             RosImage, f'{node.args.ns.rstrip("/")}/box_model/image', self._on_picker_image,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        # what the picker's own window shows (box_picker/src/pick_loop.py, 2026-11-03):
+        # its drawing (V), the depth picture (D), the target close up, its settings
+        self.picker_view = None       # (BGR, monotonic time): the picker's own drawing
+        self.close_up = None          # (JPEG bytes, monotonic time): the target box, cut out
+        self.picker_settings = {}     # box_model/settings: frames, score, order, skipped, tilt, last
+        self.depth_on = False         # D: the depth picture instead of the colour one
+        self.picker_on = False        # V: the picker's own drawing in the captured view
+        self.tally = {'picked': 0, 'failed': 0}
+        self.history = collections.deque(maxlen=12)   # the last picks: close-up, result
+        self._history_n = 0
+        self._rate = collections.deque(maxlen=16)     # (monotonic, colour frames): the camera's rate
+        self.snapshot_path = None     # the last S: colour + depth saved
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        ns = node.args.ns.rstrip('/')
+        node.create_subscription(RosImage, f'{ns}/box_model/picker_view', self._on_picker_view, latched)
+        node.create_subscription(RosImage, f'{ns}/box_model/close_up', self._on_close_up, latched)
+        node.create_subscription(RosString, f'{ns}/box_model/settings', self._on_settings, latched)
         self.show_markers = True      # the live ArUco outlines + ids
         self.click_only = bool(node.args.click)   # --click: no box model
         # the model decides the box and FRONT / TOP; clicking points (and the
@@ -89,6 +131,11 @@ class WebStack(pick_stack.PickStack):
         self.box = None               # the last DETECT BOX result (PickTarget)
         self.model_pick = None        # self.pick when it came from that result
         self.retry = None             # the last pick did not take its box: MOVE = TRY AGAIN
+        # BYPASS (2026-11-05, on by default): DETECT BOX picks the box at once when the
+        # reach check says it can be picked -- no MOVE to press. Off: it waits for MOVE
+        self.bypass = True
+        self.picking_all = None       # PICK ALL running: {'round', 'picked', 'skipped'}
+        self._ahead = None            # ... its look-ahead for the pick running now (_pick_all_one)
         self.boxes = []               # every box of that frame (pixels)
         self.log = collections.deque(maxlen=80)
         self.error = False
@@ -116,7 +163,7 @@ class WebStack(pick_stack.PickStack):
     def action(self, name, data):
         """One button. Returns (ok, message) for the page's toast."""
         motion = {'move', 'pick', 'return', 'navigation', 'pre_pick', 'cal_arms', 'calibrate',
-                  'ready_to_pick', 'detect', 'recapture', 'overlay', 'manual_target'}
+                  'ready_to_pick', 'detect', 'recapture', 'overlay', 'manual_target', 'pick_all'}
         if name == 'stop':
             self.node.stop_motion()
             self.abort.set()
@@ -126,6 +173,27 @@ class WebStack(pick_stack.PickStack):
                      True)
             self.report('stopped')
             return True, 'stopped'
+        if name == 'vacuum':
+            # by hand, at any time -- also mid-pick (OFF lets go of a box on the
+            # cup). The same /beast_arm/vacuum a pick switches; the ESP32 bridge
+            # (terminal 1) follows it
+            if data.get('value') not in ('on', 'off'):
+                return False, 'on or off?'
+            on = data['value'] == 'on'
+            self.vacuum(TOOL_ARM['vacuum'], on)
+            self.say(f'VACUUM {"ON" if on else "OFF"} (by hand)')
+            if not self.vacuum_pub.get_subscription_count():
+                return False, (f'vacuum {data["value"]} -- but no bridge is listening '
+                               '(terminal 1 starts it): nothing switches')
+            return True, f'vacuum {data["value"]}'
+        if name == 'bypass':
+            # a setting, at any time -- also during DETECT BOX (off: it stops at the check)
+            self.bypass = not self.bypass
+            return True, ('bypass on: a box that can be picked is picked at once' if self.bypass
+                          else 'bypass off: DETECT BOX waits for MOVE')
+        picker = self.picker_action(name, data)
+        if picker is not None:
+            return picker
         if name == 'tip_check':
             # measures only (nothing moves): also while a touch is held
             arm = data.get('arm') or (self.last_touch or {}).get('arm') or self.tip_arm()
@@ -251,10 +319,16 @@ class WebStack(pick_stack.PickStack):
             return True, 'teach'
         if name == 'refit':
             return self._start(self.refit)
-        if name in ('detect', 'ready_to_pick') and self.click_only:
+        if name in ('detect', 'ready_to_pick', 'pick_all') and self.click_only:
             return False, 'click-only mode (--click): no box model - click the picture'
         if name == 'detect':
             return self._start(self._detect_job)
+        if name == 'pick_all':
+            if self.last_touch is not None:
+                return False, 'an arm is still out: RETURN it first'
+            if TOOL_ARM.get(self.pick_tool) in self.node.held:
+                return False, 'the arm still holds a box: take it off the cup, then RELEASE'
+            return self._start(self.pick_all, 'PICK ALL')
         if name in ('pick', 'move') and self.retry is not None and self.pick is None:
             return self._start(lambda: self._pick_and_retry(self.try_again), 'trying again')
         if name == 'pick' or name == 'move':
@@ -289,6 +363,178 @@ class WebStack(pick_stack.PickStack):
                 self.view = 'captured'
             return True, name
         return False, f'unknown action {name}'
+
+    # -- the box picker's own window (pick_loop.py's keys) ----------------------------------
+
+    PICKER_LIMITS = {'frames': (1, 15, 1), 'score': (0.2, 0.9, 0.05), 'check_frames': (1, 10, 1)}
+
+    def picker_action(self, name, data):
+        """The picker window's keys, as buttons: (ok, message), or None for the
+        other buttons. D depth picture, V the picker's view, S save colour + depth,
+        T next target, skip, R forget skipped, O order, C check now, and the
+        - / + settings."""
+        if name == 'depth_view':
+            self.depth_on = not self.depth_on
+            return True, 'depth picture ' + ('on (red near, blue far, black: no reading)'
+                                             if self.depth_on else 'off')
+        if name == 'picker_view':
+            self.picker_on = not self.picker_on
+            return True, "the picker's view " + ('on: every box it found, its faces and grip points'
+                                                 if self.picker_on else 'off')
+        if name not in ('snapshot_save', 'next_target', 'skip_box', 'forget_skipped', 'order',
+                        'picker_setting', 'check_now', 'top_faces'):
+            return None
+        if self.click_only:
+            return False, 'click-only mode (--click): no box model'
+        if name == 'snapshot_save':
+            threading.Thread(target=self._save_snapshot, daemon=True).start()
+            return True, 'saving colour + depth'
+        if name == 'top_faces':
+            # box_picker/src/pick_rules.py: from the next detection (nothing moves, also
+            # during PICK ALL). off: a box on a box by its front; on: the larger face
+            value = data.get('value')
+            if value not in ('on', 'off'):
+                return False, 'top faces on or off?'
+            threading.Thread(target=lambda: self._say_cmd(self.model_cmd(f'set top_faces {value}')),
+                             daemon=True).start()
+            return True, ('faces: the larger of front and top, anywhere' if value == 'on' else
+                          'faces: a box on a box by its front') + ' (from the next detection)'
+        if name == 'forget_skipped':
+            threading.Thread(target=lambda: self._say_cmd(self.model_cmd('reset')),
+                             daemon=True).start()
+            return True, 'forgetting the skipped boxes'
+        if name == 'picker_setting':
+            key = data.get('key')
+            if key not in self.PICKER_LIMITS:
+                return False, 'frames, score or check_frames?'
+            lo, hi, unit = self.PICKER_LIMITS[key]
+            now = self.picker_settings.get(key)
+            if now is None:
+                return False, 'the box picker has not started yet'
+            value = round(min(max(float(now) + unit * (1 if float(data.get('step') or 0) > 0 else -1),
+                                  lo), hi), 2)
+            threading.Thread(target=lambda: self._say_cmd(self.model_cmd(f'set {key} {value:g}')),
+                             daemon=True).start()
+            return True, f'{key}: {value:g}'
+        if self.busy:
+            return False, 'busy'
+        if name == 'order':
+            value = data.get('value')
+            if value not in ('v1', 'v2'):
+                return False, 'order v1 or v2?'
+            if self.picker_settings.get('order') == value:
+                return True, f'order {value}'
+            return self._start(lambda: self._cmd_then_detect(f'set order {value}'),
+                               f'order {value}: choosing again')
+        if name == 'next_target':
+            return self._start(lambda: self._cmd_then_detect('pass'), 'next target')
+        if name == 'skip_box':
+            return self._start(lambda: self._cmd_then_detect('skip'), 'skipping this box')
+        return self._start(self._check_now, 'checking')       # check_now
+
+    def model_cmd(self, text, wait=5.0):
+        """box_model/cmd, and its answer (box_model/settings' "last"), or None."""
+        sent = time.time()
+        self.model_cmd_pub.publish(String(data=text))
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            last = self.picker_settings.get('last') or {}
+            if str(last.get('text', '')).startswith(text) and float(last.get('time') or 0) >= sent - 1.0:
+                return last
+            time.sleep(0.05)
+        return None
+
+    def _say_cmd(self, last):
+        if last is None:
+            self.say('the box model did not answer (is box_model_node.py running?)', True)
+        else:
+            self.say(f'box picker: {last.get("message")}', not last.get('ok'))
+        return last
+
+    def _cmd_then_detect(self, text):
+        """A setting or a box passed over / skipped, then DETECT BOX again."""
+        last = self._say_cmd(self.model_cmd(text))
+        if last is not None and last.get('ok'):
+            self.box = self.model_pick = self.retry = None
+            self._detect_job()
+
+    def _save_snapshot(self):
+        """S: the newest colour + depth, as the picker saves it (pick_pipeline.py
+        --capture replays it), with the tilt."""
+        last = self._say_cmd(self.model_cmd('save', 35.0))
+        if last is not None and last.get('ok'):
+            self.snapshot_path = last.get('path')
+
+    def _check_now(self):
+        """C: the pick check now, as if the robot said "done" -- for a box taken
+        by hand, or to look again: the scene against the last detection."""
+        self.activity = 'checking'
+        try:
+            asked = time.monotonic()
+            self.say('CHECK NOW: comparing new frames with the last detection...')
+            picked, outcome, message, verdict = self.verify_pick()
+            shown = self._new_picture(asked)
+            if shown is not None:
+                if self.frame is not None:
+                    self.capture()                       # the scene now, for the next detection
+                self.picker_shown, self.scene_shown = shown
+                self.check_shown = True
+                self.view = 'captured'
+            self.say(f'check: {message}', picked is not True)
+            if picked is True:
+                self.pick = self.check = self.box = self.model_pick = self.retry = None
+            self.record_pick({'picked': picked, 'outcome': outcome, 'message': message,
+                              'verdict': verdict})
+        finally:
+            self.activity = None
+
+    def record_pick(self, r, close_up=None):
+        """The tally and the strip of the last picks (close-up, result colour).
+        close_up: the box's (PICK ALL has the next box's by then)."""
+        if not r or r.get('outcome') in ('arm_out', 'not_started', 'stopped', None, ''):
+            return
+        picked = r.get('picked')
+        if picked is True:
+            self.tally['picked'] += 1
+        elif picked is False:
+            self.tally['failed'] += 1
+        self._history_n += 1
+        close_up = close_up or self.close_up
+        self.history.append({'n': self._history_n, 'jpg': close_up[0] if close_up else None,
+                             'tone': 'ok' if picked is True else 'bad' if picked is False else 'edge',
+                             'outcome': r.get('outcome'), 'time': time.strftime('%H:%M:%S')})
+
+    def _on_picker_view(self, msg):
+        try:
+            self.picker_view = (decode_image(msg), time.monotonic())
+        except ValueError:
+            pass
+
+    def _on_close_up(self, msg):
+        try:
+            ok, jpg = cv2.imencode('.jpg', decode_image(msg), [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if ok:
+                self.close_up = (jpg.tobytes(), time.monotonic())
+        except ValueError:
+            pass
+
+    def _on_settings(self, msg):
+        try:
+            self.picker_settings = json.loads(msg.data) or {}
+        except ValueError:
+            pass
+
+    def history_jpg(self, n):
+        return next((h['jpg'] for h in self.history if h['n'] == n), None)
+
+    def camera_fps(self):
+        """Colour frames a second, over the last few seconds."""
+        now = time.monotonic()
+        self._rate.append((now, getattr(self.node, 'color_count', 0)))
+        while len(self._rate) > 2 and now - self._rate[0][0] > 3.0:
+            self._rate.popleft()
+        (t0, c0), (t1, c1) = self._rate[0], self._rate[-1]
+        return round((c1 - c0) / (t1 - t0), 1) if t1 - t0 > 0.5 else None
 
     DUMMY_MM = (170.0, 100.0, 25.0)   # height x width x depth
 
@@ -401,6 +647,7 @@ class WebStack(pick_stack.PickStack):
         asked = time.monotonic()
         super().finish_pick(arm)
         r = self.pick_result or {}
+        self.record_pick(r)
         # not taken (or can't tell): MOVE becomes TRY AGAIN, for that box only
         self.retry = ({'xyz': r.get('xyz'), 'outcome': r.get('outcome') or '?',
                        'pick': self.pick, 'target': self.target}
@@ -436,7 +683,10 @@ class WebStack(pick_stack.PickStack):
         try:
             self.scene_msg = (json.loads(msg.data), time.monotonic())
         except ValueError:
-            pass
+            return
+        # the last of each kind, for the target and result cards
+        setattr(self, 'last_check_scene' if self.scene_msg[0].get('kind') == 'check'
+                else 'last_detect_scene', self.scene_msg[0])
 
     def _on_picker_image(self, msg):
         try:
@@ -444,11 +694,17 @@ class WebStack(pick_stack.PickStack):
         except ValueError:
             pass
 
-    def detect_box(self):
+    def detect_box(self, start_from=None, before_check=None):
         """DETECT BOX: the box picker looks (5 frames), its drawing is shown --
         every box, the one it chose, FRONT or TOP by its rules -- the pick is
-        planned; nothing moves until MOVE."""
-        if self.mode != 'pick' and not self.ensure_pick_mode():
+        planned; nothing moves until MOVE.
+
+        PICK ALL's look-ahead (the arm away at the drop): start_from, the joints
+        the reach check plans from (the pre_pick the arm comes back to; nothing
+        is moved to get there), and before_check(), called once the box is
+        chosen -- False: stop there, no reach check (the arm came into the
+        picture while the picker looked)."""
+        if start_from is None and self.mode != 'pick' and not self.ensure_pick_mode():
             return
         if not self.detect_client.wait_for_service(timeout_sec=3.0):
             self.say(f'no box model ({self.detect_client.srv_name}) - is box_model_node.py '
@@ -488,13 +744,18 @@ class WebStack(pick_stack.PickStack):
         self.say(f'box: {answer.message}')
         self.model_pick = self.pick
         if check is not None:
+            if before_check is not None and not before_check():
+                return
+            if start_from is not None:
+                check['start_from'] = [float(v) for v in start_from]
             self.check_pick(check, in_job=True)
             ok = check.get('ok')
             if ok is False and check.get('not_here'):    # not pickable from here: the wheels
                 self.unreachable_adjust(check.get('why') or 'not reachable')
                 self.retry = None
             self.say(f'{t.approach.upper()} pick of the box shown - ' +
-                     ('press MOVE to pick it' if ok else
+                     (('picking it' if self.bypass or self.picking_all is not None
+                       else 'press MOVE to pick it') if ok else
                       f'cannot pick it: {check.get("why") or "not reachable"}'), not ok)
 
     def move(self):
@@ -581,6 +842,432 @@ class WebStack(pick_stack.PickStack):
             self.detect_box()
         finally:
             self.activity = None
+        # BYPASS: a box the reach check passed is picked at once, as MOVE would
+        if self.bypass and self._detected_pickable() and not self.halted():
+            self._pick_and_retry(self._pick_detected)
+
+    def _detected_pickable(self):
+        """DETECT BOX's box has a pick the reach check passed."""
+        return (self.pick is not None and self.pick is self.model_pick
+                and (self.check or {}).get('ok') is True)
+
+    # -- PICK ALL ----------------------------------------------------------------------
+
+    PICK_ALL_ROUNDS = 200         # at most this many detections in one PICK ALL (a backstop)
+    PICK_ALL_PASSES = 3           # rounds over the skipped boxes, while each one takes some
+    PICK_ALL_REOFFERS = 3         # a skipped box offered again: skipped again this often per pass
+    VIEW_MARGIN_PX = 30           # the picture's edges widened (the lens shows a little more)
+    ARM_RADIUS_M = 0.05           # the arm, as a chain of spheres this big
+    BOX_UNKNOWN_M = 0.15          # a box on the cup: at least this long (its depth is not seen)
+
+    def pick_all(self):
+        """PICK ALL: clear every box it can -- the picker's boxes one after another,
+        with no MOVE to press: DETECT BOX, the pick, the drop, the next.
+
+        A box it cannot pick is never tried: the reach check says no, it is
+        skipped (the picker's "skip") and the next one taken. One try per box
+        (2026-11-05: a box not taken cost 1.5-2.5 min of TRY AGAIN): one the
+        camera says is still in its place is skipped -- flagged first when the
+        cup touched it (photos for a person). The base is never asked to move.
+
+        To clear everything it can (2026-11-05): when the picker has no box left
+        but some were skipped and others taken meanwhile, it goes round once
+        more -- the skipped ones forgotten, as taking their neighbours may have
+        freed them -- until a round takes none (at most PICK_ALL_PASSES). A box
+        the reach check could never pick from here (out of reach, the wrist, no
+        posture: not "something in the way") is skipped at once in the later
+        rounds, with no reach check.
+
+        The next box is found while the arm takes the last one away
+        (_look_ahead): once the arm has backed out and it -- and the box it may
+        hold -- is out of the camera's picture, the camera checks the pick, the
+        picker looks for the next box and the reach check plans it from the
+        pre_pick the arm comes back to, skipping what cannot be picked.
+
+        Ends when a round takes nothing, on STOP, with an arm left out or a box
+        still on the cup. The boxes skipped in the last round stay skipped after
+        it: Forget skipped brings them back."""
+        run = self.picking_all = {'round': 0, 'picked': 0, 'skipped': 0, 'pass': 1,
+                                  'unreachable': []}
+        self.abort.clear()                               # a new command: STOP is past
+        why, bad = 'STOP', True
+        try:
+            last = self._say_cmd(self.model_cmd('reset'))   # every box in view, skipped ones too
+            while True:
+                taken = run['picked']
+                run['skipped'], run['retry'], run['reoffers'] = 0, 0, 0
+                given_up = []                            # where this round's skipped boxes are
+                tried = []                               # tried: the camera could not tell / dropped
+                go, why, bad = self._next_pickable(run, given_up, tried)
+                while go:
+                    go, why, bad = self._pick_all_one(run, given_up, tried)
+                if bad or not run['retry'] or run['picked'] == taken or \
+                        run['pass'] >= self.PICK_ALL_PASSES:
+                    break
+                # skipped boxes that may come free now their neighbours are gone
+                run['pass'] += 1
+                self.say(f'PICK ALL: round {run["pass"]} - the {run["retry"]} box(es) skipped '
+                         f'that may be free now, once more ({run["picked"] - taken} taken in '
+                         f'the last round)')
+                last = self._say_cmd(self.model_cmd('reset'))
+                if last is None or not last.get('ok'):
+                    why, bad = 'the picker did not forget the skipped boxes', True
+                    break
+        finally:
+            self.picking_all = None
+            self._ahead = None
+            self.retry = None
+            self.activity = None
+        dropped = f', {run["dropped"]} dropped' if run.get('dropped') else ''
+        rounds = f' in {run["pass"]} rounds' if run['pass'] > 1 else ''
+        self.say(f'PICK ALL done: {run["picked"]} picked, {run["skipped"]} skipped{dropped}'
+                 f'{rounds} - {why}' +
+                 ('. The skipped boxes stay skipped: Forget skipped (Advanced) brings them back'
+                  if run['skipped'] else ''), bad)
+
+    @staticmethod
+    def _for_good(why):
+        """A reach check's no that taking other boxes cannot change (out of reach,
+        the wrist, no posture, too near the camera) -- not "something in the
+        way" or "blocked", nor a check that failed or was stopped."""
+        w = (why or '').lower()
+        return bool(w) and not any(k in w for k in ('in the way', 'blocked', 'could not check',
+                                                     'stop'))
+
+    def _next_pickable(self, run, given_up, tried, detect=None):
+        """DETECT BOX until the picker offers a box the reach check can pick
+        (self.pick, as DETECT BOX leaves it), skipping every one it cannot -- one
+        known from an earlier round to be out of reach from here without a
+        reach check. detect(before_check): how to look (the look-ahead's,
+        during the drop). (found, why not, whether that is a fault)."""
+        detect = detect or (lambda before_check: self.detect_box(before_check=before_check))
+        while True:
+            if self.halted():
+                return False, 'STOP', True
+            if run['round'] >= self.PICK_ALL_ROUNDS:
+                return False, f'{self.PICK_ALL_ROUNDS} detections, the most in one PICK ALL', True
+            run['round'] += 1
+            self.say(f'PICK ALL {run["round"]}: looking ({run["picked"]} picked, '
+                     f'{run["skipped"]} skipped so far)')
+            self.retry = None
+            self.box = self.pick = self.check = self.model_pick = None   # this look's only
+            known = []
+
+            def before_check():
+                at = self._target_xyz(self.box)
+                known.extend(u for u in run.get('unreachable', [])
+                             if np.linalg.norm(at - u['xyz']) < 0.03)
+                return not known                         # (known: no reach check again)
+            detect(before_check)
+            if self.halted():
+                return False, 'STOP', True
+            if self.box is None:
+                return (False, 'no box to take (the picker found none, or its look failed: '
+                        'above)', False)
+            where = self._target_xyz(self.box)
+            retry = True                                 # may come free in a later round
+            if any(np.linalg.norm(where - g) < 0.03 for g in given_up):
+                # skipped already: its outline in the picture did not cover it -- again
+                run['reoffers'] = run.get('reoffers', 0) + 1
+                if run['reoffers'] > self.PICK_ALL_REOFFERS:
+                    return False, 'the picker keeps offering boxes it was told to skip', True
+                reason, retry = 'offered again after a skip', False
+            elif known:
+                reason, retry = f'out of reach from here, as found before ({known[0]["why"]})', False
+            elif not self._detected_pickable():
+                reason = (self.check or {}).get('why') or 'it cannot be picked from here'
+                if (self.check or {}).get('not_here') and self._for_good(reason):
+                    run.setdefault('unreachable', []).append({'xyz': where, 'why': reason})
+                    retry = False
+            elif any(np.linalg.norm(where - g) < 0.03 for g in tried):
+                reason = 'tried once already (the camera could not tell, or it was dropped)'
+            else:
+                return True, None, False
+            if not self._skip_box(where, given_up, reason):
+                return False, 'the picker did not skip it', True
+            run['skipped'] += 1
+            run['retry'] = run.get('retry', 0) + int(retry)
+
+    def _pick_all_one(self, run, given_up, tried):
+        """The box DETECT BOX left in self.pick, picked -- one try -- with the next
+        box looked for meanwhile (_look_ahead). (go on, why not, fault)"""
+        if not self.ensure_pick_mode():
+            return False, 'STOP' if self.halted() else 'could not get to pre_pick', True
+        _u, _v, point, arm, origin = self.pick
+        mine = {'pick': self.pick, 'target': self.target, 'close_up': self.close_up,
+                'where': self._target_xyz(self.box if self.box is not None else self.target)}
+        ahead = {'arm': arm, 'box_m': self._box_size_m(self.target), 'box': 0.0, 'start': None,
+                 'returning': threading.Event(), 'done': threading.Event(),
+                 'cancel': threading.Event(), 'verified': None, 'fate': None, 'found': None}
+        worker = threading.Thread(target=self._look_ahead,
+                                  args=(ahead, mine, run, given_up, tried), daemon=True)
+        self._ahead = ahead                              # on_returning: the arm on its way back
+        self.retry = None
+        self.activity = 'picking'
+        self.report('picking')
+        worker.start()
+        try:
+            self.touch(arm, point, origin, self.frame)
+        finally:
+            ahead['done'].set()
+            if self.last_touch is not None or self.halted() or \
+                    not getattr(self, 'touch_moved', True):
+                ahead['cancel'].set()                    # (refused, left out, STOP: no look-ahead)
+            worker.join()
+            self._ahead = None
+            self.activity = None
+        pick_stack.PickStack.finish_pick(self, arm, pick=mine['pick'], target=mine['target'],
+                                         verified=ahead['verified'], count=False)
+        r = self.pick_result or {}
+        self.record_pick(r, close_up=mine['close_up'])
+        out = 'an arm is still out: RETURN it' if self.last_touch is not None else None
+        if self.halted() or r.get('outcome') == 'stopped':
+            return False, 'STOP' + (f' - {out}' if out else ''), True
+        if out:
+            return False, out, True
+        if TOOL_ARM.get(self.pick_tool) in self.node.held:
+            return False, 'a box is still on the cup: take it off, then RELEASE', True
+        if ahead['fate'] is None:                        # (no look-ahead: decided here)
+            picked = False if r.get('outcome') == 'not_started' else r.get('picked')
+            if self._box_fate(mine, picked, r.get('outcome'), self.last_contact is not None,
+                              run, given_up, tried, gone=r.get('outcome') == 'dropped') is None:
+                return False, 'the picker did not skip it', True
+        if ahead['found'] is not None:
+            if ahead['found'][0]:
+                self.say('PICK ALL: the next box was found and planned during the drop - '
+                         'picking it')
+            return ahead['found']
+        return self._next_pickable(run, given_up, tried)
+
+    def _box_fate(self, mine, picked, outcome, touched, run, given_up, tried, gone=False):
+        """After its pick: a box taken is counted; one not taken and still in its
+        place is skipped (flagged first when the cup touched it: photos for a
+        person); one gone from its place without being taken (dropped, knocked
+        off) is not -- the picker skips by the place in the picture, and what is
+        there now is another box, or the next one behind; one the camera could
+        not tell about is remembered -- offered again, it is skipped then.
+        'picked', 'skipped', 'dropped', 'tried', or None (the picker did not skip)."""
+        if picked is True:
+            run['picked'] += 1
+            return 'picked'
+        if picked is None:
+            tried.append(mine['where'])
+            return 'tried'
+        if touched:
+            self.model_cmd('flag', 15.0)                 # (before the skip: of this box)
+        if gone:
+            tried.append(mine['where'])                  # (fell back there: skipped then)
+            run['dropped'] = run.get('dropped', 0) + 1
+            self.say(f'PICK ALL: not taken ({outcome or "?"}), but gone from its place - '
+                     f'not skipped (the picker may find it where it fell)', True)
+            return 'dropped'
+        if not self._skip_box(mine['where'], given_up, f'not picked: {outcome or "?"}'):
+            return None
+        run['skipped'] += 1
+        run['retry'] = run.get('retry', 0) + 1           # (a later round tries it once more)
+        return 'skipped'
+
+    def on_returning(self, arm, lt, holding):
+        """The touch is out of the box, on its way back: PICK ALL's look-ahead may
+        start once the arm -- and the box, if the cup pressed one -- is out of the
+        picture. The reach check plans from where the arm comes back to."""
+        ahead = getattr(self, '_ahead', None)
+        if ahead is None or ahead['arm'] != arm or ahead['returning'].is_set():
+            return
+        ahead['start'] = [float(v) for v in lt['start']]
+        if holding or lt.get('pressed'):
+            held = self.node.held.get(arm) or {}
+            ahead['box'] = max([ahead['box_m']] + [float(v) for v in held.get('extents') or []])
+        ahead['returning'].set()
+
+    def _look_ahead(self, ahead, mine, run, given_up, tried):
+        """PICK ALL, while the arm takes its box away (a thread beside the touch):
+        once the arm is on its way back and out of the camera's picture, the
+        camera's check of this pick (ahead['verified']), this box skipped if it
+        was not taken (ahead['fate']), then the next pickable box -- left in
+        self.pick, checked from the pre_pick the arm comes back to
+        (ahead['found']). Nothing if the touch ends first without that (refused
+        before moving, an arm left out, STOP): pick_all then does it after the
+        touch, as before."""
+        try:
+            self._wait_out_of_view(ahead)
+            if not ahead['done'].is_set():
+                self.say('PICK ALL: the arm is out of the picture - checking this pick and '
+                         'finding the next box while it drops')
+            contact = self.last_contact                  # this pick's (set at the press)
+            holding = {True: 'held', False: 'empty'}.get((contact or {}).get('held'), '')
+            verified = self._out_of_view(ahead, lambda: self.verify_pick(holding, wait=0.0))
+            ahead['verified'] = verified
+            # as finish_pick will read it: never touched = not taken; no camera check:
+            # the contact and the weight
+            picked, outcome = verified[0], verified[1]
+            gone = picked is True or outcome == 'dropped'     # (from its place, by the camera)
+            if contact is None:
+                picked, outcome = False, 'no_contact'
+            elif outcome == 'no_check':
+                felt = bool(contact.get('felt')) and 'STOPPED' not in contact.get('how', '')
+                picked = felt and contact.get('held') is not False
+            ahead['fate'] = self._box_fate(mine, picked, outcome, contact is not None,
+                                           run, given_up, tried, gone=gone)
+            if ahead['fate'] is None:
+                ahead['found'] = (False, 'the picker did not skip it', True)
+                return
+            ahead['found'] = self._next_pickable(run, given_up, tried,
+                                                 detect=lambda bc: self._detect_ahead(ahead, bc))
+        except _LookAgain:
+            pass                                         # after the touch, as before
+        except Exception as exc:                         # noqa: BLE001 - then after the touch
+            self.say(f'PICK ALL: looking ahead failed ({exc}) - after the drop instead', True)
+
+    def _wait_out_of_view(self, ahead):
+        """Until the touch is on its way back and the arm (and the box it may hold)
+        has been out of the camera's picture for 0.3 s -- the frames from then on
+        are without it -- or the touch is over with the arm back. _LookAgain if
+        the touch ends otherwise, or on STOP. (Out since: ahead['clear_since'],
+        kept from one step to the next.)"""
+        while True:
+            if ahead['cancel'].is_set() or self.halted():
+                raise _LookAgain()
+            if ahead['returning'].is_set():
+                if ahead['done'].is_set():
+                    if self.last_touch is None:
+                        return                           # back at pre_pick: out of it
+                    raise _LookAgain()
+                now = time.monotonic()
+                if self.arm_in_view(ahead['arm'], ahead['box']) is False:
+                    ahead['clear_since'] = ahead.get('clear_since') or now
+                    if now - ahead['clear_since'] >= 0.3:
+                        return
+                else:
+                    ahead['clear_since'] = None          # (in it, or cannot tell)
+            elif ahead['done'].is_set():
+                raise _LookAgain()                       # never on its way back
+            time.sleep(0.05)
+
+    def _watch_view(self, ahead):
+        """A thread: sets ['spoiled'] if the arm comes into the picture (or it
+        cannot tell) before ['stop'] -- or the touch is over, the arm back."""
+        watch = {'stop': threading.Event(), 'spoiled': threading.Event()}
+
+        def poll():
+            while not watch['stop'].is_set() and not ahead['done'].is_set():
+                if self.arm_in_view(ahead['arm'], ahead['box']) is not False:
+                    if not ahead['done'].is_set():
+                        watch['spoiled'].set()
+                        ahead['clear_since'] = None      # (the 0.3 s out again first)
+                    return
+                watch['stop'].wait(0.05)
+        threading.Thread(target=poll, daemon=True).start()
+        return watch
+
+    def _out_of_view(self, ahead, work, tries=3):
+        """work() with the arm out of the picture all the while -- again if it came
+        into it. Its answer; _LookAgain if it never stayed out."""
+        for _ in range(tries):
+            self._wait_out_of_view(ahead)
+            watch = self._watch_view(ahead)
+            try:
+                out = work()
+            finally:
+                watch['stop'].set()
+            if not watch['spoiled'].is_set():
+                return out
+            self.say('PICK ALL: the arm came into the picture meanwhile - again', True)
+        raise _LookAgain()
+
+    def _detect_ahead(self, ahead, also=None, tries=3):
+        """DETECT BOX during the drop: the picker's look and the capture with the arm
+        out of the picture all the while (else again); the reach check from the
+        pre_pick the arm comes back to, once the box it held is out of the
+        planners (they would carry it on the tool) -- and only if also() (a box
+        known out of reach: none)."""
+        for _ in range(tries):
+            self._wait_out_of_view(ahead)
+            watch = self._watch_view(ahead)
+
+            def before_check():
+                watch['stop'].set()
+                if watch['spoiled'].is_set():
+                    return False
+                if also is not None and not also():
+                    return False
+                while ahead['arm'] in self.node.held:
+                    if ahead['cancel'].is_set() or self.halted() or ahead['done'].is_set():
+                        raise _LookAgain()           # (over with the box still on: PICK ALL stops)
+                    time.sleep(0.05)
+                return True
+            try:
+                self.detect_box(start_from=ahead['start'], before_check=before_check)
+            finally:
+                watch['stop'].set()
+            if not watch['spoiled'].is_set():
+                return
+            self.say('PICK ALL: the arm came into the picture while the picker looked - '
+                     'looking again', True)
+        raise _LookAgain()
+
+    def arm_in_view(self, arm, box_m=0.0):
+        """Is any of this arm in the colour camera's picture -- its links as a chain
+        of ARM_RADIUS_M spheres from link2 to the tool's tip, and a box of up to
+        box_m on the cup (a sphere around where it can hang)? None if it cannot
+        tell (no camera info or tf)."""
+        node = self.node
+        _c, _d, info = node.latest()
+        if info is None or not info.width or not info.height:
+            return None
+        optical = info.header.frame_id or (self.frame[3] if self.frame is not None else None)
+        t_wo = node.lookup(BASE_FRAME, optical) if optical else None
+        frames = [node.lookup(BASE_FRAME, f'openarm_{arm}_{n}') for n in
+                  ('link2', 'link3', 'link4', 'link5', 'link6', 'link7', 'hand', 'hand_tcp')]
+        if t_wo is None or any(f is None for f in frames):
+            return None
+        axis = frames[-1][:3, 2]
+        tip = frames[-1][:3, 3] + axis * node.args.tip_offsets[arm]
+        chain = [f[:3, 3] for f in frames] + [tip]
+        centres = [a + (b - a) * s for a, b in zip(chain[:-1], chain[1:])
+                   for s in np.linspace(0.0, 1.0, 5)]
+        radii = [self.ARM_RADIUS_M] * len(centres)
+        if box_m > 0:
+            # the cup on one face, the box any way turned on it: within 0.75 of its
+            # longest side from a point that far along the tool, and 2 cm of swing
+            centres.append(tip + axis * (box_m / 2.0))
+            radii.append(0.75 * box_m + 0.02)
+        return bool(view_hits(centres, radii, t_wo, info, self.VIEW_MARGIN_PX).any())
+
+    def _box_size_m(self, target):
+        """The longest side the box being picked may have, m: its measured face (and
+        the known box), at least BOX_UNKNOWN_M -- the depth along the tool is
+        not seen."""
+        sides = []
+        for name in ('face_mm', 'box_mm'):               # (numpy arrays in a real PickTarget:
+            values = getattr(target, name, None)         # never `values or []`)
+            if values is not None:
+                sides += [float(v) for v in values if float(v) > 0]
+        return min(0.30, max([self.BOX_UNKNOWN_M] + [v / 1000.0 for v in sides]))
+
+    @staticmethod
+    def _target_xyz(t):
+        return np.array([t.position.x, t.position.y, t.position.z], float)
+
+    def _skip_box(self, where, given_up, reason):
+        """The picker's "skip" for its last box (it says when it has it): the
+        next detection takes another. False if it did not answer."""
+        self.say(f'PICK ALL: skipping this box ({reason}) - the next one', True)
+        last = self.model_cmd('skip')
+        if last is None or not last.get('ok'):
+            self._say_cmd(last)
+            return False
+        given_up.append(where)
+        return True
+
+    def request_base_adjust(self, result, outcomes):
+        """PICK ALL keeps the robot where it is: no base_adjust -- the box is
+        skipped (pick_all) and the next one taken."""
+        if self.picking_all is None:
+            return super().request_base_adjust(result, outcomes)
+        if outcomes != ['unreachable']:
+            self.model_cmd_pub.publish(String(data='flag'))   # photos of it for a person
+        return None
 
     def _pick_detected(self):
         """The pick of the detected box (self.pick), in a job."""
@@ -727,10 +1414,17 @@ class WebStack(pick_stack.PickStack):
                         'box_mm': [round(float(v)) for v in t.box_mm]}
                        if t is not None else None),
             'pick_tool': self.pick_tool, 'pick_result': self.pick_result,
+            'vacuum': self.vacuum_on,
+            'vacuum_listeners': self.vacuum_pub.get_subscription_count(),
+            'bypass': self.bypass,
+            'pick_all': dict(self.picking_all) if self.picking_all else None,
             'retry': self.retry['outcome'] if self.retry else None,
-            # what the page draws over the picker's picture (box_model/scene)
+            # what the page draws over the picker's picture (box_model/scene); not
+            # over the picker's own drawing (V), which has its own
             'scene': (self.scene_shown if self.view == 'captured' and self.picker_shown
-                      is not None and self.calib_view is None else None),
+                      is not None and self.calib_view is None
+                      and not (self.picker_on and self.picker_view is not None) else None),
+            'picker': self.picker_state(),
             'models': models, 'model_when': raw.get('when'),
             'depth_n': len(getattr(self, 'depth_samples', [])),
             'depth_cal': self._depth_cal_text(),
@@ -745,6 +1439,41 @@ class WebStack(pick_stack.PickStack):
                             if self.node.object_size else None),
             'object_source': (self.node.object_size or {}).get('source'),
             'log': list(self.log)[-40:],
+        }
+
+    def picker_state(self):
+        """The picker window's panel, for the page: settings, tilt, tally, the
+        target (camera coordinates, timings, close-up), the last check's numbers,
+        the strip of the last picks, the camera's rate."""
+        ps = self.picker_settings or {}
+        det = getattr(self, 'last_detect_scene', None) or {}
+        chk = getattr(self, 'last_check_scene', None) or {}
+        t = det.get('target') or {}
+        last = ps.get('last') or {}
+        same = self.fails.get('xyz') is not None and self.pick is not None and float(np.linalg.norm(
+            np.subtract(self.pick[2], self.fails['xyz']))) <= 0.05
+        return {
+            'settings': {k: ps.get(k) for k in ('frames', 'check_frames', 'score', 'order',
+                                                'top_faces')},
+            'tilt': ps.get('tilt') or det.get('tilt'),
+            'depth_on': self.depth_on, 'picker_on': self.picker_on,
+            'has_view': self.picker_view is not None,
+            'tally': {**self.tally, 'skipped': ps.get('skipped') or 0, 'passed': ps.get('passed') or 0},
+            'target': ({'cam': [t.get('x_m'), t.get('y_m'), t.get('z_m')], 'approach': t.get('approach'),
+                        'size_mm': t.get('size_mm'), 'agreeing': t.get('agreeing'),
+                        'frames': t.get('frames'), 'boxes': t.get('num_boxes'),
+                        'took': det.get('took'), 'seconds': det.get('seconds')} if t else None),
+            'close_up': int(self.close_up[1] * 1000) if self.close_up else None,
+            'attempt': (len(self.fails['outcomes']) if same else 0) + 1,
+            'tries': max(1, int(getattr(self.node.args, 'adjust_after', 2) or 1)),
+            'check': ({'outcome': chk.get('outcome'), 'picked': chk.get('picked'),
+                       'frames': chk.get('frames'), 'disturbed': len(chk.get('disturbed') or []),
+                       **(chk.get('verdict') or {})} if chk else None),
+            'history': [{k: h[k] for k in ('n', 'tone', 'outcome', 'time')} | {'img': h['jpg'] is not None}
+                        for h in self.history],
+            'last': {k: last.get(k) for k in ('text', 'ok', 'message', 'path', 'photos', 'time')}
+            if last else None,
+            'fps': self.camera_fps(),
         }
 
     # -- the picture -------------------------------------------------------------------
@@ -779,15 +1508,21 @@ class WebStack(pick_stack.PickStack):
                                cv2.MARKER_CROSS, 18, 2)
             return img
         if self.view == 'captured' and self.picker_shown is not None:
-            # the box picker's own drawing: every box, the face it chose
-            img = self.picker_shown.copy()
+            # the box picker's answer: clean (the page draws the boxes), or its own
+            # drawing (V), or the depth picture of that moment (D)
+            if self.picker_on and self.picker_view is not None:
+                img = self.picker_view[0].copy()
+            elif self.depth_on and self.frame is not None:
+                img = depth_picture(self.frame[1])
+            else:
+                img = self.picker_shown.copy()
             if self.frame is not None and img.shape[:2] != self.frame[0].shape[:2]:
                 img = cv2.resize(img, (self.frame[0].shape[1], self.frame[0].shape[0]))
-            if not self.check_shown:
+            if not self.check_shown and not self.picker_on:
                 self._draw_tip_seen(img)
-            return img                                   # clean: the page draws the boxes
+            return img
         if self.view == 'captured' and self.frame is not None:
-            img = self.frame[0].copy()
+            img = depth_picture(self.frame[1]) if self.depth_on else self.frame[0].copy()
             h, w = img.shape[:2]
             if self.unreachable is not None and self.unreachable.shape == (h, w):
                 bad = self.unreachable
@@ -809,11 +1544,14 @@ class WebStack(pick_stack.PickStack):
                 p = pts[ok].astype(int)
                 img[p[:, 1], p[:, 0]] = np.where(agree[ok][:, None], [0, 255, 0], [0, 0, 255])
         else:
-            color, _d, _i = self.node.latest()
-            img = decode_image(color).copy() if color is not None else \
-                np.full((480, 640, 3), 24, np.uint8)
-            if color is not None and self.show_markers:
-                self._draw_markers(img)
+            color, depth, _i = self.node.latest()
+            if self.depth_on and depth is not None:
+                img = depth_picture(decode_image(depth))
+            else:
+                img = decode_image(color).copy() if color is not None else \
+                    np.full((480, 640, 3), 24, np.uint8)
+                if color is not None and self.show_markers:
+                    self._draw_markers(img)
         self._draw_tip_seen(img)
         h, w = img.shape[:2]
         cv2.line(img, (w // 2, 0), (w // 2, h), (255, 255, 255), 1)
@@ -858,6 +1596,20 @@ class WebStack(pick_stack.PickStack):
                         cv2.LINE_AA)
             cv2.putText(img, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, colour, 1,
                         cv2.LINE_AA)
+
+
+DEPTH_RANGE = (0.30, 0.65)    # m, warm (near) to cool (far): the picker window's depth picture
+
+
+def depth_picture(depth_m):
+    """Depth (metres) as a picture, as the picker's window draws it
+    (loop_screen.depth_view): red near, blue far, black where there is none."""
+    near, far = DEPTH_RANGE
+    depth_m = np.nan_to_num(np.asarray(depth_m, np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    t = np.clip((far - depth_m) / (far - near), 0, 1)
+    out = cv2.applyColorMap((t * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+    out[depth_m <= 0] = 0
+    return out
 
 
 # -- the web server ----------------------------------------------------------------------
@@ -921,6 +1673,23 @@ def make_app(stack):
         jpg = cv2.imencode('.jpg', stack.picture(), [cv2.IMWRITE_JPEG_QUALITY, 85])[1]
         return Response(jpg.tobytes(), media_type='image/jpeg',
                         headers={'Cache-Control': 'no-store'})
+
+    @app.get('/picker/close_up.jpg')
+    def close_up():
+        """The target box, cut out, its pick face boxed in red."""
+        from fastapi.responses import Response
+        if stack.close_up is None:
+            return Response(status_code=404)
+        return Response(stack.close_up[0], media_type='image/jpeg', headers={'Cache-Control': 'no-store'})
+
+    @app.get('/picker/history/{n}.jpg')
+    def history(n: int):
+        """A past pick's close-up, for the strip of the last picks."""
+        from fastapi.responses import Response
+        jpg = stack.history_jpg(n)
+        if jpg is None:
+            return Response(status_code=404)
+        return Response(jpg, media_type='image/jpeg', headers={'Cache-Control': 'max-age=3600'})
 
     @app.get('/api/events')
     async def events(request: Request):

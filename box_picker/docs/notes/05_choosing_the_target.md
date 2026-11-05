@@ -4,7 +4,7 @@
 
 ## Step 1: each box's pick face
 
-For each box, look at its **front** and **top** faces (never a side) and take the **larger** one, by real size in mm². That decides how the robot approaches it: from the front or from above.
+For each box, look at its **front** and **top** faces (never a side). A box **on another box** is picked by its **front**; a box **on the base** (no box under it) by the **larger** of the two, by real size in mm². That decides how the robot approaches it: from the front or from above. The rules are in [`pick_rules.py`](../../src/pick_rules.py). A box on a box with only its top found is picked by its top as a last resort, and flagged. With **top faces** on (`--top-faces`, or F in the window's Advanced tab) every box gets the larger face, as before 5 Nov 2026.
 
 Exceptions, when the box has a front: a top whose front edge is seen at under 10° (almost edge-on) is measured badly, and a "top" narrower than the front is a sliver of another box. Then the front is used.
 
@@ -16,19 +16,19 @@ A box with neither a front nor a top isn't a whole box. It's usually a side spli
 |---|---|---|
 | 1 | **Nothing on top:** a box with another box resting on it waits | the box on top must go first, or it falls |
 | 2 | **Nothing in front:** a box with another box in front of it waits | a box behind can't be reached yet |
-| 3 | **On a box first, the highest top first:** boxes standing on another box before those on the floor; of those, keep the ones whose top is within 1.5 cm of the highest | stacks are cleared from the top down, so nothing under or beside a stack is pulled while it stands; by height, so a pile of thin boxes doesn't beat one box on tall ones; boxes on the floor are not ranked by height |
+| 3 | **The highest top first:** on a box or on the floor, keep the ones whose top is within 1.5 cm of the highest | stacks are cleared from the top down, so nothing under or beside a stack is pulled while it stands; a tall box on the floor goes before a lower stack; by height, so a pile of thin boxes doesn't beat one box on tall ones |
 | 4 | **Nearest:** of those, keep the ones whose grip point is within 3 cm of the nearest one | the arm reaches less deep, and boxes behind come free |
 | 5 | **Leftmost** of those | a fixed order, so the choice doesn't flicker |
 
 ![How the next box is chosen](../images/pick_logic_flow.png)
 
-"Resting on" means: the box's bottom is within 3 cm of the other box's top height, above its middle and not below its top by more than 1.5 cm (so a box standing on the floor next to a thin flat box isn't "on" it), it is above it in the picture and overlaps it side to side, and it stands no more than 30 cm behind its front. In the overlay, such boxes say "(box on it)".
+"Resting on" means: the box's bottom is within 3 cm of the other box's top height, above its middle and not below its top by more than 1.5 cm (so a box standing on the floor next to a thin flat box isn't "on" it), it is above it in the picture and overlaps it side to side, and it stands no more than 30 cm behind its front and no more than 3 cm in front of it. A box lying flat may stick out further towards the camera if the back of its top still reaches 2 cm behind the lower box's front. In the overlay, such boxes say "(box on it)".
 
-Never chosen, but still in the way of others: a box whose pick face runs off the edge of the picture, a box nothing holds up (not at the floor, not on a box that is held up: the AI calls pieces of the carton's rim "box"), and a box the robot gave up on. Two boxes pressed together, fronts level, look like one box twice as thick as the others: they are split in two first.
+A box whose pick face runs off the edge of the picture can be chosen: its grip point is the middle of the part in view. Never chosen, but still in the way of others: a box nothing holds up (not at the floor, not on a box that is held up: the AI calls pieces of the carton's rim "box"), and a box the robot gave up on (or that was passed over with T), with every box under it, all the way down. Two boxes pressed together, fronts level, look like one box twice as thick as the others: they are split in two first.
 
 **In front** means either of:
 - **In its way:** another box is nearer by more than 1.5 cm, at the same height, and across from it side to side with less than 3 cm to spare (a gripper can't use a narrow gap).
-- **Hiding part of it:** a nearer box (by more than 1.5 cm) touches its bottom edge in the picture, and the camera can see that box's top **beside** it, ending there. Then it isn't standing on that box but behind it, and the box in front goes first.
+- **Hiding part of it:** a nearer box (by more than 1.5 cm) touches its bottom edge in the picture, and the camera can see that box's top **beside** it, ending there. Then it isn't standing on that box but behind it, and the box in front goes first. A top only a few pixels tall is read straight from the depth (when seen at 10° or more), only in the columns where it could be seen running on past the box above (a nearer box looks wider), and not under other boxes standing on it. When the boxes under it are all covered, the top of a twin beside them (same front size, same row, same height) tells instead.
 
   If that top can't be seen there (a level camera sees tops edge-on, or the box in front is no wider than the box above it), the camera can't tell "on top" from "behind". The box above then always counts as **resting on** it, so the box underneath waits: nothing is ever pulled out from under a box. The price: the robot may have to reach over a box for the one behind it.
 

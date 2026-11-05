@@ -4,7 +4,13 @@
 
 const $ = (id) => document.getElementById(id);
 const ALWAYS = new Set(['stop', 'markers', 'view', 'dummy_size', 'tip_check', 'abort', 'save', 'skip', 'up', 'down', 'left',
-  'right', 'in', 'out', 'confirm', 'abort']);
+  'right', 'in', 'out', 'confirm', 'abort',
+  // the box picker's views and settings: nothing moves
+  'depth_view', 'picker_view', 'snapshot_save', 'picker_setting', 'forget_skipped', 'top_faces',
+  // the vacuum by hand: also mid-pick (OFF lets go of the box)
+  'vacuum',
+  // a setting: may be switched off while DETECT BOX looks (then it waits for MOVE)
+  'bypass']);
 let S = null;                 // the last state from beast
 const NUDGES = ['left', 'right', 'up', 'down', 'in', 'out'];
 let lastLog = 0;
@@ -84,6 +90,15 @@ document.addEventListener('click', (e) => {
   }
   if (name === 'tool') {
     return act('tool', { arm: b.dataset.arm, step: b.dataset.step ? Number(b.dataset.step) : 0 });
+  }
+  if (name === 'order') return act('order', { value: b.dataset.value });
+  if (name === 'top_faces') return act('top_faces', { value: b.dataset.value });
+  if (name === 'vacuum') {
+    if (S && S.vacuum === (b.dataset.value === 'on')) return;
+    return act('vacuum', { value: b.dataset.value });
+  }
+  if (name === 'picker_setting') {
+    return act('picker_setting', { key: b.dataset.key, step: Number(b.dataset.step) });
   }
   if (name === 'topdown') {
     // a segmented choice: only send when it changes something
@@ -170,10 +185,13 @@ document.addEventListener('keydown', (e) => {
     n: 'navigation', p: 'pre_pick', f: 'cal_arms', c: 'calibrate', o: 'overlay',
     k: 'markers', a: 'anchor', e: 'refit', i: 'tip_check' };
   const key = e.key.toLowerCase();
-  if (key === 'd') {                    // FRONT / TOP: the model decides, unless --click
-    if (S && S.click_only) { e.preventDefault(); act('topdown'); }
-    return;
+  if (key === 'd') {                    // FRONT / TOP with --click; else the depth picture
+    e.preventDefault();
+    return act(S && S.click_only ? 'topdown' : 'depth_view');
   }
+  // the box picker window's keys (not with --click: T is TEACH there)
+  const pickerKeys = { v: 'picker_view', t: 'next_target', s: 'snapshot_save', h: 'check_now' };
+  if (S && !S.click_only && pickerKeys[key]) { e.preventDefault(); return act(pickerKeys[key]); }
   if (key === 'l') {
     return act('view', { value: S && S.view === 'live' ? 'captured' : 'live' });
   }
@@ -195,12 +213,18 @@ function render(s) {
   const st = $('armState');
   setText(st, s.arm_state.replaceAll('_', ' '));
   st.dataset.tone = TONE[s.arm_state] || 'busy';
-  setText($('viewChip'), s.calib_view ? 'CALIBRATION' : s.view === 'live' ? 'LIVE' : 'CAPTURED');
+  const pk = s.picker || {};
+  const viewing = pk.picker_on && pk.has_view && s.view === 'captured' ? " · PICKER'S VIEW"
+    : pk.depth_on ? ' · DEPTH' : '';
+  setText($('viewChip'), (s.calib_view ? 'CALIBRATION' : s.view === 'live' ? 'LIVE' : 'CAPTURED') + viewing);
+  setText($('fpsChip'), pk.fps == null ? '– fps' : `${Math.round(pk.fps)} fps`);
+  $('fpsChip').classList.toggle('warn', pk.fps != null && pk.fps < 5);
   setText($('approachChip'), s.top_down ? 'TOP DOWN' : 'FRONT');
   $('haltChip').hidden = !s.halted;
   $('clickChip').hidden = !s.click_only;
   document.querySelectorAll('.btn.model').forEach((b) => { b.hidden = s.click_only; });
   document.querySelectorAll('.click-only').forEach((g) => { g.hidden = !s.click_only; });
+  $('grpAuto').hidden = s.click_only;                 // (bypass and pick all: the box model's)
   $('stage').classList.toggle('pickable', !!(s.click_only || s.anchor_mode));
   document.querySelector('[data-action="recapture"]').style.gridColumn = s.click_only ? '1 / -1' : '';
   $('viewLive').setAttribute('aria-selected', s.view === 'live');
@@ -258,6 +282,7 @@ function render(s) {
         ? 'none - already lined up sideways, left or right cannot help'
         : `move ${ba.direction} ${Number(ba.distance_m).toFixed(3)} m - detect again after the move`) : ''));
   }
+  renderPicker(s);
   const badge = $('targetBadge');
   if (!p) {
     setText(badge, 'none'); badge.dataset.tone = 'idle';
@@ -326,6 +351,22 @@ function render(s) {
     s.box_cal ? `Cal tip: ${Math.round(s.box_cal.box_holdout_mm * 10) / 10} mm mean on unseen postures (90 % under ${Math.round(s.box_cal.box_holdout_p90_mm * 10) / 10} mm), ${s.box_cal.box_tips} tips.` : 'No Cal tip yet.'].join(' '));
   $('btnApply').disabled = !s.calibration_ready || s.busy;
 
+  // pick all, bypass
+  setPressed($('tgBypass'), s.bypass);
+  setText($('pickAllLabel'), s.pick_all
+    ? `Picking all · ${s.pick_all.picked} picked${s.pick_all.skipped ? `, ${s.pick_all.skipped} skipped` : ''}` +
+      `${s.pick_all.dropped ? `, ${s.pick_all.dropped} dropped` : ''}`
+    : 'Pick all');
+
+  // advanced: the vacuum
+  setPressed($('vacOn'), s.vacuum);
+  setPressed($('vacOff'), !s.vacuum);
+  const bridge = s.vacuum_listeners > 0;
+  $('vacStatus').classList.toggle('warn', !bridge);
+  setText($('vacStatus'), bridge
+    ? `${s.vacuum ? 'On' : 'Off'} · the ESP32 bridge is listening. A pick switches it by itself: on at the press, off at the drop.`
+    : 'No bridge is listening on /beast_arm/vacuum (terminal 1 starts it): these buttons switch nothing.');
+
   // system
   setText($('sysState'), s.arm_state);
   setText($('sysPhase'), s.phase || 'idle');
@@ -360,6 +401,97 @@ function render(s) {
     list.prepend(li);
   }
   while (list.children.length > 120) list.lastChild.remove();
+}
+
+// -- the box picker's own window, as cards -------------------------------------------
+// (box_picker/src/pick_loop.py: tally, the target close up with its camera
+// coordinates and tries, timings, the strip of the last picks, the check's
+// numbers, FLAG; on the Advanced tab its views, order and settings)
+
+const pct = (v) => (v == null ? '–' : `${Math.round(v * 100)}%`);
+const cm = (v) => (v == null ? '–' : (v * 100).toFixed(1));
+let closeUpKey = null;
+let historyKey = '';
+
+function renderPicker(s) {
+  const pk = s.picker || {};
+  document.querySelectorAll('.model-group').forEach((g) => { g.hidden = s.click_only; });
+  const tally = pk.tally || {};
+  const stats = [['picked', tally.picked ?? 0, 'ok'], ['failed tries', tally.failed ?? 0, 'bad'],
+    ['skipped', tally.skipped ?? 0, 'edge']].concat(tally.passed ? [['passed over', tally.passed, '']] : [])
+    .map(([what, n, tone]) => `<span data-tone="${n ? tone : ''}"><b>${n}</b>${what}</span>`).join('');
+  if ($('pickerTally').innerHTML !== stats) $('pickerTally').innerHTML = stats;
+  // the tilt: gravity's (the accelerometer, or its saved reading) or the TF's
+  const tilt = pk.tilt || {};
+  const tb = $('tiltBadge');
+  const deg = tilt.deg == null ? '' : `${Math.abs(tilt.deg).toFixed(1)}° ${tilt.deg >= 0 ? 'down' : 'up'}`;
+  setText(tb, !tilt.source ? 'tilt –' : tilt.source === 'tf' ? `tilt ${deg} · TF` : `tilt ${deg} · accel`);
+  tb.dataset.tone = !tilt.source ? 'idle' : tilt.source === 'tf' ? 'edge' : 'ok';
+  tb.title = !tilt.source ? 'The tilt the picker uses: not known yet'
+    : tilt.source === 'tf' ? "The picker's tilt comes from the TF, not gravity: no accelerometer reading yet (install the RealSense udev rules, then the camera launch's accel:=auto turns it on)"
+    : `The picker's tilt from the camera's accelerometer (${tilt.source})`;
+
+  // the target, close up
+  const t = pk.target;
+  const showCrop = !!(t && pk.close_up && s.pick);
+  $('closeUpRow').hidden = !showCrop;
+  if (showCrop && closeUpKey !== pk.close_up) {
+    closeUpKey = pk.close_up;
+    $('closeUp').src = `/picker/close_up.jpg?${pk.close_up}`;
+  }
+  if (t && t.cam) {
+    [['camX', 0], ['camY', 1], ['camZ', 2]].forEach(([id, i]) => {
+      const h = `${cm(t.cam[i])}<i>cm</i>`;
+      if ($(id).innerHTML !== h) $(id).innerHTML = h;
+    });
+  }
+  const dots = Array.from({ length: pk.tries || 1 }, (_, i) =>
+    `<span class="dot${i < (pk.attempt || 1) ? (pk.attempt > 1 ? ' on retry' : ' on') : ''}"></span>`).join('')
+    + `<span class="muted small">try ${pk.attempt || 1} of ${pk.tries || 1}</span>`;
+  if ($('tryDots').innerHTML !== dots) $('tryDots').innerHTML = dots;
+  setText($('pickerAgree'), !t || !s.pick ? '' : `${t.agreeing ?? '?'} of ${t.frames ?? '?'} frames agree · ${t.boxes ?? '?'} boxes`
+    + (t.size_mm ? ` · face ${t.size_mm[0]} × ${t.size_mm[1]} mm` : ''));
+  const took = t && t.took;
+  setText($('pickerTook'), !took || !s.pick ? '' : `found in ${fmt(took.pictures + took.picker, 1)} s · pictures ${fmt(took.pictures, 1)} s · picker ${fmt(took.picker, 1)} s`);
+
+  // the last picks: close-ups with their result's colour
+  const hist = pk.history || [];
+  const hk = hist.map((h) => `${h.n}${h.tone}`).join(',');
+  if (hk !== historyKey) {
+    historyKey = hk;
+    $('history').innerHTML = hist.slice().reverse().map((h) => (h.img
+      ? `<img src="/picker/history/${h.n}.jpg" data-tone="${h.tone}" alt="${h.outcome}" title="${h.time} · ${h.outcome}">`
+      : `<span class="nothumb" data-tone="${h.tone}" title="${h.time} · ${h.outcome}"></span>`)).join('');
+  }
+  const last = pk.last;
+  setText($('pickerLast'), last && last.time && Date.now() / 1000 - last.time < 30 ? `box picker: ${last.message}` : '');
+
+  // the result card: the check's numbers, and a FLAG
+  const c = pk.check;
+  const r = s.pick_result;
+  setText($('resultNumbers'), !c || !r || !r.verdict ? '' : `gone ${pct(c.gone)} · same ${pct(c.same)}`
+    + (c.other_box ? ` · another box ${pct(c.other_box)}` : '') + ` · ${c.by || '?'} · ${c.frames ?? '?'} frames`
+    + (c.disturbed ? ` · ${c.disturbed} other box(es) disturbed` : '')
+    + (c.boxes_around ? ` · boxes around it ${c.boxes_around[0]} → ${c.boxes_around[1]}` : ''));
+  const flag = last && last.text === 'flag' && last.ok && last.photos && Date.now() / 1000 - last.time < 600;
+  $('resultFlag').hidden = !flag;
+  if (flag) {
+    const dir = Object.values(last.photos)[0] || '';
+    setText($('resultFlag'), `FLAG RAISED: not picked after ${r && r.base_adjust ? r.base_adjust.failures : 'repeated'} tries. Photos for a person in ${dir.replace(/\/[^/]*$/, '/')}`);
+  }
+
+  // the Advanced tab
+  const st = pk.settings || {};
+  setPressed($('tgDepth'), pk.depth_on);
+  setPressed($('tgPickerView'), pk.picker_on);
+  setPressed($('ordV1'), st.order === 'v1');
+  setPressed($('ordV2'), st.order === 'v2');
+  setPressed($('facesFront'), st.top_faces === false);
+  setPressed($('facesLarger'), st.top_faces === true);
+  setText($('setFrames'), st.frames == null ? '–' : String(st.frames));
+  setText($('setScore'), st.score == null ? '–' : Number(st.score).toFixed(2));
+  setText($('setCheck'), st.check_frames == null ? '–' : String(st.check_frames));
+  setText($('btnForget'), `Forget skipped${tally.skipped || tally.passed ? ` (${(tally.skipped || 0) + (tally.passed || 0)})` : ''}`);
 }
 
 // the dummy size: sent when a field is changed (Enter or leaving it)

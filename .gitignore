@@ -45,3 +45,6 @@ core.*
 # old_version/ is committed, except the old container build output inside it.
 old_version/container/build/
 old_version/container/install/
+
+# the box picker's own outputs: pick_loop sessions, the GUI's snapshots and flag photos
+box_picker/src/outputs/

@@ -1,0 +1,33 @@
+# Arm poses for the VLM pick-and-place cycle.
+# Written by record_states.py -- re-record with:
+#     python3 record_states.py <state_name>
+# joints are openarm_<arm>_joint1..joint7 in radians. tcp_xyz is where
+# that pose puts the tool, in the world frame, and is informational.
+arm: left
+states:
+  ready_state:
+    joints: [0.942054, 0.033379, -0.138666, 2.15362, -0.07763, -0.032616, -0.353056]
+    joint_names: [openarm_left_joint1, openarm_left_joint2, openarm_left_joint3, openarm_left_joint4,
+      openarm_left_joint5, openarm_left_joint6, openarm_left_joint7]
+    tcp_xyz: [0.2017, 0.214, 0.4932]
+    recorded: '2026-09-03T13:37:14'
+  pre_pick_state:
+    joints: [1.3439, -0.680678, 0.610865, 1.91986, -0.593412, 0.680678, -1.44862]
+    joint_names: [openarm_left_joint1, openarm_left_joint2, openarm_left_joint3, openarm_left_joint4,
+      openarm_left_joint5, openarm_left_joint6, openarm_left_joint7]
+    tcp_xyz: [0.0354, 0.1734, 0.4969]
+    recorded: '2026-09-22T10:16:32'
+    mirrored_from: right:pre_pick_state
+  drop_state:
+    joints: [0.872665, -0.733038, 0.558505, 1.658063, -0.541052, 0.471239, 0.523599]
+    joint_names: [openarm_left_joint1, openarm_left_joint2, openarm_left_joint3, openarm_left_joint4,
+      openarm_left_joint5, openarm_left_joint6, openarm_left_joint7]
+    recorded: '2026-10-08T00:00:00'
+    note: set from RViz 2026-10-08
+  navigation_state:
+    joints: [0.872665, -0.087266, -0.087266, 2.007129, 0.0, 0.0, 0.0]
+    joint_names: [openarm_left_joint1, openarm_left_joint2, openarm_left_joint3, openarm_left_joint4,
+      openarm_left_joint5, openarm_left_joint6, openarm_left_joint7]
+    recorded: '2026-10-08T00:00:00'
+    note: SRDF navigation
+    mirrored_from: right:navigation_state

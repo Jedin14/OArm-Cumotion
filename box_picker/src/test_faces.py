@@ -410,6 +410,22 @@ def standing_box_in_front_of_a_thin_box(noise=0.0, holes=0.0, tol=5.0):
     return check("thin box", boxes[0].blocked_by == [], f"blocked by {boxes[0].blocked_by} (expected [])")
 
 
+@case
+def front_on_a_box_top_on_the_base(noise=0.0, holes=0.0, tol=5.0):
+    """Two flat boxes, one lying on the other, seen from above (camera tilted down): the lower one, on the base,
+    is gripped by its top (larger than its thin front); the upper one, on a box, by its front (pick_rules.py).
+    With top_faces, both by their tops."""
+    lower = box_world(0.0, 0.45, (0.17, 0.03, 0.20))             # deep: the front half of its top is in view
+    upper = box_world(0.0, 0.50, (0.17, 0.03, 0.10))             # on its back half
+    upper["centre"] = upper["centre"] + [0, 0.03, 0]
+    depth, masks = render([lower, upper], noise, holes, floor=True)
+    kinds = lambda bs: [b.pick.kind if b.pick else None for b in bs]
+    boxes = analyse(depth, masks, INTR, up_from_pitch(PITCH))
+    ok = check("default", kinds(boxes) == ["top", "front"], f"pick faces {kinds(boxes)} (expected ['top', 'front'])")
+    boxes = analyse(depth, masks, INTR, up_from_pitch(PITCH), top_faces=True)
+    return ok & check("top faces", kinds(boxes) == ["top", "top"], f"pick faces {kinds(boxes)} (expected ['top', 'top'])")
+
+
 def main():
     results = {}
     for label, kw in [("clean", {}), ("noise 1.5 mm + 10% holes", {"noise": 1.5, "holes": 0.10, "tol": 8.0})]:

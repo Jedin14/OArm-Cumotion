@@ -2,8 +2,9 @@
 
 ROS 2 Humble's Python is 3.10; the pipeline's .venv is 3.11 and can't load rclpy. So this
 small node runs with the system Python: it subscribes to the colour image, the depth image
-aligned to it and the camera info, pairs colour and depth by time stamp, and hands the newest
-pair to the pipeline over a local socket. In the pipeline, rgbd.RosCamera reads from it (the
+aligned to it, the camera info and the accelerometer, pairs colour and depth by time stamp, and
+hands the newest pair (with the accelerometer's mean of the last 0.5 s, for the camera's tilt) to
+the pipeline over a local socket. In the pipeline, rgbd.RosCamera reads from it (the
 --ros option of live_pick.py, pick_frame.py, pick_pipeline.py and record_rgbd.py).
 
 Run it in its own terminal (system Python, not the .venv), and leave it running:
@@ -15,9 +16,10 @@ Run it in its own terminal (system Python, not the .venv), and leave it running:
 
 Protocol (127.0.0.1:--port): the client sends one byte per frame it wants; the bridge
 answers with the next pair newer than that request: a 4-byte length, a JSON header (width,
-height, fx, fy, cx, cy, stamp) and the raw colour (BGR uint8) then depth (uint16, mm) bytes.
+height, fx, fy, cx, cy, stamp, accel: [x, y, z] m/s^2 or null) and the raw colour (BGR uint8) then depth (uint16, mm) bytes.
 """
 import argparse
+import collections
 import json
 import socket
 import struct
@@ -29,9 +31,10 @@ import rclpy
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, Imu
 
 PORT = 50555
+ACCEL_S = 0.5            # the accelerometer is averaged over this long
 
 
 def to_numpy(msg):
@@ -58,6 +61,8 @@ class Bridge(Node):
         # reliable resends lost pieces, but only connects to a publisher that is reliable too.
         qos = qos_profile_sensor_data if args.qos == "best_effort" else QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE)
         self.create_subscription(CameraInfo, args.info, self.on_info, qos)
+        self.accels = collections.deque(maxlen=400)          # (time, x, y, z)
+        self.create_subscription(Imu, args.accel, self.on_accel, qos_profile_sensor_data)
         color = Subscriber(self, Image, args.color, qos_profile=qos)
         depth = Subscriber(self, Image, args.depth, qos_profile=qos)
         self.counts = {"colour": 0, "depth": 0, "pairs": 0}
@@ -84,6 +89,22 @@ class Bridge(Node):
             if self.intr is None:
                 self.get_logger().info(f"camera info: {msg.width}x{msg.height} fx {k[0]:.1f} fy {k[4]:.1f} cx {k[2]:.1f} cy {k[5]:.1f}")
             self.intr = (k[0], k[4], k[2], k[5])
+
+    def on_accel(self, msg):
+        a = msg.linear_acceleration
+        with self.lock:
+            self.accels.append((time.time(), a.x, a.y, a.z))
+
+    def accel(self):
+        """Mean accelerometer reading of the last ACCEL_S, or None (none received, or the camera
+        is moving: far from 1 g)."""
+        with self.lock:
+            now = time.time()
+            a = [s[1:] for s in self.accels if now - s[0] < ACCEL_S]
+        if not a:
+            return None
+        m = np.mean(a, axis=0)
+        return [float(v) for v in m] if 8.8 < np.linalg.norm(m) < 10.8 else None
 
     def on_pair(self, color, depth):
         c, d = to_numpy(color), to_numpy(depth)
@@ -137,7 +158,7 @@ def client(bridge, conn):
             c, d, stamp, _ = pair
             fx, fy, cx, cy = intr
             header = json.dumps({"width": c.shape[1], "height": c.shape[0], "fx": fx, "fy": fy, "cx": cx, "cy": cy,
-                                 "stamp": stamp}).encode()
+                                 "stamp": stamp, "accel": bridge.accel()}).encode()
             conn.sendall(struct.pack("!I", len(header)) + header + c.tobytes() + d.tobytes())
 
 
@@ -146,6 +167,8 @@ def main():
     ap.add_argument("--color", default="/camera/camera/color/image_raw")
     ap.add_argument("--depth", default="/camera/camera/aligned_depth_to_color/image_raw")
     ap.add_argument("--info", default="/camera/camera/color/camera_info")
+    ap.add_argument("--accel", default="/camera/camera/accel/sample",
+                    help="the camera's accelerometer (launch the driver with enable_accel:=true)")
     ap.add_argument("--slop", type=float, default=0.05, help="max time between a colour and a depth frame, s")
     ap.add_argument("--qos", choices=["best_effort", "reliable"], default="best_effort",
                     help="reliable resends lost pieces of big images, but needs a reliable publisher")

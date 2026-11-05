@@ -29,10 +29,10 @@ from faces import DEFAULT_DEPTH_TOL, Intrinsics, analyse, choose_target, split_d
 FACE_COLORS = {"front": (0, 200, 0), "top": (255, 120, 0), "side": (150, 150, 150)}   # BGR
 
 
-def run(finder, color, depth, intr, up, tol, depth_tol, avoid=()):
+def run(finder, color, depth, intr, up, tol, depth_tol, avoid=(), order="v1", top_faces=False):
     points, masks, timings, scores = finder(color)
     t0 = time.time()
-    boxes = analyse(depth, masks, intr, up)
+    boxes = analyse(depth, masks, intr, up, top_faces)
     # Two boxes pressed together in one outline: split, and measured again.
     halves = split_doubles(boxes)
     if any(len(h) == 2 for h in halves):
@@ -40,8 +40,8 @@ def run(finder, color, depth, intr, up, tol, depth_tol, avoid=()):
         points = [q for p, h in zip(points, halves) for q in ([p] if len(h) == 1 else [centre(m) for m in h])]
         scores = [sc for sc, h in zip(scores, halves) for sc in [sc] * len(h)]
         masks = [m for h in halves for m in h]
-        boxes = analyse(depth, masks, intr, up)
-    target = choose_target(boxes, tol, depth_tol, avoid)
+        boxes = analyse(depth, masks, intr, up, top_faces)
+    target = choose_target(boxes, tol, depth_tol, avoid, order)
     timings["depth_s"] = round(time.time() - t0, 3)
     return points, boxes, target, timings, scores
 
@@ -146,6 +146,10 @@ def main():
     ap.add_argument("--frames", type=int, default=1,
                     help="--capture: one answer per this many consecutive frames, as the robot asks "
                          "after it stops (PickDetector.detect_frames)")
+    ap.add_argument("--order", choices=["v1", "v2"], default="v1",
+                    help="v1: stack tops (highest first), then nearest, then leftmost; v2: leftmost free box")
+    ap.add_argument("--top-faces", action="store_true",
+                    help="tops anywhere (pick_rules.py): the larger of front and top, also for boxes on a box")
     ap.add_argument("--out", default="outputs/pipeline")
     args = ap.parse_args()
     if args.frames > 1:
@@ -158,7 +162,8 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     for name, color, depth, intr, up in frames_from(args):
-        points, boxes, target, timings, scores = run(finder, color, depth, intr, up, None, args.depth_tol)
+        points, boxes, target, timings, scores = run(finder, color, depth, intr, up, None, args.depth_tol, order=args.order,
+                                                             top_faces=args.top_faces)
         res = result_json(name, points, boxes, target, timings, up, scores)
         (out / f"{name}.json").write_text(json.dumps(res, indent=2))
         cv2.imwrite(str(out / f"{name}.jpg"), draw(color, points, boxes, target))
@@ -171,7 +176,8 @@ def run_groups(args):
     """One answer per args.frames consecutive frames (in name order): <first frame>.json with the
     answer and the frames used, and <first frame>.jpg, the overlay of the frame nearest it."""
     from pick_frame import PickDetector
-    detector = PickDetector(depth_tol=args.depth_tol, prompt=args.prompt, score=args.score)
+    detector = PickDetector(depth_tol=args.depth_tol, prompt=args.prompt, score=args.score, order=args.order,
+                            top_faces=args.top_faces)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     group = []

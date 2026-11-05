@@ -132,6 +132,8 @@ DESCRIPTIONS = {
                   'captured from',
     'pre_pick_state': 'staging pose the arm passes through on its way to the object',
     'drop_state': 'where the object is released -- mind the drop height under it',
+    'pre_pick_top_state': 'after a TOP pick: near pre_pick, the tool pointing straight down (not in the '
+                          'walkthrough: name it to record it)',
 }
 
 

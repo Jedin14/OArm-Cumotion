@@ -47,7 +47,7 @@ ros2 topic echo /beast_arm/arm_action/status
 | `app/robot_camera_calibration.py` | Camera pose from the arms (the GUI's camera Calibrate / Apply) |
 | `app/ctm/` | The pick stack's modules: robot interface, touch, calibrations, box matching, ... (`app/ctm/common.py` defines every folder below) |
 | `app/web/`, `app/launch/` | The page (HTML, JS, CSS); `web_gui.launch.py`, `pick_stack.launch.py` |
-| `robot/` | The robot stack (terminal 1): `launch_everything.launch.py`, `boot_pre_pick.py`, `octomap_gater.py`; the robot model `openarm.yml` (cuMotion) and `openarm.urdf`; the navigation / pre_pick / drop poses `pick_place_states_{left,right}.yaml` and `record_states.py`, which records them |
+| `robot/` | The robot stack (terminal 1): `launch_everything.launch.py`, `boot_pre_pick.py`, `octomap_gater.py`; the robot model `openarm.yml` (cuMotion) and `openarm.urdf`; the navigation / pre_pick / pre_pick_top (after a top pick) / drop poses `pick_place_states_{left,right}.yaml` and `record_states.py`, which records them |
 | `calibration/` | What the calibrations and the GUI write and the picks read: `arm_model.yaml`, `armcal_anchors.yaml`, `touch_corrections.yaml`, `payload_left.yaml`, `camera_calibration.yaml`, `depth_correction.yaml` (when saved), `tools.yaml` (the tool past each gripper's fingertips), `cam_org.txt` (the head camera's mount history), and the raw recordings in `armcal_samples/` |
 | `docs/` | The documents above; `docs/sheets/` the printable marker sheets |
 | `native/` | Run scripts, the native build environment, `install.sh` and `check_isolation.sh` |

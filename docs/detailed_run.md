@@ -102,7 +102,7 @@ native/run_launch_everything.sh            # options: depth_profile:=424x240x15 
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `depth_profile` | `640x480x15` | Depth resolution. The depth camera's minimum range grows with it: 424x240 ≈ 0.20 m, 640x480 ≈ 0.34 m, 848x480 ≈ 0.45 m |
-| `accel` | `false` | The camera's accelerometer. Off by default because the camera node hung at start with it on. Without it the box picker takes "up" from the camera's TF |
+| `accel` | auto | The camera's accelerometer (gravity's "up" for the box picker). On when its motion sensor can be read, which needs the RealSense udev rules (see `docs/cmds.md`); without them the camera node hung at start with it on. Off, the box picker uses the accelerometer's last saved reading (`calibration/camera_tilt.yaml`), else the TF's tilt, which is not gravity's. The GUI's Box picker card shows which (`TILT ... ACCEL` / `TF`) |
 | `octomap` | `static` (from the script) | The 3-D map is filled only on request (Detect box, Recapture), not continuously |
 | `use_rviz` | `true` | RViz window |
 | `boot_pre_pick` | `true` | Walk the arms to the navigation pose at start |
@@ -132,6 +132,8 @@ When terminal 1 settles, the arms are at navigation. Nothing under `/beast_arm` 
 ```bash
 native/run_web_gui.sh                       # open http://beast:8080 (or http://beast.local:8080) from any PC
 # options: port:=8090  host:=127.0.0.1  pick_tool:=vacuum|finger  approach:=auto|top|front  model:=false
+#          order:=v1|v2 (which box first: v1 stack tops, then nearest, then leftmost; v2 the leftmost free box)
+#          score:=0.4 (SAM's confidence to count as a box)
 #          --click   (click-only: no box model)
 ```
 
@@ -150,7 +152,7 @@ native/run_web_gui.sh                       # open http://beast:8080 (or http://
 | 2 | Subscribes to `/camera/camera/color/camera_info`, `/camera/camera/accel/sample` (only useful with `accel:=true`) and TF | - |
 | 3 | Starts `ros_bridge.py` (Python 3.10). It subscribes to the colour image, aligned depth and camera info, and serves synchronised frame pairs on TCP `127.0.0.1:50555` | Log: `native/logs/box_picker_bridge.log` |
 | 4 | Waits up to 30 s for camera info and the TF `world` → colour optical frame, and computes the camera's pitch | Fails: `no camera info / tf for the camera after 30 s` |
-| 5 | Starts `box_picker_server.py` in `box_picker/src/.venv` (Python 3.11), which loads SAM 3.1. It waits up to 120 s for its first line, `{"ready": true, ...}` | Missing venv: `the box picker is not installed (...): cd box_picker/src && ./setup.sh`. Picker log: `native/logs/box_picker.log` |
+| 5 | Waits (up to 20 s) until the bridge takes connections, then starts `box_picker_server.py` in `box_picker/src/.venv` (Python 3.11) with `--score 0.4 --order v1` (the `score` / `order` launch options), which loads SAM 3.1. It waits up to 120 s for its first line, `{"ready": true, ...}` | Missing venv: `the box picker is not installed (...): cd box_picker/src && ./setup.sh`. Bridge not up: `ros_bridge.py not listening on 50555 after 20 s; see native/logs/box_picker_bridge.log`. Picker log: `native/logs/box_picker.log` |
 | 6 | Logs `box picker ready (camera pitch X deg); serving /beast_arm/box_model/detect`. Now it serves `box_model/detect` and `box_model/check` | A Detect while it is still loading waits up to 90 s, then answers `the box picker is still starting - try again` |
 
 It publishes `box_model/target`, `box_model/image` (latched), `box_model/scene` (latched JSON) and `box_model/check_result` (latched JSON), each only when a detection or check happens.
@@ -195,7 +197,7 @@ What the GUI process (the same as `run_pick_stack.sh`) publishes and listens to:
 | `pick_target` | out | PickTarget | depth 10 | Once per detection |
 | `pick_result` | out | String (JSON) | latched | Once per pick, and when the box is unreachable from here |
 | `base_adjust` | out | BaseAdjust | depth 10, not latched | When the base should move (11.4) |
-| `vacuum` | out | Bool | latched | On a change only: `true` just before each press, `false` at the drop pose and when the arm is back with nothing held. Left arm only |
+| `vacuum` | out | Bool | latched | On a change only: `true` just before each press, `false` at the drop pose and when the arm is back with nothing held. Left arm only. The vacuum bridge (`app/vacuum_bridge.py`, started by terminal 1) switches the ESP32 relay from it |
 | `held_object/size` | in, and out from the GUI's Dummy size | ObjectSize | - | Size of the box to pick |
 | `arm_state/cmd` | in | String | depth 10 | `navigation`, `pre_pick`, `return`, `status` |
 | `arm_action` | in | String | depth 10 | `ready_to_pick [top\|front\|auto] [vacuum\|finger]`, `stop` |
@@ -220,7 +222,7 @@ Open `http://beast:8080` from any PC on the network. The page gets its state fro
 
 Over the picture:
 
-- Chips: arm state, `LIVE` / `CAPTURED` / `CALIBRATION`, `FRONT` / `TOP DOWN`, `STOPPED`, `CLICK ONLY`.
+- Chips: arm state, `LIVE` / `CAPTURED` / `CALIBRATION` (`· DEPTH` or `· PICKER'S VIEW` when on), `FRONT` / `TOP DOWN`, `STOPPED`, `CLICK ONLY`, the camera's rate (`15 FPS`; red under 5).
 - The Live/Captured switch and **STOP** (Esc).
 - The status line along the bottom.
 
@@ -228,14 +230,36 @@ Tabs:
 
 | Tab | Controls |
 | --- | --- |
-| Pick | Navigation (N), Pre-pick (P); Gripper: Vacuum · left / Finger · right; the target card; the result card; **Move** (M; reads **Try again** after a failed pick), **Detect box** (Space), Recapture (R), Return arm (B, only when an arm is out); Held object: H/W/D, Dummy size, Release; tool length toggles and steppers. Approach, Teach and ArUco ext are shown only with `--click` |
+| Pick | Navigation (N), Pre-pick (P); Gripper: Vacuum · left / Finger · right; the target card; the **Box picker** card (below); the result card (with the check's numbers and a FLAG line); **Move** (M; reads **Try again** after a failed pick), **Detect box** (Space; with **Bypass** on -- the default -- a box the reach check passes is picked at once, no Move), **Pick all** (every box in view, one after another: detect, pick, drop, the next -- one try per box: a box that cannot be picked, or that the camera says is still in its place, is skipped with the picker's skip (flagged first when the cup touched it; one dropped off its place is not skipped -- the picker skips by the place in the picture); while the arm takes a box to the drop, as soon as it and the box are out of the camera picture, the pick is checked and the next box detected and planned from pre_pick, skipping what cannot be picked; to clear all it can, when no box is left but some were skipped and others taken meanwhile it goes round again (up to 3 rounds; a box out of reach for good is skipped at once, without a reach check); no base_adjust; ends when a round takes none, on STOP, an arm out, or a box still on the cup), Recapture (R), Return arm (B, only when an arm is out); Held object: H/W/D, Dummy size, Release; tool length toggles and steppers. Approach, Teach and ArUco ext are shown only with `--click` |
 | Calibrate | Live markers, the arm model table, Cal arms, Overlay, Anchor, Refit, Weigh tool, Apply weight, Auto calibrate (box), Depth capture/fit, Tip check, camera pose Calibrate/Apply |
-| Advanced | Move to coordinates: X/Y/Z (camera frame, m), Front/Top, Left/Right, **Check target**, and a second **Move** |
+| Advanced | **Vacuum** On / Off: by hand, at any time, also mid-pick (Off drops a box on the cup); the same `vacuum` topic a pick switches, with a warning when no ESP32 bridge listens. **Box picker**: Depth picture (D), Picker's view (V), order v1 / v2, − / + for frames per target, SAM confidence and frames per pick check, Look again, Forget skipped; Move to coordinates: X/Y/Z (camera frame, m), Front/Top, Left/Right, **Check target**, and a second **Move** |
 | System | The ROS topic values and sample commands |
 
 The Activity list (collapsible, newest first) shows the same lines as `/beast_arm/log`. A refused button press also shows as a toast at the top.
 
-While a job runs, every button is disabled except STOP, Live/Captured, markers, Dummy size and Tip check.
+While a job runs, every button is disabled except STOP, Live/Captured, markers, Dummy size, Tip check, the depth and picker's views, Save picture, the picker's settings and Forget skipped.
+
+### 6.1 The box picker's own window, in the page
+
+Everything the picker's window (`box_picker/src/pick_loop.py`) shows and does, on the Pick and Advanced tabs. Nothing here moves an arm.
+
+| Piece | Shows / does |
+| --- | --- |
+| Tilt badge | The camera tilt the picker uses and where it comes from: `ACCEL` (the accelerometer now, or its saved reading) or `TF` (orange: not gravity's; install the RealSense udev rules) |
+| Tally | Picked, failed tries, skipped (and passed over) since the GUI started |
+| Close-up | The target box cut out, its pick face boxed in red; the grip point in camera coordinates (X right, Y down, Z away, cm); the tries on this box as dots |
+| Lines | `N of M frames agree · boxes · face A × B mm`; `found in … s · pictures … s · picker … s` |
+| **Next target** (T) | Pass over this box (and every box under it) until the next successful pick, and detect again; press again for the one after |
+| **Skip box** | Never choose this box again until Forget skipped, and detect again |
+| **Check now** (H) | The pick check now, as if the robot said done: for a box taken by hand, or to look again. Counts in the tally |
+| **Save picture** (S) | The colour + depth now, with the tilt, in `box_picker/src/outputs/gui/<run>/snapshots/`, for `pick_pipeline.py --capture` |
+| History strip | The last 12 picks' close-ups, framed green (picked), red (not) or orange (can't tell) |
+| Result card | The check's numbers: gone %, same %, another box %, depth or colour, frames used, disturbed neighbours, boxes counted around it; FLAG RAISED with the photos' folder when the stack gave up on a box |
+| Depth picture (D) | The depth instead of the colour, live and captured: red near, blue far (0.30 to 0.65 m), black no reading (the bands at the sides have no depth). The target stays drawn on it |
+| Picker's view (V) | In the captured view, the picker's own drawing: every box, its faces and grip points; after a pick, the check's picture (red gone, green unchanged, blue nearer, purple another box) |
+| Order | v1: boxes on a box first, the highest first, then nearest, then leftmost (piles). v2: the leftmost free box (rows). Changing it detects again |
+| − / + | Frames per target (1-15), SAM confidence (0.20-0.90), frames per pick check (1-10): from the next detection / check on |
+| Forget skipped | The skipped and passed boxes can be chosen again |
 
 ---
 
@@ -322,9 +346,9 @@ GUI: **Detect box** (Space). It is hidden with `--click`.
 | 3 | Both arms to pre_pick if they are not there (7.1) | `arm_state` = `detecting` throughout; phase `both to_pre_pick` | - |
 | 4 | Waits up to 3 s for the model service | - | none: `no box model (/beast_arm/box_model/detect) - is box_model_node.py running?` |
 | 5 | **In parallel:** (a) the capture and (b) the model call | | `DETECT BOX: the box picker is looking (5 frames)...` |
-| 5a | **Capture:** waits for camera frames, averages 8 depth frames, rebuilds the 3-D map | calls `/clear_octomap`, then `/octomap_gater/refresh` (3 frames into the map) | `frame captured; averaging 8 depth frames...`, `frame captured; rebuilding the octomap...`, `octomap rebuilt (passing 3 frames); walls around the picture (138).` |
+| 5a | **Capture:** waits for camera frames, averages 8 depth frames, rebuilds the 3-D map, then puts the green walls (`unseen_walls`) where the camera cannot see: above, below and beside the part of the picture that has **depth** (about 45 px on the left, 60 px on the right and the top 9 rows of the colour picture have none, so an object there would be invisible), from 11 cm in front of the nearest thing seen but never nearer than x 0.30 m. Launch `walls_edges:=picture` / `walls_ahead:=0.05` for the walls as before 2026-11-05 (more reach at the sides, less safe) | calls `/clear_octomap`, then `/octomap_gater/refresh` (3 frames into the map), then `/apply_planning_scene` | `frame captured; averaging 8 depth frames...`, `frame captured; rebuilding the octomap...`, `octomap rebuilt (passing 3 frames); walls around the picture (138).` |
 | 5b | **Model:** calls `box_model/detect` with approach `auto` and the tool, waiting up to 90 s | request `DetectTarget{approach: auto, tool: vacuum}` | - |
-| 5b-i | The box model drops stale picker output, takes "up" (accelerometer, else TF), sends `pick ux uy uz` to the picker | - | without the accelerometer, once: `no accelerometer readings ...: the up direction from the TF tilt` |
+| 5b-i | The box model drops stale picker output, takes "up" (the accelerometer, else the reading the picker's bridge sends with the frames, else the saved reading, else the TF), sends `pick ux uy uz` to the picker | `box_model/settings` (the tilt and its source) | without the accelerometer, once: `no accelerometer readings ...: the tilt from its saved reading (...)` or `... from the TF, which is not gravity's` |
 | 5b-ii | The picker takes 5 frames and finds every box's outline and faces. It chooses the box: nothing on it and nothing in front first, then the highest standing on another box, then the nearest, then the leftmost. It chooses the face: the largest visible front or top face. A top seen at under 10° loses to its front | - | - |
 | 5b-iii | The box model turns the answer into a world point (with the depth correction if one is saved) and a PickTarget | publishes `box_model/target`, `box_model/image`, `box_model/scene` | `box: top, 5 of 5 frames agree, face 168 x 120 mm, 5 boxes seen, at x=+0.438 y=+0.013 z=+0.422 (2.15 s); vacuum -> left arm` |
 | 6 | The GUI pairs the answer with the picker's picture (up to 2 s) and switches to the captured view with the outlines drawn | receives `box_model/image`, `box_model/scene` | - |
@@ -459,9 +483,10 @@ From the first press until the drop, every move is gentle: straight lines at 3 c
 | `left back_out` | Straight out along the tool to the approach point. A held box may overlap the old map here, where it still stands | `backing straight out` | The pose counts as colliding: `backing out along the way in (model says this pose touches something)` (unchecked line), else a joint move |
 | `left box_clear` (size known) | Further out until the whole box has left its old spot (its length along the tool + 3 cm) | `lifting the box clear (N cm off the contact)` | `could not take the box further out along the tool; the planners may see it in its old spot` |
 | (same) | Box held: the 3-D map is taken again without the box in its old spot | `box lifted - the camera map again, without the box in its old spot`; calls `/clear_octomap` and `/octomap_gater/refresh` | - |
-| `left turn_level` (top only) | Turns the tool level again, up there | `turning the tool level` | Fails with a box: `turning level with the box let through the camera map` (tried again with the box exempt) |
-| `left return` | Back to pre_pick along the way it came (replayed in reverse at 40 %), if that way is clear with the box on | `returning the way it came` | Too tight with the box: `the way in is too tight with the box - planning a way back` (cuMotion/OMPL). Nothing works with a box: `no planned way home with the box - retracing the way in` (box exempt) |
-| `left to_drop` | To the drop pose (40 %) | `to the drop pose` | Unreachable: `could not reach the drop pose; staying at pre_pick` (vacuum stays on) |
+| `left to_pre_pick_top` (top, after a press) | The tool stays pointing straight down, so the box stays level: to **pre_pick_top**, beside pre_pick (tool at 0.13, ±0.27, 0.46 m: the held box, any face up and turned any way, stays 3 cm behind where the green walls can start; `pre_pick_top_state` in `robot/pick_place_states_<arm>.yaml`). A straight line at 5 cm/s (`--top-carry-speed`), the tool turned only about the vertical, by the least that reaches; then straight on to `to_drop` (no `turn_level`, no `return`) | `to pre_pick_top in a straight line, the tool still pointing down (the box stays level)` | No straight line: `to pre_pick_top (planned), the tool pointing down` (joints found from where the arm is, 40 %); then `pre_pick_top_state`'s own joints; nothing reaches: `no way to pre_pick_top - turning the tool level ...` and the rows below as before |
+| `left turn_level` (top, only without pre_pick_top) | Turns the tool level again, up there | `turning the tool level` | Fails with a box: `turning level with the box let through the camera map` (tried again with the box exempt) |
+| `left return` (front; top without pre_pick_top) | Back to pre_pick along the way it came (replayed in reverse at 40 %), if that way is clear with the box on | `returning the way it came` | Too tight with the box: `the way in is too tight with the box - planning a way back` (cuMotion/OMPL). Nothing works with a box: `no planned way home with the box - retracing the way in` (box exempt) |
+| `left to_drop` | To the drop pose (40 %), from pre_pick or pre_pick_top: the tool points down there too | `to the drop pose` | Unreachable: `could not reach the drop pose; back to pre_pick with the box` (vacuum stays on) |
 | `left drop` | **Vacuum off**; holds 1 s (`--drop-hold`); the box leaves the planners | `vacuum` = `false`; `held_object/state` = `none`; logs `at the drop pose; holding 1 s`, `vacuum: off (left arm)`, `box dropped - out of the planners` | - |
 | `left to_pre_pick` | Back to pre_pick at normal speed | `back to pre_pick` | - |
 | `left done` | Back | `left arm: done in 45.1 s. Detect a box, then MOVE.` | Not back: `could not get back to the start posture -- press RETURN (b) to try again`; `arm_state` = `arm_out` |
@@ -479,7 +504,7 @@ If anything throws on the way: `touch failed (<error>); bringing it back`, and t
 | 1 | Decide before the check, from the touch | see 11.2 |
 | 2 | `arm_state` = `checking`; `arm_action/status` = `checking`; phase `left check` | - |
 | 3 | Calls `box_model/check` with `holding` = `held` / `empty` / `""` from the weighing (25 s timeout; once more after 1.5 s if `blocked`) | request `CheckPick{holding: held}` |
-| 4 | The picker takes 3 new frames and compares them with the 5 frames from the detection: depth inside the box's outline, its neighbours too. No SAM; milliseconds | box model publishes `box_model/check_result`, `box_model/image`, `box_model/scene` (kind `check`) |
+| 4 | The picker takes 3 new frames and compares them with the 5 frames from the detection: depth and print inside the box's outline, its neighbours too. No SAM, milliseconds, unless another box now stands in the target's place: then SAM runs once to count the boxes around it | box model publishes `box_model/check_result`, `box_model/image`, `box_model/scene` (kind `check`) |
 | 5 | Result | `pick_result` (JSON); `arm_action/status` = the result; log `pick check: PICK SUCCESS: the box is gone from its place` |
 | 6 | GUI: shows the check picture with the verdict banner, captures a fresh frame, fills the result card | - |
 
@@ -491,6 +516,7 @@ Check outcomes, decided in this order:
 | `blocked` | Something in front, or the outline unsteady | `null` | `pick_unverified: blocked - ...` |
 | `unknown` | Under 50 pixels of depth on the target | `null` | `pick_unverified: unknown - ...` |
 | `success` | 70 % or more of the box gone | `true` | `pick_complete` |
+| `replaced` → `success` / `moved` | Another print at the target's depth (30 % of it) and a neighbour moved: a neighbour slid or leaned into the gap. With `held` it is `success`, with `empty` `dropped`; otherwise SAM counts the boxes around the spot: one fewer → `success`, as many → `moved` | `true` / `false` | `pick_complete` / `pick_failed: moved - ...` |
 | `dropped` | Gone, but the weighing said empty | `false` | `pick_failed: dropped - ...` |
 | `wrong_box` | Target 80 % the same, a neighbour 70 % gone | `false` | `pick_failed: wrong_box - ...` |
 | `missed` | Target 80 % the same | `false` | `pick_failed: missed - PICK FAILED: MISSED: the box is still there` |
@@ -558,6 +584,8 @@ Sent:
 - **After it is sent:** the arms do nothing more. Log `...: base_adjust sent - move left 0.100 m; detect the box again once the base has moved`, or `... - none: the box is already lined up sideways, and moving left or right cannot help (...)`.
 - **Not latched:** a wheel node that starts later never acts on an old request.
 - **After the base moves:** Detect box (or `ready_to_pick`) again.
+- **The box is flagged** (after failed picks, not for `unreachable`): three photos for a person (the scene with it marked, close up, the last check) in `box_picker/src/outputs/gui/<run>/flags/`; the result card shows FLAG RAISED.
+- **`none`: the box is skipped**, as the picker's own loop does: the next detection takes another box (Forget skipped brings it back). **`left` / `right`:** the skipped boxes are forgotten instead, because they are remembered by their place in the picture.
 
 ---
 
@@ -708,7 +736,7 @@ From the run of 2026-10-30 12:23-12:24; the messages are as the current code pri
 12:24:36  log  left contact: contact (openarm_left_joint3 +0.33 Nm in 0.3 s, stuck 34 of 30 mm in)
           phase  left holding
 12:24:40  log  the box is on the cup (36 +- 3 g)
-          phase  left back_out -> left turn_level -> left return -> left to_drop
+          phase  left back_out -> left to_pre_pick_top -> left to_drop
 12:24:50  phase  left drop        pub vacuum=false
           phase  left to_pre_pick -> left done
 12:24:54  log  left arm: done in 45.1 s.
@@ -767,13 +795,14 @@ From the run of 2026-10-30 12:23-12:24; the messages are as the current code pri
 | Nothing on the cup | `nothing on the cup` → pressed again (up to 3 presses) | - | Automatic; check the vacuum is on |
 | Cup beside the face | `... beside it; not pressing again` | camera decides | Recalibrate if it repeats |
 | Something pushes up (front) | `something pushes up on the cup ...` | camera decides | - |
+| Box taken, a neighbour slid into its place | `PICK SUCCESS` (settled by counting the boxes there) | `success` | Next box |
 | Box still there | `PICK FAILED: MISSED` | `missed` | Retried; then base_adjust |
 | Box pushed / tipped | `PICK FAILED: BOX MOVED` | `moved` | Retried with a new detection |
 | Neighbour taken | `PICK FAILED: WRONG BOX` | `wrong_box` | Retried |
 | Box gone, cup empty | `PICK FAILED: DROPPED` | `dropped` | Find the box |
 | View blocked / camera moved / too little depth | `CAN'T TELL ...`; `pick_unverified: ...` | `blocked` / `camera_moved` / `unknown` | Press Try again (it looks again) |
 | Check did not answer | `pick_unverified: ...` | `check_timeout` | Check the box model |
-| Two failures on one box | base_adjust sent | (the second outcome) | Move the base left/right as asked, Detect again |
+| Two failures on one box | base_adjust sent; FLAG photos saved | (the second outcome) | Move the base left/right as asked, Detect again; with `none` the box is skipped and the next detection takes another |
 | Arm did not get back | `could not get back ... press RETURN`; `arm_out` | `arm_out` | Return arm / `arm_state/cmd return` |
 | Box still held from before | `still holds the box from the last pick - release it first` | `not_started` | Take the box off, press Release |
 | Command while busy | `busy` | - | Wait, or STOP |

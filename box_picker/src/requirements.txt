@@ -14,8 +14,6 @@ pycocotools==2.0.11
 huggingface-hub==0.36.2
 safetensors==0.8.0
 tqdm==4.70.1
-einops==0.8.2                    # sam3 needs it (installed --no-deps, so listed here)
-psutil==7.2.2                    # likewise
 setuptools==81.0.0               # sam3 imports pkg_resources, removed in later setuptools
 
 numpy==2.4.6

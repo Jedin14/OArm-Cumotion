@@ -172,6 +172,10 @@ class ClickToMove(Node):
         self.halt = threading.Event()
         self.active_goals = {}          # id(handle) -> (handle, arms) (handles are not hashable)
         self._acm_lock = threading.RLock()  # the collision matrix: read, change, write back
+        # one MoveGroup goal at a time: PICK ALL plans the next box while the arm
+        # drops the last one, and cuMotion aborts a second plan ("Planner is
+        # busy") -- MoveIt 2.5.9 itself runs two goals side by side (2026-11-05)
+        self.move_group_lock = threading.Lock()
         # straight to each arm's trajectory controller: the one way to stop a
         # move at once (move_group's ExecuteTrajectory cancel did nothing -- a
         # contact move ran 4.7 s past the felt contact, 2026-10-28)
@@ -829,10 +833,15 @@ class ClickToMove(Node):
                 return False
         return True
 
-    def refresh_walls(self, optical):
+    def refresh_walls(self, optical, ahead=None, x_min=None, bounds=None):
         """After a capture: walls in the planning scene where the camera cannot
-        see -- above and below its picture, from just in front of the nearest
-        thing it saw (ctm/walls.py). Returns how many boxes, or None."""
+        see -- above, below and beside its picture, from `ahead` (walls.AHEAD)
+        in front of the nearest thing it saw, never nearer the robot than
+        `x_min` (walls.X_MIN) (ctm/walls.py). bounds: the part of the picture
+        with depth (walls.depth_bounds); the whole picture if None. Returns
+        how many boxes, or None."""
+        ahead = walls.AHEAD if ahead is None else float(ahead)
+        x_min = walls.X_MIN if x_min is None else float(x_min)
         _c, _d, info = self.latest()
         t_wo = self.lookup(BASE_FRAME, optical)
         if info is None or t_wo is None or not self.scene_query.wait_for_service(timeout_sec=5.0):
@@ -845,12 +854,12 @@ class ClickToMove(Node):
             o = result.scene.world.octomap
             nearest = walls.nearest_seen(o.octomap, np.array(
                 [o.origin.position.x, o.origin.position.y, o.origin.position.z]))
-        start = (nearest - walls.AHEAD) if nearest is not None else walls.X_MIN
+        start = (nearest - ahead) if nearest is not None else x_min
         obj = CollisionObject()
         obj.header.frame_id = BASE_FRAME
         obj.id = walls.WALL_ID
         obj.operation = CollisionObject.ADD
-        for centre, size in walls.boxes(t_wo, info, start):
+        for centre, size in walls.boxes(t_wo, info, start, x_min, bounds):
             box = SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[float(v) for v in size])
             pose = Pose()
             pose.position.x, pose.position.y, pose.position.z = map(float, centre)
@@ -1411,6 +1420,35 @@ class ClickToMove(Node):
         ok, _ = self.execute(robot, label, timeout=total + lead + 20.0)
         return ok
 
+    def lead_in(self, trajectory, rate=0.3):
+        """The planned trajectory from where the arm is now: a short joint move
+        onto its first point (at most `rate` rad/s, 0.3 s at least), then the
+        path as planned. For a plan made from where the arm was to come back to
+        (PICK ALL plans the next box during the drop): the arm settles a few
+        hundredths of a radian off that, and MoveIt would refuse the start or the
+        controller jump to it. (a copy, how far off the arm was in rad), or
+        (None, None) without /joint_states."""
+        import copy
+        out = copy.deepcopy(trajectory)
+        jt = out.joint_trajectory
+        with self.lock:
+            now = [self.joints.get(n) for n in jt.joint_names]
+        if not jt.points or any(v is None for v in now):
+            return None, None
+        gap = float(np.max(np.abs(np.subtract(now, jt.points[0].positions))))
+        lead = max(0.3, gap / rate)
+        seconds = lambda p: p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
+        for p in jt.points:
+            t = seconds(p) + lead
+            p.time_from_start.sec = int(t)
+            p.time_from_start.nanosec = int((t % 1.0) * 1e9)
+        first = JointTrajectoryPoint(positions=[float(v) for v in now],
+                                     velocities=[0.0] * len(now))
+        if jt.points[0].accelerations:
+            first.accelerations = [0.0] * len(now)
+        jt.points.insert(0, first)
+        return out, gap
+
     def still_torque(self, arm, settle=0.5, window=0.4):
         """The arm held still: let it settle `settle` s, then its joints and the
         mean (and noise of the mean) of its torques over `window` s. None if no
@@ -1890,11 +1928,11 @@ class ClickToMove(Node):
         except (OSError, ValueError):
             pass
 
-    def plan_joints(self, arm, positions, velocity=None, tries=2):
+    def plan_joints(self, arm, positions, velocity=None, tries=2, start=None):
         stats = getattr(self, '_plan_stats', None)
         t0 = time.monotonic()
         try:
-            return self._plan_joints(arm, positions, velocity, tries)
+            return self._plan_joints(arm, positions, velocity, tries, start)
         finally:
             if stats is not None:
                 rec = stats.setdefault('path', [0, 0, 0.0])
@@ -1902,32 +1940,37 @@ class ClickToMove(Node):
                 rec[1] += 1
                 rec[2] += time.monotonic() - t0
 
-    def _plan_joints(self, arm, positions, velocity=None, tries=2):
+    def _plan_joints(self, arm, positions, velocity=None, tries=2, start=None):
         """A plan to `positions`, not executed: (code, trajectory).
 
         cuMotion, retried once (its optimiser starts from random seeds). A
         big turn of the tool -- level at pre_pick to straight down for TOP
         DOWN -- still defeats it now and then; then MoveIt's sampling planner
-        (OMPL, checked against the same octomap) finds the way."""
+        (OMPL, checked against the same octomap) finds the way.
+
+        start: this arm's joints to plan from, instead of where it is (PICK
+        ALL plans the next box from pre_pick while the arm is at the drop)."""
         for _ in range(tries):
-            code, trajectory = self._plan_joints_once(arm, positions, velocity)
+            code, trajectory = self._plan_joints_once(arm, positions, velocity, start=start)
             if code != MoveItErrorCodes.PLANNING_FAILED:
                 return code, trajectory
-        code_o, trajectory_o = self._plan_joints_once(arm, positions, velocity, 'ompl')
+        code_o, trajectory_o = self._plan_joints_once(arm, positions, velocity, 'ompl',
+                                                      start=start)
         if code_o == MoveItErrorCodes.SUCCESS:
             self.get_logger().info(f'{arm}: cuMotion found no path; OMPL did')
             return code_o, trajectory_o
         return code, trajectory
 
-    def _plan_joints_once(self, arm, positions, velocity=None, pipeline='cumotion'):
-        goal = self._joint_goal(arm, positions, velocity, pipeline)
+    def _plan_joints_once(self, arm, positions, velocity=None, pipeline='cumotion', start=None):
+        goal = self._joint_goal(arm, positions, velocity, pipeline, start=start)
         goal.planning_options.plan_only = True
-        handle = self.wait(self.move_client.send_goal_async(goal), 15.0)
-        if handle is None:
-            self.require_move_group()
-        if handle is None or not handle.accepted:
-            return MoveItErrorCodes.FAILURE, None
-        result = self.wait_or_dead(handle.get_result_async(), self.args.motion_timeout)
+        with self.move_group_lock:
+            handle = self.wait(self.move_client.send_goal_async(goal), 15.0)
+            if handle is None:
+                self.require_move_group()
+            if handle is None or not handle.accepted:
+                return MoveItErrorCodes.FAILURE, None
+            result = self.wait_or_dead(handle.get_result_async(), self.args.motion_timeout)
         if result is None:
             handle.cancel_goal_async()
             return MoveItErrorCodes.TIMED_OUT, None
@@ -1978,7 +2021,7 @@ class ClickToMove(Node):
                 return ompl
         return code
 
-    def _joint_goal(self, arm, positions, velocity=None, pipeline='cumotion'):
+    def _joint_goal(self, arm, positions, velocity=None, pipeline='cumotion', start=None):
         if not self.move_client.wait_for_server(timeout_sec=5.0):
             raise MoveGroupDown('/move_action is not served')
         velocity = self.args.velocity if velocity is None else velocity
@@ -1991,6 +2034,14 @@ class ClickToMove(Node):
         req.max_velocity_scaling_factor = velocity
         req.max_acceleration_scaling_factor = velocity
         req.start_state.is_diff = True
+        if start is not None:
+            # From these joints, not from where the arm is. NOT a diff: cuMotion
+            # adds a diff's positions to the current ones (cumotion_planner.py,
+            # execute_callback); MoveIt and cuMotion both take the joints given
+            # and the rest of the robot as it is now
+            req.start_state.is_diff = False
+            req.start_state.joint_state.name = arm_joints(arm)
+            req.start_state.joint_state.position = [float(v) for v in start]
         req.workspace_parameters.header.frame_id = BASE_FRAME
         for corner, sign in ((req.workspace_parameters.min_corner, -1.0),
                              (req.workspace_parameters.max_corner, 1.0)):
@@ -2013,19 +2064,20 @@ class ClickToMove(Node):
             if self.halt.is_set():
                 self.get_logger().error(f'{label}: STOP is on - not moving')
                 return MoveItErrorCodes.FAILURE
-            handle = self.wait(self.move_client.send_goal_async(goal), 15.0)
-            if handle is None:
-                self.require_move_group()
-            if handle is None or not handle.accepted:
-                self.get_logger().error(f'{label}: goal rejected by move_group')
-                return MoveItErrorCodes.FAILURE
-            arms = [a for a in ('left', 'right') if goal.request.group_name.startswith(a)]
-            self.active_goals[id(handle)] = (handle, arms)
-            try:
-                result = self.wait_or_dead(handle.get_result_async(), self.args.motion_timeout,
-                                           handle=handle, arms=arms)
-            finally:
-                self.active_goals.pop(id(handle), None)
+            with self.move_group_lock:               # (a plan for the next box waits)
+                handle = self.wait(self.move_client.send_goal_async(goal), 15.0)
+                if handle is None:
+                    self.require_move_group()
+                if handle is None or not handle.accepted:
+                    self.get_logger().error(f'{label}: goal rejected by move_group')
+                    return MoveItErrorCodes.FAILURE
+                arms = [a for a in ('left', 'right') if goal.request.group_name.startswith(a)]
+                self.active_goals[id(handle)] = (handle, arms)
+                try:
+                    result = self.wait_or_dead(handle.get_result_async(),
+                                               self.args.motion_timeout, handle=handle, arms=arms)
+                finally:
+                    self.active_goals.pop(id(handle), None)
             if self.halt.is_set():
                 return MoveItErrorCodes.FAILURE
             if result is None:

@@ -28,7 +28,7 @@ The robot does the picking and says when it is finished (`done`). The program ne
 |---|---|
 | OS | Linux (tested on Ubuntu 22.04) |
 | GPU | NVIDIA, 6 GB or more (uses ~4.3 GB), driver 570 or newer (CUDA 12.8) |
-| Camera | Intel RealSense D455 on a **USB 3** port. Only one program can use it at a time |
+| Camera | Intel RealSense D455 on a **USB 3** port. Only one program can use it at a time. Or on another machine, published over ROS 2 (section 3b) |
 | Disk | ~10 GB |
 | Internet | During setup only (packages + the 3.5 GB model). For a PC without internet, see INTEGRATION.md, "Offline" |
 
@@ -47,10 +47,10 @@ Plug the camera in, then:
 
 ```bash
 cd box_picker/src
-.venv/bin/python pick_loop.py --pitch 0
+.venv/bin/python pick_loop.py
 ```
 
-A window opens. After ~10 s (the model loads, then the first 5 frames) it shows the chosen box in red.
+A window opens. After ~10 s (the model loads, then the first 5 frames) it shows the face to pick on the chosen box framed in red, with a red cross on the grip point. The panel on the right shows a close-up, the position in cm and the try number.
 
 1. Take that box away by hand, and keep your hand out of view.
 2. Press **C**. This stands in for the robot's `done`.
@@ -58,16 +58,55 @@ A window opens. After ~10 s (the model loads, then the first 5 frames) it shows 
 4. Press C **without** taking the box. The window shows **PICK FAILED: MISSED**, and the same box is chosen again ("try 2").
 5. After 3 failed tries a **FLAG** is shown and the box is skipped.
 
-Keys: **C** check now (= `done`), **N** choose a new box now, **R** forget the skipped boxes, **Q** quit.
+Keys: **C** check now (= `done`), **T** next target (pass over this box and every box under it), **S** save a snapshot, **A** the Advanced tab, **Q** quit.
+The Advanced tab (buttons can be clicked too): **D** depth picture, **V** the picker's overlay of every box, **S** save a snapshot, **O** order v1 / v2, **N** choose again with new frames, **R** forget the skipped boxes, and − / + for **Frames per target** (5), **SAM confidence** (0.40) and **Frames per pick success** (3). On the command line: `--frames`, `--score`, `--check-frames`.
 
-`--pitch 0` means the camera is level. If it is mounted tilted down, give the angle in degrees.
+The Pick tab also shows how long the target took: `found in 2.9 s · pictures 0.4 s · picker 2.5 s`. The result screen shows how many frames the pick check used.
+
+**Camera tilt.** With the camera on USB, leave out `--pitch`: the camera's motion sensor gives its real tilt. That matters: 1° wrong moves a top's front-to-back size 5–6 mm (a 100 mm top read as 109). If the start-up says `no accelerometer reading`, install the RealSense USB rules once:
+
+```bash
+sudo wget -O /etc/udev/rules.d/99-realsense-libusb.rules https://raw.githubusercontent.com/IntelRealSense/librealsense/master/config/99-realsense-libusb.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger      # then unplug and replug the camera
+```
+
+Over ROS (below) the tilt comes from the driver's motion sensor topic. Without any motion sensor, give `--pitch` with the tilt in degrees down (0 = level).
+
+### 3b. Camera on another machine (ROS 2)
+
+If the D455 is plugged into another machine that publishes it with the RealSense ROS 2 driver, and this machine has ROS 2 Humble. On the **camera** machine, start the driver with colour, aligned depth and the motion sensor:
+
+```bash
+ros2 launch realsense2_camera rs_launch.py enable_color:=true align_depth.enable:=true enable_accel:=true
+```
+
+Then on this machine:
+
+```bash
+.venv/bin/python pick_loop.py --ros
+```
+
+The tilt is read from `/camera/camera/accel/sample` anew for every pick, so it follows the robot as it moves; each target line in the log shows it (`tilt 1.9 deg`). If the start-up says `no accelerometer reading`, the driver wasn't started with `enable_accel:=true` (check: `ros2 topic hz /camera/camera/accel/sample`).
+
+It starts the ROS bridge by itself and stops it on exit. If frames don't arrive or come very slowly, run this once on **this** machine (lost at reboot; INTEGRATION.md, "Camera over ROS 2", says how to keep it):
+
+```bash
+sudo sysctl -w net.core.rmem_max=2147483647 net.core.rmem_default=2147483647
+sudo sysctl -w net.ipv4.ipfrag_time=3 net.ipv4.ipfrag_high_thresh=134217728
+```
+
+### 3c. Choosing the order, and when boxes are missed
+
+- **Order:** `--order v2` (or **O** in the Advanced tab) takes the leftmost free box first. The default, v1, clears stacks from the top down first. v2 suits boxes standing apart; v1 suits piled or leaning boxes.
+- **Top faces:** by default a box on another box is gripped by its front, and only a box on the base may be gripped from above (the bigger of its front and top). `--top-faces` (or **F** in the Advanced tab) allows tops anywhere. A box on a box with no front found is still picked by its top, and a `flag` with reason `top face only` tells a person.
+- **Boxes not found:** SAM gives each box a confidence. Thin boxes standing on end score only 0.45–0.6, so the cut-off is 0.40 (`--score`). If boxes are missed, lower **SAM confidence** in the Advanced tab; if bits of the carton are taken for boxes, raise it.
 
 ## 4. Connect the robot
 
 Run it without the window:
 
 ```bash
-.venv/bin/python pick_loop.py --pitch 0 --no-window
+.venv/bin/python pick_loop.py --no-window          # over ROS: add --ros
 ```
 
 - It reads commands from **stdin**, one per line.
@@ -80,7 +119,7 @@ Run it without the window:
 |---|---|---|
 | `{"event": "ready", ...}` | model and camera are up (~10 s after start) | wait for the first target |
 | `{"event": "target", "pick": 1, "attempt": 1, "target": {...}}` | pick this box (`attempt` 2 or 3 = a retry on the same box) | convert to robot coordinates, pick it, move the arm out of view, then send `done` |
-| `{"event": "result", "picked": true, "verdict": {...}}` | the box is gone: the pick worked | wait for the next `target` |
+| `{"event": "result", "picked": true, "verdict": {...}}` | the box is gone: the pick worked (`outcome` `success`, or `replaced`: another box slid into its place) | wait for the next `target` |
 | `{"event": "result", "picked": false, ...}` | the box is still there, or was pushed or dropped (`verdict.outcome` says which) | wait for the next `target` |
 | `{"event": "result", "picked": null, ...}` | can't tell (an arm or hand still in view, or something new appeared) | clear the view, send `done` again. After 3 in a row a new `target` comes instead |
 | `{"event": "flag", "reason": "...", "photo": "...", "crop": "...", "check_photo": "..."}` | 3 tries on one box failed. The box is skipped, and the next box comes as a normal `target` | tell a person; the three photos show the box |
@@ -95,7 +134,7 @@ The `target` dictionary:
 
 | Field | Meaning |
 |---|---|
-| `x_m`, `y_m`, `z_m` | where to grip: the centre of the chosen face, metres, **camera coordinates** (x right, y down, z forward from the colour lens). Convert with the camera's pose on the robot (hand-eye calibration) |
+| `x_m`, `y_m`, `z_m` | where to grip: the centre of the chosen face, metres, **camera coordinates** (x right, y down, z forward from the colour lens). Convert with the camera's pose on the robot (hand-eye calibration). Over ROS, the camera is the one in the topics' `camera_info` |
 | `approach` | `front`: come at the face horizontally. `top`: come down from above |
 | `size_mm` | that face's size, long × short. Worth checking against the boxes you expect |
 | `agreeing` | how many of the 5 frames chose this box. Under 3 means the scene was moving |
@@ -116,7 +155,7 @@ The `target` dictionary:
 import json, subprocess
 
 SRC = "/path/to/box_picker/src"
-loop = subprocess.Popen([f"{SRC}/.venv/bin/python", "pick_loop.py", "--pitch", "0", "--no-window"],
+loop = subprocess.Popen([f"{SRC}/.venv/bin/python", "pick_loop.py", "--no-window"],
                         cwd=SRC, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
 
 def send(line):
@@ -147,7 +186,7 @@ A ROS 2 node can run the same code: the program runs in its own Python 3.11, so 
 | **The robot base doesn't move** from the `target` event until the `result` event | the check compares the picture before and after pixel by pixel |
 | **Send `done` only when the arm and the held box are out of view** | anything in front of the boxes spoils the check (`picked: null`) |
 | **Keep the arm out of view until the next `target` arrives** (about 3 s after `result`) | the next box is chosen from new frames, and a box in the gripper would be seen as a box |
-| **The camera doesn't move on the robot**, and `--pitch` is its real tilt | sets "up", which decides front vs top and "on top of" |
+| **The camera doesn't move on the robot**, and its tilt is known (motion sensor over USB, else `--pitch`) | sets "up", which decides front vs top and "on top of" |
 | **Boxes about 0.4–0.6 m from the camera** (what was tested) | closer than ~0.4 m the camera gives no depth; further away, more noise |
 
 ## 6. What it saves
@@ -162,10 +201,12 @@ Everything goes under `src/outputs/pick_loop/<date_time>/`:
 | You see | Do |
 |---|---|
 | `Device or resource busy` / `Frame didn't arrive` | another program has the camera: close it. The program also resets the camera once by itself |
-| `no accelerometer reading (... Permission denied)` | harmless: the camera is taken as level (`--pitch`) |
+| `no accelerometer reading (... Permission denied)` | the camera is taken as level, so tops can be measured ~1 cm off: install the RealSense USB rules (section 3), or give `--pitch` |
 | `CUDA out of memory` | another program is using the GPU |
 | `picked: null` again and again | something stays in view after `done` (arm, cable, hand, or a box put back), or the camera moved. After 3 in a row it chooses again |
-| `no_target` but a box is still there | 1. `skipped` > 0: that box (or one in its place) was flagged earlier. Skipped boxes are remembered by their place in the picture until `reset` (R in the window) or a restart. 2. A box standing with its **narrow end** (~2 cm) towards the camera is sometimes not found as pickable: turn it so a wider face shows, or send `pick` to look again. 3. A box whose face runs off the edge of the picture is never picked: move the robot so it is fully in view |
+| `no colour + depth pair in 5 s` with `--ros` | frames lost on the network: the `sysctl` lines in section 3b |
+| a box at the far left or right isn't picked | the camera gives no depth in a band at each side (black in the depth picture, D). Move the robot so the box is further in |
+| `no_target` but a box is still there | 1. `skipped` > 0: that box (or one in its place) was flagged earlier. Skipped boxes are remembered by their place in the picture until `reset` (R in the window) or a restart. 2. A box standing with its **narrow end** (~2 cm) towards the camera is sometimes not found as pickable: turn it so a wider face shows, or send `pick` to look again. |
 | the same box flagged often | look at the flag photos: a box the gripper can't hold, or two boxes pressed together seen as one (split automatically only when at least 3 other boxes of that size are in view) |
 
 ## Status
@@ -175,5 +216,6 @@ Everything goes under `src/outputs/pick_loop/<date_time>/`:
   - box never taken → 3 tries, flag with photos, next box
   - can't tell → checked again on the next `done`
 - Run live with the D455 and a person in place of the robot (C for `done`): taken / missed / flag / moved, merged boxes split, the carton's rim ignored.
-- The picker has been tested live with the D455.
+- Run live over ROS 2, the camera on another machine over Wi-Fi.
+- The picker has been tested live with the D455. Sizes checked with ArUco markers and 170 × 100 × 25 boxes (3 Nov): fronts 169–172 × 98–107, tops 167–170 × 96–101 with the motion sensor's tilt.
 - **The full loop has not yet been run with real robot picks.** Please keep the `outputs/` folder of the first runs: it shows what the camera saw and decided at each step.

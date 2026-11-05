@@ -82,6 +82,8 @@ class Worker(threading.Thread):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pitch", type=float, help="camera tilt down in degrees (default: accelerometer, else 0)")
+    ap.add_argument("--order", choices=["v1", "v2"], default="v1",
+                    help="v1: stack tops (highest first), then nearest, then leftmost; v2: leftmost free box")
     ap.add_argument("--depth-tol", type=float, default=DEFAULT_DEPTH_TOL, help="front-layer thickness, metres")
     ap.add_argument("--out", default="outputs/live_pick", help="folder for frames saved with S")
     ap.add_argument("--log", metavar="FILE.jsonl", help="also append every result to this file")
@@ -93,7 +95,7 @@ def main():
     args = ap.parse_args()
 
     print("loading SAM 3.1 ...", flush=True)
-    detector = PickDetector(depth_tol=args.depth_tol, smooth=args.smooth)
+    detector = PickDetector(depth_tol=args.depth_tol, smooth=args.smooth, order=args.order)
     cam = open_camera(args.ros)
     up = up_from_accel(cam.accel) if cam.accel and args.pitch is None else up_from_pitch(args.pitch or 0)
     if args.log:

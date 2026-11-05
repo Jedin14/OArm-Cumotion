@@ -14,6 +14,10 @@
 #   sudo ip link set can1 type can bitrate 1000000 dbitrate 5000000 fd on
 #   sudo ip link set can1 up
 #
+# It also starts the vacuum relay bridge (app/vacuum_bridge.py: /beast_arm/vacuum
+# -> the ESP32 by its USB id): vacuum:=false leaves it out, vacuum_port:=... for
+# another port.
+#
 set -eo pipefail
 
 NATIVE_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"

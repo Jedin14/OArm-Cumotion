@@ -7,6 +7,27 @@ from launch_ros.actions import Node, SetRemap
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch.conditions import IfCondition
 
+
+def realsense_imu_readable():
+    """True when the D455's motion sensor (its accelerometer: /dev/iio:device*
+    named accel_3d, on the camera's USB) can be read without root. It needs
+    the RealSense udev rules (librealsense's 99-realsense-libusb.rules); without
+    them the camera node hung at start with enable_accel on (2026-10-29)."""
+    import glob
+    found = False
+    for d in glob.glob('/sys/bus/iio/devices/iio:device*'):
+        try:
+            name = open(os.path.join(d, 'name')).read().strip()
+        except OSError:
+            continue
+        if name != 'accel_3d':
+            continue
+        found = True
+        dev = os.path.join('/dev', os.path.basename(d))
+        if not os.access(dev, os.R_OK):
+            return False
+    return found
+
 # Inject override directory for patched cumotion planner
 os.environ['PYTHONPATH'] = '/workspaces/isaac_ros-dev/src/isaac_ros_cumotion_override:' + os.environ.get('PYTHONPATH', '')
 
@@ -74,12 +95,20 @@ def generate_launch_description():
     # picker -- a box top seen at a shallow angle got too few points at 424x240
     # and lost to the box's front -- still measuring from ~0.34 m. Use
     # depth_profile:=424x240x15 for work nearer than that.
-    # off: with it on, the camera node hung at start (2026-10-29); the box picker
-    # then takes the camera's tilt from the TF
+    # auto (2026-11-04): on when the D455's motion sensor can be read -- the
+    # RealSense udev rules. Without them the camera node hung at start with it on
+    # (2026-10-29): its /dev/iio devices were root's only. Off, the box picker
+    # uses the accelerometer's last saved reading (calibration/camera_tilt.yaml),
+    # else the TF's tilt, which is not gravity's.
+    imu_ok = realsense_imu_readable()
+    if not imu_ok:
+        print('[launch_everything] the D455 accelerometer is off: its motion sensor is not '
+              'readable (install the RealSense udev rules, then replug the camera; see '
+              'docs/cmds.md). accel:=true forces it on.')
     declare_accel = DeclareLaunchArgument(
-        'accel', default_value='false',
-        description='the D455 accelerometer (the box picker\'s up direction); the camera '
-                    'node hung at start with it on')
+        'accel', default_value='true' if imu_ok else 'false',
+        description='the D455 accelerometer (the box picker\'s up direction). Default: on when '
+                    'its motion sensor is readable (the RealSense udev rules), else off')
     declare_depth_profile = DeclareLaunchArgument(
         'depth_profile',
         default_value='640x480x15',
@@ -92,6 +121,23 @@ def generate_launch_description():
         description='Once move_group is up, walk both arms to their recorded '
                     'navigation_state (boot_pre_pick.py; click_to_move switches '
                     'to pre_pick when picking starts).'
+    )
+    # The vacuum relay (2026-11-05): app/vacuum_bridge.py writes the pick stack's
+    # /beast_arm/vacuum to the ESP32 ('1' / '0' over USB serial). Here, with the
+    # rest of the hardware, so the GUI's restarts leave it alone: opening the port
+    # restarts the ESP32, and a box on the cup would drop.
+    declare_vacuum = DeclareLaunchArgument(
+        'vacuum',
+        default_value='true',
+        description='Start the vacuum relay bridge (app/vacuum_bridge.py: '
+                    '/beast_arm/vacuum -> the ESP32 over USB serial).'
+    )
+    declare_vacuum_port = DeclareLaunchArgument(
+        'vacuum_port',
+        default_value='/dev/serial/by-id/'
+                      'usb-Espressif_USB_JTAG_serial_debug_unit_34:CD:B0:16:1D:30-if00',
+        description="The ESP32's serial port (default: its own USB port by id, "
+                    "/dev/ttyACM0 now; auto = the only USB serial device there is)."
     )
     declare_tool_frame = DeclareLaunchArgument(
         'tool_frame',
@@ -164,6 +210,8 @@ def generate_launch_description():
         declare_boot_pre_pick,
         declare_depth_profile,
         declare_accel,
+        declare_vacuum,
+        declare_vacuum_port,
         demo_launch,
         cumotion_node,
         ExecuteProcess(
@@ -171,6 +219,18 @@ def generate_launch_description():
             output='screen',
             additional_env={'PYTHONUNBUFFERED': '1'},
             condition=IfCondition(LaunchConfiguration('boot_pre_pick')),
+        ),
+        # It catches every serial error itself (unplugged: it reopens the port);
+        # respawned only if it dies anyway, else the vacuum would stay as it was.
+        ExecuteProcess(
+            cmd=['python3', '/workspaces/isaac_ros-dev/app/vacuum_bridge.py', '--ros-args',
+                 '-p', ['port:=', LaunchConfiguration('vacuum_port')]],
+            output='screen',
+            additional_env={'PYTHONUNBUFFERED': '1'},
+            name='vacuum_bridge',
+            respawn=True,
+            respawn_delay=2.0,
+            condition=IfCondition(LaunchConfiguration('vacuum')),
         ),
     ]
 

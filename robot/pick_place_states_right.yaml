@@ -24,3 +24,15 @@ states:
       openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
     recorded: '2026-10-08T00:00:00'
     note: SRDF navigation
+  pre_pick_top_state:
+    joints: [-1.1940, 1.3442, 0.6227, 2.2997, 1.3503, -0.5839, -1.1347]
+    joint_names: [openarm_right_joint1, openarm_right_joint2, openarm_right_joint3, openarm_right_joint4,
+      openarm_right_joint5, openarm_right_joint6, openarm_right_joint7]
+    tcp_xyz: [0.1300, -0.2626, 0.4600]
+    recorded: '2026-11-05T00:00:00'
+    note: after a TOP pick, the tool still pointing straight down, beside pre_pick (computed by IK
+      2026-11-05, 8 deg inside every joint limit) -- far enough back that the held box, any face
+      up and turned any way, stays 3 cm behind the nearest the unseen-space walls start (x 0.30);
+      the way to it is planned from the pick, so these joints are a fallback and the tool
+      position is what counts. (Was tcp 0.25, +/-0.19, 0.50 on 2026-11-04 -- the box reached x 0.31.)
+    mirrored_from: left:pre_pick_top_state

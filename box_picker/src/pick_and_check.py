@@ -47,7 +47,7 @@ NEAR_SHARE = 0.03      # this share 5 cm or more nearer than before: the arm (or
 MOVING_SHARE = 0.01    # this share changing from one frame to the next: still moving
 PICKER_SHOW_S = 2.0    # the picker's own overlay is shown this long after each new target
 RESULT_S = 3.0         # a result stays on screen this long before the next target
-PICKED = {"success": True, "missed": False, "moved": False, "dropped": False, "wrong_box": False}
+PICKED = {"success": True, "replaced": True, "missed": False, "moved": False, "dropped": False, "wrong_box": False}
 WINDOW = "pick and check"
 
 
@@ -231,7 +231,7 @@ def main():
 
                 # ---- 3. CHECK -------------------------------------------------------------------
                 after = grab(3)
-                verdict = pc.check(before, after, holding)
+                verdict = pc.check(before, after, holding, detector, cam.intr, up)
                 write(d, f"after_{time.strftime('%H%M%S')}", after)
                 result_img = pc.big_result(pc.draw(before, after, verdict), verdict)
                 cv2.imwrite(str(d / "check.jpg"), result_img)

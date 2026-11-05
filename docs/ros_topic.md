@@ -30,7 +30,7 @@ All names below are relative to `/beast_arm` (change it with `--ns`). "Latched" 
 | `pick_target` | topic | `pick_interfaces/PickTarget` | out | depth 10 | The target of the current pick: coordinates, approach, tool, arm, the matched box |
 | `pick_result` | topic | `std_msgs/String` (JSON) | out | latched | Each pick's outcome: picked true / false / null, from the camera's check |
 | `base_adjust` | topic | `pick_interfaces/BaseAdjust` | out | depth 10, not latched | When the box cannot be picked from here (out of reach, only at the edge of reach, too near the camera), or after 2 failed picks in a row on it: how the wheels should move the robot |
-| `vacuum` | topic | `std_msgs/Bool` | out | latched | What the vacuum should be: on just before the cup goes in, off at the drop pose. Switched by hand for now; the valve will follow this |
+| `vacuum` | topic | `std_msgs/Bool` | out | latched | What the vacuum should be: on just before the cup goes in, off at the drop pose. The ESP32 relay follows it: `app/vacuum_bridge.py`, started by terminal 1 (`run_launch_everything.sh`; `vacuum:=false` leaves it out), writes `1` / `0` over USB serial |
 | `status` | topic | `std_msgs/String` (JSON) | out | latched | Everything above as one JSON object, on change and every 1 s |
 | `log` | topic | `std_msgs/String` | out | depth 10 | Every human-readable message, as the GUI shows it |
 | `box_model/detect` | service | `pick_interfaces/DetectTarget` | request | - | Served by the box model; called by the pick stack |
@@ -38,7 +38,11 @@ All names below are relative to `/beast_arm` (change it with `--ns`). "Latched" 
 | `box_model/check` | service | `pick_interfaces/CheckPick` | request | - | After a pick: is the box gone? Called by the pick stack |
 | `box_model/check_result` | topic | `std_msgs/String` (JSON) | out | latched | Every check's answer |
 | `box_model/image` | topic | `sensor_msgs/Image` | out | latched | The frame of each answer and of each check, clean (nothing drawn) |
-| `box_model/scene` | topic | `std_msgs/String` (JSON) | out | latched | What that frame shows, for a GUI to draw: every box's outline and face, the target, or the check's outline and verdict |
+| `box_model/scene` | topic | `std_msgs/String` (JSON) | out | latched | What that frame shows, for a GUI to draw: every box's outline and face, the target (with camera coordinates and timings), or the check's outline, verdict numbers and frames |
+| `box_model/picker_view` | topic | `sensor_msgs/Image` | out | latched | The picker's own drawing: of each answer (every box, its faces, grip points) and of each check (red gone, green unchanged, blue nearer, purple another box) |
+| `box_model/close_up` | topic | `sensor_msgs/Image` | out | latched | The target box cut out, its pick face boxed in red |
+| `box_model/settings` | topic | `std_msgs/String` (JSON) | out | latched | The picker's settings (`frames`, `check_frames`, `score`, `order`), `skipped` / `passed` counts, the `tilt` it uses (`source`: accelerometer / saved / tf, `deg` down) and the `last` command's answer |
+| `box_model/cmd` | topic | `std_msgs/String` | in | - | The picker window's keys: `set frames N` (1-15), `set score X` (0.20-0.90), `set check_frames N` (1-10), `set order v1\|v2`, `pass` (next target), `skip`, `reset` (forget skipped), `save` (colour + depth snapshot), `flag` (photos of the target), `settings`. See 1.12 |
 
 ### 1.0 Tool and arm
 
@@ -134,6 +138,7 @@ Latched. One object for each pick (also a GUI Move after Detect box):
 | `picked` | `outcome` | Meaning |
 | --- | --- | --- |
 | `true` | `success` | The box is gone from its place |
+| `true` | `replaced` | Another box now stands where the target was (a neighbour slid or leaned into the gap). The box model counts the boxes around the spot to settle it, so this normally arrives as `success` (one box fewer) or `moved` (as many) |
 | `false` | `missed` | The box is still there, unchanged |
 | `false` | `moved` | Part of it changed: pushed, tipped, pulled part way |
 | `false` | `dropped` | Gone, but the gripper says it is empty (only when the gripper can tell) |
@@ -172,8 +177,9 @@ The step running now, as `<arm> <step>` or `both <step>`; `idle` between jobs.
 | `<arm> off_surface` | Backing off the surface |
 | `<arm> back_out` | Straight out along the tool |
 | `<arm> box_clear` | Further out, until the held box has left its old spot |
-| `<arm> turn_level` | Top pick: turning the tool level again |
-| `<arm> return` | Back to pre_pick (replayed if clear, else planned) |
+| `<arm> to_pre_pick_top` | Top pick, after the press: to pre_pick_top (near pre_pick), the tool still pointing down so the box stays level; on to the drop from there |
+| `<arm> turn_level` | Top pick without pre_pick_top: turning the tool level again |
+| `<arm> return` | Back to pre_pick (replayed if clear, else planned): front picks |
 | `<arm> to_drop`, `<arm> drop` | To the drop pose; releasing the box there |
 | `<arm> to_pre_pick` | From the drop pose back to pre_pick |
 | `<arm> done` | Back at pre_pick |
@@ -251,6 +257,29 @@ When a box size is known (`held_object/size`, or the GUI's dummy size), the pick
 
 ---
 
+### 1.12 `box_model/cmd` (in) and `box_model/settings` (out)
+
+What the box picker's own window (`box_picker/src/pick_loop.py`) does, as one-line commands. Each is answered on `box_model/settings` (latched JSON): the settings after it, and `last` = `{text, ok, message, path, photos, time}`.
+
+| Command | Does |
+| --- | --- |
+| `set frames N` | Frames per target, 1-15 (default 5), from the next detection |
+| `set score X` | SAM's confidence needed to count as a box, 0.20-0.90 (default 0.4; thin boxes standing on end score 0.45-0.6) |
+| `set check_frames N` | New frames the pick check compares with the detection's, 1-10 (default 3) |
+| `set order v1` / `v2` | Which box first: v1 stack tops (highest first), then nearest, then leftmost; v2 the leftmost free box |
+| `pass` | Next target: the last target, and every box under it, is passed over until the next successful pick. With no other box left, the first again |
+| `skip` | The last target is never chosen again until `reset` (it still blocks the boxes behind and under it) |
+| `reset` | Forget the skipped and passed boxes |
+| `save` | The newest colour + depth, with the tilt, in `box_picker/src/outputs/gui/<run>/snapshots/` (`pick_pipeline.py --capture` replays it) |
+| `flag` | Three photos of the last target for a person (the scene with it marked, close up, the last check) in `.../flags/` |
+
+Skipped and passed boxes are remembered by their place in the picture, so they are only right while the base stays put. The pick stack sends `flag` when it gives up on a box (base_adjust), and `skip` when moving the base cannot help (`none`); when the base is asked to move it sends `reset`.
+
+```bash
+ros2 topic pub --once /beast_arm/box_model/cmd std_msgs/msg/String "{data: 'set order v2'}"
+ros2 topic echo /beast_arm/box_model/settings
+```
+
 ## 2. Messages (`pick_interfaces`)
 
 The package is `src/pick_interfaces`. After a change: `native/build_ws.sh --packages-select pick_interfaces`.
@@ -300,7 +329,7 @@ PickTarget target
 string holding         # "held", "empty", or "" (the gripper can't tell; the vacuum has no sensor)
 ---
 int8 picked            # 1 picked, 0 not picked, -1 can't tell (or nothing to check)
-string outcome         # success, missed, moved, dropped, wrong_box, blocked, camera_moved, unknown; "" = nothing to check
+string outcome         # success, replaced, missed, moved, dropped, wrong_box, blocked, camera_moved, unknown; "" = nothing to check
 string message
 string verdict_json    # the check's whole verdict
 ```

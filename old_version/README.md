@@ -15,4 +15,5 @@ not needed for the robot, the GUI or the pick stack to work.
 | `src_backups/demo.launch.py.backup` | The MoveIt demo launch as it was in July, before the single-spawner fix (from `src/openarm_ros2/openarm_bimanual_moveit_config/launch/`) |
 | `src_backups/ros2_lelab_bridge.py.pre-v21-sync.bak` | A teleop bridge backup (from `src/qnbot_teleoperator/scripts/`) |
 | `calibration_backups/` | Arm models, anchors and a depth correction from before they were replaced or rejected. New backups are written here too: the box calibration (`arm_model.before_boxcal_*.yaml`) and the tool weighing (`*.before_weigh_*`) |
+| `box_picker_2026-11-03/` | The box picker's files as they were on 3 Nov, replaced on 4 Nov by the version from `box_picker_for_robot.zip` (the accelerometer over ROS, the flat-box rest rule) |
 | `armcal_samples/` | Calibration recordings superseded by newer ones (the fits use only the newest of each kind, in `calibration/armcal_samples/`) |

@@ -42,6 +42,12 @@ CORRECT_AT = 0.05
 # contact finds the face anyway (2026-10-26); the case it guards against was
 # 26 mm beside a box (2026-10-14).
 MAX_LEFT = 0.010
+# A checked plan whose start is this far from where the arm is (rad, any joint)
+# is flown from where the arm is: a short joint move onto its start first
+# (node.lead_in, not collision checked: at most ~3 cm at the tool, from pre_pick
+# where nothing is near). Nearer: flown as it is; further: checked again from here.
+LEAD_IN_FROM = 0.02
+LEAD_IN_MAX = 0.06
 
 
 
@@ -103,16 +109,27 @@ class TouchMixin:
                 node.require_move_group()
                 node.ensure_grippers_in_octomap()
                 aim = self.aim_for(arm, point)[0]
-                start = node.arm_positions(arm)
-                plan, why = self._checked_plan(arm, aim, point, origin, start)
+                # check['start_from']: the joints the arm will start from, when it is
+                # not there yet (PICK ALL checks the next box during the drop, from
+                # the pre_pick it comes back to)
+                start = check.get('start_from')
+                self._plan_start = start
+                try:
+                    if start is None:
+                        start = node.arm_positions(arm)
+                    plan, why = self._checked_plan(arm, aim, point, origin, start)
+                finally:
+                    self._plan_start = None
         except Exception as exc:                     # noqa: BLE001 - only a preview
             plan, why, aim, start = None, f'could not check ({exc})', None, None
             check['error'] = True
         # not pickable from where the robot stands (a base move helps), as
         # against a check that failed (move_group down, an error)
+        # (cut short by STOP: not a verdict on the box -- no base move for it)
         check.update(ok=plan is not None, plan=plan, aim=aim, start=start, why=why,
                      time=time.monotonic(),
-                     not_here=plan is None and not check.get('error'))
+                     not_here=plan is None and not check.get('error')
+                     and not node.halt.is_set())
         if self.check is not check or (self.busy and not in_job):
             return
         if plan is not None:
@@ -183,6 +200,9 @@ class TouchMixin:
         best = None                                  # (residual, offset, joints)
         corrections = args.corrections if corrections is None else corrections
         tolerance = args.tolerance if tolerance is None else tolerance
+        # the correction moves: a few mm to 4 cm, out in free space (--correct-speed;
+        # they ran at --line-speed, 2 cm/s, until 2026-11-05)
+        speed = getattr(args, 'correct_speed', None) or args.line_speed
         for attempt in range(corrections + 1):
             t0 = time.monotonic()
             joint_err = node.settle(arm, expected, timeout=settle)
@@ -206,7 +226,8 @@ class TouchMixin:
             if best is not None and residual > best[0]:
                 self.say(f'{arm} arm: correction made it worse ({1000 * best[0]:.1f} -> '
                          f'{1000 * residual:.1f} mm); going back')
-                if node.line_or_step(arm, tcp_goal + best[1], quat, f'{arm} back') is None:
+                if node.line_or_step(arm, tcp_goal + best[1], quat, f'{arm} back',
+                                     speed=speed) is None:
                     return offset, residual              # still where it is now
                 node.settle(arm, best[2])
                 return best[1], best[0]
@@ -222,7 +243,8 @@ class TouchMixin:
             # overshot as often as not ("4.8 -> 4.8 mm", 2026-10-26)
             offset += error * (1.0 if attempt == 0 else gain)
             self.say(f'{arm} arm: {1000 * residual:.1f} mm off at {label}; correcting')
-            expected = node.line_or_step(arm, tcp_goal + offset, quat, f'{arm} correct')
+            expected = node.line_or_step(arm, tcp_goal + offset, quat, f'{arm} correct',
+                                         speed=speed)
             if expected is None:
                 break
         return (best[1], best[0]) if best else (offset, None)
@@ -496,7 +518,7 @@ class TouchMixin:
         The trajectory, or None."""
         node = self.node
         with node.fingers_touching(arm):
-            _code, traj = node.plan_joints(arm, plan['above'])
+            _code, traj = self._plan_path(arm, plan['above'])
         if traj is None:
             return None
         import copy
@@ -514,6 +536,37 @@ class TouchMixin:
             f'{arm} arm: a way to {cm(plan["standoff"])} cm in front of the box (checked with the '
             f'tool counted up to the last {100 * CLOSE_FREE:.0f} % of it)')
         return traj
+
+    def _checked_already(self, check, arm, point, aim, start):
+        """The plan the reach check made for this very point, if it still holds
+        from `start` (where the arm is): as it is when the arm has not moved; with
+        a lead-in onto its start when it is a little off that (PICK ALL plans the
+        next box from where the arm comes back to); else None -- check again."""
+        if not (check is not None and check.get('plan') is not None
+                and check['pick'][2] is point and np.allclose(check['aim'], aim)
+                and time.monotonic() - check['time'] < 300.0):
+            return None
+        off = float(np.max(np.abs(np.array(check['start']) - np.array(start))))
+        if off < LEAD_IN_FROM:
+            # checked on the click; the arm has not moved (it creeps a few mrad
+            # at rest: with 3 mrad the 72 s check was done twice, 2026-10-28)
+            return check['plan']
+        if off > LEAD_IN_MAX:
+            return None
+        # planned from where the arm was to come back to, and it stopped a little
+        # off that: onto the planned start first, then the path as checked (not
+        # checked again for 2-27 s)
+        led, gap = self.node.lead_in(check['plan']['trajectory'])
+        if led is None:
+            return None
+        self.node.get_logger().info(f'{arm} arm: {1000 * gap:.0f} mrad from the planned start; '
+                                    f'onto it first, then the checked path')
+        return dict(check['plan'], trajectory=led)
+
+    def _plan_path(self, arm, goal):
+        """The reach check's path to the approach: from where the arm is, or --
+        while check_pick has a check['start_from'] -- from those joints."""
+        return self.node.plan_joints(arm, goal, start=getattr(self, '_plan_start', None))
 
     def _fast_ik(self, arm, tcp, quat, start, want=3):
         """node.fast_ik, timed and remembered within a reach check."""
@@ -563,7 +616,6 @@ class TouchMixin:
         """A posture that passed _solve_standoff: (TOP DOWN) the level way up
         there, then the planned path to it. The plan, or None (a plan with
         no room to correct goes to `edge`, used only if nothing better)."""
-        node = self.node
         plan = {'label': g['label'] + f', from {100 * g["standoff"]:.1f} cm',
                 'axis': g['axis'], 'way': g['way'], 'quat': g['quat'],
                 'standoff': g['standoff'], 'approach': g['approach'],
@@ -586,7 +638,7 @@ class TouchMixin:
         if g['standoff'] <= NEAR + 1e-6 and not plan['level']:
             plan['trajectory'] = self._plan_close(arm, plan)     # ends near the box
         else:
-            _code, plan['trajectory'] = node.plan_joints(
+            _code, plan['trajectory'] = self._plan_path(
                 arm, plan['level']['joints'] if plan['level'] else g['above'])
         if plan['trajectory'] is not None:
             return plan
@@ -636,7 +688,9 @@ class TouchMixin:
         cut = [False]                                # the search stopped before its end
 
         def late():
-            if time.monotonic() > deadline:
+            # STOP too (the motion's: abort may still be set from an earlier STOP):
+            # PICK ALL checks the next box during the drop, and STOP waits for it
+            if time.monotonic() > deadline or node.halt.is_set():
                 cut[0] = True
             return cut[0]
         rings = {}
@@ -685,15 +739,17 @@ class TouchMixin:
             if late():
                 break
             if plan['level']:                            # TOP DOWN: level, then turn up there
-                _code, plan['trajectory'] = node.plan_joints(arm, plan['level']['joints'])
+                _code, plan['trajectory'] = self._plan_path(arm, plan['level']['joints'])
             elif plan['standoff'] <= NEAR + 1e-6:
                 plan['trajectory'] = self._plan_close(arm, plan)
             else:
-                _code, plan['trajectory'] = node.plan_joints(arm, plan['above'])
+                _code, plan['trajectory'] = self._plan_path(arm, plan['above'])
             if plan['trajectory'] is not None:
                 return plan, None
             tally['path'] += 1
         how = 'from above' if self.top_down else 'from the front'
+        if cut[0] and node.halt.is_set():
+            return None, 'STOP: the reach check was cut short'
         if cut[0]:
             return None, (f'no way to pick it {how} found in {args.plan_budget:.0f} s '
                           f'(--plan-budget) - not from here')
@@ -884,8 +940,9 @@ class TouchMixin:
         return None
 
     def vacuum(self, arm, on):
-        """The vacuum: on before the cup goes in, off at the drop. Switched by
-        hand for now; the pick stack publishes it (<ns>/vacuum) for the valve."""
+        """The vacuum: on before the cup goes in, off at the drop. The pick
+        stack publishes it (<ns>/vacuum); app/vacuum_bridge.py switches the
+        ESP32 relay from that."""
         return None
 
     def _weigh_held(self, arm, still_in, weigh_at):
@@ -1041,13 +1098,23 @@ class TouchMixin:
                              f'tool; the planners may see it in its old spot', True)
 
     def _return_rest(self, arm, lt, holding):
-        """From out at the approach: level again (TOP DOWN), back to pre_pick,
-        the drop, pre_pick. Clears self.last_touch once back."""
+        """From out at the approach: back to pre_pick, the drop, pre_pick. A FRONT
+        pick goes back the way it came (the tool as it is at pre_pick). A TOP pick
+        with the box maybe on the cup goes to pre_pick_top instead -- near
+        pre_pick, the tool still pointing down -- and on to the drop from there
+        (2026-11-04: turning the tool level with the box on it swung it about);
+        without one, the tool is turned level and the way back retraced. Clears
+        self.last_touch once back."""
         node, args = self.node, self.node.args
         _line_speed, velocity = self._carry(lt, holding)
         slow = velocity or 1.0                       # the retrace: as much slower
+        self.on_returning(arm, lt, holding)
         node.settle(arm, lt['above'], timeout=1.5)   # plans must start from where it is
         lvl = lt.get('level')
+        if lvl is not None and lt.get('turned') and (holding or lt.get('pressed')) and \
+                self._to_top_pre_pick(arm, velocity):
+            lt['turned'] = False
+            lt['top_carry'] = True                   # at pre_pick_top: on to the drop
         if lvl is not None and lt.get('turned'):
             # TOP DOWN: the tool level again, up there, before retracing the
             # (level) way it came
@@ -1068,10 +1135,15 @@ class TouchMixin:
             node.settle(arm, lvl['joints'], timeout=1.5)
         # Back to pre_pick the way it came (retrace; planned if that fails) ...
         # With a box held, only if that way is clear of everything WITH the
-        # box: the way in was checked without it.
-        self.phase(f'{arm} return')
-        clear = node.path_is_clear(arm, lt['trajectory']) if holding else True
-        if clear:
+        # box: the way in was checked without it. (From pre_pick_top: on to
+        # the drop as it is.)
+        back = bool(lt.get('top_carry'))
+        if not back:
+            self.phase(f'{arm} return')
+        clear = node.path_is_clear(arm, lt['trajectory']) if holding and not back else True
+        if back:
+            pass
+        elif clear:
             self.say(f'{arm} arm: returning the way it came')
             back = node.retrace(arm, lt['trajectory'], f'{arm} return', scale=slow)
         else:
@@ -1097,7 +1169,7 @@ class TouchMixin:
             lt['dropped'] = True                     # once per touch, also after a RETURN
             self.phase(f'{arm} to_drop')
             self.say(f'{arm} arm: to the drop pose')
-            if node.move_joints(arm, drop, f'{arm} to drop', velocity=velocity,
+            if node.move_joints(arm, drop, f'{arm} to drop', velocity=self._drop_velocity(velocity),
                                 via_home=False):
                 self.phase(f'{arm} drop')
                 self.say(f'{arm} arm: at the drop pose; holding {args.drop_hold:g} s')
@@ -1107,10 +1179,17 @@ class TouchMixin:
                     node.detach_held(arm)
                     self.say(f'{arm} arm: box dropped - out of the planners')
             else:
-                self.say(f'{arm} arm: could not reach the drop pose; staying at pre_pick', True)
+                self.say(f'{arm} arm: could not reach the drop pose; back to pre_pick with the box',
+                         True)
             self.phase(f'{arm} to_pre_pick')
             self.say(f'{arm} arm: back to pre_pick')
             back = node.move_joints(arm, lt['start'], f'{arm} return', via_home=False)
+        elif back and lt.get('top_carry'):
+            # at pre_pick_top with no drop pose (or past it already): on to pre_pick
+            self.phase(f'{arm} to_pre_pick')
+            self.say(f'{arm} arm: from pre_pick_top back to pre_pick')
+            back = node.move_joints(arm, lt['start'], f'{arm} return', velocity=velocity,
+                                    via_home=False)
         if back and arm in node.held and drop is None:
             # no drop pose: the box goes where the system takes it from pre_pick
             node.detach_held(arm)
@@ -1121,6 +1200,83 @@ class TouchMixin:
             return
         self.say(f'{arm} arm: could not get back to the start posture -- press RETURN (b) to '
                  f'try again', True)
+
+    def on_returning(self, arm, lt, holding):
+        """Called once the arm is out of the box and on its way back (pre_pick,
+        the drop, pre_pick): PICK ALL looks ahead from here (web_gui.py)."""
+
+    def _drop_velocity(self, velocity):
+        """The move to the drop pose starts at pre_pick (or pre_pick_top), clear of
+        the boxes: --drop-velocity with the box maybe on the cup (--held-velocity is
+        for the way out beside the others, where the yank swung it into them), the
+        full --velocity without (velocity None)."""
+        if velocity is None:
+            return None
+        args = self.node.args
+        return min(args.velocity, max(velocity, getattr(args, 'drop_velocity', velocity)))
+
+    def _to_top_pre_pick(self, arm, velocity):
+        """TOP DOWN, the box maybe on the cup: from up above it to pre_pick_top --
+        near pre_pick, the tool still pointing straight down -- so the box is never
+        turned on its side. The place is pre_pick_top_state's tool. Straight down
+        there is reached only turned about the vertical another way than above most
+        boxes (2026-11-04), so: a straight line there, the tool kept down and turned
+        about the vertical by the least that reaches; else a planned move to the
+        joints that put it down there, found from where the arm is (a joint move
+        leaves the tool within a few degrees of down); else pre_pick_top_state's own
+        joints. True once there; False with nothing moved."""
+        node, args = self.node, self.node.args
+        pose = self.pose(arm, 'pre_pick_top_state')
+        here = node.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+        q_here = node.arm_positions(arm)
+        if pose is None or here is None or q_here is None:
+            if pose is None:
+                self.say(f'{arm} arm: no pre_pick_top_state on file - turning the tool level with '
+                         f'the box on it', True)
+            return False
+        place = self._tcp_of(arm, pose)
+        down = np.array([0.0, 0.0, -1.0])
+        roll = math.atan2(here[0, 0], here[1, 0])    # the hand's x, about the vertical
+        quats = [quat_from_matrix(tool_frame_along(down, roll + math.radians(d)))
+                 for d in sorted(range(-180, 181, 15), key=lambda d: (abs(d), d))]
+        # (plain IK first: milliseconds, and most turns cannot be down there at all)
+        reach = [q for q in quats if len(self._fast_ik(arm, place, q, q_here, want=1))]
+        self.phase(f'{arm} to_pre_pick_top')
+        speed = min(args.fast_line_speed, getattr(args, 'top_carry_speed', 0.05))
+        for quat in reach:
+            fraction, _t, _end = node.cartesian_plan(arm, place, quat)
+            if fraction < 0.98:
+                continue
+            self.say(f'{arm} arm: to pre_pick_top in a straight line, the tool still pointing '
+                     f'down (the box stays level)')
+            if node.line_move(arm, place, quat, f'{arm} to pre_pick_top', speed=speed) is not None:
+                return True
+            break                                    # it failed on the way: a planned move
+        q_now = node.arm_positions(arm) or q_here
+        for quat in reach[:3]:
+            q = node.solve_ik(arm, place, quat, q_now)
+            if q is None:
+                continue
+            self.say(f'{arm} arm: to pre_pick_top (planned), the tool pointing down')
+            if node.move_joints(arm, q, f'{arm} to pre_pick_top', velocity=velocity,
+                                via_home=False):
+                return True
+        if node.move_joints(arm, pose, f'{arm} to pre_pick_top_state', velocity=velocity,
+                            via_home=False):
+            self.say(f'{arm} arm: at pre_pick_top_state, the tool pointing down')
+            return True
+        self.say(f'{arm} arm: no way to pre_pick_top - turning the tool level with the box on it '
+                 f'and going back the way it came', True)
+        return False
+
+    def _tcp_of(self, arm, joints):
+        """Where hand_tcp is at `joints`, plain URDF (the planners' model)."""
+        from ctm.kinematics import Arm
+        if not hasattr(self.node, '_kin'):
+            self.node._kin = {}
+        if arm not in self.node._kin:
+            self.node._kin[arm] = Arm(arm)
+        return self.node._kin[arm].tcp(np.asarray(joints, float))[:3, 3]
 
     def _touch(self, arm, point, origin, scene=None):
         node, args = self.node, self.node.args
@@ -1147,15 +1303,8 @@ class TouchMixin:
 
         t0 = time.monotonic()
         with self.plan_lock:                         # lets the click's own check finish
-            check = self.check
-            if (check is not None and check.get('plan') is not None
-                    and check['pick'][2] is point and np.allclose(check['aim'], aim)
-                    and time.monotonic() - check['time'] < 300.0
-                    and np.max(np.abs(np.array(check['start']) - np.array(start))) < 0.02):
-                # checked on the click; the arm has not moved (it creeps a few mrad
-                # at rest: with 3 mrad the 72 s check was done twice, 2026-10-28)
-                plan, why = check['plan'], None
-            else:
+            plan, why = self._checked_already(self.check, arm, point, aim, start), None
+            if plan is None:
                 self.say(f'{arm} arm: checking the whole touch before moving...')
                 plan, why = self._checked_plan(arm, aim, point, origin, start)
         if plan is None:

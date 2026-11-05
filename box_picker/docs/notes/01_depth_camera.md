@@ -37,4 +37,4 @@ Depth is never exact. The error grows with distance: at 0.5 m it's a few millime
 
 ## Which way is up: the accelerometer
 
-The D455 also has an accelerometer. When the camera is still, it measures gravity, which tells us which way is **up** in the camera's view. We need that to tell a top face (pointing up) from a front face. On some PCs Linux blocks access to it (`Permission denied`); then the code assumes the camera is level, or you pass `--pitch <degrees the camera is tilted down>`. The fix is the librealsense udev rules (see the project README).
+The D455 also has an accelerometer. When the camera is still, it measures gravity, which tells us which way is **up** in the camera's view. We need that to tell a top face (pointing up) from a front face. On some PCs Linux blocks access to it (`Permission denied`); then the code assumes the camera is level, or you pass `--pitch <degrees the camera is tilted down>`. The fix is the librealsense udev rules (see the project README). Over ROS 2 the camera machine sends it when its driver is started with `enable_accel:=true`; the pick loop then reads the tilt anew for every pick, as the robot moves.

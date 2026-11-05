@@ -32,13 +32,40 @@ depth check's correction (ctm/depth_cal.py), as a pick_interfaces/PickTarget:
               /beast_arm/box_model/scene    std_msgs/String (latched): what box_model/image
                                             shows, JSON, for a GUI to draw over it --
                                             {kind: detect, size, boxes: [{poly, face, kind,
-                                            size_mm, target, why_not}], target} or {kind:
-                                            check, size, outline, picked, outcome, title, why}
+                                            size_mm, target, why_not}], target, took, seconds}
+                                            or {kind: check, size, outline, picked, outcome,
+                                            title, why, verdict, frames}
+              /beast_arm/box_model/picker_view  sensor_msgs/Image (latched): the picker's own
+                                            drawing of each answer (every box, its faces and
+                                            grip points) and of each check (red gone, green
+                                            unchanged, blue nearer, purple another box)
+              /beast_arm/box_model/close_up sensor_msgs/Image (latched): the target box cut
+                                            out, its pick face boxed in red
+              /beast_arm/box_model/settings std_msgs/String (latched), JSON: frames,
+                                            check_frames, score, order, skipped, passed,
+                                            tilt {source, deg}, last {text, ok, message,
+                                            path, photos, time}
+    listens   /beast_arm/box_model/cmd      std_msgs/String: what the picker window's keys
+                                            do -- "set frames 7", "set score 0.45", "set
+                                            check_frames 3", "set order v2", "pass" (next
+                                            target), "skip", "reset" (forget skipped),
+                                            "save" (colour + depth snapshot), "flag" (photos
+                                            of the target for a person), "settings"
 
     parameters  ns (/beast_arm), frames (5), world_frame (world),
-                picker_dir (box_picker/src), tool (vacuum)
+                picker_dir (box_picker/src), tool (vacuum),
+                score (0.4: SAM's confidence to count as a box, as pick_loop.py),
+                order (v1: stack tops, highest first, then nearest, then
+                leftmost; v2: the leftmost free box -- for boxes standing apart
+                or in neat rows), top_faces (false: box_picker/src/pick_rules.py,
+                a box on a box by its front, a top only when no front was found;
+                true: the larger of front and top anywhere, as before 2026-11-05)
 
-The camera's tilt for the picker (--pitch) is read from the TF at start.
+The camera's tilt for the picker, each request: its accelerometer (the camera
+launch's accel), read here; else the one ros_bridge.py sends with the frames;
+else the last reading, saved (calibration/camera_tilt.yaml) -- the camera is
+fixed to the robot; only without any, the TF's tilt (--pitch at start), which
+is not gravity's.
 Install the picker once: cd box_picker/src && ./setup.sh
 
     source native/setup.bash; python3 box_model_node.py
@@ -65,7 +92,10 @@ from pick_interfaces.msg import PickTarget
 from pick_interfaces.srv import CheckPick, DetectTarget
 
 from ctm import depth_cal
-from ctm.common import BASE_FRAME, INFO_TOPIC, TOOL_ARM, WS, matrix_from_quat
+from ctm.common import BASE_FRAME, CALIB_DIR, INFO_TOPIC, TOOL_ARM, WS, matrix_from_quat
+
+TILT_FILE = os.path.join(CALIB_DIR, 'camera_tilt.yaml')   # the accelerometer's last tilt
+COMMANDS = ('set', 'pass', 'skip', 'reset', 'save', 'flag', 'settings')
 
 
 class BoxModelNode(Node):
@@ -77,6 +107,12 @@ class BoxModelNode(Node):
         self.declare_parameter('tool', 'vacuum')         # when a request does not say
         self.declare_parameter('world_frame', BASE_FRAME)
         self.declare_parameter('picker_dir', os.path.join(WS, 'box_picker', 'src'))
+        self.declare_parameter('score', 0.4)
+        self.declare_parameter('order', 'v1')
+        # box_picker/src/pick_rules.py (5 Nov 2026): false -- a box on a box by its front,
+        # its top only when no front was found ("top_only"); true -- the larger of front
+        # and top anywhere, as before
+        self.declare_parameter('top_faces', False)
         cb = ReentrantCallbackGroup()
         self.lock = threading.Lock()
         self.info = None
@@ -103,6 +139,19 @@ class BoxModelNode(Node):
         self.check_pub = self.create_publisher(
             String, f'{ns}/box_model/check_result',
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.picker_view_pub = self.create_publisher(Image, f'{ns}/box_model/picker_view', latched)
+        self.close_up_pub = self.create_publisher(Image, f'{ns}/box_model/close_up', latched)
+        self.settings_pub = self.create_publisher(String, f'{ns}/box_model/settings', latched)
+        self.settings = {}                               # the picker's, from its last answer
+        self.last_cmd = None                             # the last box_model/cmd and its answer
+        self.saved_up = self._load_tilt()                # (up, deg, when) or None
+        self.tilt = {'source': 'tf', 'deg': None}        # what the last request used
+        import queue
+        self.commands = queue.Queue()
+        self.create_subscription(String, f'{ns}/box_model/cmd',
+                                 lambda m: self.commands.put(m.data), 10, callback_group=cb)
+        threading.Thread(target=self._command_worker, daemon=True).start()
         self.overlay = os.path.join(WS, 'native', 'cache',
                                     'box_picker_overlay.jpg')
         self.detect_lock = threading.Lock()
@@ -152,7 +201,48 @@ class BoxModelNode(Node):
             self._up_said = tilt
             self.get_logger().info(f'camera tilt from its accelerometer: {tilt:+.1f} deg down '
                                    f'(the picker\'s up direction)')
+        if self.saved_up is None or abs(tilt - self.saved_up[1]) > 0.3:
+            self._save_tilt(up, tilt)
         return up
+
+    def picker_up(self):
+        """(up, source) for the picker: the accelerometer now, else its saved
+        reading, else None (the picker keeps the TF's tilt from --pitch)."""
+        up = self.current_up()
+        if up is not None:
+            source = 'accelerometer'
+        elif self.saved_up is not None:
+            up, source = self.saved_up[0], f'accelerometer, saved {self.saved_up[2]}'
+        else:
+            source = 'tf'
+        deg = (float(np.degrees(np.arcsin(np.clip(-up[2], -1, 1)))) if up is not None
+               else getattr(self, 'tf_pitch', None))
+        self.tilt = {'source': source, 'deg': None if deg is None else round(deg, 1)}
+        return up, source
+
+    def _load_tilt(self):
+        try:
+            import yaml
+            d = yaml.safe_load(open(TILT_FILE)) or {}
+            up = np.asarray(d['up'], float)
+            return up / np.linalg.norm(up), float(d['tilt_deg']), str(d.get('when', '?'))
+        except (OSError, KeyError, TypeError, ValueError):
+            return None
+
+    def _save_tilt(self, up, tilt):
+        """The accelerometer's up in the colour camera's frame, for when it is off."""
+        import yaml
+        when = time.strftime('%Y-%m-%d %H:%M')
+        self.saved_up = (np.asarray(up, float), float(tilt), when)
+        try:
+            with open(TILT_FILE, 'w') as f:
+                f.write('# The D455 accelerometer\'s up direction in the colour camera\'s optical frame\n'
+                        '# (x right, y down, z forward): the box picker\'s tilt while the accelerometer\n'
+                        '# is off. Written by box_model_node.py.\n')
+                yaml.safe_dump({'up': [round(float(v), 5) for v in up], 'tilt_deg': round(tilt, 2),
+                                'when': when}, f, sort_keys=False)
+        except OSError as exc:
+            self.get_logger().warn(f'could not save the camera tilt: {exc}')
 
     def _on_info(self, msg):
         with self.lock:
@@ -252,15 +342,21 @@ class BoxModelNode(Node):
                     time.sleep(0.5)
             if pitch is None:
                 raise RuntimeError('no camera info / tf for the camera after 30 s')
+            self.tf_pitch = pitch
+            self._wait_for_bridge()
             time.sleep(2.0)                                  # the bridge's first frames
             # our box_picker_server.py: pick_server.py's answer plus the drawing
             os.makedirs(os.path.dirname(self.overlay), exist_ok=True)
+            order = str(self.get_parameter('order').value)
             self.picker = subprocess.Popen(
                 [os.path.join(pdir, '.venv', 'bin', 'python'),
                  os.path.join(os.path.dirname(os.path.abspath(__file__)), 'box_picker_server.py'),
                  '--pitch', f'{pitch:.1f}', '--ros',
                  '--frames', str(int(self.get_parameter('frames').value)),
-                 '--overlay', self.overlay],
+                 '--score', f"{float(self.get_parameter('score').value):.2f}",
+                 '--order', order if order in ('v1', 'v2') else 'v1',
+                 '--overlay', self.overlay]
+                + (['--top-faces'] if bool(self.get_parameter('top_faces').value) else []),
                 cwd=pdir, env=self._picker_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=open(os.path.join(logdir, 'box_picker.log'), 'w'), text=True, bufsize=1)
             self._start_reader()
@@ -270,6 +366,9 @@ class BoxModelNode(Node):
                                    f'native/logs/box_picker.log')
             self.detector = 'picker'
             self.load_error = None
+            self.settings = first.get('settings') or {}
+            self.picker_up()                             # (where the tilt comes from, for the GUI)
+            self._publish_settings()
             self.ready.set()
             self.get_logger().info(f'box picker ready (camera pitch {pitch:.1f} deg); serving '
                                    f'{self.service_name}')
@@ -278,6 +377,23 @@ class BoxModelNode(Node):
             self.load_error = f'box picker failed to start: {exc}' + (f' - {why}' if why else '')
             self.get_logger().error(self.load_error)
             self.ready.set()                             # (waiters see load_error)
+
+    def _wait_for_bridge(self, port=50555, timeout=20.0):
+        """Until ros_bridge.py takes connections. The picker's RosCamera starts a
+        bridge of its own when it finds none (2026-11-03), and a second one on the
+        same port fails and takes the picker down with it."""
+        import socket
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                socket.create_connection(('127.0.0.1', port), timeout=1.0).close()
+                return
+            except OSError:
+                if self.bridge_proc is not None and self.bridge_proc.poll() is not None:
+                    return                   # ours ended (port taken: one is running already)
+                time.sleep(0.25)
+        raise RuntimeError(f'ros_bridge.py not listening on {port} after {timeout:.0f} s; see '
+                           f'native/logs/box_picker_bridge.log')
 
     def _start_reader(self):
         """One thread reads all of pick_server.py's stdout into a queue (two
@@ -329,20 +445,25 @@ class BoxModelNode(Node):
                 return obj
 
     def _publish_overlay(self, ans):
-        """The frame of this answer (clean) on box_model/image, and what it
-        found on box_model/scene, for the GUI to draw."""
+        """The frame of this answer (clean) on box_model/image, the picker's own
+        drawing and the target's close-up, and what it found on box_model/scene,
+        for the GUI to draw."""
         import json
+        self._publish_image(ans.get('picker_view'), None, self.picker_view_pub)
+        self._publish_image(ans.get('close_up'), None, self.close_up_pub)
         self._publish_image(ans.get('overlay'), None)
         t = ans.get('target')
         self.scene_pub.publish(String(data=json.dumps({
             'kind': 'detect', 'time': time.time(), 'size': ans.get('size'),
-            'boxes': ans.get('boxes') or [],
-            'target': ({k: t.get(k) for k in ('u', 'v', 'approach', 'size_mm', 'agreeing',
-                                               'frames')} if t else None)})))
+            'boxes': ans.get('boxes') or [], 'took': ans.get('took'),
+            'seconds': ans.get('seconds'), 'tilt': self.tilt,
+            'target': ({k: t.get(k) for k in ('u', 'v', 'x_m', 'y_m', 'z_m', 'approach', 'size_mm',
+                                               'agreeing', 'frames', 'num_boxes')} if t else None)})))
         self.last_answer = ans
+        self._take_settings(ans)
 
-    def _publish_image(self, path, img):
-        """An image (or the file at path) on box_model/image."""
+    def _publish_image(self, path, img, pub=None):
+        """An image (or the file at path) on box_model/image, or on `pub`."""
         import cv2
         if img is None:
             img = cv2.imread(path) if path else None
@@ -354,7 +475,61 @@ class BoxModelNode(Node):
         with self.lock:
             info = self.info
         msg.header.frame_id = info.header.frame_id if info is not None else ''
-        self.image_pub.publish(msg)
+        (pub or self.image_pub).publish(msg)
+
+    def _take_settings(self, ans):
+        if isinstance(ans.get('settings'), dict):
+            self.settings = ans['settings']
+            self._publish_settings()
+
+    def _publish_settings(self):
+        import json
+        self.settings_pub.publish(String(data=json.dumps(
+            {**self.settings, 'tilt': self.tilt, 'last': self.last_cmd})))
+
+    # -- the picker window's keys: box_model/cmd ---------------------------------------
+
+    def _command_worker(self):
+        """box_model/cmd, one at a time, between the detections and checks."""
+        while True:
+            text = ' '.join(str(self.commands.get()).strip().lower().split())
+            if not text:
+                continue
+            try:
+                ok, message, ans = self.command(text)
+            except Exception as exc:                     # noqa: BLE001 - reported, not raised
+                ok, message, ans = False, f'{text} failed: {exc}', {}
+            self.last_cmd = {'text': text, 'ok': ok, 'message': message,
+                             'path': ans.get('path'), 'photos': ans.get('photos'),
+                             'time': time.time()}
+            self._take_settings(ans)
+            self._publish_settings()
+            # (one severity per call site: rclpy refuses a line that changes it)
+            if ok:
+                self.get_logger().info(f'box_model/cmd "{text}": {message}')
+            else:
+                self.get_logger().warn(f'box_model/cmd "{text}": {message}')
+
+    def command(self, text):
+        """One box_model/cmd line for the picker: (ok, message, its answer)."""
+        cmd = text.split()[0]
+        if cmd not in COMMANDS:
+            return False, f'unknown command "{cmd}" ({", ".join(COMMANDS)})', {}
+        if cmd == 'save' and len(text.split()) == 1:
+            up, _source = self.picker_up()               # the tilt, saved with the frames
+            if up is not None:
+                text += ' %.5f %.5f %.5f' % tuple(up)
+        with self.detect_lock:
+            if not hasattr(self, 'ready') or not self.ready.is_set() or \
+                    self.picker is None or self.picker.poll() is not None:
+                return False, 'the box picker is not running', {}
+            self._drain()
+            self.picker.stdin.write(text + '\n')
+            self.picker.stdin.flush()
+            ans = self._picker_line(30.0 if cmd == 'save' else 10.0, key='cmd')
+        if ans is None:
+            return False, 'the box picker did not answer', {}
+        return bool(ans.get('ok')), str(ans.get('message', '')), ans
 
     def detect_picker(self):
         """pick_server.py's answer, into the world frame: (found, message, target)."""
@@ -373,13 +548,18 @@ class BoxModelNode(Node):
             if self.picker is None or self.picker.poll() is not None or self.load_error:
                 return False, self.load_error or 'the box picker is not running', PickTarget()
         self._drain()
-        up = self.current_up()
-        if up is None and not getattr(self, '_no_imu_said', False):
-            self._no_imu_said = True
-            self.get_logger().warn('no accelerometer readings (enable_accel in the camera launch?):'
-                                   ' the up direction from the TF tilt -- tops may lose to fronts')
-        self.picker.stdin.write('pick' + ('' if up is None else
-                                          ' %.5f %.5f %.5f' % tuple(up)) + '\n')
+        up, source = self.picker_up()
+        if source != 'accelerometer' and getattr(self, '_tilt_said', None) != source:
+            self._tilt_said = source
+            self.get_logger().warn(
+                f'no accelerometer readings (the camera launch\'s accel; the RealSense udev rules): '
+                f'the tilt from its saved reading ({self.saved_up[2]})' if self.saved_up is not None
+                else 'no accelerometer readings, nor a saved one (the camera launch\'s accel; the '
+                     'RealSense udev rules): the tilt from the TF, which is not gravity\'s -- tops '
+                     'may lose to fronts')
+        # (a saved tilt is marked: a live reading sent with the frames goes before it)
+        self.picker.stdin.write('pick' + ('' if up is None else ' %.5f %.5f %.5f' % tuple(up)) +
+                                (' saved' if up is not None and source != 'accelerometer' else '') + '\n')
         self.picker.stdin.flush()
         ans = self._picker_line(60.0)
         if ans is None:
@@ -389,6 +569,11 @@ class BoxModelNode(Node):
                                (f': {why}' if why else '') + ' - it restarts on the next try'), \
                     PickTarget()
             return False, 'the box picker did not answer in 60 s', PickTarget()
+        if ans.get('up_source') == 'camera' and ans.get('up'):
+            # this node had no reading, but the bridge sent one with the frames
+            u = np.asarray(ans['up'], float)
+            self.tilt = {'source': 'accelerometer (with the frames)',
+                         'deg': round(float(np.degrees(np.arcsin(np.clip(-u[2], -1, 1)))), 1)}
         self._publish_overlay(ans)
         t = ans.get('target')
         if not t:
@@ -430,10 +615,16 @@ class BoxModelNode(Node):
         target.num_boxes = int(t.get('num_boxes', 0))
         self.target_pub.publish(target)
         size = t.get('size_mm') or ['?', '?']
+        # pick_rules.py: a box on a box with only its top found is picked by it as a last
+        # resort, and a person is told
+        top_only = ('; TOP ONLY: a box on a box with no front found - picked by its top as a '
+                    'last resort, have a look' if t.get('top_only') else '')
+        if top_only:
+            self.get_logger().warn(f'box picker{top_only}')
         return True, (f'{target.approach}, {agreeing} of {frames} frames agree, face '
                       f'{size[0]} x {size[1]} mm, {target.num_boxes} boxes seen, at '
                       f'x={position[0]:+.3f} y={position[1]:+.3f} z={position[2]:+.3f} '
-                      f'({ans.get("seconds", "?")} s)'), target
+                      f'({ans.get("seconds", "?")} s){top_only}'), target
 
     # -- the pick check -----------------------------------------------------------
 
@@ -466,6 +657,7 @@ class BoxModelNode(Node):
         ans = self._picker_line(20.0, key='check')
         if ans is None:
             return None, '', 'no check: the box picker did not answer in 20 s', None
+        self._publish_image(ans.get('picker_view'), None, self.picker_view_pub)
         self._publish_image(ans.get('overlay'), None)
         verdict = ans.get('check')
         if verdict is not None:
@@ -473,7 +665,10 @@ class BoxModelNode(Node):
                 'kind': 'check', 'time': time.time(), 'size': ans.get('size'),
                 'outline': ans.get('outline'), 'picked': ans.get('picked'),
                 'outcome': verdict['outcome'], 'title': ans.get('title'), 'why': ans.get('why'),
-                'disturbed': verdict.get('disturbed') or []})))
+                'disturbed': verdict.get('disturbed') or [], 'frames': ans.get('frames'),
+                'verdict': {k: verdict.get(k) for k in ('gone', 'same', 'closer', 'other_box', 'by',
+                                                        'boxes_around', 'holding')}})))
+        self._take_settings(ans)
         if verdict is None:
             return None, '', ans.get('message', 'nothing to check'), None
         return ans.get('picked'), verdict['outcome'], ans.get('message', verdict['outcome']), verdict

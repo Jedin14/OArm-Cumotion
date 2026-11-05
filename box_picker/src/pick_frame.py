@@ -28,6 +28,8 @@ Python (robot side):
 Result:
     {"x_m", "y_m", "z_m"}  centroid of the pick face, camera coordinates (x right, y down, z forward)
     "approach"             "front" or "top"
+    "top_only"             true: a box on a box with only its top found, picked by it as a last
+                           resort (pick_rules.py); worth telling a person
     "u", "v"               the centroid in image pixels
     "size_mm"              the pick face, long x short edge
     "num_boxes"            boxes found in the frame
@@ -69,10 +71,12 @@ class PickDetector:
     (same approach, centre within SAME_TARGET_M of the average); 1 = no averaging. Depth noise
     moves a still box's result by about a millimetre from frame to frame."""
 
-    def __init__(self, tol=None, depth_tol=DEFAULT_DEPTH_TOL, smooth=1, prompt="box", score=0.5):
+    def __init__(self, tol=None, depth_tol=DEFAULT_DEPTH_TOL, smooth=1, prompt="box", score=0.5, order="v1",
+                 top_faces=False):
         from box_masks import BoxFinder
         self.finder = BoxFinder(prompt, score)
-        self.tol, self.depth_tol, self.smooth = tol, depth_tol, smooth
+        self.tol, self.depth_tol, self.smooth, self.order = tol, depth_tol, smooth, order
+        self.top_faces = top_faces   # pick_rules.py: tops anywhere, not only on the base
         self.last = None   # (points, boxes, target) of the last call, for annotate()
         self.history = []  # recent results for the current target, newest last
 
@@ -80,7 +84,7 @@ class PickDetector:
         """Target dict, or None if no box has a pickable face. up: camera-frame up direction.
         avoid: outlines (bool HxW) of boxes not to choose, same camera pose (faces.choose_target)."""
         points, boxes, target, timings, _ = run(self.finder, color, depth_m, intr, np.asarray(up, float),
-                                                self.tol, self.depth_tol, avoid)
+                                                self.tol, self.depth_tol, avoid, self.order, self.top_faces)
         self.last = points, boxes, target
         if target is None:
             self.history = []
@@ -98,7 +102,7 @@ class PickDetector:
         return {"x_m": x, "y_m": y, "z_m": z, "approach": p.kind,
                 "u": round(float(avg["uv"][0]), 1), "v": round(float(avg["uv"][1]), 1),
                 "size_mm": [round(float(v)) for v in avg["size"]], "num_boxes": len(boxes),
-                "averaged_over": len(self.history), "timings": timings}
+                "averaged_over": len(self.history), "top_only": bool(boxes[target].top_only), "timings": timings}
 
     def detect_frames(self, frames, intr, up=(0.0, -1.0, 0.0), avoid=()):
         """[(colour, depth_m), ...] of one still scene -> one target dict, or None.
@@ -141,7 +145,7 @@ class PickDetector:
         return {"x_m": round(med["x_m"], 4), "y_m": round(med["y_m"], 4), "z_m": round(med["z_m"], 4),
                 "approach": group[0][1]["approach"], "u": round(med["u"], 1), "v": round(med["v"], 1),
                 "size_mm": [round(float(v)) for v in size], "num_boxes": best[1]["num_boxes"],
-                "frames": len(frames), "agreeing": len(group)}
+                "top_only": best[1]["top_only"], "frames": len(frames), "agreeing": len(group)}
 
     def annotate(self, color):
         """Overlay of the last detect() call."""
@@ -198,7 +202,11 @@ def main():
     ap.add_argument("--annotate", metavar="OUT.jpg", help="overlay path (default: <out>/<frame name>.jpg)")
     ap.add_argument("--out", default="outputs/frame", help="folder for the overlay and live inputs")
     ap.add_argument("--pitch", type=float, help="camera tilt down in degrees (default: accelerometer, else 0)")
+    ap.add_argument("--order", choices=["v1", "v2"], default="v1",
+                    help="v1: stack tops (highest first), then nearest, then leftmost; v2: leftmost free box")
     ap.add_argument("--depth-tol", type=float, default=DEFAULT_DEPTH_TOL, help="front-layer thickness, metres")
+    ap.add_argument("--top-faces", action="store_true",
+                    help="tops anywhere (pick_rules.py): the larger of front and top, also for boxes on a box")
     args = ap.parse_args()
     if not args.live and not args.frame:
         ap.error("give a frame or --live")
@@ -206,7 +214,7 @@ def main():
     Path(args.out).mkdir(parents=True, exist_ok=True)
     name, frames, intr, accel = read_frames(args)
     up = up_from_accel(accel) if accel and args.pitch is None else up_from_pitch(args.pitch or 0)
-    detector = PickDetector(depth_tol=args.depth_tol)
+    detector = PickDetector(depth_tol=args.depth_tol, order=args.order, top_faces=args.top_faces)
     if len(frames) == 1:
         print(json.dumps(detector.detect(frames[0][0], frames[0][1], intr, up)))
         shown = frames[0][0]

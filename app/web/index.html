@@ -27,6 +27,7 @@
           <span class="chip subtle" id="approachChip">FRONT</span>
           <span class="chip warn" id="haltChip" hidden>STOPPED</span>
           <span class="chip subtle" id="clickChip" hidden>CLICK ONLY</span>
+          <span class="chip subtle" id="fpsChip" title="Colour frames a second from the camera">– fps</span>
         </div>
         <div class="segmented" role="tablist" aria-label="Picture">
           <button role="tab" data-action="view" data-value="live" id="viewLive">Live</button>
@@ -130,19 +131,60 @@
             <div class="why" id="targetBox"></div>
           </div>
 
+          <!-- the box picker's own window (pick_loop.py), as a card -->
+          <div class="card picker model-group" id="pickerCard">
+            <div class="card-row">
+              <span class="label">Box picker</span>
+              <span class="badge" id="tiltBadge" data-tone="idle" title="The camera's tilt the picker uses: from its accelerometer (gravity), else the TF">tilt –</span>
+            </div>
+            <div class="tally" id="pickerTally"></div>
+            <div class="closeup-row" id="closeUpRow" hidden>
+              <img id="closeUp" class="closeup" alt="The target box, close up, its pick face boxed in red">
+              <div class="closeup-info">
+                <div class="coords" title="The grip point in the colour camera's frame">
+                  <span><small>X right</small><b id="camX">–</b></span>
+                  <span><small>Y down</small><b id="camY">–</b></span>
+                  <span><small>Z away</small><b id="camZ">–</b></span>
+                </div>
+                <div class="dots" id="tryDots" aria-label="Tries on this box"></div>
+              </div>
+            </div>
+            <div class="why" id="pickerAgree"></div>
+            <div class="why" id="pickerTook"></div>
+            <div class="actions">
+              <button class="btn" data-action="next_target" id="btnNext" title="Pass over this box, and every box under it, until the next successful pick; press again for the one after. With no other box left, back to the first">Next target <kbd>T</kbd></button>
+              <button class="btn" data-action="skip_box" id="btnSkip" title="Never choose this box again, until Forget skipped (it still blocks the boxes behind and under it)">Skip box</button>
+              <button class="btn" data-action="check_now" id="btnCheckNow" title="The pick check now, as if the robot said done: new frames against the last detection (a box taken by hand, or to look again)">Check now <kbd>H</kbd></button>
+              <button class="btn" data-action="snapshot_save" id="btnSnap" title="Save the colour + depth picture now, with the tilt (box_picker/src/outputs/gui/…/snapshots): pick_pipeline.py --capture replays it">Save picture <kbd>S</kbd></button>
+            </div>
+            <div class="history" id="history" aria-label="The last picks"></div>
+            <div class="why" id="pickerLast"></div>
+          </div>
+
           <div class="card result" id="resultCard" hidden>
             <div class="card-row">
               <span class="label">Last pick</span>
               <span class="badge" id="resultBadge" data-tone="idle">–</span>
             </div>
             <div class="why" id="resultWhy"></div>
+            <div class="why" id="resultNumbers"></div>
+            <div class="flag" id="resultFlag" hidden></div>
           </div>
 
           <div class="actions">
             <button class="btn primary big" data-action="move" id="btnMove"><span id="moveLabel">Move</span> <kbd>M</kbd></button>
-            <button class="btn model" data-action="detect" id="btnDetect" title="The box picker looks at 5 frames and shows every box it found and the one it will pick (FRONT or TOP); nothing moves until MOVE">Detect box <kbd>Space</kbd></button>
+            <button class="btn model" data-action="detect" id="btnDetect" title="The box picker looks at 5 frames and shows every box it found and the one it will pick (FRONT or TOP). Bypass on: picked at once if it can be; off: nothing moves until MOVE">Detect box <kbd>Space</kbd></button>
+            <button class="btn model" data-action="pick_all" id="btnPickAll" title="Every box the picker finds, one after another: detect, pick, drop, the next -- no MOVE. A box it cannot pick is never tried, it is skipped; one not taken is skipped after one try. When no box is left, the skipped ones get another round while others were taken meanwhile (up to 3). The next box is found while the arm drops the last. STOP (Esc) ends it"><span id="pickAllLabel">Pick all</span></button>
             <button class="btn" data-action="recapture">Recapture <kbd>R</kbd></button>
             <button class="btn danger-soft" data-action="return" id="btnReturn" hidden>Return arm <kbd>B</kbd></button>
+          </div>
+
+          <div class="group" id="grpAuto">
+            <div class="toggles">
+              <button class="toggle" data-action="bypass" id="tgBypass" aria-pressed="true" title="On: DETECT BOX picks the box at once when the reach check says it can be picked -- no MOVE to press. Off: it waits for MOVE">
+                <span class="knob"></span>Bypass (no Move)
+              </button>
+            </div>
           </div>
 
           <div class="group click-only" id="grpOptions">
@@ -298,8 +340,69 @@
 
         <!-- SYSTEM -->
         <section class="pane" data-pane="advanced" hidden>
+          <div class="card advanced model-group" id="pickerAdvanced">
+            <div class="label">Box picker</div>
+            <div class="why">What the picker's own window has. The settings count from the next detection or check on.</div>
+            <div class="sublabel">View</div>
+            <div class="toggles">
+              <button class="toggle" data-action="depth_view" id="tgDepth" aria-pressed="false" title="The depth picture instead of the colour one: red near, blue far, black no reading (the bands at the sides have no depth)">
+                <span class="knob"></span>Depth picture <kbd>D</kbd>
+              </button>
+              <button class="toggle" data-action="picker_view" id="tgPickerView" aria-pressed="false" title="The picker's own drawing in the captured view: every box it found, its faces and grip points; after a pick, the check's (red gone, green unchanged, blue nearer, purple another box)">
+                <span class="knob"></span>Picker's view <kbd>V</kbd>
+              </button>
+            </div>
+            <div class="sublabel">Which box first</div>
+            <div class="segmented wide" role="radiogroup" aria-label="Order">
+              <button data-action="order" data-value="v1" id="ordV1" title="Boxes on a box first, the highest top first, then the nearest, then the leftmost: for piled or leaning boxes">v1 · stack tops</button>
+              <button data-action="order" data-value="v2" id="ordV2" title="The leftmost free box (nothing on it, nothing in front), whatever its height or distance: for boxes standing apart or in neat rows">v2 · leftmost</button>
+            </div>
+            <div class="sublabel">Face of a box on a box</div>
+            <div class="segmented wide" role="radiogroup" aria-label="Faces">
+              <button data-action="top_faces" data-value="off" id="facesFront" title="The picker's rules (pick_rules.py, 5 Nov): a box standing or lying on another box is gripped by its FRONT; its top only if no front was found (flagged: TOP ONLY). A box on the base: the larger of front and top">Front on a box</button>
+              <button data-action="top_faces" data-value="on" id="facesLarger" title="As before 5 Nov: every box by the larger of its front and top, wherever it is">Larger face</button>
+            </div>
+            <div class="setting">
+              <span>Frames per target</span>
+              <div class="stepper">
+                <button data-action="picker_setting" data-key="frames" data-step="-1" aria-label="Fewer">−</button>
+                <span class="len" id="setFrames">–</span>
+                <button data-action="picker_setting" data-key="frames" data-step="1" aria-label="More">+</button>
+              </div>
+            </div>
+            <div class="setting">
+              <span>SAM confidence</span>
+              <div class="stepper">
+                <button data-action="picker_setting" data-key="score" data-step="-1" aria-label="Lower">−</button>
+                <span class="len" id="setScore">–</span>
+                <button data-action="picker_setting" data-key="score" data-step="1" aria-label="Higher">+</button>
+              </div>
+            </div>
+            <div class="setting">
+              <span>Frames per pick check</span>
+              <div class="stepper">
+                <button data-action="picker_setting" data-key="check_frames" data-step="-1" aria-label="Fewer">−</button>
+                <span class="len" id="setCheck">–</span>
+                <button data-action="picker_setting" data-key="check_frames" data-step="1" aria-label="More">+</button>
+              </div>
+            </div>
+            <div class="actions">
+              <button class="btn model" data-action="detect" title="New frames, choose again">Look again</button>
+              <button class="btn" data-action="forget_skipped" id="btnForget" title="Forget the skipped and passed-over boxes: they can be chosen again">Forget skipped</button>
+            </div>
+          </div>
+
           <div class="group">
             <div class="hint">For testing: a point you type instead of the box model's. Normal picking uses Detect box on the Pick tab.</div>
+          </div>
+
+          <div class="card advanced" id="vacuumCard">
+            <div class="label">Vacuum</div>
+            <div class="segmented wide" role="radiogroup" aria-label="Vacuum">
+              <button data-action="vacuum" data-value="on" id="vacOn" aria-pressed="false" title="Switch the left arm's vacuum on (/beast_arm/vacuum true)">On</button>
+              <button data-action="vacuum" data-value="off" id="vacOff" aria-pressed="true" title="Switch the vacuum off: a box on the cup drops">Off</button>
+            </div>
+            <div class="hint" id="vacStatus">–</div>
           </div>
 
           <div class="card advanced" id="advanced">
@@ -351,13 +454,16 @@ ros2 topic echo /beast_arm/status</pre>
             <div class="title">Keys</div>
             <div class="keys">
               <span><kbd>M</kbd> move</span><span><kbd>Space</kbd> detect</span>
-              <span><kbd>R</kbd> recapture</span><span><kbd>D</kbd> top down</span>
-              <span><kbd>T</kbd> teach</span><span><kbd>B</kbd> return</span>
+              <span><kbd>R</kbd> recapture</span><span><kbd>D</kbd> top down (--click)</span>
+              <span><kbd>T</kbd> teach (--click)</span><span><kbd>B</kbd> return</span>
               <span><kbd>N</kbd> navigation</span><span><kbd>P</kbd> pre-pick</span>
               <span><kbd>F</kbd> cal arms</span><span><kbd>C</kbd> camera</span>
               <span><kbd>O</kbd> overlay</span><span><kbd>K</kbd> markers</span>
               <span><kbd>A</kbd> anchor</span><span><kbd>E</kbd> refit</span>
               <span><kbd>I</kbd> tip check</span>
+              <span><kbd>D</kbd> depth picture</span><span><kbd>V</kbd> picker's view</span>
+              <span><kbd>T</kbd> next target</span><span><kbd>S</kbd> save picture</span>
+              <span><kbd>H</kbd> check now</span>
               <span><kbd>L</kbd> live / captured</span><span><kbd>Esc</kbd> STOP</span>
             </div>
           </div>

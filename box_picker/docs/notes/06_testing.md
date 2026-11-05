@@ -46,7 +46,7 @@ An `.mp4` from `record_realsense.py` has colour only: the pipeline can't run on 
 .venv/bin/python pick_pipeline.py --capture "recordings/test3/frame_*" --out outputs/test3 --pitch 0
 ```
 
-- `--pitch <degrees>`: how far the camera was tilted down. Needed while the accelerometer can't be read (note 1); 0 = level.
+- `--pitch <degrees>`: how far the camera was tilted down. Needed only when the frames were saved without an accelerometer reading (note 1); 0 = level.
 - For long recordings, every 10th frame (one a second): `--capture "recordings/test3/frame_*0"`.
 - One frame: `.venv/bin/python pick_frame.py recordings/test3/frame_00030`
 

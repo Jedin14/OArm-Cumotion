@@ -88,21 +88,55 @@ class Camera:
         self.pipe.stop()
 
 
-class RosCamera:
-    """The same as Camera, but frames come over ROS 2 through ros_bridge.py (start that first,
-    with the system Python). For when the D455 is plugged into another machine."""
+ROS_SETUP = "/opt/ros/humble/setup.bash"
+BRIDGE_LOG = Path(__file__).parent / "outputs" / "ros_bridge.log"
 
-    def __init__(self, port=50555, host="127.0.0.1"):
-        import json, socket, struct
+
+def start_bridge(port):
+    """Start ros_bridge.py with the system Python and ROS 2 (rclpy can't load in the .venv).
+    Its 10 s reports go to BRIDGE_LOG, not to stdout, which pick_loop uses for its events."""
+    import os, subprocess
+    env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH")}
+    env["PATH"] = ":".join(p for p in env.get("PATH", "").split(":") if ".venv" not in p)
+    BRIDGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    bridge = Path(__file__).with_name("ros_bridge.py")
+    return subprocess.Popen(["bash", "-c", f'source {ROS_SETUP} && exec /usr/bin/python3 "{bridge}" --port {port}'],
+                            env=env, stdout=open(BRIDGE_LOG, "w"), stderr=subprocess.STDOUT)
+
+
+class RosCamera:
+    """The same as Camera, but frames come over ROS 2 through ros_bridge.py. For when the D455 is
+    plugged into another machine. Uses a bridge that is already running, or starts its own."""
+
+    def __init__(self, port=50555, host="127.0.0.1", wait_s=30):
+        import atexit, json, socket, struct
         self._json, self._struct = json, struct
+        self.bridge = None
         try:
             self.sock = socket.create_connection((host, port), timeout=10)
-        except OSError as e:
-            raise SystemExit(f"can't reach ros_bridge.py on {host}:{port} ({e}). Start it first:\n"
-                             "  source /opt/ros/humble/setup.bash && python3 ros_bridge.py")
-        self.accel = None                        # not sent over ROS; pass --pitch
+        except OSError:
+            print(f"starting ros_bridge.py (log: {BRIDGE_LOG})", flush=True)
+            self.bridge = start_bridge(port)
+            atexit.register(self.close)
+            end = time.time() + wait_s
+            while True:
+                try:
+                    self.sock = socket.create_connection((host, port), timeout=10)
+                    break
+                except OSError:
+                    if self.bridge.poll() is not None or time.time() > end:
+                        raise SystemExit(f"ros_bridge.py didn't start; see {BRIDGE_LOG}")
+                    time.sleep(0.5)
+        self.accel = None                        # from each frame's header, when the driver sends it
         self.depth_scale = 0.001
-        color, depth = self.read()               # first frame: also gives the intrinsics
+        end = time.time() + wait_s               # a new bridge needs a few seconds to find the camera
+        while True:
+            try:
+                color, depth = self.read()       # first frame: also gives the intrinsics
+                break
+            except RuntimeError:
+                if self.bridge is None or time.time() > end:
+                    raise
         print(f"ROS camera: {color.shape[1]}x{color.shape[0]}, fx {self.intr.fx:.1f} fy {self.intr.fy:.1f}", flush=True)
 
     def _recv(self, n):
@@ -125,15 +159,21 @@ class RosCamera:
         color = np.frombuffer(self._recv(w * ht * 3), np.uint8).reshape(ht, w, 3).copy()
         depth = np.frombuffer(self._recv(w * ht * 2), np.uint16).reshape(ht, w).astype(np.float32) / 1000
         self.intr = Intrinsics(h["fx"], h["fy"], h["cx"], h["cy"])
+        self.accel = h.get("accel")              # mean of the last 0.5 s, None while moving
         return color, depth
 
     def meta(self):
         i = self.intr
-        return {"fx": i.fx, "fy": i.fy, "cx": i.cx, "cy": i.cy, "depth_scale": self.depth_scale, "accel": None,
+        return {"fx": i.fx, "fy": i.fy, "cx": i.cx, "cy": i.cy, "depth_scale": self.depth_scale, "accel": self.accel,
                 "source": "ros"}
 
     def close(self):
-        self.sock.close()
+        if getattr(self, "sock", None):
+            self.sock.close()
+            self.sock = None
+        if self.bridge and self.bridge.poll() is None:   # only the bridge this started
+            self.bridge.terminate()
+            self.bridge.wait(5)
 
 
 def open_camera(ros=False, **kw):

@@ -114,6 +114,7 @@ from ctm.boxcal_run import BoxCalMixin
 from ctm.payload import PayloadMixin
 from ctm.camera_calibration import CameraCalibrationMixin
 from ctm import tools as tl
+from ctm import walls
 from ctm.common import BASE_FRAME, FONT, TOOL_ARM, MoveGroupDown, WINDOW, decode_image
 from ctm.modes import ModesMixin, load_poses
 from ctm.robot import ClickToMove
@@ -230,7 +231,12 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin, BoxCalMix
             self.node.get_logger().warn(f'reach map: {exc}')
         self.say('frame captured; rebuilding the octomap...')
         message = self.node.rebuild_octomap()
-        n = self.node.refresh_walls(self.frame[3])
+        args = self.node.args
+        # the walls' edges where the depth ends: aligned depth has none in a band
+        # down each side and along the top, which the octomap cannot fill
+        bounds = walls.depth_bounds(averaged) if args.walls_edges == 'depth' and \
+            averaged.shape[:2] == (info.height, info.width) else None
+        n = self.node.refresh_walls(self.frame[3], args.walls_ahead, args.walls_x_min, bounds)
         self.say(f'{message}' + ('' if n is None else f'; walls around the picture ({n})')
                  + f'. {self.next_hint}')
 
@@ -762,9 +768,19 @@ def make_parser():
                         help='velocity scaling (acceleration: its square) for the moves with the '
                              'box maybe on the cup, until the drop: at 1.0 the yank swung it into '
                              'the boxes beside it (2026-10-30)')
+    parser.add_argument('--drop-velocity', type=float, default=0.7,
+                        help='velocity scaling (acceleration too) for the move from pre_pick to the '
+                             'drop pose with the box maybe on the cup: clear of the other boxes by '
+                             'then, so faster than --held-velocity (0.4 took 5 s, 2026-11-05)')
+    parser.add_argument('--correct-speed', type=float, default=0.04,
+                        help='tool speed for the correction moves at the approach point and short '
+                             'of the box, m/s (--line-speed until 2026-11-05)')
     parser.add_argument('--held-line-speed', type=float, default=0.03,
                         help='tool speed for the straight lines out with the box maybe on the '
                              'cup, m/s (--fast-line-speed otherwise)')
+    parser.add_argument('--top-carry-speed', type=float, default=0.05,
+                        help='after a TOP pick: tool speed of the straight line to pre_pick_top '
+                             '(the tool kept pointing down, the box level), m/s')
     parser.add_argument('--planning-time', type=float, default=5.0)
     parser.add_argument('--attempts', type=int, default=3,
                         help='cuMotion resends per goal on PLANNING_FAILED')
@@ -775,6 +791,16 @@ def make_parser():
                         help='aligned depth frames median-averaged per capture')
     parser.add_argument('--octomap-settle', type=float, default=1.5,
                         help='seconds to let move_group integrate a refreshed map')
+    parser.add_argument('--walls-edges', choices=('depth', 'picture'), default='depth',
+                        help="the unseen-space walls (green in RViz) start where the depth "
+                             "ends (about 45 px left, 60 px right, 9 rows at the top of "
+                             "the colour picture have none) or at the picture's edges "
+                             "(as before 2026-11-05: more reach, but objects in those bands "
+                             "are invisible to the planners)")
+    parser.add_argument('--walls-ahead', type=float, default=walls.AHEAD,
+                        help='the walls start this far in front of the nearest thing seen, m')
+    parser.add_argument('--walls-x-min', type=float, default=walls.X_MIN,
+                        help='... never nearer the robot than this, m')
     return parser
 
 

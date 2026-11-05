@@ -61,7 +61,7 @@ d.text((40, 790), "STEP 2   Choose ONE of the free boxes", fill=BLUE, font=F(26,
 y = 845
 box(40, y, 250, 70, "All free boxes", fill=(220, 245, 225), bold=True)
 arrow(290, y + 35, 340, y + 35)
-box(340, y, 330, 70, "A. ON A BOX first,\nthe HIGHEST top", fill=(245, 245, 245), size=20)
+box(340, y, 330, 70, "A. The HIGHEST top\n(on a box or the floor)", fill=(245, 245, 245), size=20)
 arrow(670, y + 35, 720, y + 35)
 box(720, y, 300, 70, "B. Keep the NEAREST\n(within 3 cm)", fill=(245, 245, 245))
 arrow(1020, y + 35, 1070, y + 35)

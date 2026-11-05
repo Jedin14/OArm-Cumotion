@@ -40,11 +40,11 @@ The interface -- everything under /beast_arm (--ns):
                        arms do nothing more on their own: after the move,
                        ready_to_pick again
   vacuum               std_msgs/Bool, out, latched -- what the vacuum should be: on
-                       just before the cup goes in, off at the drop pose (switched by
-                       hand for now; the valve will follow this)
+                       just before the cup goes in, off at the drop pose (the ESP32
+                       relay follows it: app/vacuum_bridge.py, in terminal 1)
   pick_result          std_msgs/String, out, latched -- each pick's outcome, JSON:
-                       {picked: true/false/null, outcome (success, missed, moved,
-                       dropped, wrong_box, blocked, camera_moved, unknown,
+                       {picked: true/false/null, outcome (success, replaced, missed,
+                       moved, dropped, wrong_box, blocked, camera_moved, unknown,
                        no_contact), contact, tool, arm, approach, xyz, box_mm,
                        message, verdict (the camera check's numbers)}
   arm_action/phase     std_msgs/String, out, latched -- the step running now,
@@ -143,7 +143,8 @@ class PickStack(ctm_app.App):
         self.target_pub = pub(PickTarget, 'pick_target')
         self.result_pub = pub(String, 'pick_result', latched)
         self.base_pub = pub(BaseAdjust, 'base_adjust')   # (volatile: no stale orders)
-        self.vacuum_pub = pub(Bool, 'vacuum', latched)    # for the valve, when it is wired
+        self.model_cmd_pub = pub(String, 'box_model/cmd')  # flag / skip a box given up on
+        self.vacuum_pub = pub(Bool, 'vacuum', latched)    # the ESP32 relay: vacuum_bridge.py
         self.vacuum_on = False
         self.fails = {'xyz': None, 'outcomes': []}     # failed picks in a row, one box
         self.size_pub = pub(ObjectSize, 'held_object/size', latched)    # the GUI's dummy size
@@ -170,8 +171,8 @@ class PickStack(ctm_app.App):
 
     def vacuum(self, arm, on):
         """<ns>/vacuum (std_msgs/Bool, latched): on before the cup goes in, off
-        at the drop. Switched by hand for now -- this is what the valve will
-        follow."""
+        at the drop. app/vacuum_bridge.py switches the ESP32 relay from it
+        ('1' / '0' over USB serial)."""
         if arm != TOOL_ARM['vacuum']:
             return                                       # (the finger arm has no vacuum)
         if bool(on) != self.vacuum_on:
@@ -615,14 +616,16 @@ class PickStack(ctm_app.App):
                  f'far edge blurs at this angle): aiming {excess / 2:.0f} mm nearer, at the '
                  f'real centre')
 
-    def verify_pick(self, holding=''):
+    def verify_pick(self, holding='', wait=0.5):
         """The box picker's check, the arm out of the view: (picked, outcome,
         message, verdict) -- picked None when it cannot tell or is not served.
-        holding: 'held' / 'empty' from the joint torques after the press, or ''."""
+        holding: 'held' / 'empty' from the joint torques after the press, or ''.
+        wait: s first, for the arm to be still (0: it is out of the picture
+        already, PICK ALL's look-ahead)."""
         if not self.check_client.wait_for_service(timeout_sec=2.0):
             return None, 'no_check', f'no check ({self.check_client.srv_name} not served)', None
         for attempt in range(2):
-            time.sleep(0.5 if attempt == 0 else 1.5)     # the arm still; then once more
+            time.sleep(wait if attempt == 0 else 1.5)    # the arm still; then once more
             answer = self.node.wait(self.check_client.call_async(
                 CheckPick.Request(holding=holding)), 25.0)
             if answer is None:                           # served but silent: can't tell
@@ -714,7 +717,25 @@ class PickStack(ctm_app.App):
         else:
             self.say(f'{why}: base_adjust sent - move {direction} {abs(left):.3f} m; detect '
                      f'the box again once the base has moved', True)
+        self.give_up_on_box(outcomes, direction)
         return adjust
+
+    def give_up_on_box(self, outcomes, direction):
+        """As the picker's own loop does with a box it gave up on (2026-11-03): photos
+        of it for a person (box_model/cmd "flag": the scene with it marked, close up,
+        the last check), and -- when moving the base cannot help -- skipped, so the
+        next detection takes another box. When the base is to move, the skipped boxes
+        are forgotten instead: they are remembered by their place in the picture."""
+        tried = outcomes != ['unreachable']
+        if tried:
+            self.model_cmd_pub.publish(String(data='flag'))
+        if direction == 'none':
+            self.model_cmd_pub.publish(String(data='skip'))
+            self.say('this box is skipped: the next detection takes another one (Forget skipped '
+                     'brings it back)' + ('; photos of it saved for a person (FLAG)' if tried else ''),
+                     True)
+        else:
+            self.model_cmd_pub.publish(String(data='reset'))
 
     @staticmethod
     def adjust_text(adjust):
@@ -723,14 +744,23 @@ class PickStack(ctm_app.App):
             return 'none (already lined up sideways; left or right cannot help)'
         return f'move {adjust["direction"]} {adjust["distance_m"]:.3f} m'
 
-    def finish_pick(self, arm):
+    def finish_pick(self, arm, pick=None, target=None, verified=None, count=True):
         """After touch(): arm_action/status and pick_result from the contact
-        and the camera's check."""
-        contact, t = self.last_contact, self.target
+        and the camera's check.
+
+        PICK ALL (web_gui.py) finishes a pick after it has already detected the
+        next box: `pick` / `target` are the picked box's (self.pick / self.target
+        are the next one's by then), `verified` the camera's check it made as
+        soon as the arm was out of the picture (verify_pick's answer), and
+        count=False: its boxes get one try each -- a failure is not counted
+        toward base_adjust, and the next box's measured face stays."""
+        contact = self.last_contact
+        t = self.target if target is None else target
+        pick = self.pick if pick is None else pick
         felt = bool(contact and contact['felt'] and 'STOPPED' not in contact.get('how', ''))
         result = {'tool': self.pick_tool, 'arm': arm, 'contact': felt,
                   'approach': t.approach if t is not None else None,
-                  'xyz': ([round(float(v), 4) for v in self.pick[2]] if self.pick else None),
+                  'xyz': ([round(float(v), 4) for v in pick[2]] if pick else None),
                   'box_mm': ([round(float(v)) for v in t.box_mm] if t is not None else None),
                   'picked': None, 'outcome': None, 'message': None, 'verdict': None,
                   'time': time.strftime('%Y-%m-%d %H:%M:%S')}
@@ -752,8 +782,8 @@ class PickStack(ctm_app.App):
             self.phase(f'{arm} check')
             held = contact.get('held')
             result.update(held=held, held_g=contact.get('held_g'))
-            picked, outcome, message, verdict = self.verify_pick(
-                {True: 'held', False: 'empty'}.get(held, ''))
+            picked, outcome, message, verdict = verified if verified is not None else \
+                self.verify_pick({True: 'held', False: 'empty'}.get(held, ''))
             result.update(picked=picked, outcome=outcome, message=message, verdict=verdict)
             if picked is True:
                 status = 'pick_complete'
@@ -768,7 +798,7 @@ class PickStack(ctm_app.App):
             else:
                 status = f'pick_unverified: {outcome} - {message}'
             self.say(f'pick check: {message}', picked is False)
-        adjust = self.count_failure(result)
+        adjust = self.count_failure(result) if count else None
         if adjust is not None:
             result['base_adjust'] = adjust
             status += f'; base_adjust requested: {self.adjust_text(adjust)}'
@@ -776,8 +806,9 @@ class PickStack(ctm_app.App):
                 not getattr(self, 'final_attempt', True):
             status = f'retrying: {result.get("outcome")}'  # not the end: another attempt follows
         self.pick_result = result
-        self.node.pick_box = None                        # (used: the next target's own)
-        self.node.pick_face_mm = None
+        if count:
+            self.node.pick_box = None                    # (used: the next target's own)
+            self.node.pick_face_mm = None
         self.result_pub.publish(String(data=json.dumps(result, default=str)))
         self.report(status)
 

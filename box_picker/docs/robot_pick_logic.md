@@ -31,10 +31,10 @@ sequenceDiagram
 
 ```python
 from pick_frame import PickDetector
-from faces import up_from_pitch
+from faces import up_from_accel, up_from_pitch
 
 detector = PickDetector()          # once at start-up: loads SAM 3.1 (~5 s, ~4.3 GB GPU memory)
-UP = up_from_pitch(0)              # the camera's tilt, set once (degrees down; 0 = level)
+UP = up_from_accel(cam.accel)      # the camera's tilt from its motion sensor (USB, or ROS with enable_accel:=true), or up_from_pitch(degrees down)
 
 result = detector.detect_frames([(color, depth_m), ...], intr, UP)
 ```
@@ -94,10 +94,10 @@ The camera only says which box and whether the pick worked; when the pick is ove
 The robot always gets **one** box. The rules, in order:
 
 1. **Only front or top faces.** A face pointing at the camera is picked from the front, a face pointing up from above. A side face (left/right) is never picked.
-2. **The bigger face wins.** Of a box's front and top, the larger in real size. A top counts only if it is as wide as the front (else it's a sliver of another box), and if its front edge is seen at 10° or more (else it's almost edge-on and measured badly); otherwise the front is used.
+2. **Which face** ([`pick_rules.py`](../src/pick_rules.py)). A box **on another box**: its **front**. A box **on the base** (no box under it): the larger of its front and top, in real size. A top counts only if it is as wide as the front (else it's a sliver of another box), and if its front edge is seen at 10° or more (else it's almost edge-on and measured badly); otherwise the front is used. A box on a box with only its top found is picked by its top as a last resort, with a `flag` event (reason `top face only`) and `"top_only": true` in the target; the robot still picks it. **Top faces mode** (`--top-faces`, or F in the window's Advanced tab): the larger face for every box, as before 5 Nov 2026.
 3. **Nothing on top of it.** A box with another box resting on it waits: the one on top goes first.
 4. **Nothing in front of it.** A box with another box in its way, or with a nearer box hiding part of it, waits: the box in front goes first. A box lying on top of a stack is *not* blocked by the stack below it. When the camera can't see whether a box stands **on** a nearer box or **behind** it (a level camera sees tops edge-on), it counts as *on*: nothing is pulled out from under a box, but the robot may have to reach over a box. Details: [picking_rules.md](picking_rules.md).
-5. **On a box first, the highest top first.** Of the free boxes, those standing on another box come before those on the floor, and of those the ones whose top is within 1.5 cm of the highest. Stacks are cleared from the top down, even when a stack's top stands a few cm further back. Boxes on the floor are not ranked by height.
+5. **The highest top first.** Of the free boxes, on a box or on the floor, the ones whose top is within 1.5 cm of the highest. Stacks are cleared from the top down, even when a stack's top stands a few cm further back, and a tall box standing on the floor goes before a lower stack.
 6. **Nearest, then leftmost.** Of those, the ones whose grip point is within 3 cm of the nearest one, then the leftmost.
 
 ![How the next box is chosen](images/pick_logic_flow.png)
@@ -124,7 +124,7 @@ So a stack is cleared from the top down, the front boxes go before the ones behi
 | Assumption | Why it matters | If it's broken |
 |---|---|---|
 | The camera is fixed and doesn't tilt | "up" is set once; it decides front vs top, levels tops, and finds boxes resting on others | wrong `approach`, wrong tops; pass the new `UP` |
-| `UP` matches the real mounting | as above | set `up_from_pitch(<degrees down>)` once, or read the camera's accelerometer (needs the librealsense udev rules) |
+| `UP` matches the real mounting | as above | read the camera's accelerometer before each pick (USB: needs the librealsense udev rules; ROS: driver with `enable_accel:=true`), or set `up_from_pitch(<degrees down>)` |
 | The robot is still while the frames are taken | the answer combines the frames | `agreeing` drops; results smear |
 | Arm and gripper out of view | anything box-like is a box | a held box can become the target |
 | Depth aligned to colour | every pixel's depth must match its colour pixel | sizes and centres are wrong |
@@ -134,7 +134,7 @@ So a stack is cleared from the top down, the front boxes go before the ones behi
 
 - **Two boxes pressed together** (side by side, or one lying on the other) with their fronts level are drawn as one outline by the AI. When the doubled face is about twice as thick as other boxes of the same length in view (at least 3 of them), it is split in two and the left or top one is picked. Alone, or among boxes of other sizes, it can't be told: check `size_mm` against the boxes you expect. If a box really is twice as thick as its neighbours of the same length, it is split by mistake; the grip point then lands a quarter of the way across that box, still on it.
 - **Anything box-shaped counts**, including things outside the carton (a case on the table). Keep the view to the carton, or tell us to limit the search to it.
-- **A top seen at a flat angle** (camera nearly level with it) is measured less well; its size can be 5–10 mm off.
+- **A top seen at a flat angle** (camera nearly level with it) is measured less well: 1° of error in `UP` moves its front-to-back size 5–6 mm. With the camera's real tilt, 170 × 100 tops measured 167–170 × 96–101.
 
 ## Not returned yet
 

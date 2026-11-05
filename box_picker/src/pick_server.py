@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--skip", type=int, default=5, help="frames dropped first, so all are from after the request")
     ap.add_argument("--pitch", type=float, help="camera tilt down in degrees (default: accelerometer, else 0)")
     ap.add_argument("--ros", action="store_true", help="camera over ROS 2, through ros_bridge.py")
+    ap.add_argument("--top-faces", action="store_true",
+                    help="tops anywhere (pick_rules.py): the larger of front and top, also for boxes on a box")
     ap.add_argument("--save", metavar="DIR", help="save each request's frames (colour + depth + meta) and overlay here")
     args = ap.parse_args()
 
@@ -45,7 +47,7 @@ def main():
     from faces import up_from_accel, up_from_pitch
     from pick_frame import PickDetector
     from rgbd import open_camera, save
-    detector = PickDetector()
+    detector = PickDetector(top_faces=args.top_faces)
     cam = open_camera(args.ros)
     up = up_from_accel(cam.accel) if cam.accel and args.pitch is None else up_from_pitch(args.pitch or 0)
     sys.stdout = real_stdout
@@ -63,6 +65,8 @@ def main():
             for _ in range(args.skip):
                 cam.read()
             frames = [cam.read() for _ in range(args.frames)]
+            if cam.accel and args.pitch is None:          # over ROS: the tilt now, as the robot moves
+                up = up_from_accel(cam.accel)
             result = detector.detect_frames(frames, cam.intr, up)
             out = {"target": result, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "seconds": round(time.time() - t0, 2)}
             if args.save:
