@@ -577,7 +577,17 @@ class BoxModelNode(Node):
         self._publish_overlay(ans)
         t = ans.get('target')
         if not t:
-            return False, f'no box to pick ({ans.get("seconds", "?")} s)', PickTarget()
+            # say what is in view: "no box" with a box in the picture read as a fault
+            # (2026-11-06: the one left was skipped, out of reach)
+            seen = len(ans.get('boxes') or [])
+            skipped = int((ans.get('settings') or {}).get('skipped') or 0)
+            why = ''
+            if seen:
+                why = f' - {seen} box(es) in view' + (
+                    f', {skipped} skipped (out of reach, or not taken: Forget skipped brings them '
+                    f'back; the base correction shows where the robot should stand)'
+                    if skipped else ', none it can grip (a box on it or in front)')
+            return False, f'no box to pick{why} ({ans.get("seconds", "?")} s)', PickTarget()
         frames, agreeing = int(t.get('frames', 0)), int(t.get('agreeing', 0))
         if agreeing * 2 < frames:
             return False, (f'the frames disagree ({agreeing} of {frames}: something moved) - '

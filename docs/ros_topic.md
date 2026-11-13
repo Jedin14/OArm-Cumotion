@@ -31,6 +31,7 @@ All names below are relative to `/beast_arm` (change it with `--ns`). "Latched" 
 | `pick_result` | topic | `std_msgs/String` (JSON) | out | latched | Each pick's outcome: picked true / false / null, from the camera's check |
 | `base_adjust` | topic | `pick_interfaces/BaseAdjust` | out | depth 10, not latched | When the box cannot be picked from here (out of reach, only at the edge of reach, too near the camera), or after 2 failed picks in a row on it: how the wheels should move the robot |
 | `vacuum` | topic | `std_msgs/Bool` | out | latched | What the vacuum should be: on just before the cup goes in, off at the drop pose. The ESP32 relay follows it: `app/vacuum_bridge.py`, started by terminal 1 (`run_launch_everything.sh`; `vacuum:=false` leaves it out), writes `1` / `0` over USB serial |
+
 | `status` | topic | `std_msgs/String` (JSON) | out | latched | Everything above as one JSON object, on change and every 1 s |
 | `log` | topic | `std_msgs/String` | out | depth 10 | Every human-readable message, as the GUI shows it |
 | `box_model/detect` | service | `pick_interfaces/DetectTarget` | request | - | Served by the box model; called by the pick stack |
@@ -43,6 +44,18 @@ All names below are relative to `/beast_arm` (change it with `--ns`). "Latched" 
 | `box_model/close_up` | topic | `sensor_msgs/Image` | out | latched | The target box cut out, its pick face boxed in red |
 | `box_model/settings` | topic | `std_msgs/String` (JSON) | out | latched | The picker's settings (`frames`, `check_frames`, `score`, `order`), `skipped` / `passed` counts, the `tilt` it uses (`source`: accelerometer / saved / tf, `deg` down) and the `last` command's answer |
 | `box_model/cmd` | topic | `std_msgs/String` | in | - | The picker window's keys: `set frames N` (1-15), `set score X` (0.20-0.90), `set check_frames N` (1-10), `set order v1\|v2`, `pass` (next target), `skip`, `reset` (forget skipped), `save` (colour + depth snapshot), `flag` (photos of the target), `settings`. See 1.12 |
+
+The Unitree L2 4D LiDAR (2026-11-11; started by terminal 1 with `lidar:=serial|udp`: the user's own driver, `4D_lidar`'s `l2_driver`, and `robot/lidar_bridge.py`; not under `/beast_arm`):
+
+| Name | Kind | Type | Direction | QoS | What it is |
+|---|---|---|---|---|---|
+| `/l2/cloud` | topic | `sensor_msgs/PointCloud2` | in | best effort | The driver's cloud, 10 Hz, ~4000 points (frame `l2_lidar`) |
+| `/l2/imu` | topic | `sensor_msgs/Imu` | in | best effort | The L2's IMU, ~250 Hz (frame `l2_imu`, which the driver hangs on `l2_lidar`). Its accelerometer's say is reported in `/lidar/status`; used for the tilt only with `lidar_tilt:=imu` (on 2026-11-12 it read 1.9 g at rest) |
+| `/lidar/cloud` | topic | `sensor_msgs/PointCloud2` | out | default | The same points in `l2_lidar`, which hangs on `openarm_body_link0` by the mount (static TF): RViz |
+| `/lidar/cloud_work` | topic | `sensor_msgs/PointCloud2` | out | default | Only the work area in front (x 0.15–1.5 m from the body): what goes to the octomap |
+| `/lidar/cloud_octomap` | topic | `sensor_msgs/PointCloud2` | out | default | What MoveIt's `l2_lidar` updater reads: the work clouds of 0.8 s after each `/octomap_gater/refresh` (octomap:=static), or every one (live) |
+| `/merged_cloud` | topic | `sensor_msgs/PointCloud2` | out | default | The D455's depth (coloured) and the last 1.5 s of LiDAR (coloured by height), in `openarm_body_link0`, 2 Hz while someone subscribes |
+| `/lidar/status` | topic | `std_msgs/String` (JSON) | out | latched, 1 Hz | `ok`, `rate_hz`, `work_points`, `reach_points` (below the LiDAR, where the arms work: x 0.15–1.0, z up to 0.7), `mount_rpy_deg`, `mount_from` (`measured` / `imu`), `camera_in_view` / `camera_agree_pct` (its points in the D455's picture, and how many sit at the camera's depth: the mount's check), `imu_g` / `imu_lean_deg` (the accelerometer's say), `lean_deg` (with `lidar_tilt:=imu`), `why`. `ok` = 10 clouds/s, 200 reach points in 1.5 s, and the camera agreeing (30% of 50+ points within 4 cm). While `ok`, a capture removes the unseen-space walls; not `ok` (or no word for 3 s): the walls are back |
 
 ### 1.0 Tool and arm
 

@@ -30,7 +30,7 @@ FACE_COLORS = {"front": (0, 200, 0), "top": (255, 120, 0), "side": (150, 150, 15
 
 
 def run(finder, color, depth, intr, up, tol, depth_tol, avoid=(), order="v1", top_faces=False):
-    points, masks, timings, scores = finder(color)
+    points, masks, timings, scores = finder(color, depth)
     t0 = time.time()
     boxes = analyse(depth, masks, intr, up, top_faces)
     # Two boxes pressed together in one outline: split, and measured again.

@@ -27,6 +27,7 @@ octomap_resolution: 0.02
 max_range: 1.5
 sensors:
   - realsense_depth
+  - l2_lidar
 realsense_depth:
   sensor_plugin: occupancy_map_monitor/DepthImageOctomapUpdater
   image_topic: /camera/camera/depth/image_rect_raw
@@ -64,3 +65,21 @@ realsense_depth:
   padding_scale: 1.1
   padding_offset: 0.12
   max_update_rate: 5.0
+# The Unitree L2 4D LiDAR (2026-11-11), above the arms, 60 deg down: its cloud of
+# the work area in front (robot/lidar_bridge.py crops it: behind x 0.15 is the
+# robot and the drop, where the arm goes while the camera looks), passed in by
+# robot/octomap_gater.py on each refresh (octomap:=static) or every frame
+# (octomap:=live). The same self-filter as the camera's: the robot drawn from the
+# URDF at the live TF, its points dropped before they become voxels. With no
+# LiDAR nothing arrives on the topic and this updater does nothing.
+l2_lidar:
+  sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater
+  point_cloud_topic: /lidar/cloud_octomap
+  # from the LiDAR, 0.85 m up: the work area is within ~1 m of it
+  max_range: 1.6
+  point_subsample: 1
+  padding_offset: 0.12
+  padding_scale: 1.1
+  max_update_rate: 5.0
+  # what is left after the self-filter, for RViz
+  filtered_cloud_topic: /lidar/cloud_filtered

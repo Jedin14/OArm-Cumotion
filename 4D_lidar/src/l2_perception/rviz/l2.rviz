@@ -1,0 +1,189 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+      Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid (1 m)
+      Enabled: false
+      Cell Size: 1
+      Plane Cell Count: 40
+      Reference Frame: <Fixed Frame>
+      Color: 160; 160; 164
+      Alpha: 0.25
+      Value: false
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Arrows: false
+      Show Axes: true
+      Show Names: false
+      Marker Scale: 0.3
+      Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Scene image (l2/points_image, depth-camera style, colour = height)
+      Enabled: true
+      Topic:
+        Value: /l2/points_image
+        Depth: 1
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+        Durability Policy: Volatile
+      Style: Points
+      Size (Pixels): 2
+      Decay Time: 0
+      Color Transformer: RGB8
+      Use Fixed Frame: true
+      Alpha: 1
+      Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Scene raw points (l2/points_scene, 60 s decay)
+      Enabled: false
+      Topic:
+        Value: /l2/points_scene
+        Depth: 10
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+        Durability Policy: Volatile
+      Style: Points
+      Size (Pixels): 2
+      Decay Time: 60
+      Color Transformer: RGB8
+      Use Fixed Frame: true
+      Alpha: 1
+      Value: false
+    - Class: rviz_default_plugins/PointCloud2
+      Name: People / moving / new objects (l2/points_live, white)
+      Enabled: true
+      Topic:
+        Value: /l2/points_live
+        Depth: 5
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+        Durability Policy: Volatile
+      Style: Points
+      Size (Pixels): 3
+      Decay Time: 0
+      Color Transformer: FlatColor
+      Color: 255; 255; 255
+      Use Fixed Frame: true
+      Alpha: 1
+      Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Live cloud (l2/points, 5 s decay)
+      Enabled: false
+      Topic:
+        Value: /l2/points
+        Depth: 5
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+        Durability Policy: Volatile
+      Style: Flat Squares
+      Size (m): 0.03
+      Decay Time: 5
+      Color Transformer: AxisColor
+      Axis: Z
+      Use Fixed Frame: true
+      Autocompute Value Bounds: false
+      Min Value: -0.2
+      Max Value: 3
+      Alpha: 1
+      Value: false
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Raw cloud (l2/cloud, lidar frame)
+      Enabled: false
+      Topic:
+        Value: /l2/cloud
+        Depth: 5
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+        Durability Policy: Volatile
+      Style: Points
+      Size (Pixels): 2
+      Decay Time: 0
+      Color Transformer: FlatColor
+      Color: 200; 200; 200
+      Alpha: 1
+      Value: false
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Obstacle points (l2/obstacles/points)
+      Enabled: false
+      Topic:
+        Value: /l2/obstacles/points
+        Depth: 5
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+        Durability Policy: Volatile
+      Style: Flat Squares
+      Size (m): 0.05
+      Decay Time: 0
+      Color Transformer: FlatColor
+      Color: 255; 255; 255
+      Alpha: 1
+      Value: false
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Obstacle boxes
+      Enabled: true
+      Topic:
+        Value: /l2/obstacles/markers
+        Depth: 5
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+        Durability Policy: Volatile
+      Namespaces:
+        labels: false
+        obstacles: true
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Name: Depth image (l2/depth_image)
+      Enabled: true
+      Topic:
+        Value: /l2/depth_image
+        Depth: 2
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+        Durability Policy: Volatile
+      Normalize Range: false
+      Min Value: 0
+      Max Value: 1
+      Median window: 5
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 0; 0; 0
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/Measure
+    - Class: rviz_default_plugins/PublishPoint
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 10
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Pitch: 0.75
+      Yaw: 0.6
+      Name: Current View
+      Target Frame: <Fixed Frame>
+      Value: Orbit (rviz)
+    Saved: ~
+Window Geometry:
+  Height: 1000
+  Width: 1600
+  X: 40
+  Y: 40

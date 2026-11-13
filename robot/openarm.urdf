@@ -4,6 +4,9 @@
 <!-- |    EDITING THIS FILE BY HAND IS NOT RECOMMENDED                                 | -->
 <!-- =================================================================================== -->
 <robot name="openarm">
+  <!-- 2026-11-13: the RIGHT arm's joints 4, 5, 6 read -5.1, +3.0, -5.7 deg off their real angle
+       (fitted on the 82 CAL ARMS postures of 2026-10-16, zero offsets + sag only): their origins are
+       turned by that about their own axes (also in openarm_arm.xacro, right_zero_*). -->
   <!-- Is the robot being simulated in gazebo? -->
   <!-- <xacro:arg name="gazebo" default="false" /> -->
   <link name="world"/>
@@ -383,7 +386,7 @@
     </inertial>
   </link>
   <joint name="openarm_right_joint4" type="revolute">
-    <origin rpy="0 0 0" xyz="-0.0 0.0315 0.15375"/>
+    <origin rpy="0 -0.089012 0" xyz="-0.0 0.0315 0.15375"/>
     <parent link="openarm_right_link3"/>
     <child link="openarm_right_link4"/>
     <axis xyz="0 1 0"/>
@@ -410,7 +413,7 @@
     </inertial>
   </link>
   <joint name="openarm_right_joint5" type="revolute">
-    <origin rpy="0 0 0" xyz="0.0 -0.0315 0.0955"/>
+    <origin rpy="0 0 0.052360" xyz="0.0 -0.0315 0.0955"/>
     <parent link="openarm_right_link4"/>
     <child link="openarm_right_link5"/>
     <axis xyz="0 0 1"/>
@@ -437,7 +440,7 @@
     </inertial>
   </link>
   <joint name="openarm_right_joint6" type="revolute">
-    <origin rpy="0 0 0" xyz="0.0375 0.0 0.1205"/>
+    <origin rpy="-0.099484 0 0" xyz="0.0375 0.0 0.1205"/>
     <parent link="openarm_right_link5"/>
     <child link="openarm_right_link6"/>
     <axis xyz="1 0 0"/>

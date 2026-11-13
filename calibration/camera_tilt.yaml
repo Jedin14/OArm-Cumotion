@@ -2,8 +2,8 @@
 # (x right, y down, z forward): the box picker's tilt while the accelerometer
 # is off. Written by box_model_node.py.
 up:
-- -0.01528
-- -0.99948
-- -0.02853
-tilt_deg: 1.63
-when: 2026-11-04 12:10
+- -0.01517
+- -0.99979
+- -0.01356
+tilt_deg: 0.78
+when: 2026-11-12 10:50

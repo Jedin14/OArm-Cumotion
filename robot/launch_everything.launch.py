@@ -1,7 +1,8 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, ExecuteProcess, GroupAction
+from launch.actions import (IncludeLaunchDescription, DeclareLaunchArgument, ExecuteProcess, GroupAction,
+                            OpaqueFunction)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node, SetRemap
 from launch.substitutions import LaunchConfiguration, PythonExpression
@@ -31,12 +32,64 @@ def realsense_imu_readable():
 # Inject override directory for patched cumotion planner
 os.environ['PYTHONPATH'] = '/workspaces/isaac_ros-dev/src/isaac_ros_cumotion_override:' + os.environ.get('PYTHONPATH', '')
 
+L2_WS = '/workspaces/isaac_ros-dev/4D_lidar'
+L2_DRIVER = f'{L2_WS}/install/l2_driver/lib/l2_driver/l2_driver_node'
+L2_CONFIG = f'{L2_WS}/install/l2_perception/share/l2_perception/config/l2.yaml'
+
+
+def lidar_nodes(context):
+    """The L2: the user's own driver (4D_lidar's l2_driver, their l2.yaml) and
+    robot/lidar_bridge.py, as lidar:= says. Only the driver of their stack: their
+    l2_stabilizer hangs l2_lidar on a floor 'world' of its own (not the robot's)."""
+    import subprocess
+    cfg = context.launch_configurations
+    mode = cfg.get('lidar', 'serial').strip().lower()
+    if mode in ('off', 'false', 'none', '0'):
+        print('[launch_everything] the Unitree L2 LiDAR is off (lidar:=off): the unseen-space '
+              'walls are used')
+        return []
+    nodes = []
+    already = subprocess.run(['pgrep', '-x', 'l2_driver_node'], capture_output=True,
+                             text=True).stdout.split()
+    if already:
+        # one driver per L2: the port is taken, and their stabilizer's world -> l2_lidar
+        # would give l2_lidar a second parent
+        print(f'[launch_everything] an L2 driver is already running (pid {" ".join(already)}): '
+              'is 4D_lidar/scripts/l2.sh running? Stop it (scripts/l2.sh stop) and restart this; '
+              'until then no LiDAR here, the walls are used.')
+    elif not os.access(L2_DRIVER, os.X_OK):
+        print(f'[launch_everything] the L2 driver is not built ({L2_DRIVER}): no LiDAR, the walls '
+              'are used. Build 4D_lidar (its README).')
+    else:
+        # work_mode stays -1 (their l2.yaml): never write the L2's stored mode. It starts the
+        # L2 rotating (~25 s from standby to the first cloud) and stops it at Ctrl-C
+        nodes.append(ExecuteProcess(
+            cmd=[L2_DRIVER, '--ros-args', '-r', '__node:=l2_driver', '--params-file', L2_CONFIG,
+                 '-p', f"connection:={'udp' if mode == 'udp' else 'serial'}",
+                 '-p', f"serial_port:={cfg.get('lidar_port')}",
+                 '-p', f"lidar_ip:={cfg.get('lidar_ip', '192.168.1.62')}",
+                 '-p', f"local_ip:={cfg.get('lidar_local_ip', '192.168.1.2')}"],
+            output='screen', name='l2_driver', respawn=True, respawn_delay=5.0,
+            sigterm_timeout='15'))
+    f = lambda k, d: float(cfg.get(k, d))
+    nodes.append(ExecuteProcess(
+        cmd=['python3', '/workspaces/isaac_ros-dev/robot/lidar_bridge.py', '--ros-args',
+             '-p', 'in_topic:=/l2/cloud', '-p', 'imu_topic:=/l2/imu',
+             '-p', f"mount_xyz:=[{f('lidar_x', -0.028)}, {f('lidar_y', 0.003)}, {f('lidar_z', 0.8829)}]",
+             '-p', f"mount_rpy_deg:=[{f('lidar_roll', 2.2)}, {f('lidar_pitch', 113.4)}, {f('lidar_yaw', 0.8)}]",
+             '-p', f"mount_spin_deg:={f('lidar_spin', 161.3)}",
+             '-p', f"tilt_from_imu:={'false' if cfg.get('lidar_tilt', 'measured') != 'imu' else 'true'}",
+             '-p', f"octomap_live:={'false' if cfg.get('octomap', 'live') == 'static' else 'true'}"],
+        output='screen', additional_env={'PYTHONUNBUFFERED': '1'}, name='lidar_bridge',
+        respawn=True, respawn_delay=2.0))
+    return nodes
+
+
 def generate_launch_description():
     use_fake_hardware = LaunchConfiguration('use_fake_hardware')
     right_can = LaunchConfiguration('right_can_interface')
     left_can = LaunchConfiguration('left_can_interface')
     octomap_mode = LaunchConfiguration('octomap')
-    enable_4d = LaunchConfiguration('4d')
     tool_frame = LaunchConfiguration('tool_frame')
     collision_distance = LaunchConfiguration('collision_activation_distance')
     
@@ -68,8 +121,58 @@ def generate_launch_description():
     declare_4d = DeclareLaunchArgument(
         '4d',
         default_value='false',
-        description='Enable 4D lidar TF bridge'
+        description='unused since 2026-11-11 (its placeholder TF clashed with the L2 '
+                    "driver's own frames): the Unitree L2 is lidar:=serial|udp|off"
     )
+    # The Unitree L2 4D LiDAR (2026-11-11): the user's driver (4D_lidar's l2_driver) and
+    # robot/lidar_bridge.py (its mount, its cloud in the robot's frames, the merged cloud,
+    # the walls' switch). serial: the USB serial adapter (the L2 is in serial mode);
+    # udp: Ethernet (the PC at lidar_local_ip); off: neither. Not with 4D_lidar's
+    # scripts/l2.sh running at the same time.
+    declare_lidar = [
+        DeclareLaunchArgument('lidar', default_value='serial',
+                              description='the Unitree L2: serial, udp or off'),
+        DeclareLaunchArgument('lidar_port', default_value='/dev/serial/by-id/'
+                              'usb-1a86_USB_Single_Serial_593A033327-if00',
+                              description="the L2's USB serial adapter (by id)"),
+        DeclareLaunchArgument('lidar_ip', default_value='192.168.1.62',
+                              description="udp: the L2's address (factory 192.168.1.62)"),
+        DeclareLaunchArgument('lidar_local_ip', default_value='192.168.1.2',
+                              description='udp: this PC on the L2\'s network (factory 192.168.1.2)'),
+        # 2026-11-12 17:30: FITTED to the camera (ICP of its cloud onto the D455's, window cleaned):
+        # agreement 30% -> 54%. The tape measure said (0.0154, 0.0062, 0.8457); the fit is 6.7 cm
+        # behind and 3.9 cm left of that (lidar_x / lidar_y / lidar_z below).
+        # 2026-11-13 10:00: RE-FITTED to the robot's own body as the LiDAR sees it (the URDF at the
+        # live TF) together with the camera: 4 cm to the robot's right (y 0.045 -> 0.005, the tape's
+        # y), 3.5 cm up, pitch +2.7 deg. Its points on the body: 1.5 -> 0.9 cm median gap, 58 -> 87%
+        # within 2 cm; on the left hand 5.9 -> 1.4 cm; the camera's agreement unchanged (54%).
+        # 10:10 the user: 2 cm further right by eye (y 0.0045 -> -0.0155).
+        # 11:40 RE-FITTED on two postures (parked, and the right arm in the workspace: its LiDAR points
+        # were 3.5 cm right of the drawn arm): y back to 0.003, yaw +2. The arm's points: 4.5 -> 3.0 cm
+        # median gap (2.6 with the range trim), 69 -> 91% inside the self-filter's 6 cm.
+        # the mount, in openarm_body_link0 (m, deg): 111.3 mm above the centre of the
+        # two arms' bases (0.0126, 0.0062, 0.7344), 2.8 mm in front. Turned (2026-11-12, as the
+        # user set it in RViz, then levelled on the room against gravity as the D455 measures it in
+        # the robot frame -- the robot leans ~5 deg forward -- walls square, 2026-11-12): blue (dome) forward 30 deg below level, red up-forward leaning left, green right
+        DeclareLaunchArgument('lidar_x', default_value='-0.028'),
+        DeclareLaunchArgument('lidar_y', default_value='0.003'),
+        DeclareLaunchArgument('lidar_z', default_value='0.8829'),
+        DeclareLaunchArgument('lidar_roll', default_value='2.2'),
+        DeclareLaunchArgument('lidar_pitch', default_value='113.4',
+                              description='deg, + = its top (the dome, blue) tipped forward from upright: '
+                                          '120 = the dome 30 deg below level, toward the box'),
+        DeclareLaunchArgument('lidar_yaw', default_value='0.8',
+                              description='deg, its X turned left of straight ahead (about the '
+                                          "robot's vertical; which side of it faces where: lidar_spin)"),
+        DeclareLaunchArgument('lidar_spin', default_value='161.3',
+                              description='deg, then turned about its own Z (blue in RViz, the dome '
+                                          'axis): which side faces where (with pitch ~120: 180 = red up-forward; '
+                                          'less = red turned to the left)'),
+        DeclareLaunchArgument('lidar_tilt', default_value='measured',
+                              description="measured: lidar_roll/pitch/yaw; imu: its tilt from its "
+                                          "own accelerometer (on 2026-11-12 this L2's read 1.9 g "
+                                          "at rest: not to be trusted)"),
+    ]
     # cuMotion has a single ee_link and rejects any pose goal aimed at a
     # different link with INVALID_LINK_NAME, so this is what decides which arm
     # can be given Cartesian goals -- from RViz or from pick_place_orchestrator.
@@ -212,6 +315,7 @@ def generate_launch_description():
         declare_accel,
         declare_vacuum,
         declare_vacuum_port,
+        *declare_lidar,
         demo_launch,
         cumotion_node,
         ExecuteProcess(
@@ -234,20 +338,9 @@ def generate_launch_description():
         ),
     ]
 
-    is_4d_enabled = PythonExpression(["'", enable_4d, "' == 'true'"])
-    try:
-        tf_bridge_launch_file = os.path.join(
-            get_package_share_directory('robot_tf_bringup'),
-            'launch',
-            'tf_bridge.launch.py'
-        )
-        tf_bridge_node = IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(tf_bridge_launch_file),
-            condition=IfCondition(is_4d_enabled)
-        )
-        launch_nodes.append(tf_bridge_node)
-    except Exception as e:
-        print(f"\n[WARNING]: robot_tf_bringup package not found!\n")
+    # (the old 4d:=true TF bridge, robot_tf_bringup, is not started any more: it hung
+    # unilidar_lidar 25 cm in front of base_link, which Unitree's stock L2 driver also parents)
+    launch_nodes.append(OpaqueFunction(function=lidar_nodes))
 
 
     # 3. Add the RealSense Camera Node

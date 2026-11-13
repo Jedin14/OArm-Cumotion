@@ -28,6 +28,7 @@
           <span class="chip warn" id="haltChip" hidden>STOPPED</span>
           <span class="chip subtle" id="clickChip" hidden>CLICK ONLY</span>
           <span class="chip subtle" id="fpsChip" title="Colour frames a second from the camera">– fps</span>
+          <span class="chip subtle" id="lidarChip" title="The Unitree L2 4D LiDAR. Working: the green walls are off (it sees round the camera's picture). Not working: the walls are used">LIDAR –</span>
         </div>
         <div class="segmented" role="tablist" aria-label="Picture">
           <button role="tab" data-action="view" data-value="live" id="viewLive">Live</button>
@@ -88,6 +89,7 @@
     <aside class="panel">
       <nav class="tabs" role="tablist" aria-label="Sections">
         <button role="tab" class="tab" data-tab="pick" aria-selected="true">Pick</button>
+        <button role="tab" class="tab model-tab" data-tab="pickall">Pick all</button>
         <button role="tab" class="tab" data-tab="calibrate">Calibrate</button>
         <button role="tab" class="tab" data-tab="advanced">Advanced</button>
         <button role="tab" class="tab" data-tab="system">System</button>
@@ -130,6 +132,9 @@
             <div class="why" id="targetWhy"></div>
             <div class="why" id="targetBox"></div>
           </div>
+
+          <!-- a box it cannot pick from here: where the robot should move (shown, not sent) -->
+          <div class="card basecorr" id="baseCorrPick" hidden></div>
 
           <!-- the box picker's own window (pick_loop.py), as a card -->
           <div class="card picker model-group" id="pickerCard">
@@ -174,7 +179,6 @@
           <div class="actions">
             <button class="btn primary big" data-action="move" id="btnMove"><span id="moveLabel">Move</span> <kbd>M</kbd></button>
             <button class="btn model" data-action="detect" id="btnDetect" title="The box picker looks at 5 frames and shows every box it found and the one it will pick (FRONT or TOP). Bypass on: picked at once if it can be; off: nothing moves until MOVE">Detect box <kbd>Space</kbd></button>
-            <button class="btn model" data-action="pick_all" id="btnPickAll" title="Every box the picker finds, one after another: detect, pick, drop, the next -- no MOVE. A box it cannot pick is never tried, it is skipped; one not taken is skipped after one try. When no box is left, the skipped ones get another round while others were taken meanwhile (up to 3). The next box is found while the arm drops the last. STOP (Esc) ends it"><span id="pickAllLabel">Pick all</span></button>
             <button class="btn" data-action="recapture">Recapture <kbd>R</kbd></button>
             <button class="btn danger-soft" data-action="return" id="btnReturn" hidden>Return arm <kbd>B</kbd></button>
           </div>
@@ -433,6 +437,43 @@
           </div>
         </section>
 
+        <section class="pane" data-pane="pickall" hidden>
+          <div class="card pickall-start">
+            <div class="card-row">
+              <span class="label">Pick all</span>
+              <span class="badge" id="pickAllState" data-tone="idle">ready</span>
+            </div>
+            <div class="why">Clears every box it can, one after another: detect, pick, drop, the next &ndash;
+              no Move to press. A box not taken gets one more round later. A box out of reach is
+              skipped, or &ndash; with No base movement off &ndash; it asks for the base to be moved
+              and picks it once it is in place. <b>STOP</b> (Esc) ends it.</div>
+            <button class="btn primary big model" data-action="pick_all" id="btnPickAll"><span id="pickAllLabel">Pick all</span></button>
+            <div class="toggles">
+              <button class="toggle" data-action="no_base_move" id="tgNoBaseMove" aria-pressed="true" title="On: a box it cannot reach from here is skipped. Off: Pick all stops at it, shows how to move the base, and picks it by itself once the box is in place">
+                <span class="knob"></span>No base movement
+              </button>
+            </div>
+            <div class="why small" id="noBaseMoveHint"></div>
+          </div>
+
+          <div class="card basecorr" id="baseCorrAll" hidden></div>
+
+          <!-- its time record, live while it runs, then the last run's -->
+          <div class="card pickall" id="pickAllCard" hidden>
+            <div class="card-row">
+              <span class="label" id="pickAllTitle">Pick all</span>
+              <span class="badge" id="pickAllBadge" data-tone="idle">–</span>
+            </div>
+            <div class="why" id="pickAllSummary"></div>
+            <table class="times" id="pickAllTimes" aria-label="Each box's time">
+              <thead><tr><th>#</th><th>Box</th><th title="From the arm leaving to the pick's result">Pick</th><th title="Since the last box was done: the pick and any waiting before it">Since last</th><th>At</th></tr></thead>
+              <tbody></tbody>
+            </table>
+            <div class="why small" id="pickAllFile"></div>
+          </div>
+
+        </section>
+
         <section class="pane" data-pane="system" hidden>
           <div class="card">
             <div class="title">ROS interface</div>
@@ -479,6 +520,19 @@ ros2 topic echo /beast_arm/status</pre>
     </aside>
   </div>
 
+  <div class="base-alert" id="baseAlert" role="alert" hidden>
+    <div class="ba-head"><b>Move the base</b><span id="baseAlertWhy"></span></div>
+    <div class="ba-moves" id="baseAlertMoves"></div>
+    <div class="ba-note" id="baseAlertNote"></div>
+    <div class="ba-actions">
+      <button class="btn" data-action="base_try" title="Check the reach now, as the robot stands">Try now</button>
+      <button class="btn" data-action="base_skip" title="Give up on this box and go on with the next">Skip box</button>
+    </div>
+  </div>
+  <div class="done-banner" id="doneBanner" role="alert" hidden>
+    <div class="done-text"><b id="doneTitle">Pick all done</b><span id="doneText"></span></div>
+    <button class="btn" id="doneClose">OK</button>
+  </div>
   <div class="toasts" id="toasts" aria-live="assertive"></div>
   <script src="/static/app.js"></script>
 </body>

@@ -11,7 +11,8 @@ import numpy as np
 
 import robot_camera_calibration as rcc
 from ctm.kinematics import directions
-from ctm.common import (ARM_REACH, BASE_FRAME, TOOL_ARM, NUDGE, decode_image, matrix_from_quat,
+from ctm.common import (ARM_REACH, BASE_FRAME, TOOL_ARM, NUDGE, arm_joints, decode_image,
+                        matrix_from_quat,
                         quat_from_matrix,
                         tool_frame_along)
 from ctm import armcal
@@ -91,7 +92,13 @@ class TouchMixin:
         model."""
         learned, _used, taught = learned_correction(arm, point, self.mode_name(),
                                                     self.arm_models.tag(arm))
-        return point + learned, learned, taught
+        aim = point + learned
+        if self.top_down:
+            # TOP DOWN went in too deep along x, straight ahead (2026-11-06: the user
+            # asked for it 1.5 cm back): --top-x-offset, world x. (TEACH saves its
+            # nudge on top of `learned`, so a taught spot stays right with it.)
+            aim = aim + np.array([float(getattr(self.node.args, 'top_x_offset', 0.0)), 0.0, 0.0])
+        return aim, learned, taught
 
     def mode_name(self):
         return 'top-down' if self.top_down else 'level'
@@ -1109,8 +1116,13 @@ class TouchMixin:
         _line_speed, velocity = self._carry(lt, holding)
         slow = velocity or 1.0                       # the retrace: as much slower
         self.on_returning(arm, lt, holding)
-        node.settle(arm, lt['above'], timeout=1.5)   # plans must start from where it is
         lvl = lt.get('level')
+        # plans and the straight lines up there start from where it is: still first.
+        # The retrace leads in onto its path from wherever the arm is -- the 1.5 s
+        # wait before it was only standing still (2026-11-05): 0.3 s; 0.8 s with a
+        # box maybe on the cup (it starts gently, not while the arm still moves)
+        node.settle(arm, lt['above'], timeout=1.5 if lvl is not None and lt.get('turned')
+                    else 0.8 if (holding or lt.get('pressed')) else 0.3)
         if lvl is not None and lt.get('turned') and (holding or lt.get('pressed')) and \
                 self._to_top_pre_pick(arm, velocity):
             lt['turned'] = False
@@ -1169,8 +1181,7 @@ class TouchMixin:
             lt['dropped'] = True                     # once per touch, also after a RETURN
             self.phase(f'{arm} to_drop')
             self.say(f'{arm} arm: to the drop pose')
-            if node.move_joints(arm, drop, f'{arm} to drop', velocity=self._drop_velocity(velocity),
-                                via_home=False):
+            if self._leg(arm, 'to_drop', drop, f'{arm} to drop', self._drop_velocity(velocity)):
                 self.phase(f'{arm} drop')
                 self.say(f'{arm} arm: at the drop pose; holding {args.drop_hold:g} s')
                 self.vacuum(arm, False)                  # let go of the box
@@ -1178,12 +1189,13 @@ class TouchMixin:
                 if arm in node.held:
                     node.detach_held(arm)
                     self.say(f'{arm} arm: box dropped - out of the planners')
+                self.on_dropped(arm)
             else:
                 self.say(f'{arm} arm: could not reach the drop pose; back to pre_pick with the box',
                          True)
             self.phase(f'{arm} to_pre_pick')
             self.say(f'{arm} arm: back to pre_pick')
-            back = node.move_joints(arm, lt['start'], f'{arm} return', via_home=False)
+            back = self._leg(arm, 'from_drop', lt['start'], f'{arm} return')
         elif back and lt.get('top_carry'):
             # at pre_pick_top with no drop pose (or past it already): on to pre_pick
             self.phase(f'{arm} to_pre_pick')
@@ -1204,6 +1216,54 @@ class TouchMixin:
     def on_returning(self, arm, lt, holding):
         """Called once the arm is out of the box and on its way back (pre_pick,
         the drop, pre_pick): PICK ALL looks ahead from here (web_gui.py)."""
+
+    def on_dropped(self, arm):
+        """Called once the box was let go at the drop pose (the vacuum off, held
+        --drop-hold): nothing on the cup any more (web_gui.py's look-ahead)."""
+
+    LEG_END_TOL = 0.03                               # rad: a stored leg ends near enough its goal
+
+    def _leg(self, arm, key, goal, label, velocity=None):
+        """A joint move made every pick between the same poses (pre_pick -> the drop
+        -> pre_pick): planned once and stored, then flown again from where the
+        arm is (node.lead_in) when it starts within LEAD_IN_MAX of the stored path,
+        that path ends within LEG_END_TOL of `goal`, and it is clear in the
+        planning scene now (the held box, the map, the walls). Planning it every
+        time cost 1.2-1.6 s per leg (2026-11-05). Else planned (cuMotion, then
+        OMPL), flown and stored; failing that, move_joints as before. True once
+        there."""
+        node = self.node
+        legs = self.__dict__.setdefault('_legs', {})
+        names = arm_joints(arm)
+        here = node.arm_positions(arm)
+        got = legs.get((arm, key, velocity))
+        if got is not None and here is not None and not node.halt.is_set():
+            traj, start, end = got
+            if (np.max(np.abs(np.subtract(here, start))) <= LEAD_IN_MAX
+                    and np.max(np.abs(np.subtract(goal, end))) <= self.LEG_END_TOL):
+                led, _gap = node.lead_in(traj)
+                if led is not None and node.path_is_clear(arm, led) is True:
+                    ok, _ = node.execute(led, f'{label} (stored path)')
+                    if ok:
+                        return True
+                    if node.halt.is_set():
+                        return False
+        if node.halt.is_set():
+            return False
+        _code, traj = node.plan_joints(arm, goal, velocity=velocity)
+        if traj is not None and traj.joint_trajectory.points:
+            ok, _ = node.execute(traj, label)
+            if ok:
+                jt = traj.joint_trajectory
+                first = dict(zip(jt.joint_names, jt.points[0].positions))
+                last = dict(zip(jt.joint_names, jt.points[-1].positions))
+                if all(n in first and n in last for n in names):
+                    legs[(arm, key, velocity)] = (traj, [first[n] for n in names],
+                                                  [last[n] for n in names])
+                return True
+            if node.halt.is_set():
+                return False
+        return node.move_joints(arm, goal, label, velocity=velocity, via_home=False)
 
     def _drop_velocity(self, velocity):
         """The move to the drop pose starts at pre_pick (or pre_pick_top), clear of
@@ -1316,6 +1376,10 @@ class TouchMixin:
         near_d, correct_d = min(NEAR, standoff), min(CORRECT_AT, standoff)
         approach, contact = plan['approach'], plan['contact']
         node.publish_target(contact, quat)
+        dx = float(getattr(args, 'top_x_offset', 0.0)) if self.top_down else 0.0
+        if dx:
+            self.say(f'{arm} arm: TOP DOWN - aiming {abs(1000 * dx):.0f} mm '
+                     f'{"nearer the robot" if dx < 0 else "further out"} in x (--top-x-offset)')
         self.say(f'{arm} arm: planned in {time.monotonic() - t0:.1f} s [{plan["label"]}]'
                  + (f'; taught correction from {taught} touches' if taught else '')
                  + ('; AT THE EDGE OF REACH - a correction may not fit' if plan['edge']
@@ -1361,7 +1425,11 @@ class TouchMixin:
         # Corrections happen out at the approach point (--standoff, 10 cm),
         # away from the object, and again NEAR short; from there the way in
         # is ONE straight line along the tool axis, slow at the end until it
-        # feels the surface.
+        # feels the surface. Settled here AND again in correct_to before the first
+        # measurement: with only correct_to's (2026-11-05, to save ~1.2 s) the arm
+        # was still 52 mrad off its command when measured (37 with both), the
+        # approach read 29 mm off (15-21), the corrections started from a wrong
+        # reading -- and that run picked nothing. Kept.
         node.settle(arm, plan['above'], timeout=args.settle_time)
         # TOP DOWN: the arm sags much more reaching down (36-42 mm off at
         # the approach, 2026-10-09): two corrections, and larger ones.

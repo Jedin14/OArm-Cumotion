@@ -34,7 +34,7 @@ FAR_SMEAR_M = 0.015      # a top's depth reaching up to this past its outline's 
 HIGHEST_TOL_M = 0.015    # boxes on a box whose tops are within this of the highest one's count as highest
                          # (under the thinnest box, 2.7 cm: a pile one box lower is lower)
 NEAREST_TOL_M = 0.03     # free boxes whose grip point is within this of the nearest one's count as nearest
-SKIP_OVERLAP = 0.5       # a box whose outline overlaps a skipped one's this much (of the smaller) is that box
+SKIP_OVERLAP = 0.5       # a box whose outline overlaps an avoided one's (passed over) this much (of the smaller) is that box
 EDGE_PX = 3              # a pick face this close to the picture's edge is cut off by it (at_edge)
 SAME_LENGTH = 0.07       # fronts this close in length (share) are the same kind of box, for split_doubles
 DOUBLE_TOL = 0.15        # a front this close (share) to twice the others' thickness is two boxes pressed together

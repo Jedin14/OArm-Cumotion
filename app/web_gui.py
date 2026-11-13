@@ -136,6 +136,18 @@ class WebStack(pick_stack.PickStack):
         self.bypass = True
         self.picking_all = None       # PICK ALL running: {'round', 'picked', 'skipped'}
         self._ahead = None            # ... its look-ahead for the pick running now (_pick_all_one)
+        self.pick_all_report = None   # the last PICK ALL's time record (the page tells you it is done)
+        # a box it could not pick from here: the wheel moves that would bring it to its
+        # spot (base_correction_for) -- shown, not sent (PICK ALL never moves the base)
+        self.base_correction = None
+        # PICK ALL, "No base movement" (on by default): a box out of reach is skipped.
+        # Off: it waits for the base to be moved (base_wait, the alert), then picks it
+        self.no_base_move = True
+        self.base_wait = None         # waiting for the base: {'correction', 'since', 'note'}
+        self._base_cmd = None         # the alert's buttons: 'try' / 'skip'
+        self.base_corr_pub = node.create_publisher(
+            String, f'{node.args.ns.rstrip("/")}/base_correction',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.boxes = []               # every box of that frame (pixels)
         self.log = collections.deque(maxlen=80)
         self.error = False
@@ -186,6 +198,20 @@ class WebStack(pick_stack.PickStack):
                 return False, (f'vacuum {data["value"]} -- but no bridge is listening '
                                '(terminal 1 starts it): nothing switches')
             return True, f'vacuum {data["value"]}'
+        if name == 'no_base_move':
+            # a setting, at any time (from the next box out of reach on)
+            self.no_base_move = not self.no_base_move
+            return True, ('no base movement: a box out of reach is skipped' if self.no_base_move
+                          else 'base movement allowed: Pick all asks for the base to be moved, '
+                               'then picks the box by itself')
+        if name in ('base_try', 'base_skip'):
+            if self.base_wait is None:
+                return False, 'not waiting for the base'
+            self._base_cmd = 'try' if name == 'base_try' else 'skip'
+            if name == 'base_try' and self.base_wait is not None:
+                self.base_wait['note'] = 'Try now: one more look, then the reach check (up to 30 s)...'
+            return True, ('Try now: looking, then checking the reach (up to 30 s)'
+                          if name == 'base_try' else 'skipping this box')
         if name == 'bypass':
             # a setting, at any time -- also during DETECT BOX (off: it stops at the check)
             self.bypass = not self.bypass
@@ -750,13 +776,19 @@ class WebStack(pick_stack.PickStack):
                 check['start_from'] = [float(v) for v in start_from]
             self.check_pick(check, in_job=True)
             ok = check.get('ok')
+            base = ''
             if ok is False and check.get('not_here'):    # not pickable from here: the wheels
+                self.base_correction = self.base_correction_for(
+                    self._target_xyz(t), t.approach, check.get('why') or 'not reachable')
+                base = f' - base: {self.correction_text(self.base_correction)}'
                 self.unreachable_adjust(check.get('why') or 'not reachable')
                 self.retry = None
+            elif ok and self.picking_all is None:
+                self.base_correction = None              # (this one can be picked from here)
             self.say(f'{t.approach.upper()} pick of the box shown - ' +
                      (('picking it' if self.bypass or self.picking_all is not None
                        else 'press MOVE to pick it') if ok else
-                      f'cannot pick it: {check.get("why") or "not reachable"}'), not ok)
+                      f'cannot pick it: {check.get("why") or "not reachable"}{base}'), not ok)
 
     def move(self):
         """MOVE: a detected box is picked as ready_to_pick does -- its box
@@ -887,8 +919,11 @@ class WebStack(pick_stack.PickStack):
         Ends when a round takes nothing, on STOP, with an arm left out or a box
         still on the cup. The boxes skipped in the last round stay skipped after
         it: Forget skipped brings them back."""
+        self.base_correction = None
         run = self.picking_all = {'round': 0, 'picked': 0, 'skipped': 0, 'pass': 1,
-                                  'unreachable': []}
+                                  'unreachable': [], 'picks': [], 'out_of_reach': [],
+                                  'started': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                  't0': time.monotonic(), 'last_end': time.monotonic()}
         self.abort.clear()                               # a new command: STOP is past
         why, bad = 'STOP', True
         try:
@@ -896,6 +931,7 @@ class WebStack(pick_stack.PickStack):
             while True:
                 taken = run['picked']
                 run['skipped'], run['retry'], run['reoffers'] = 0, 0, 0
+                run['out_of_reach'] = []                 # (this round's: what is left at the end)
                 given_up = []                            # where this round's skipped boxes are
                 tried = []                               # tried: the camera could not tell / dropped
                 go, why, bad = self._next_pickable(run, given_up, tried)
@@ -920,10 +956,20 @@ class WebStack(pick_stack.PickStack):
             self.activity = None
         dropped = f', {run["dropped"]} dropped' if run.get('dropped') else ''
         rounds = f' in {run["pass"]} rounds' if run['pass'] > 1 else ''
+        left = run.get('out_of_reach') or []
+        if left:                                         # the boxes left that it could not reach
+            self.base_correction = dict(left[0], more=len(left) - 1)
+        rep = self._pick_all_report(run, why, bad)
+        took = f'; {self._duration(rep["total_s"])} in all' + (
+            f', {self._duration(rep["per_box_s"])} per box picked (each pick '
+            f'{self._duration(rep["pick_s"])})' if rep['per_box_s'] else '')
         self.say(f'PICK ALL done: {run["picked"]} picked, {run["skipped"]} skipped{dropped}'
-                 f'{rounds} - {why}' +
+                 f'{rounds} - {why}{took}' +
                  ('. The skipped boxes stay skipped: Forget skipped (Advanced) brings them back'
-                  if run['skipped'] else ''), bad)
+                  if run['skipped'] else '') +
+                 (f'. Base correction for the box out of reach: '
+                  f'{self.correction_text(self.base_correction)}' if left else '') +
+                 (f'. Time record: {rep["file"]}' if rep['file'] else ''), bad)
 
     @staticmethod
     def _for_good(why):
@@ -934,12 +980,18 @@ class WebStack(pick_stack.PickStack):
         return bool(w) and not any(k in w for k in ('in the way', 'blocked', 'could not check',
                                                      'stop'))
 
-    def _next_pickable(self, run, given_up, tried, detect=None):
+    def _next_pickable(self, run, given_up, tried, detect=None, can_wait=True):
         """DETECT BOX until the picker offers a box the reach check can pick
         (self.pick, as DETECT BOX leaves it), skipping every one it cannot -- one
         known from an earlier round to be out of reach from here without a
         reach check. detect(before_check): how to look (the look-ahead's,
-        during the drop). (found, why not, whether that is a fault)."""
+        during the drop). (found, why not, whether that is a fault).
+
+        With "No base movement" off (self.no_base_move False), a box out of reach
+        that a base move would bring into reach is not skipped: Pick all waits
+        for the base to be moved (_wait_for_base) and picks it then. can_wait
+        False (the look-ahead, the arm still away): ('wait', ...) instead --
+        pick_all waits once the arm is back."""
         detect = detect or (lambda before_check: self.detect_box(before_check=before_check))
         while True:
             if self.halted():
@@ -972,13 +1024,39 @@ class WebStack(pick_stack.PickStack):
                 if run['reoffers'] > self.PICK_ALL_REOFFERS:
                     return False, 'the picker keeps offering boxes it was told to skip', True
                 reason, retry = 'offered again after a skip', False
-            elif known:
-                reason, retry = f'out of reach from here, as found before ({known[0]["why"]})', False
+            elif known or (not self._detected_pickable() and (self.check or {}).get('not_here')):
+                # out of reach from here: a base move would help
+                why = known[0]['why'] if known else \
+                    ((self.check or {}).get('why') or 'it cannot be picked from here')
+                corr = self.base_correction_for(where, self.box.approach, why)
+                centre = False
+                if not corr['moves'] and corr['inside']:
+                    # in its zone already and still out of reach: the zone's middle, if
+                    # that is any move at all
+                    corr = self.base_correction_for(where, self.box.approach, why, True)
+                    centre = True
+                if not self.no_base_move and corr['moves']:
+                    if not can_wait:
+                        return 'wait', why, False        # (the arm away: once it is back)
+                    got, where = self._wait_for_base(run, given_up, tried, corr, centre)
+                    if got == 'pickable':
+                        return True, None, False
+                    if got == 'stop':
+                        return False, 'STOP', True
+                    if got == 'gone':
+                        continue                         # (out of view now: look again)
+                    reason, retry = 'skipped while waiting for the base (Skip box)', False
+                    corr = self.base_correction or corr
+                elif known:
+                    reason, retry = f'out of reach from here, as found before ({why})', False
+                else:
+                    reason = why
+                    if self._for_good(reason):
+                        run.setdefault('unreachable', []).append({'xyz': where, 'why': reason})
+                        retry = False
+                run.setdefault('out_of_reach', []).append(corr)
             elif not self._detected_pickable():
                 reason = (self.check or {}).get('why') or 'it cannot be picked from here'
-                if (self.check or {}).get('not_here') and self._for_good(reason):
-                    run.setdefault('unreachable', []).append({'xyz': where, 'why': reason})
-                    retry = False
             elif any(np.linalg.norm(where - g) < 0.03 for g in tried):
                 reason = 'tried once already (the camera could not tell, or it was dropped)'
             else:
@@ -987,6 +1065,123 @@ class WebStack(pick_stack.PickStack):
                 return False, 'the picker did not skip it', True
             run['skipped'] += 1
             run['retry'] = run.get('retry', 0) + int(retry)
+
+    BASE_CLOSE_M = 0.03           # every move left this small or less: try the reach again
+    BASE_STILL_M = 0.01           # two looks this close: the base has stopped
+
+    def _wait_for_base(self, run, given_up, tried, corr, centre=False):
+        """PICK ALL with base movement allowed, a box out of reach: the alert (the
+        correction, on the page and on <ns>/base_correction), then the camera
+        watched -- each look shows what is left to move -- until the box is
+        within BASE_CLOSE_M of its spot and the base has stopped (two looks
+        within BASE_STILL_M); then the reach check, and picked if it passes (else
+        on waiting, with the new correction). The alert's Try now checks the
+        reach as it is; Skip box gives up on it. Once the base has moved, every
+        place remembered (skipped boxes, out of reach) is from before: forgotten.
+        (result, where): 'pickable' (self.pick checked), 'skip', 'gone' (the box
+        out of view after the base moved), 'stop'."""
+        where0 = np.array(corr['box'], float)
+        where, prev, last_try = where0, None, None
+        moved = False                                    # centre: the zone's middle, not its edge
+        misses = 0                                       # looks in a row with no box
+        self._base_cmd = None
+        self.base_correction = corr
+        self.base_wait = {'correction': corr, 'since': time.time(), 'note': '', 'checking': False}
+        self._publish_base('needed', corr)
+        self.say(f'PICK ALL: cannot pick this box from here ({corr["why"]}) - move the base: '
+                 f'{self.correction_text(corr)}. It goes on by itself once the box is in place '
+                 f'(or: Try now / Skip box)', True)
+        result = 'stop'
+        try:
+            while not self.halted():
+                cmd, self._base_cmd = self._base_cmd, None
+                if cmd == 'skip':
+                    result = 'skip'
+                    break
+                self.box = self.pick = self.check = self.model_pick = None
+                self.detect_box(before_check=lambda: False)   # the look and the map; no reach check
+                if self.halted():
+                    break
+                if self.box is None:
+                    misses += 1
+                    dead = any(k in (self.status or '') for k in (
+                        'failed to start', 'stopped while looking', 'no depth frames',
+                        'no camera frames', 'did not answer'))
+                    self.base_wait['note'] = (
+                        'the camera / box picker is not sending pictures (the D455 unplugged? '
+                        'check terminal 1) - waiting' if dead else
+                        'no box in view right now - still moving?')
+                    if moved and not dead:
+                        result = 'gone'
+                        break
+                    time.sleep(2.0 if dead else 0.5)
+                    continue
+                misses = 0
+                where = self._target_xyz(self.box)
+                moved = moved or float(np.linalg.norm(where - where0)) > 0.02
+                corr = self.base_correction_for(where, self.box.approach, corr['why'], centre)
+                still = prev is not None and float(np.linalg.norm(where - prev)) < self.BASE_STILL_M
+                prev = where
+                close = all(m['m'] <= self.BASE_CLOSE_M for m in corr['moves'])
+                self.base_correction = corr
+                self.base_wait.update(correction=corr, note=(
+                    'in place - checking the reach' if close and still else
+                    'in place - waiting for the base to stop' if close else
+                    'waiting for the base to move'))
+                self._publish_base('needed', corr)
+                fresh = last_try is None or float(np.linalg.norm(where - last_try)) > 0.01
+                if cmd == 'try' or (close and still and fresh):
+                    last_try = where
+                    check = self.check
+                    if check is not None:
+                        self.base_wait.update(checking=True, note=(
+                            'Try now: checking the reach where the robot stands - up to 30 s'
+                            if cmd == 'try' else 'in place - checking the reach - up to 30 s'))
+                        self.check_pick(check, in_job=True)
+                        self.base_wait['checking'] = False
+                        if self._detected_pickable():
+                            result = 'pickable'
+                            break
+                        why = check.get('why') or 'not reachable'
+                        # in its zone already and still not: on to the middle of it
+                        inside = self.base_correction_for(where, self.box.approach, why)['inside']
+                        centre = centre or inside
+                        corr = self.base_correction_for(where, self.box.approach, why, centre)
+                        self.base_correction = corr
+                        self.base_wait.update(correction=corr, note=(
+                            f'still out of reach here ({why}) - '
+                            + (self.correction_text(corr) if corr['moves'] else 'Skip box?')))
+                        self.say(f'PICK ALL: still cannot pick it ({why}) - '
+                                 f'{self.correction_text(corr)}, or Skip box', True)
+                time.sleep(0.3)
+        finally:
+            self.base_wait = None
+            self._base_cmd = None
+            self._publish_base({'pickable': 'done', 'skip': 'skipped', 'gone': 'done'}.get(
+                result, 'cancelled'), corr)
+        if moved:                                        # the robot moved: all places are old
+            self._say_cmd(self.model_cmd('reset'))
+            given_up.clear()
+            tried.clear()
+            run['unreachable'] = []
+            run['out_of_reach'] = []
+            run['reoffers'] = 0
+        if result == 'pickable':
+            self.base_correction = None
+            self.say('PICK ALL: the box is in reach now - picking it')
+        return result, where
+
+    def _publish_base(self, state, corr):
+        """<ns>/base_correction (latched JSON): what the base should do -- "needed"
+        with the moves, then "done" / "skipped" / "cancelled"."""
+        try:
+            self.base_corr_pub.publish(String(data=json.dumps(
+                {'state': state, 'moves': (corr or {}).get('moves', []),
+                 'box': (corr or {}).get('box'), 'approach': (corr or {}).get('approach'),
+                 'spot': (corr or {}).get('spot'), 'why': (corr or {}).get('why'),
+                 'time': time.strftime('%Y-%m-%d %H:%M:%S')})))
+        except Exception as exc:                         # noqa: BLE001 - only a report
+            self.node.get_logger().warn(f'base_correction: {exc}')
 
     def _pick_all_one(self, run, given_up, tried):
         """The box DETECT BOX left in self.pick, picked -- one try -- with the next
@@ -1005,6 +1200,7 @@ class WebStack(pick_stack.PickStack):
         self.retry = None
         self.activity = 'picking'
         self.report('picking')
+        t_start = time.monotonic()                       # (the time record: from here)
         worker.start()
         try:
             self.touch(arm, point, origin, self.frame)
@@ -1022,22 +1218,101 @@ class WebStack(pick_stack.PickStack):
         self.record_pick(r, close_up=mine['close_up'])
         out = 'an arm is still out: RETURN it' if self.last_touch is not None else None
         if self.halted() or r.get('outcome') == 'stopped':
+            self._time_pick(run, mine, r, 'stopped', t_start)
             return False, 'STOP' + (f' - {out}' if out else ''), True
         if out:
+            self._time_pick(run, mine, r, 'arm out', t_start)
             return False, out, True
         if TOOL_ARM.get(self.pick_tool) in self.node.held:
+            self._time_pick(run, mine, r, 'still on the cup', t_start)
             return False, 'a box is still on the cup: take it off, then RELEASE', True
-        if ahead['fate'] is None:                        # (no look-ahead: decided here)
+        fate = ahead['fate']
+        if fate is None:                                 # (no look-ahead: decided here)
             picked = False if r.get('outcome') == 'not_started' else r.get('picked')
-            if self._box_fate(mine, picked, r.get('outcome'), self.last_contact is not None,
-                              run, given_up, tried, gone=r.get('outcome') == 'dropped') is None:
+            fate = self._box_fate(mine, picked, r.get('outcome'), self.last_contact is not None,
+                                  run, given_up, tried, gone=r.get('outcome') == 'dropped')
+            if fate is None:
+                self._time_pick(run, mine, r, 'not skipped', t_start)
                 return False, 'the picker did not skip it', True
+        self._time_pick(run, mine, r, fate, t_start)
         if ahead['found'] is not None:
+            if ahead['found'][0] == 'wait':              # out of reach, the base may move: from here
+                return self._next_pickable(run, given_up, tried)
             if ahead['found'][0]:
                 self.say('PICK ALL: the next box was found and planned during the drop - '
                          'picking it')
             return ahead['found']
         return self._next_pickable(run, given_up, tried)
+
+    def _time_pick(self, run, mine, r, result, t_start):
+        """The time record of one box: how long its pick took (the arm leaving to its
+        result known) and since the last box's end (with the waiting before it)."""
+        now = time.monotonic()
+        t = mine.get('target')
+        face = [round(float(v)) for v in getattr(t, 'face_mm', None) if float(v) > 0] \
+            if t is not None and getattr(t, 'face_mm', None) is not None else []
+        entry = {'n': len(run['picks']) + 1, 'result': result, 'outcome': r.get('outcome'),
+                 'seconds': round(now - t_start, 1), 'cycle': round(now - run['last_end'], 1),
+                 'at': time.strftime('%H:%M:%S'), 'round': run.get('pass', 1),
+                 'approach': getattr(t, 'approach', None) if t is not None else None,
+                 'face_mm': face, 'xyz': [round(float(v), 3) for v in mine['where']]}
+        run['picks'].append(entry)
+        run['last_end'] = now
+        self.say(f'PICK ALL: box {entry["n"]} {result} - {entry["seconds"]:.1f} s '
+                 f'({entry["cycle"]:.1f} s since the last box)', result not in ('picked',))
+
+    @staticmethod
+    def _duration(seconds):
+        """42.3 -> "42.3 s", 252 -> "4 min 12 s"."""
+        if seconds is None:
+            return '-'
+        if seconds < 60:
+            return f'{seconds:.1f} s'
+        return f'{int(seconds // 60)} min {int(round(seconds % 60))} s'
+
+    def _pick_all_report(self, run, why, bad):
+        """The run's time record: kept for the page (pick_all_report: it tells you it
+        is done) and saved as native/logs/pick_all/pick_all_<when>.json and .csv.
+        The report."""
+        total = time.monotonic() - run['t0']
+        picked = [p for p in run['picks'] if p['result'] == 'picked']
+        report = {'id': int(time.time() * 1000), 'started': run['started'],
+                  'finished': time.strftime('%Y-%m-%d %H:%M:%S'), 'total_s': round(total, 1),
+                  'picked': run['picked'], 'skipped': run['skipped'],
+                  'dropped': run.get('dropped', 0), 'rounds': run.get('pass', 1), 'why': why,
+                  'ok': not bad, 'per_box_s': round(total / len(picked), 1) if picked else None,
+                  'pick_s': (round(sum(p['seconds'] for p in picked) / len(picked), 1)
+                             if picked else None),
+                  'picks': list(run['picks']), 'file': None,
+                  'base_correction': self.base_correction}
+        try:
+            out = os.path.join(APP_DIR, '..', 'native', 'logs', 'pick_all')
+            os.makedirs(out, exist_ok=True)
+            base = os.path.join(os.path.abspath(out), time.strftime('pick_all_%Y-%m-%d_%H%M%S'))
+            with open(base + '.json', 'w') as f:
+                json.dump(report, f, indent=1)
+            with open(base + '.csv', 'w') as f:
+                f.write('n,result,outcome,seconds,since_last_s,at,round,approach,face_mm,x,y,z\n')
+                for p in report['picks']:
+                    f.write(','.join(str(v) for v in (
+                        p['n'], p['result'], p['outcome'] or '', p['seconds'], p['cycle'], p['at'],
+                        p['round'], p['approach'] or '', 'x'.join(str(v) for v in p['face_mm']),
+                        *p['xyz'])) + '\n')
+                f.write(f'total,,,{report["total_s"]},,{report["finished"][-8:]},{report["rounds"]},,,,,\n')
+            report['file'] = base + '.json'
+        except OSError as exc:
+            self.node.get_logger().warn(f'PICK ALL: the time record was not saved ({exc})')
+        self.pick_all_report = report
+        return report
+
+    def on_dropped(self, arm):
+        """The box let go at the drop: PICK ALL's look-ahead stops counting a box on
+        the cup (it kept one, and back at pre_pick its imaginary box reached into
+        the picture: every look during the drop was thrown away, 6 s a pick,
+        2026-11-05)."""
+        ahead = getattr(self, '_ahead', None)
+        if ahead is not None and ahead['arm'] == arm:
+            ahead['box'] = 0.0
 
     def _box_fate(self, mine, picked, outcome, touched, run, given_up, tried, gone=False):
         """After its pick: a box taken is counted; one not taken and still in its
@@ -1113,7 +1388,8 @@ class WebStack(pick_stack.PickStack):
                 ahead['found'] = (False, 'the picker did not skip it', True)
                 return
             ahead['found'] = self._next_pickable(run, given_up, tried,
-                                                 detect=lambda bc: self._detect_ahead(ahead, bc))
+                                                 detect=lambda bc: self._detect_ahead(ahead, bc),
+                                                 can_wait=False)
         except _LookAgain:
             pass                                         # after the touch, as before
         except Exception as exc:                         # noqa: BLE001 - then after the touch
@@ -1233,6 +1509,76 @@ class WebStack(pick_stack.PickStack):
             centres.append(tip + axis * (box_m / 2.0))
             radii.append(0.75 * box_m + 0.02)
         return bool(view_hits(centres, radii, t_wo, info, self.VIEW_MARGIN_PX).any())
+
+    ZONE_MARGIN_M = 0.01          # the move ends this far inside the zone's edge
+    MOVE_MIN_M = 0.01             # a move smaller than this is not asked for
+
+    def base_correction_for(self, xyz, approach, why=None, centre=False):
+        """The shortest wheel moves that bring a box it cannot pick from here into
+        the zone where that pick works (--top-zone / --front-zone: from the reach
+        checks in the logs, 2026-11-06 -- top picks succeeded 38-47 cm ahead, 2 cm
+        right to 6 cm left; front ones most reliably 44-50 cm ahead, 6-20 cm left):
+        just inside its nearest edge, not to its middle (the user: "a pickable
+        area with minimum movement"). centre: to the zone's middle instead (in it
+        already, and still out of reach). Across: left / right (the robot moving
+        left brings the box to its right); ahead: forward / back. Only moves of
+        MOVE_MIN_M or more. Shown -- the base is never driven from here."""
+        args = self.node.args
+        top = str(approach) == PickTarget.APPROACH_TOP
+        near, far, right, left = (args.top_zone if top else args.front_zone)
+        x, y = float(xyz[0]), float(xyz[1])
+        m = self.ZONE_MARGIN_M
+        inside = near <= x <= far and right <= y <= left
+        if centre:
+            tx, ty = (near + far) / 2.0, (right + left) / 2.0
+        elif inside:
+            tx, ty = x, y                                # in the zone: no move
+        else:
+            tx = min(max(x, near + m), far - m)
+            ty = min(max(y, right + m), left - m)
+        moves = []
+        dy, dx = y - ty, x - tx
+        if abs(dy) >= self.MOVE_MIN_M:
+            moves.append({'dir': 'left' if dy > 0 else 'right', 'm': round(abs(dy), 3)})
+        if abs(dx) >= self.MOVE_MIN_M:
+            moves.append({'dir': 'forward' if dx > 0 else 'back', 'm': round(abs(dx), 3)})
+        return {'approach': 'top' if top else 'front', 'box': [round(float(v), 3) for v in xyz[:3]],
+                'ahead_m': round(x, 3), 'side_m': round(y, 3), 'moves': moves,
+                'inside': bool(inside), 'centre': bool(centre),
+                'spot': {'near': near, 'far': far, 'right': right, 'left': left},
+                'why': why, 'time': time.strftime('%H:%M:%S'), 'more': 0}
+
+    @staticmethod
+    def correction_text(c):
+        """"move left 21 cm, forward 15 cm" / "in position (...)"."""
+        if not c:
+            return '-'
+        if not c['moves']:
+            return 'none - the box is in its zone already; it cannot be picked for another reason'
+        return 'move ' + ', '.join(f'{m["dir"]} {100 * m["m"]:.0f} cm' for m in c['moves'])
+
+    def _lidar_state(self):
+        """The L2 LiDAR for the page: its bridge's last word (robot/lidar_bridge.py) and
+        whether the last capture left the walls off."""
+        st = getattr(self.node, 'lidar_status', None)
+        if not st:
+            return None
+        d, t = st
+        return {'ok': self.node.lidar_ok(), 'rate_hz': d.get('rate_hz'),
+                'work_points': d.get('work_points'), 'why': d.get('why') or '',
+                'lean_deg': d.get('lean_deg'), 'reach_points': d.get('reach_points'),
+                'age_s': round(time.monotonic() - t, 1),
+                'walls_off': bool(getattr(self.node, 'walls_off', False))}
+
+    def _pick_all_state(self):
+        """PICK ALL running, for the page: its counts, how long so far, each box's time."""
+        run = self.picking_all
+        if not run:
+            return None
+        return {'round': run['round'], 'picked': run['picked'], 'skipped': run['skipped'],
+                'dropped': run.get('dropped', 0), 'pass': run.get('pass', 1),
+                'elapsed_s': round(time.monotonic() - run['t0'], 1),
+                'picks': list(run.get('picks', []))}
 
     def _box_size_m(self, target):
         """The longest side the box being picked may have, m: its measured face (and
@@ -1417,7 +1763,12 @@ class WebStack(pick_stack.PickStack):
             'vacuum': self.vacuum_on,
             'vacuum_listeners': self.vacuum_pub.get_subscription_count(),
             'bypass': self.bypass,
-            'pick_all': dict(self.picking_all) if self.picking_all else None,
+            'pick_all': self._pick_all_state(),
+            'pick_all_report': self.pick_all_report,
+            'base_correction': self.base_correction,
+            'no_base_move': self.no_base_move,
+            'base_wait': self.base_wait,
+            'lidar': self._lidar_state(),
             'retry': self.retry['outcome'] if self.retry else None,
             # what the page draws over the picker's picture (box_model/scene); not
             # over the picker's own drawing (V), which has its own
@@ -1734,6 +2085,16 @@ def make_parser():
     parser.add_argument('--host', default='0.0.0.0',
                         help='where the page listens (127.0.0.1: only on this machine)')
     parser.add_argument('--port', type=int, default=8080)
+    parser.add_argument('--top-zone', type=float, nargs=4, default=[0.38, 0.47, -0.02, 0.06],
+                        metavar=('NEAR', 'FAR', 'RIGHT', 'LEFT'),
+                        help='where a TOP pick works, robot frame m: NEAR..FAR straight ahead (x), '
+                             'RIGHT..LEFT across (y, + left). A box it cannot pick: the base '
+                             'correction is the shortest move into it. Default from the reach checks '
+                             'in the logs (2026-11-06): 29 top picks reachable here, none at 30-37 cm')
+    parser.add_argument('--front-zone', type=float, nargs=4, default=[0.44, 0.50, 0.06, 0.20],
+                        metavar=('NEAR', 'FAR', 'RIGHT', 'LEFT'),
+                        help='the same for a FRONT pick (the band where front picks were reachable '
+                             'and not at the edge of reach)')
     parser.add_argument('--click', action='store_true',
                         help='click-only, like click_to_move: no box model, no DETECT BOX '
                              'or AUTO PICK (ready_to_pick on arm_action is refused)')

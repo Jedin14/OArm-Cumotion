@@ -18,6 +18,9 @@
 # -> the ESP32 by its USB id): vacuum:=false leaves it out, vacuum_port:=... for
 # another port.
 #
+# The Unitree L2 LiDAR (2026-11-11) starts here too: lidar:=serial (default) | udp | off.
+# Its driver is 4D_lidar's l2_driver (~25 s to spin up): not with 4D_lidar/scripts/l2.sh running.
+# 4d:=false below is left over (the old placeholder TF bridge it switched is retired).
 set -eo pipefail
 
 NATIVE_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"

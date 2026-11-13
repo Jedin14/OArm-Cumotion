@@ -10,6 +10,52 @@ native/run_launch_everything.sh   # terminal 1: robot, MoveIt, cuMotion, camera;
 #   the VACUUM RELAY starts here too (app/vacuum_bridge.py: /beast_arm/vacuum -> the ESP32 by its USB id,
 #   /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_34:CD:B0:16:1D:30-if00, ttyACM0 now):
 #   vacuum:=false leaves it out, vacuum_port:=... another port; its lines in this terminal: [vacuum_bridge-N]
+#   the 4D LIDAR (Unitree L2, 2026-11-11) starts here too: YOUR driver (4D_lidar's l2_driver, with
+#   4D_lidar/install/.../l2.yaml; only the driver, not the stabilizer) and robot/lidar_bridge.py. The L2
+#   is in serial mode on /dev/serial/by-id/usb-1a86_USB_Single_Serial_593A033327-if00. The driver spins
+#   it up (~25 s from standby to the first cloud) and back to standby at Ctrl-C. Don't run
+#   4D_lidar/scripts/l2.sh at the same time (one driver per L2; terminal 1 says so and leaves it out).
+#   Mount: 111.3 mm above the centre of the arms' bases, 2.8 mm in front: TF openarm_body_link0 ->
+#   l2_lidar FITTED TO THE CAMERA on 2026-11-12 (its cloud laid onto the D455's, the window cleaned;
+#   agreement 30% -> 54%): at (-0.0518, 0.0452, 0.8408) -- 6.7 cm behind, 3.9 cm left of the tape
+#   measure (0.0154, 0.0062, 0.8457) -- blue (the dome) forward and 21 deg below level, red up and
+#   forward leaning left, green to the right: lidar_x:=-0.0518 lidar_y:=0.0452 lidar_z:=0.8408
+#   lidar_pitch:=110.9 lidar_yaw:=-1.3 lidar_spin:=161.3 (spin 180 = red straight up-forward). The software takes that mount as set: it cannot
+#   aim the L2 -- it must physically sit so. (lidar_tilt:=imu
+#   takes the tilt from its accelerometer instead; on 2026-11-12 that read 1.9 g at rest: not trusted.)
+#   ONLY TRUE POINTS are shown and used (RViz "LiDAR L2", "Merged camera + LiDAR", the octomap): none
+#   while the LiDAR fails a check (then the camera alone); none while the L2 reports its WINDOW DIRTY
+#   (chip LIDAR ✕ · dirty window; /lidar/status dirty_pct, limit 15 (wiped it sits at 8-11), held up to 17 so it does not flicker -- 2026-11-12 it was 18%: a shell of
+#   false points 0.3-0.9 m in front of it; clean the dome); never a point the camera sees through.
+#   The driver's raw cloud stays on /l2/cloud.
+#   The CAMERA CHECKS THE MOUNT: the LiDAR's points in the camera's picture must sit at the camera's
+#   depth (30%, 4 cm). Upright or tilted/turned otherwise, they don't: the chip says LIDAR ✕ · mount?
+#   and the walls stay. lidar_spin:= (deg, default 160) turns it about its own Z
+#   (blue in RViz, the dome axis) after the tilt: which side faces where (turned round: +180). Live:
+#   ros2 param set /lidar_bridge mount_spin_deg 161.3 / mount_rpy_deg "[0.0, 110.9, -1.3]" (also mount_xyz). RViz: "LiDAR L2" (/lidar/cloud) and "Merged camera + LiDAR" (/merged_cloud,
+#   coloured); its work-area cloud goes into the octomap with the camera's (sensors_3d.yaml, l2_lidar).
+#   While it works (LIDAR ✓ · walls off) the green walls are off; it stops, is missing or fails the
+#   camera's check: the walls are back at the next capture (--lidar-walls always: walls whatever).
+#   Args: lidar:=serial (default) | udp | off; lidar_port:= ; lidar_x:= lidar_y:= lidar_z:= (m);
+#   lidar_roll:= lidar_pitch:= lidar_yaw:= lidar_spin:= (deg). Its state: ros2 topic echo --once /lidar/status
+#   SINCE 2026-11-13 (robot/lidar_bridge.py; all three on by default, each a parameter):
+#   - self_filter: the robot is never an object. Points on the arms / hands / body (the URDF's
+#     collision shapes at the live TF, body_pad 8 cm for the LiDAR, body_pad_camera 3 cm for the
+#     camera) and anything on the way from the LiDAR to them are out of /lidar/cloud,
+#     /lidar/cloud_work and /merged_cloud. /lidar/status: self_filter ("on"), robot_points.
+#     (MoveIt's own self-filter in sensors_3d.yaml still guards the octomap, 12 cm.)
+#   - camera_first: where the camera has a depth it shows that surface (mm-exact) and the
+#     LiDAR's points there are dropped; the LiDAR stays where the camera cannot see.
+#   - steady_filter: a LiDAR point stays only if its range repeats along its view line over
+#     the last 2 s (steady_min 4 points, at most half as many beyond). /lidar/status: unsteady_pct.
+#   Measured 2026-11-13 with the box 0.9 m away (dirty 17%): 69% of the L2's points in the
+#   camera's view were false; the steady filter keeps 93% of the true and 25% of the false.
+#   The L2 near a big box is a +-3 cm instrument at best: the camera does the picking.
+#   - range_trim: the L2's ranges are a few cm off, the same at 0.6 and 1.0 m but changing with
+#     its window (+1.2 cm at 10% dirty, -2.7 cm at 17%). Where the camera sees the same surface it
+#     is right: once a second the median difference is taken off ALL the LiDAR's ranges (settles in
+#     ~6 s, at most 5 cm). /lidar/status: range_trim_cm (applied), range_left_cm (what is left).
+#   Tests (domain 77): scratchpad trim_test.py (4), selffilter_test.py (5), filter_test.py (8), lidar_test3.py (13).
 
 # AUTOMATIC CALIBRATION (web GUI, Calibrate tab; sheets at http://beast:8080/sheets/calib_box_sheets.pdf
 #   and /sheets/charuco_board.pdf, or: cd app && python3 -m ctm.calib_box):
@@ -27,7 +73,15 @@ native/run_launch_everything.sh   # terminal 1: robot, MoveIt, cuMotion, camera;
 #   copy the joints there, then native/build_ws.sh --packages-select openarm_bimanual_moveit_config
 #   and restart run_launch_everything.sh
 native/run_web_gui.sh             # or: EVERYTHING in one browser page -> http://beast:8080 (from the laptop)
-#   click the picture to pick a point; Move, Detect box, Pick all, Recapture, Return, STOP (Esc)
+#   click the picture to pick a point; Move, Detect box, Recapture, Return, STOP (Esc); Pick all has its own tab
+#   Base correction (Pick and Pick all tabs): for a box it cannot pick, the SHORTEST wheel moves into the zone
+#     where that pick works (from the logs' reach checks) -- TOP 38-47 cm ahead, 2 cm right..6 cm left
+#     (top_near:= top_far:= top_right:= top_left:=), FRONT 44-50 cm, 6..20 cm left; in the zone and still
+#     out of reach: to the zone's middle --
+#     only the moves needed ("move left 12 cm"); the base is never driven from here
+#   Pick all tab, "No base movement" (on by default): a box out of reach is skipped. Off: Pick all stops
+#     at it with an alert (the moves, live as the base moves; also <ns>/base_correction, JSON), and picks
+#     it by itself once the box is in place and the base has stopped; Try now / Skip box in the alert
 #   Bypass (on by default): Detect box picks the box at once when it can be picked -- no Move to press
 #   Pick all: every box in view, one after another (detect, pick, drop, next) -- ONE try per box: a box
 #     it cannot pick, or that the camera says is still in its place, is skipped (flagged when the cup touched
@@ -37,6 +91,8 @@ native/run_web_gui.sh             # or: EVERYTHING in one browser page -> http:/
 #     no reach check), until a round takes none. Once the arm (and the box on the cup) is out of the
 #     camera picture on its way to the drop, it checks the pick and finds + plans the next box meanwhile,
 #     so the arm goes straight on when it is back
+#     Each box's time and the total: the "Pick all" card under the buttons, the log, and
+#     native/logs/pick_all/pick_all_<date_time>.json + .csv; when it ends, a banner + chime + the tab's title
 #   Pick tab: navigation / pre-pick, front / top down, teach, ArUco ext, tool lengths
 #   Advanced tab: Vacuum On / Off by hand (any time; Off drops a box on the cup), box picker settings, typed target
 #   Calibrate tab: live markers with ids, Cal arms, Overlay, Anchor + Refit, camera Calibrate + Apply
@@ -45,8 +101,10 @@ native/run_web_gui.sh             # or: EVERYTHING in one browser page -> http:/
 #            walls_edges:=depth|picture walls_ahead:=0.11  (the green walls where the camera cannot see:
 #            from where the DEPTH ends, 11 cm in front of the nearest thing seen; picture / 0.05 = as before
 #            2026-11-05: more reach at the sides, but objects in the depth-less bands are invisible)
-#            drop_velocity:=0.7 (pre_pick -> drop with the box on, 0..1; was 0.4) correct_speed:=0.04
-#            (the correction moves, m/s; was 0.02) drop_hold:=1.0 (s at the drop, vacuum off)
+#            held_velocity:=0.4 (the way back out beside the boxes with the box on, 0..1)
+#            top_x_offset:=-0.015 (TOP DOWN: goes down 1.5 cm nearer the robot in x, straight ahead; 0 = as measured)
+#            drop_velocity:=0.7 (pre_pick -> drop with the box on, 0..1; was 0.4) correct_speed:=0.02
+#            (the correction moves, m/s; 0.04 was less accurate) drop_hold:=1.0 (s at the drop, vacuum off)
 #            top_faces:=false (the box picker's face rule, box_picker/src/pick_rules.py: a box on a box
 #            by its FRONT, its top only if no front is found -> "TOP ONLY" in the log; true = the larger of
 #            front and top anywhere, as before 2026-11-05; also on the Advanced tab, "Face of a box on a box")

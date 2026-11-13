@@ -4,6 +4,7 @@ retrace) that the touch is built from."""
 
 import collections
 import contextlib
+import json
 import math
 import os
 import re
@@ -32,6 +33,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image, JointState
 from shape_msgs.msg import SolidPrimitive
+from std_msgs.msg import String
 from std_srvs.srv import Empty, Trigger
 from tf2_ros import Buffer, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -187,6 +189,9 @@ class ClickToMove(Node):
         # arm holds now: {arm: {'size': (h, w, d), ...}}
         self.object_size = None
         self.held = {}
+        # the Unitree L2 LiDAR's health (robot/lidar_bridge.py, /lidar/status, latched
+        # JSON): while it works the unseen-space walls are not needed (refresh_walls)
+        self.lidar_status = None          # (dict, monotonic time received)
         cb = ReentrantCallbackGroup()
 
         self.lock = threading.Lock()
@@ -202,6 +207,9 @@ class ClickToMove(Node):
         self.create_subscription(Image, DEPTH_TOPIC, self._on_depth, 2, callback_group=cb)
         self.create_subscription(CameraInfo, INFO_TOPIC, self._on_info, 2, callback_group=cb)
         self.create_subscription(JointState, '/joint_states', self._on_joints, 10,
+                                 callback_group=cb)
+        self.create_subscription(String, '/lidar/status', self._on_lidar_status,
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
                                  callback_group=cb)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.marker_pub = self.create_publisher(MarkerArray, '/click_to_move/marker', latched)
@@ -257,6 +265,18 @@ class ClickToMove(Node):
     def latest(self):
         with self.lock:
             return self.color, self.depth, self.info
+
+    def _on_lidar_status(self, msg):
+        try:
+            self.lidar_status = (json.loads(msg.data), time.monotonic())
+        except ValueError:
+            pass
+
+    def lidar_ok(self, max_age=3.0):
+        """The L2 LiDAR is working: its bridge said so within max_age s (it says
+        it every second: clouds arriving, points in the work area)."""
+        st = self.lidar_status
+        return bool(st and time.monotonic() - st[1] <= max_age and st[0].get('ok'))
 
     def fresh_color(self, timeout=3.0):
         """The next colour frame to arrive after this call, or None."""
@@ -842,6 +862,20 @@ class ClickToMove(Node):
         how many boxes, or None."""
         ahead = walls.AHEAD if ahead is None else float(ahead)
         x_min = walls.X_MIN if x_min is None else float(x_min)
+        # The L2 LiDAR sees round the camera's picture: no walls while it works
+        # (2026-11-11) -- back as soon as it does not (this runs on every capture)
+        self.walls_off = (getattr(self.args, 'lidar_walls', 'auto') == 'auto'
+                          and self.lidar_ok())
+        if self.walls_off:
+            obj = CollisionObject()
+            obj.header.frame_id = BASE_FRAME
+            obj.id = walls.WALL_ID
+            obj.operation = CollisionObject.REMOVE
+            if self.scene_apply.wait_for_service(timeout_sec=5.0):
+                scene = PlanningScene(is_diff=True)
+                scene.world.collision_objects = [obj]
+                self.wait(self.scene_apply.call_async(ApplyPlanningScene.Request(scene=scene)), 5.0)
+            return 0
         _c, _d, info = self.latest()
         t_wo = self.lookup(BASE_FRAME, optical)
         if info is None or t_wo is None or not self.scene_query.wait_for_service(timeout_sec=5.0):

@@ -7,6 +7,8 @@ const ALWAYS = new Set(['stop', 'markers', 'view', 'dummy_size', 'tip_check', 'a
   'right', 'in', 'out', 'confirm', 'abort',
   // the box picker's views and settings: nothing moves
   'depth_view', 'picker_view', 'snapshot_save', 'picker_setting', 'forget_skipped', 'top_faces',
+  // Pick all's base movement setting and its alert: while it runs
+  'no_base_move', 'base_try', 'base_skip',
   // the vacuum by hand: also mid-pick (OFF lets go of the box)
   'vacuum',
   // a setting: may be switched off while DETECT BOX looks (then it waits for MOVE)
@@ -93,6 +95,11 @@ document.addEventListener('click', (e) => {
   }
   if (name === 'order') return act('order', { value: b.dataset.value });
   if (name === 'top_faces') return act('top_faces', { value: b.dataset.value });
+  if (name === 'pick_all') {
+    try {
+      if (window.Notification && Notification.permission === 'default') Notification.requestPermission();
+    } catch (_) { /* in-page only */ }
+  }
   if (name === 'vacuum') {
     if (S && S.vacuum === (b.dataset.value === 'on')) return;
     return act('vacuum', { value: b.dataset.value });
@@ -157,7 +164,8 @@ tabs.forEach((t) => t.addEventListener('click', () => selectTab(t.dataset.tab)))
   const asked = new URLSearchParams(location.search).get('tab');
   let saved = null;
   try { saved = localStorage.getItem('tab'); } catch (_) { /* private window */ }
-  selectTab(['pick', 'calibrate', 'advanced', 'system'].includes(asked) ? asked : saved || 'pick');
+  const names = tabs.map((t) => t.dataset.tab);
+  selectTab(names.includes(asked) ? asked : names.includes(saved) ? saved : 'pick');
 }
 
 $('logToggle').addEventListener('click', () => {
@@ -219,6 +227,23 @@ function render(s) {
   setText($('viewChip'), (s.calib_view ? 'CALIBRATION' : s.view === 'live' ? 'LIVE' : 'CAPTURED') + viewing);
   setText($('fpsChip'), pk.fps == null ? '– fps' : `${Math.round(pk.fps)} fps`);
   $('fpsChip').classList.toggle('warn', pk.fps != null && pk.fps < 5);
+  // the L2 LiDAR: working -> the walls are off; not -> the walls are used
+  const ld = s.lidar;
+  const lc = $('lidarChip');
+  // (looking up: it stands upright and sees nothing below itself -- tilt it down)
+  // (mount?: its points don't sit where the camera sees things -- not mounted as set)
+  const up = !!ld && !ld.ok && /looks up/.test(ld.why || '');
+  const mount = !!ld && !ld.ok && /match the camera|what the camera sees/.test(ld.why || '');
+  // (dirty: the L2 reports its window dirty -- its close points are false, none are shown or used)
+  const dirty = !!ld && !ld.ok && /window is dirty/.test(ld.why || '');
+  setText(lc, !ld ? 'LIDAR –' : ld.ok ? `LIDAR ✓${ld.walls_off ? ' · walls off' : ''}`
+    : up ? 'LIDAR ✕ · looks up · walls on' : dirty ? 'LIDAR ✕ · dirty window · walls on' : mount ? 'LIDAR ✕ · mount? · walls on' : 'LIDAR ✕ · walls on');
+  lc.classList.toggle('warn', !!ld && !ld.ok);
+  lc.title = !ld ? 'No word from the LiDAR bridge (lidar:=off, or terminal 1 not started with it)'
+    : ld.ok ? `The 4D LiDAR works: ${ld.rate_hz} clouds/s, ${ld.reach_points ?? ld.work_points} points where the arms work`
+      + (ld.lean_deg != null ? ` (tilted ${Math.round(ld.lean_deg)}°). ` : '. ')
+      + (ld.walls_off ? 'The green walls are off.' : 'The walls go off at the next capture.')
+    : `The 4D LiDAR is not working (${ld.why || 'no word for ' + ld.age_s + ' s'}): the green walls are used.`;
   setText($('approachChip'), s.top_down ? 'TOP DOWN' : 'FRONT');
   $('haltChip').hidden = !s.halted;
   $('clickChip').hidden = !s.click_only;
@@ -283,6 +308,9 @@ function render(s) {
         : `move ${ba.direction} ${Number(ba.distance_m).toFixed(3)} m - detect again after the move`) : ''));
   }
   renderPicker(s);
+  renderPickAll(s);
+  renderBaseCorrection(s);
+  renderBaseAlert(s);
   const badge = $('targetBadge');
   if (!p) {
     setText(badge, 'none'); badge.dataset.tone = 'idle';
@@ -412,6 +440,207 @@ const pct = (v) => (v == null ? '–' : `${Math.round(v * 100)}%`);
 const cm = (v) => (v == null ? '–' : (v * 100).toFixed(1));
 let closeUpKey = null;
 let historyKey = '';
+
+// -- PICK ALL: each box's time, the total, and "done" -----------------------------------
+
+const BASE_TITLE = document.title;
+let reportSeen;                 // the last report id shown (undefined: page just loaded)
+let audio = null;               // made on a click: browsers only play sound after one
+document.addEventListener('click', () => {
+  try {
+    if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+    if (audio.state === 'suspended') audio.resume();
+  } catch (_) { /* no sound */ }
+}, { capture: true });
+
+function chime(ok) {
+  if (!audio) return;
+  const notes = ok ? [660, 880, 1320] : [520, 390];
+  notes.forEach((f, i) => {
+    const o = audio.createOscillator(), g = audio.createGain(), t = audio.currentTime + i * 0.18;
+    o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.25, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
+    o.connect(g).connect(audio.destination);
+    o.start(t); o.stop(t + 0.17);
+  });
+}
+
+function dur(sec) {
+  if (sec == null) return '–';
+  return sec < 60 ? `${Number(sec).toFixed(1)} s` : `${Math.floor(sec / 60)} min ${Math.round(sec % 60)} s`;
+}
+
+let timesKey = '';
+function renderTimes(picks) {
+  const key = picks.map((p) => p.n + p.result).join(',');
+  if (key === timesKey) return;
+  timesKey = key;
+  const body = $('pickAllTimes').querySelector('tbody');
+  body.innerHTML = '';
+  for (const p of picks) {
+    const tr = document.createElement('tr');
+    const tone = ['picked', 'skipped', 'dropped', 'tried'].includes(p.result) ? p.result : 'bad';
+    const cells = [p.n, p.result, dur(p.seconds), dur(p.cycle), p.at];
+    cells.forEach((v, i) => {
+      const td = document.createElement('td');
+      td.textContent = v;
+      if (i === 1) { td.className = tone; td.title = `${p.outcome || ''}${p.approach ? ' · ' + p.approach : ''}${p.face_mm && p.face_mm.length ? ' · face ' + p.face_mm.join(' x ') + ' mm' : ''}`; }
+      tr.appendChild(td);
+    });
+    body.appendChild(tr);
+  }
+}
+
+function renderPickAll(s) {
+  const run = s.pick_all, rep = s.pick_all_report;
+  const card = $('pickAllCard'), badge = $('pickAllBadge');
+  const state = $('pickAllState');
+  setText(state, s.click_only ? 'no box model' : s.base_wait ? 'waiting for the base'
+    : run ? 'running' : s.busy ? 'busy' : 'ready');
+  state.dataset.tone = s.base_wait ? 'edge' : run ? 'busy' : s.click_only || s.busy ? 'idle' : 'ok';
+  if (run) {
+    card.hidden = false;
+    setText($('pickAllTitle'), 'Pick all · running');
+    setText(badge, dur(run.elapsed_s)); badge.dataset.tone = 'busy';
+    setText($('pickAllSummary'), `${run.picked} picked, ${run.skipped} skipped`
+      + (run.dropped ? `, ${run.dropped} dropped` : '') + (run.pass > 1 ? ` · round ${run.pass}` : ''));
+    renderTimes(run.picks || []);
+    setText($('pickAllFile'), '');
+  } else if (rep) {
+    card.hidden = false;
+    setText($('pickAllTitle'), `Pick all · done ${String(rep.finished).slice(-8)}`);
+    setText(badge, dur(rep.total_s)); badge.dataset.tone = rep.ok ? 'ok' : 'edge';
+    setText($('pickAllSummary'), `${rep.picked} picked, ${rep.skipped} skipped`
+      + (rep.dropped ? `, ${rep.dropped} dropped` : '') + (rep.rounds > 1 ? ` in ${rep.rounds} rounds` : '')
+      + ` · total ${dur(rep.total_s)}` + (rep.per_box_s ? ` · ${dur(rep.per_box_s)} per box picked` : '')
+      + ` · ${rep.why}`);
+    renderTimes(rep.picks || []);
+    setText($('pickAllFile'), rep.file ? `Saved: ${rep.file}` : '');
+  } else {
+    card.hidden = true;
+  }
+  // "done": once per new report -- not for one that was there when the page opened
+  const id = rep ? rep.id : null;
+  if (reportSeen === undefined) { reportSeen = id; return; }
+  if (id != null && id !== reportSeen) {
+    reportSeen = id;
+    const text = `${rep.picked} picked, ${rep.skipped} skipped`
+      + (rep.dropped ? `, ${rep.dropped} dropped` : '') + ` in ${dur(rep.total_s)}`
+      + (rep.per_box_s ? ` (${dur(rep.per_box_s)} per box)` : '') + ` – ${rep.why}`;
+    $('doneBanner').classList.toggle('bad', !rep.ok);
+    setText($('doneTitle'), rep.ok ? 'Pick all done' : 'Pick all stopped');
+    setText($('doneText'), text);
+    $('doneBanner').hidden = false;
+    document.title = (rep.ok ? '✓ Pick all done · ' : '! Pick all stopped · ') + BASE_TITLE;
+    chime(rep.ok);
+    try {                                   // (only where the browser allows it: https / localhost)
+      if (window.Notification && Notification.permission === 'granted') {
+        new Notification(rep.ok ? 'Pick all done' : 'Pick all stopped', { body: text });
+      }
+    } catch (_) { /* in-page only */ }
+  }
+}
+
+// -- the base correction: where the robot should stand for a box it cannot pick ------
+
+const ARROW = { left: '←', right: '→', forward: '↑', back: '↓' };
+const cmText = (m) => `${Math.round(m * 100)} cm`;
+
+function correctionMap(c) {
+  // the robot from above, facing up: its front at the bottom edge; the spot the box
+  // should be in (green), and where the box is (orange). x ahead 0..0.7 m, y +-0.35 m
+  const W = 84, H = 84, k = H / 0.7, cx = W / 2;
+  const px = (y) => cx - y * k, py = (x) => H - x * k;
+  const sp = c.spot;
+  const bx = Math.min(Math.max(px(c.side_m), 6), W - 6), by = Math.min(Math.max(py(c.ahead_m), 6), H - 6);
+  return `<svg class="cmap" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img"
+      aria-label="Top view: the robot at the bottom, the box and where it should be">
+    <rect x="${px(sp.left)}" y="${py(sp.far)}" width="${Math.max((sp.left - sp.right) * k, 5)}"
+      height="${Math.max((sp.far - sp.near) * k, 5)}" rx="2" class="cmap-spot"/>
+    <rect x="${cx - 18}" y="${H - 7}" width="36" height="7" rx="2" class="cmap-robot"/>
+    <line x1="${cx}" y1="${H - 7}" x2="${cx}" y2="3" class="cmap-axis"/>
+    <circle cx="${bx}" cy="${by}" r="4.5" class="cmap-box"/>
+  </svg>`;
+}
+
+function correctionHtml(c, where, noMove) {
+  const top = c.approach === 'top';
+  const moves = c.moves.length
+    ? c.moves.map((m) => `<div class="move"><span class="arrow">${ARROW[m.dir] || '•'}</span>
+        <span class="dir">Move ${m.dir}</span><span class="dist">${cmText(m.m)}</span></div>`).join('')
+    : `<div class="move ok"><span class="arrow">✓</span><span class="dir">In its zone</span></div>`;
+  const side = Math.abs(c.side_m) < 0.005 ? 'centred' : `${cmText(Math.abs(c.side_m))} ${c.side_m > 0 ? 'left' : 'right'}`;
+  const across = (v) => (Math.abs(v) < 0.005 ? 'centre' : `${cmText(Math.abs(v))} ${v > 0 ? 'left' : 'right'}`);
+  const want = `${Math.round(c.spot.near * 100)}–${Math.round(c.spot.far * 100)} cm ahead, `
+    + `${across(c.spot.right)} to ${across(c.spot.left)}`;
+  return `<div class="card-row"><span class="label">Base correction</span>
+      <span class="badge" data-tone="edge">${top ? 'Top' : 'Front'} pick</span></div>
+    <div class="corr">
+      <div class="moves">${moves}</div>
+      ${correctionMap(c)}
+    </div>
+    <div class="why">The box is ${cmText(c.ahead_m)} ahead, ${side}. ${top ? 'Top' : 'Front'} picks work
+      ${want} (green)${c.moves.length ? (c.centre ? '; these moves bring it to the middle of that zone.'
+        : '; these are the shortest moves into it.') : '. It is in that zone already: it cannot be picked for another reason (below).'}</div>
+    <div class="why small">${c.why || ''} · ${c.time}${c.more ? ` · ${c.more} more box${c.more > 1 ? 'es' : ''} out of reach` : ''}
+      · ${noMove ? 'shown only: Pick all does not wait for the base (No base movement)'
+                 : 'Pick all waits for the base to be moved, then picks it'}</div>`;
+}
+
+// Pick all waiting for the base: the alert, until the box is in place (or Skip / STOP)
+let alertShown = false;
+function renderBaseAlert(s) {
+  const w = s.base_wait;
+  setPressed($('tgNoBaseMove'), s.no_base_move);
+  setText($('noBaseMoveHint'), s.no_base_move
+    ? 'A box it cannot reach from here is skipped.'
+    : 'A box it cannot reach: it stops, shows how to move the base, and picks it by itself once the box is in place.');
+  const el = $('baseAlert');
+  if (!w) {
+    if (alertShown) {
+      el.hidden = true; alertShown = false;
+      if (document.title.startsWith('! Move the base')) document.title = BASE_TITLE;
+    }
+    return;
+  }
+  const c = w.correction || {};
+  const moves = c.moves || [];
+  $('baseAlertMoves').innerHTML = moves.length
+    ? moves.map((m) => `<span class="ba-move"><span class="arrow">${ARROW[m.dir] || '•'}</span>${m.dir[0].toUpperCase() + m.dir.slice(1)} <b>${cmText(m.m)}</b></span>`).join('')
+    : '<span class="ba-move ok"><span class="arrow">✓</span>in place</span>';
+  setText($('baseAlertWhy'), `${c.approach === 'top' ? 'Top' : 'Front'} pick · ${c.why || ''}`);
+  setText($('baseAlertNote'), (w.note || '') + (w.checking ? '' : ' · Pick all goes on by itself once the box is in place'));
+  el.classList.toggle('checking', !!w.checking);
+  el.querySelector('[data-action="base_try"]').disabled = !!w.checking;
+  if (!alertShown) {
+    el.hidden = false; alertShown = true;
+    document.title = '! Move the base · ' + BASE_TITLE;
+    chime(false);
+  }
+}
+
+let corrKey = '';
+function renderBaseCorrection(s) {
+  const c = s.base_correction;
+  const key = c ? JSON.stringify(c) + s.no_base_move : '';
+  if (key === corrKey) return;
+  corrKey = key;
+  for (const [id, where] of [['baseCorrPick', 'pick'], ['baseCorrAll', 'all']]) {
+    const el = $(id);
+    el.hidden = !c;
+    el.innerHTML = c ? correctionHtml(c, where, s.no_base_move) : '';
+  }
+}
+
+$('doneClose').addEventListener('click', () => {
+  $('doneBanner').hidden = true;
+  document.title = BASE_TITLE;
+});
+window.addEventListener('focus', () => {
+  if ($('doneBanner').hidden) document.title = BASE_TITLE;
+});
 
 function renderPicker(s) {
   const pk = s.picker || {};

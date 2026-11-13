@@ -7,20 +7,20 @@ This is the short version: how to install it, check it with the camera, and conn
 One program, `src/pick_loop.py`, owns the camera (Intel RealSense D455) and does two jobs:
 
 1. **Before each pick:** chooses the next box and says where to grip it (x, y, z in metres, camera coordinates) and from which side (`front` or `top`).
-2. **After each pick:** checks whether the pick worked, meaning whether the box is gone from its place.
+2. **During each pick:** watches it on every camera frame and says whether it worked: picked, or missed, moved, or dropped (lifted, then fell back into the carton).
 
-The robot does the picking and says when it is finished (`done`). The program never moves the robot.
+The robot does the picking. It doesn't have to report anything: the camera sees when the pick is over. The program never moves the robot.
 
 ```
  pick_loop                                   robot
  ─────────                                   ─────
- 5 frames → target ── {"event": "target"} ──► pick the box, move the arm out of view
-                    ◄──────── done ─────────
- 3 frames → check ─── {"event": "result"} ──► picked: true  → wait for the next target
+ 5 frames → target ── {"event": "target"} ──► pick the box, carry it out of the picture
+ every frame: watch ─ {"event": "result"} ──► picked: true  → wait for the next target
                                               picked: false → wait for the next target (usually the same box: a retry)
-                                              picked: null  → clear the view, send done again (after 3 in a row: a new target)
- after 3 failed tries on one box ── {"event": "flag"} with photos ──► tell a person; the box is skipped
+ after 3 failed tries on one box ── {"event": "flag"} with photos ──► tell a person; the box is still tried
 ```
+
+New in this version: the robot no longer sends `done`, and a box that falls back into the carton is caught (`dropped`).
 
 ## 1. Requirements
 
@@ -35,10 +35,10 @@ The robot does the picking and says when it is finished (`done`). The program ne
 ## 2. Install (once)
 
 ```bash
-unzip box_picker_for_robot.zip
+unzip box_picker_for_robot_v2.zip
 cd box_picker/src
 ./setup.sh                      # makes src/.venv (Python 3.11) and downloads the model, 10-20 min
-.venv/bin/python test_faces.py  # should end with "46/46 passed"
+.venv/bin/python test_faces.py  # should end with "48/48 passed"
 ```
 
 ## 3. Check it with the camera (no robot yet)
@@ -52,16 +52,20 @@ cd box_picker/src
 
 A window opens. After ~10 s (the model loads, then the first 5 frames) it shows the face to pick on the chosen box framed in red, with a red cross on the grip point. The panel on the right shows a close-up, the position in cm and the try number.
 
-1. Take that box away by hand, and keep your hand out of view.
-2. Press **C**. This stands in for the robot's `done`.
-3. The window shows **PICK SUCCESS**. A few seconds later the next box is chosen.
-4. Press C **without** taking the box. The window shows **PICK FAILED: MISSED**, and the same box is chosen again ("try 2").
-5. After 3 failed tries a **FLAG** is shown and the box is skipped.
+Stand in for the robot with your hand. The panel shows what the check sees (`waiting for the arm`, `arm in view`, `box left its spot, arm still in view`...).
 
-Keys: **C** check now (= `done`), **T** next target (pass over this box and every box under it), **S** save a snapshot, **A** the Advanced tab, **Q** quit.
-The Advanced tab (buttons can be clicked too): **D** depth picture, **V** the picker's overlay of every box, **S** save a snapshot, **O** order v1 / v2, **N** choose again with new frames, **R** forget the skipped boxes, and − / + for **Frames per target** (5), **SAM confidence** (0.40) and **Frames per pick success** (3). On the command line: `--frames`, `--score`, `--check-frames`.
+1. Reach in, take that box out of the carton, and take your hand (with the box) out of the picture.
+2. About 1 s later the window shows **PICK SUCCESS**. A few seconds later the next box is chosen.
+3. Reach in and touch the box **without** taking it, then take your hand out. The window shows **PICK FAILED: MISSED**, and the same box is chosen again ("try 2").
+4. Lift the box and **drop it back** into the carton, then take your hand out. The window shows **PICK FAILED: DROPPED**, with where it fell outlined, and that box is chosen again.
+5. After 3 failed tries a **FLAG** is shown (once), and the same box is tried again (try 4, 5, …).
 
-The Pick tab also shows how long the target took: `found in 2.9 s · pictures 0.4 s · picker 2.5 s`. The result screen shows how many frames the pick check used.
+Don't put anything else into the carton while a pick is watched: it would read as a dropped box.
+
+Keys: **T** next target (pass over this box and every box under it), **S** save a snapshot, **A** the Advanced tab, **Q** quit.
+The Advanced tab (buttons can be clicked too): **D** depth picture, **V** the picker's overlay of every box, **S** save a snapshot, **O** order v1 / v2, **F** top faces on / off, **N** choose again with new frames, **R** forget the boxes passed over with T, and − / + for **Frames per target** (5) and **SAM confidence** (0.40). On the command line: `--frames`, `--score`.
+
+The Pick tab also shows how long the target took: `found in 2.9 s · pictures 0.4 s · picker 2.5 s`. The result screen shows how long the pick took.
 
 **Camera tilt.** With the camera on USB, leave out `--pitch`: the camera's motion sensor gives its real tilt. That matters: 1° wrong moves a top's front-to-back size 5–6 mm (a 100 mm top read as 109). If the start-up says `no accelerometer reading`, install the RealSense USB rules once:
 
@@ -118,12 +122,11 @@ Run it without the window:
 | Event | Means | Robot does |
 |---|---|---|
 | `{"event": "ready", ...}` | model and camera are up (~10 s after start) | wait for the first target |
-| `{"event": "target", "pick": 1, "attempt": 1, "target": {...}}` | pick this box (`attempt` 2 or 3 = a retry on the same box) | convert to robot coordinates, pick it, move the arm out of view, then send `done` |
-| `{"event": "result", "picked": true, "verdict": {...}}` | the box is gone: the pick worked (`outcome` `success`, or `replaced`: another box slid into its place) | wait for the next `target` |
-| `{"event": "result", "picked": false, ...}` | the box is still there, or was pushed or dropped (`verdict.outcome` says which) | wait for the next `target` |
-| `{"event": "result", "picked": null, ...}` | can't tell (an arm or hand still in view, or something new appeared) | clear the view, send `done` again. After 3 in a row a new `target` comes instead |
-| `{"event": "flag", "reason": "...", "photo": "...", "crop": "...", "check_photo": "..."}` | 3 tries on one box failed. The box is skipped, and the next box comes as a normal `target` | tell a person; the three photos show the box |
-| `{"event": "no_target", "skipped": 0}` | no box to pick: empty, or only skipped boxes left (`skipped` > 0), or boxes it can't see well enough. It looks again every 3 s | stop, or wait. If `skipped` > 0 and a person has dealt with the flagged box, send `reset` |
+| `{"event": "target", "pick": 1, "attempt": 1, "target": {...}}` | pick this box (`attempt` 2 or 3 = a retry on the same box) | convert to robot coordinates, pick it, carry it out of the picture |
+| `{"event": "result", "picked": true, "verdict": {"outcome": "picked", ...}}` | the box left its spot and the arm has carried it out of view: the pick worked | wait for the next `target` |
+| `{"event": "result", "picked": false, ...}` | `verdict.outcome`: `missed` (still there), `moved` (knocked or dragged) or `dropped` (fell back into the carton) | wait for the next `target` (usually the same box) |
+| `{"event": "flag", "reason": "...", "photo": "...", "crop": "...", "check_photo": "..."}` | 3 tries on one box failed (sent once per box). The box is **not** skipped: it comes again as the next `target` | tell a person; the three photos show the box |
+| `{"event": "no_target"}` | no box to pick: empty, or boxes it can't see well enough. It looks again every 3 s | stop, or wait |
 
 The `target` dictionary:
 
@@ -143,10 +146,8 @@ The `target` dictionary:
 
 | Line | Means |
 |---|---|
-| `done` | the pick is over and the arm is out of view: check it now |
-| `done held` / `done empty` | the same, plus what the gripper reports, if it can tell. A box that left its place but isn't in the gripper then reads as `dropped` |
-| `pick` | choose a new box now |
-| `reset` | forget the skipped boxes |
+| `pick` | choose a new box now (e.g. the robot can't reach this one; otherwise the loop keeps watching it) |
+| `reset` | forget the boxes passed over with T |
 | `quit` | close the camera and exit |
 
 ### Example: driving it from the robot's Python (any version, standard library only)
@@ -165,11 +166,9 @@ def send(line):
 for line in loop.stdout:                      # one event per line
     e = json.loads(line)
     if e["event"] == "target":
-        robot_pick(e["target"])               # yours: convert, pick, move the arm out of view
-        send("done")
-    elif e["event"] == "result" and e["picked"] is None:
-        clear_view()                          # yours: something was in the way
-        send("done")
+        robot_pick(e["target"])               # yours: convert, pick, carry the box out of the picture
+    elif e["event"] == "result":
+        log(e["picked"], e["verdict"]["outcome"])           # picked / missed / moved / dropped; a retry comes as the next target
     elif e["event"] == "flag":
         notify_person(e["reason"], e["photo"], e["crop"])    # yours
     elif e["event"] == "no_target":
@@ -183,16 +182,18 @@ A ROS 2 node can run the same code: the program runs in its own Python 3.11, so 
 
 | Rule | Why |
 |---|---|
-| **The robot base doesn't move** from the `target` event until the `result` event | the check compares the picture before and after pixel by pixel |
-| **Send `done` only when the arm and the held box are out of view** | anything in front of the boxes spoils the check (`picked: null`) |
+| **The robot base doesn't move** from the `target` event until the `result` event | the check compares the depth pixel by pixel with the picture from before the pick |
+| **After the pick, carry the box out of the picture** | `picked` comes once nothing new stays in view; an arm that parks in view delays it up to 10 s |
+| **Nothing is put into the carton during a pick** (by hand, or a second box pulled along and let go) | it looks exactly like a dropped box. If the gripper's vacuum sensor says the box is held, trust the sensor |
 | **Keep the arm out of view until the next `target` arrives** (about 3 s after `result`) | the next box is chosen from new frames, and a box in the gripper would be seen as a box |
+| **`pick_loop.py` gets every camera frame** (don't run another program on the camera) | the check counts frames (5 for a steady state, 10 for a clear view or a drop) |
 | **The camera doesn't move on the robot**, and its tilt is known (motion sensor over USB, else `--pitch`) | sets "up", which decides front vs top and "on top of" |
 | **Boxes about 0.4–0.6 m from the camera** (what was tested) | closer than ~0.4 m the camera gives no depth; further away, more noise |
 
 ## 6. What it saves
 
 Everything goes under `src/outputs/pick_loop/<date_time>/`:
-- `pick_NN/`: the frames before and after each try, `picker.jpg` (the chosen box) and `check.jpg` (the verdict, drawn on the picture)
+- `pick_NN/`: the frames before each try and the frame the result was decided on, `picker.jpg` (the chosen box) and `check.jpg` (the verdict, drawn on the picture; for `dropped`, where the box fell)
 - `flags/flag_NN_{target,crop,check}.jpg`: the photos of each flag
 - `events.jsonl`: every event sent
 
@@ -203,19 +204,18 @@ Everything goes under `src/outputs/pick_loop/<date_time>/`:
 | `Device or resource busy` / `Frame didn't arrive` | another program has the camera: close it. The program also resets the camera once by itself |
 | `no accelerometer reading (... Permission denied)` | the camera is taken as level, so tops can be measured ~1 cm off: install the RealSense USB rules (section 3), or give `--pitch` |
 | `CUDA out of memory` | another program is using the GPU |
-| `picked: null` again and again | something stays in view after `done` (arm, cable, hand, or a box put back), or the camera moved. After 3 in a row it chooses again |
+| `dropped` though the box was taken | something new appeared in the carton during the pick (a hand, a box put back, a neighbour that fell over and stayed). Look at `check.jpg`: the outline shows where. The settings are at the top of `src/pick_watch.py` (INTEGRATION.md, "Tuning") |
+| `picked` comes late, or only after 10 s | the arm (or a cable) stays at the picture's edge after the pick: move it out of view |
+| no result at all after a `target` | the robot didn't reach into the picture (nothing was seen to happen). Send `pick` to choose again |
 | `no colour + depth pair in 5 s` with `--ros` | frames lost on the network: the `sysctl` lines in section 3b |
 | a box at the far left or right isn't picked | the camera gives no depth in a band at each side (black in the depth picture, D). Move the robot so the box is further in |
-| `no_target` but a box is still there | 1. `skipped` > 0: that box (or one in its place) was flagged earlier. Skipped boxes are remembered by their place in the picture until `reset` (R in the window) or a restart. 2. A box standing with its **narrow end** (~2 cm) towards the camera is sometimes not found as pickable: turn it so a wider face shows, or send `pick` to look again. |
-| the same box flagged often | look at the flag photos: a box the gripper can't hold, or two boxes pressed together seen as one (split automatically only when at least 3 other boxes of that size are in view) |
+| `no_target` but a box is still there | A box standing with its **narrow end** (~2 cm) towards the camera is sometimes not found as pickable: turn it so a wider face shows, or send `pick` to look again. |
+| the same box flagged, then tried again and again | look at the flag photos: a box the gripper can't hold, or two boxes pressed together seen as one (split automatically only when at least 3 other boxes of that size are in view) |
 
 ## Status
 
-- Tested on recordings, with saved frames standing in for the camera:
-  - box taken → success, next box
-  - box never taken → 3 tries, flag with photos, next box
-  - can't tell → checked again on the next `done`
-- Run live with the D455 and a person in place of the robot (C for `done`): taken / missed / flag / moved, merged boxes split, the carton's rim ignored.
+- The pick check (the camera watches): the Pick Check team's 34 tests on synthetic scenes pass (picked, missed, dropped elsewhere and onto its own spot, the arm staying in view, a neighbour sliding into the gap). A recording of hand picks run through `pick_loop.py`: 3 picked, 1 dropped (a person put boxes in during the pick), each followed by the next target. **Not yet run live: try section 3, including a deliberate drop, before the robot.**
+- The earlier check (the robot said `done`) was run live with the D455 and a person in place of the robot: taken / missed / flag / moved, merged boxes split, the carton's rim ignored. The picking side is unchanged.
 - Run live over ROS 2, the camera on another machine over Wi-Fi.
 - The picker has been tested live with the D455. Sizes checked with ArUco markers and 170 × 100 × 25 boxes (3 Nov): fronts 169–172 × 98–107, tops 167–170 × 96–101 with the motion sensor's tilt.
 - **The full loop has not yet been run with real robot picks.** Please keep the `outputs/` folder of the first runs: it shows what the camera saw and decided at each step.

@@ -12,15 +12,24 @@ Now there are three ways in, and the button is still one of them:
     ros2 service call /octomap_gater/refresh std_srvs/srv/Trigger
     ros2 topic pub --once /octomap_gater/allow_frames std_msgs/Int32 "{data: 5}"
     the Refresh button, when a display is available
+
+The Unitree L2 LiDAR (2026-11-11): each refresh also collects its work-area
+clouds (/lidar/cloud_work, robot/lidar_bridge.py) for lidar_window seconds after
+the call -- only clouds from after it: an older one could still have the arm in
+it -- and passes them on as one cloud to /lidar/cloud_octomap, which MoveIt's
+point-cloud updater (sensors_3d.yaml, l2_lidar) turns into voxels. No LiDAR: no
+clouds, nothing passed, the camera's frames as before.
 """
 
 import os
 import threading
+import time
 
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import Int32
 from std_srvs.srv import Trigger
 
@@ -30,6 +39,7 @@ class OctomapGater(Node):
     def __init__(self):
         super().__init__('octomap_gater')
         self.declare_parameter('default_frames', 3)
+        self.declare_parameter('lidar_window', 0.8)
 
         cb = ReentrantCallbackGroup()
         self.subscription = self.create_subscription(
@@ -45,6 +55,14 @@ class OctomapGater(Node):
 
         self.frames_to_pass = 0
         self.lock = threading.Lock()
+        # the LiDAR: its work-area clouds collected during a refresh, then one cloud
+        self.create_subscription(
+            PointCloud2, '/lidar/cloud_work', self.lidar_callback,
+            QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT), callback_group=cb)
+        self.lidar_publisher = self.create_publisher(PointCloud2, '/lidar/cloud_octomap', 5)
+        self.lidar_until = None
+        self.lidar_parts = []
+        self.create_timer(0.05, self.lidar_flush, callback_group=cb)
 
         self.get_logger().info(
             'octomap gater started; call /octomap_gater/refresh to update the map')
@@ -57,10 +75,29 @@ class OctomapGater(Node):
                 if self.frames_to_pass == 0:
                     self.get_logger().info('frames sent; octomap is static again')
 
+    def lidar_callback(self, msg):
+        with self.lock:
+            if self.lidar_until is not None and time.monotonic() < self.lidar_until:
+                self.lidar_parts.append(msg)
+
+    def lidar_flush(self):
+        """Once the window is over: the clouds of it, as one, to the octomap."""
+        with self.lock:
+            if self.lidar_until is None or time.monotonic() < self.lidar_until:
+                return
+            parts, self.lidar_parts, self.lidar_until = self.lidar_parts, [], None
+        merged = merge_clouds(parts)
+        if merged is not None:
+            self.lidar_publisher.publish(merged)
+            self.get_logger().info(f'LiDAR: {len(parts)} clouds, {merged.width} points passed '
+                                   f'to the octomap')
+
     def allow_frames(self, num_frames=3):
         with self.lock:
             self.frames_to_pass = max(1, int(num_frames))
             count = self.frames_to_pass
+            self.lidar_until = time.monotonic() + float(self.get_parameter('lidar_window').value)
+            self.lidar_parts = []
         self.get_logger().info(f'passing the next {count} frames to the octomap')
         return count
 
@@ -72,6 +109,28 @@ class OctomapGater(Node):
 
     def allow_frames_callback(self, msg):
         self.allow_frames(msg.data)
+
+
+def merge_clouds(parts):
+    """One PointCloud2 of several of the same layout and frame (the LiDAR's, the
+    robot standing still); the newest one's stamp. None if there are none."""
+    parts = [m for m in parts if m.width * m.height > 0]
+    if not parts:
+        return None
+    first = parts[-1]
+    same = [m for m in parts if m.point_step == first.point_step
+            and m.header.frame_id == first.header.frame_id
+            and [f.name for f in m.fields] == [f.name for f in first.fields]]
+    out = PointCloud2()
+    out.header = first.header
+    out.fields, out.is_bigendian = first.fields, first.is_bigendian
+    out.point_step = first.point_step
+    out.height = 1
+    out.width = sum(m.width * m.height for m in same)
+    out.row_step = out.point_step * out.width
+    out.is_dense = all(m.is_dense for m in same)
+    out.data = b''.join(bytes(m.data) for m in same)
+    return out
 
 
 def run_gui(node):

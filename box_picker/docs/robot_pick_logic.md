@@ -46,7 +46,7 @@ result = detector.detect_frames([(color, depth_m), ...], intr, UP)
 | `intr` | the colour camera's intrinsics (`faces.Intrinsics(fx, fy, cx, cy)`) |
 | `UP` | which way is up, in camera coordinates. The camera is fixed and doesn't tilt, so this never changes |
 
-`rgbd.Camera` in [`src/rgbd.py`](../src/rgbd.py) gives aligned frames and intrinsics straight from the D455, if the vision PC owns the camera. Frames from elsewhere (ROS topic, files) work too: `detect_frames` only needs the arrays. For a robot program in another Python or language, use `src/pick_server.py` ([INTEGRATION.md](../INTEGRATION.md)).
+`rgbd.Camera` in [`src/rgbd.py`](../src/rgbd.py) gives aligned frames and intrinsics straight from the D455, if the vision PC owns the camera. Frames from elsewhere (ROS topic, files) work too: `detect_frames` only needs the arrays. For a robot program in another Python or language, use `src/pick_loop.py` ([INTEGRATION.md](../INTEGRATION.md)).
 
 **Time:** about 0.3–1 s per frame, more with more boxes in view (SAM 3.1 about 0.25–0.5 s, depth 0.05–0.7 s). 5 frames ≈ 2–5 s.
 
@@ -79,15 +79,18 @@ result = detector.detect_frames([(color, depth_m), ...], intr, UP)
 
 ## Pick, check, next
 
-After each pick the camera checks whether the box was really taken (the **pick check**, by the Pick Check team), with no second run of SAM: it compares the depth inside the target's outline before the pick (the median of the 5 frames the target came from) and after (3 new frames, when the robot says `done`). Then:
+While the robot picks, the camera watches (the **pick check**, by the Pick Check team: [`pick_watch.py`](../src/pick_watch.py)), with no second run of SAM and no message from the robot. Every camera frame, the depth on the target's pick face is compared with the face's plane: something in front of it (the arm), the face still there, or the face gone (the camera sees past it). Once the box has left its spot, the whole view is compared with the depth from before the pick, until it settles:
 
-| Check says | Next |
-|---|---|
-| success | the next box |
-| failed (missed, moved, dropped, wrong box) | pick again: usually the same box (a retry). After 2 retries on the same box a **flag** is raised for a person, with photos of the box (the scene with it marked, a close-up, the last check), and the box is **skipped**: never chosen again (until `reset`), but it still blocks the boxes behind and under it |
-| can't tell (an arm or hand still in view) | wait for the next `done` and check again; after 3 in a row (something new stays in view), new pictures and a new choice |
+| Check says | When | Next |
+|---|---|---|
+| `picked` | the box left its spot and nothing new stays in view: the arm has carried it out of the picture (about 1 s after it leaves; at most 10 s if the arm stays in view) | the next box |
+| `dropped` | the box left its spot, then a new surface stands still in the carton, not touching the picture's edge: the box fell back in (anywhere, also onto its own spot) | pick again (a retry); the box is looked for where it fell |
+| `missed` | the arm came and went, the box is still on its spot | pick again: usually the same box (a retry) |
+| `moved` | the arm came and went, the box is neither there nor gone: knocked or dragged | pick again |
 
-The camera only says which box and whether the pick worked; when the pick is over is the robot's to say (`done`). All of this runs in one program, [`pick_loop.py`](../src/pick_loop.py), which owns the camera. The robot base must not move between the target and the check.
+After 2 retries on the same box a **flag** is raised for a person, once, with photos of the box (the scene with it marked, a close-up, the last check). The box is **not skipped**: it is tried again (try 4, 5, …) as long as the picker chooses it.
+
+The camera only says which box and whether the pick worked; the robot never has to report. All of this runs in one program, [`pick_loop.py`](../src/pick_loop.py), which owns the camera and must get every camera frame (30 a second over USB). The robot base must not move between the target and the result.
 
 ## How the target is chosen
 

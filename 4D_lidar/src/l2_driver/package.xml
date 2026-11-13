@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>l2_driver</name>
+  <version>1.0.0</version>
+  <description>
+    Unitree L2 4D LiDAR driver with hardware-timestamp synchronisation: device clock to host
+    clock mapping (lower envelope on CLOCK_MONOTONIC_RAW), sequence-counter timeline guard,
+    IMU sample regularisation, burst-free dedicated reader thread, timing diagnostics.
+  </description>
+  <maintainer email="user@example.com">l2</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>tf2_ros</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

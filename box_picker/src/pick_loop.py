@@ -12,40 +12,53 @@ worked (the box is gone from its place). When the pick happens is the robot's: i
                successful?
                success          -> 1, the next box
                failed           -> 1 again: the picker chooses again (usually the same box, a retry).
-                                   After 1 + --retries tries on the same box it is skipped: left out
-                                   of the picker's choice from then on (it still blocks the boxes
-                                   behind and under it), a FLAG is raised with photos of the box for
-                                   a person, and the next box is taken.
+                                   After 1 + --retries failed tries on the same box a FLAG is raised,
+                                   once, with photos of the box for a person; the box is not skipped:
+                                   it is tried again for as long as the picker chooses it.
                can't tell       -> 2 again (an arm or hand still in view: the robot clears the view
                                    and says "done" again). After CANT_TELL of them in a row (something
                                    new stays in view), back to 1: new frames, the target chosen again.
-    No target (empty, or only skipped boxes and the ones they block): the picker tries again every
-    few seconds. "reset" forgets the skipped boxes.
+    No target (empty, or only boxes passed over with T): the picker tries again every few seconds.
+    "reset" forgets the boxes passed over.
 
-The pick check's code (pick_check.py, and pick_and_check.py for drawing) belongs to the Pick Check
-team and is used
-unchanged: here, from ../../Pick Check/ (or this folder, in the robot package).
+Check v2 (--check v2, or W in the window): steps 2 and 3 are done by the camera, as in the Pick
+Check team's box_picking_integration (pick_watch.py, their pick_check.py renamed). No "done" is
+needed: from the frame the target came from, every camera frame is compared with the target's
+face (arm in view, box still there, box gone), and once the box has left its spot, the whole
+view: picked once nothing new stays in view (the arm has carried the box out of the picture);
+dropped if a new surface stands still in the carton (the box fell back in); missed (the arm came
+and went, the box is still there) or moved (knocked or dragged). Anything but picked is a failed
+try, retried as in v1 (also when the box chosen is where the dropped one fell). Needs every frame
+at the camera's rate (30 fps). "picked" comes later than in v1: once the arm has left the view
+(at most SETTLE_FRAMES, 10 s, if it stays in view).
+
+Check v1's code (pick_check.py, pick_and_check.py) belongs to the Pick Check team and is used
+unchanged: from this folder, else from ../../Pick Check/. Without it (the v2 robot package) only
+check v2 is there, and it is the default.
 
 stdin, one line at a time (the robot, or you):
     done | done held | done empty   the pick is over, the arm out of view: check it (held / empty: what
-                                    the gripper says, so a box that left its place but isn't held is "dropped")
+                                    the gripper says, so a box that left its place but isn't held is "dropped").
+                                    Check v2: not needed, ignored
     pick                            choose a new target now
-    reset                           forget the skipped boxes
+    reset                           forget the boxes passed over (T)
     quit
 stdout carries only JSON events, one a line; everything else goes to stderr:
     {"event": "ready", ...}
     {"event": "target", "pick": n, "attempt": k, "target": {...}}     go and pick it (attempt k on this box)
     {"event": "result", "pick": n, "attempt": k, "picked": true / false / null, "verdict": {...}}
+                                     check v2: "verdict": {"check": "v2", "outcome": "picked" / "missed" /
+                                     "moved" / "dropped", "success": ..., "seconds": ..., "shift_mm": ...}
     {"event": "flag", "pick": n, "reason": "...", "outcomes": [...], "target": {...},
      "photo": ".../target.jpg", "crop": ".../crop.jpg", "check_photo": ".../check.jpg"}
-                                     given up on this box after k tries: it is skipped. photo: the scene
-                                     with the target marked; crop: the box close up; check_photo: why
-                                     the last try failed
+                                     this box failed k tries; it is still tried (once per box). photo: the
+                                     scene with the target marked; crop: the box close up; check_photo:
+                                     why the last try failed
     {"event": "flag", "pick": n, "reason": "top face only", "target": {...}, "photo": ..., "crop": ...}
                                      a box on another box with no front found, only its top: the
                                      target is that top (pick_rules.py, a last resort). The robot
                                      still picks it; this tells a person. Once per box.
-    {"event": "no_target", "pick": n, "skipped": m}
+    {"event": "no_target", "pick": n}
 
 Keys in the window (for testing without the robot), also buttons on the panel's two tabs:
     PICK       C = "done" (check now), T next target (pass over this box until the next successful
@@ -53,7 +66,8 @@ Keys in the window (for testing without the robot), also buttons on the panel's 
     ADVANCED   D depth picture, V the picker's view (all boxes and faces), S save colour + depth
                (snapshots/), O order v1 / v2 (looks again), F top faces on / off (looks again; on:
                tops anywhere, off: tops only for boxes on the base, pick_rules.py), N new target now (new frames),
-               R forget the skipped boxes, − / + frames per target, SAM confidence (--score) and
+               R forget the boxes passed over, W check v1 (robot says done) / v2 (camera watches; looks
+               again), − / + frames per target, SAM confidence (--score) and
                frames per pick success (from the next one on)
 
 Usage (from this folder):
@@ -61,6 +75,7 @@ Usage (from this folder):
     .venv/bin/python pick_loop.py --pitch 0                  # with a window (C stands in for the robot's "done")
     .venv/bin/python pick_loop.py --ros                      # camera over ROS 2 (ros_bridge.py; tilt from its accel topic)
     .venv/bin/python pick_loop.py --ros --top-faces          # tops anywhere, as before 5 Nov (pick_rules.py)
+    .venv/bin/python pick_loop.py --ros --check v2           # the camera watches each pick, no "done" (pick_watch.py)
     -> outputs/pick_loop/<session>/pick_NN/{before_*, after_*, picker.jpg, check.jpg}, events.jsonl,
        flags/flag_NN_{target,crop,check}.jpg, flags/toponly_NN_{target,crop}.jpg
 """
@@ -76,20 +91,29 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# Check v1 (Pick Check's pick_check.py): from this folder, else from ../../Pick Check/ in the repository.
+# Without it (the v2 robot package) only check v2 is there.
+sys.path.append(str(Path(__file__).resolve().parents[2] / "Pick Check"))
 try:
     import pick_check as pc
-except ImportError:                       # in the repository, the check lives in Pick Check/
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "Pick Check"))
-    import pick_check as pc
-from pick_and_check import PICKED, RESULT_S, pc_outline
+    from pick_and_check import PICKED
+except ImportError:
+    pc, PICKED = None, {}
 
 import loop_screen as ui
+import pick_watch as pw
 
-RETRIES = 2              # a box that still isn't picked after this many retries is skipped
+RETRIES = 2              # a box that still isn't picked after this many retries is flagged (and still tried)
+RESULT_S = 3.0           # a result stays on screen this long before the next target
 # The ADVANCED tab's - / + settings: label, lowest, highest, step
 FRAMES = {"frames": ("Frames per target", 1, 15, 1), "check_frames": ("Frames per pick success", 1, 10, 1),
           "score": ("SAM confidence", 0.2, 0.9, 0.05)}
 CANT_TELL = 3            # this many "can't tell" in a row for one pick: choose the target again
+# Check v2 (pick_watch.py, the camera watches the pick): title, why, colour (BGR) of each result
+V2_RESULT = {"picked": ("PICK SUCCESS", "the box left its spot and the camera's view", (0, 200, 0)),
+             "missed": ("PICK FAILED: MISSED", "the arm came and went, the box is still there", (0, 0, 255)),
+             "moved": ("PICK FAILED: BOX MOVED", "the box was knocked or dragged, not picked", (0, 0, 255)),
+             "dropped": ("PICK FAILED: DROPPED", "the box was lifted but fell back into the carton", (0, 0, 255))}
 WINDOW = "pick loop"
 
 
@@ -106,6 +130,41 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+class Target:
+    """What the loop keeps of a target (check v2; check v1 keeps pick_check.Before, which has these too)."""
+    def __init__(self, colour, target, result):
+        self.colour, self.target, self.result = colour, target, result   # BGR; bool HxW outline; the picker's answer
+
+
+def remember(detector, frames, result):
+    """Right after detector.detect_frames(frames, ...): the target to keep, or None (no target)."""
+    if pc is not None:
+        return pc.remember(detector, frames, result)
+    if result is None or detector.last is None or detector.last[2] is None:
+        return None
+    _, boxes, t = detector.last
+    return Target(frames[detector.best_frame][0].copy(), boxes[t].mask.copy(), result)
+
+
+def same_target(previous, new):
+    """The picker's next answer is the box it was just sent to (same approach, within SAME_TARGET_M):
+    the last pick didn't take it."""
+    if previous is None or new is None or previous["approach"] != new["approach"]:
+        return False
+    from pick_frame import SAME_TARGET_M
+    xyz = lambda r: np.array([r["x_m"], r["y_m"], r["z_m"]])
+    return bool(np.linalg.norm(xyz(previous) - xyz(new)) <= SAME_TARGET_M)
+
+
+def outline(img, before):
+    """img with the target's outline and centre."""
+    img = img.copy()
+    contours, _ = cv2.findContours(before.target.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(img, contours, -1, (0, 255, 255), 2)
+    cv2.drawMarker(img, (int(before.result["u"]), int(before.result["v"])), (0, 0, 255), cv2.MARKER_CROSS, 24, 2)
+    return img
+
+
 def raise_flag(session, n, picker_img, before, check_img=None, name="flag"):
     """Photos for a person, of a box given up on (or picked by its top only): the scene with the
     target marked (the picker's overlay), the box close up, and the last check (why it failed;
@@ -115,7 +174,7 @@ def raise_flag(session, n, picker_img, before, check_img=None, name="flag"):
     ys, xs = np.nonzero(before.target)
     pad = 40
     h, w = before.target.shape
-    crop = pc_outline(before.colour, before)[max(ys.min() - pad, 0):min(ys.max() + pad, h),
+    crop = outline(before.colour, before)[max(ys.min() - pad, 0):min(ys.max() + pad, h),
                                              max(xs.min() - pad, 0):min(xs.max() + pad, w)]
     paths = {"photo": d / f"{name}_{n:02d}_target.jpg", "crop": d / f"{name}_{n:02d}_crop.jpg"}
     if check_img is not None:
@@ -124,6 +183,28 @@ def raise_flag(session, n, picker_img, before, check_img=None, name="flag"):
         if key in paths:
             cv2.imwrite(str(paths[key]), img)
     return {k: str(v) for k, v in paths.items()}
+
+
+def result_text(verdict):
+    """(title, why, colour) of a check's verdict, v1 (pick_check.check) or v2 (pick_watch)."""
+    return V2_RESULT[verdict["outcome"]] if verdict.get("check") == "v2" else pc.RESULT[verdict["outcome"]]
+
+
+def watch_image(colour, watcher, outcome):
+    """Check v2's picture: the target's pick face, and for "dropped" where the box fell, in the
+    result's colour, with the result in large letters at the bottom."""
+    title, why, col = V2_RESULT[outcome]
+    img = colour.copy()
+    cv2.polylines(img, [np.round(watcher.corners_px).astype(np.int32)], True, col, 4)
+    if outcome == "dropped" and watcher.drop is not None:
+        fell = cv2.resize(watcher.drop.astype(np.uint8), (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+        cv2.drawContours(img, cv2.findContours(fell, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0], -1,
+                         pw.RESULT_COLORS["dropped"], 3)
+    h = img.shape[0]
+    cv2.rectangle(img, (0, h - 110), (img.shape[1], h), col, -1)
+    cv2.putText(img, title, (20, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (255, 255, 255), 4)
+    cv2.putText(img, why, (22, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    return img
 
 
 def read_stdin(q):
@@ -136,7 +217,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pitch", type=float, help="camera tilt down in degrees (default: accelerometer, else 0)")
     ap.add_argument("--ros", action="store_true", help="camera over ROS 2, through ros_bridge.py")
-    ap.add_argument("--retries", type=int, default=RETRIES, help="retries on the same box before it is skipped")
+    ap.add_argument("--retries", type=int, default=RETRIES, help="retries on the same box before a flag is raised (it is still tried)")
     ap.add_argument("--frames", type=int, default=5, help="frames per picker answer")
     ap.add_argument("--check-frames", type=int, default=3, help="new frames the pick check compares with before")
     ap.add_argument("--score", type=float, default=0.4,
@@ -147,8 +228,14 @@ def main():
     ap.add_argument("--top-faces", action="store_true",
                     help="tops anywhere: the larger of front and top, also for boxes on a box (pick_rules.py); "
                          "default: tops only for boxes on the base")
+    ap.add_argument("--check", choices=["v1", "v2"], default="v1" if pc else "v2",
+                    help="v1: the robot says done, then new frames are compared with before (Pick Check's pick_check); "
+                         "v2: the camera watches the pick on every frame and decides picked / missed / moved / "
+                         "dropped itself, no done needed (pick_watch.py)")
     ap.add_argument("--out", default="outputs/pick_loop", help="where each session is saved")
     args = ap.parse_args()
+    if args.check == "v1" and pc is None:
+        ap.error("check v1 needs Pick Check's pick_check.py and pick_and_check.py (not in this package): use --check v2")
 
     real_stdout, sys.stdout = sys.stdout, sys.stderr  # library prints go to stderr
     from faces import up_from_accel, up_from_pitch
@@ -195,16 +282,19 @@ def main():
                 ("button", "F", "Top faces", "on: anywhere" if detector.top_faces else "off: base only",
                  detector.top_faces),
                 ("button", "N", "Look again (new frames)", ""),
-                ("button", "R", "Forget skipped boxes", f"{len(skipped)} skipped" if skipped else "none"),
+                ("button", "R", "Forget passed boxes", f"{len(passed)} passed" if passed else "none"),
                 ("setting", "frames", FRAMES["frames"][0], str(args.frames), False),
                 ("setting", "score", FRAMES["score"][0], f"{args.score:.2f}", False),
                 None, ("label", "PICK CHECK"),
-                ("setting", "check_frames", FRAMES["check_frames"][0], str(args.check_frames), False)]
+                *([("button", "W", "Check", "v2: camera watches" if args.check == "v2" else "v1: robot says done",
+                    args.check == "v2"),
+                   ("setting", "check_frames", FRAMES["check_frames"][0], str(args.check_frames), False)]
+                  if pc else [("text", "Check v2: the camera watches the pick")])]
 
     def show(img, status, colour, panel, step, live=False, target=False):
         """Draw the window (loop_screen) and return the key pressed or clicked (lower case), or ''.
         live: img is the live colour picture (the depth picture instead when that is on); target:
-        draw the target over it. A, D, V, O, F and S are handled here, in every step."""
+        draw the target over it. A, D, V, O, F, W and S are handled here, in every step."""
         nonlocal sized, tab, depth_on, picker_on, snap
         if not window:
             return ""
@@ -216,7 +306,7 @@ def main():
         if target:
             view = picker_img if picker_on else ui.target_view(view, before)
         canvas = ui.render(view, status, colour, advanced() if tab == "advanced" else panel,
-                           f"Picked {picked_n}     Failed tries {failed_n}     Skipped {len(skipped)}",
+                           f"Picked {picked_n}     Failed tries {failed_n}     Flags {flag_n}",
                            step, fps, history if tab == "pick" else (), tab, depth)
         if not sized:
             cv2.resizeWindow(WINDOW, canvas.shape[1], canvas.shape[0])
@@ -236,12 +326,15 @@ def main():
         elif key == "f":
             detector.top_faces = not detector.top_faces
             log(f"top faces: {'on (anywhere)' if detector.top_faces else 'off (boxes on the base only)'}")
+        elif key == "w" and pc is not None:
+            args.check = "v2" if args.check == "v1" else "v1"
+            log(f"pick check: {args.check} ({'the camera watches the pick' if args.check == 'v2' else 'the robot says done'})")
         elif key[2:] in FRAMES:                       # frames, SAM's confidence: from the next target / check on
             name = key[2:]
             _, lo, hi, step = FRAMES[name]
             setattr(args, name, round(min(max(getattr(args, name) + (step if key[0] == "+" else -step), lo), hi), 2))
             if name == "score":
-                detector.finder.processor.confidence_threshold = args.score
+                detector.finder.score_threshold = args.score   # SAM runs at LONE_SCORE; box_masks splits by score
             log(f"{FRAMES[name][0].lower()}: {getattr(args, name)}")
         elif key == "s" and latest[0] is not None:
             snap = f"snap_{time.strftime('%H%M%S')}"
@@ -285,13 +378,14 @@ def main():
 
     stage, n = "pick", 0
     before = d = ev = result = None
-    skipped = []                 # outlines of the boxes given up on (the picker's `avoid`)
     passed = []                  # outlines of the boxes passed over with T, until the next pick succeeds
     failed, attempt = None, 0    # the last target that wasn't picked, and how many tries it has had
+    watcher, fell = None, None   # check v2: the pick being watched; where the last dropped box fell
     outcomes = []                # the check's outcome for each try on the current box
     cant_tell_run = 0            # "can't tell" results in a row for the current pick
     shown_until, result_img, check_img, picker_img, target_line = 0.0, None, None, None, ""
-    picked_n, failed_n, flag_tries = 0, 0, 0   # the tally, and the tries before the last flag (0: none)
+    picked_n, failed_n, flag_n = 0, 0, 0   # the tally
+    flag_tries = 0               # the result screen: tries when a flag was just raised (0: none)
     history = []                 # the last picks for the window: (close-up, colour)
     try:
         while True:
@@ -303,8 +397,8 @@ def main():
             if words[:1] == ["quit"]:
                 break
             if words[:1] == ["reset"]:
-                skipped, passed, failed = [], [], None
-                log("skipped boxes forgotten")
+                passed, failed = [], None
+                log("boxes passed over forgotten")
             colour, depth = read()
 
             # ---- 1. PICK ------------------------------------------------------------------------
@@ -318,11 +412,11 @@ def main():
                 up = tilt()                                   # the tilt while these frames were taken
 
                 def find():
-                    r = detector.detect_frames(frames, cam.intr, up, avoid=skipped + passed)
+                    r = detector.detect_frames(frames, cam.intr, up, avoid=passed)
                     if r is None and passed:      # no box after the passed ones: back to the first
                         passed.clear()
-                        r = detector.detect_frames(frames, cam.intr, up, avoid=skipped)
-                    return r, pc.remember(detector, frames, r)
+                        r = detector.detect_frames(frames, cam.intr, up)
+                    return r, remember(detector, frames, r)
                 found = in_background(find, f"PICK {n + 1}: FINDING THE TARGET",
                                       [("label", "PICKER"), ("text", f"SAM 3.1 on {args.frames} frames...")])
                 if found is None:
@@ -336,12 +430,15 @@ def main():
                 d.mkdir(exist_ok=True)
                 write(d, "before", frames)
                 if before is None:
-                    event({"event": "no_target", "pick": n, "skipped": len(skipped)}, events)
-                    log(f"pick {n}: no target" + (f" ({len(skipped)} box(es) skipped)" if skipped else ""))
+                    event({"event": "no_target", "pick": n}, events)
+                    log(f"pick {n}: no target")
                     stage, shown_until = "no_target", time.time() + RESULT_S
                     continue
                 # A retry when the picker chose the box that just failed again.
-                attempt = attempt + 1 if failed is not None and pc.same_target(failed, result) else 1
+                # (check v2: or the box chosen is where the dropped one fell).
+                box = detector.last[1][detector.last[2]]
+                attempt = attempt + 1 if failed is not None and (same_target(failed, result)
+                                                                 or pw.fell_there(fell, box.pick)) else 1
                 outcomes = outcomes if attempt > 1 else []
                 picker_img = detector.annotate(frames[detector.best_frame][0])
                 cv2.imwrite(str(d / "picker.jpg"), picker_img)
@@ -356,20 +453,21 @@ def main():
                     event({"event": "flag", "pick": n, "reason": "top face only", "target": result, **flag}, events)
                     log(f"pick {n}: FLAG: top face only (a box on a box, no front found); picking it by its top; "
                         f"photos in {Path(flag['photo']).parent}")
+                # Check v2: from now on every frame is compared with the depth of the frame the target came from.
+                watcher = pw.PickWatcher(box.pick, frames[detector.best_frame][1], box.mask) \
+                    if args.check == "v2" else None
+                watch_t0 = time.time()
                 stage, cant_tell_run = "wait", 0
                 continue
             if stage == "no_target":
                 panel = [("title", "No target"), ("text", "No box the robot can pick right now.")]
-                if skipped:
-                    panel += [None, ("text", f"{len(skipped)} box(es) skipped after failed tries. "
-                                             "Press R to try them again.", ui.ORANGE)]
                 panel += [None, ("label", "NEXT"), ("text", f"Looking again in {max(shown_until - time.time(), 0):.0f} s")]
                 key = show(colour, "NO TARGET", ui.GREY, panel, 0, live=True)
                 if key == "q":
                     break
                 if key == "r":
-                    skipped, passed, failed = [], [], None
-                if time.time() >= shown_until or key in ("n", "o", "f") or words[:1] in (["pick"], ["reset"]):
+                    passed, failed = [], None
+                if time.time() >= shown_until or key in ("n", "o", "f", "w") or words[:1] in (["pick"], ["reset"]):
                     stage = "pick"
                 continue
 
@@ -382,47 +480,66 @@ def main():
                 panel = [("label", "TARGET"), ("title", f"{r['approach'].capitalize()} face"), ("image", target_crop),
                          ("coords", [("X  RIGHT", f"{r['x_m'] * 100:+.1f} cm"), ("Y  DOWN", f"{r['y_m'] * 100:+.1f} cm"),
                                      ("Z  AWAY", f"{r['z_m'] * 100:.1f} cm")]),
-                         None, ("dots", attempt, tries, ui.ORANGE if attempt > 1 else ui.BLUE), None,
+                         None, ("dots", min(attempt, tries), tries, ui.ORANGE if attempt > 1 else ui.BLUE),
+                         *([("text", f"Try {attempt}: flagged after {tries} tries, still trying", ui.RED)]
+                           if attempt > tries else []), None,
                          *([("text", "FLAG: top face only. A box on a box with no front found: "
                                      "picking it by its top.", ui.ORANGE), None] if r.get("top_only") else []),
                          ("small", f"{r['agreeing']} of {r['frames']} frames agree  \u00b7  {r['num_boxes']} boxes  "
                                    f"\u00b7  face {r['size_mm'][0]}\u00d7{r['size_mm'][1]} mm"),
                          ("small", f"found in {sum(took):.1f} s  \u00b7  pictures {took[0]:.1f} s  \u00b7  "
                                    f"picker {took[1]:.1f} s")]
-                key = show(colour, f"PICK {n}:  PICK IT, THEN SAY DONE", ui.BLUE, panel, 1, target=True)
+                if watcher is not None:                  # check v2: what the camera sees of the pick
+                    st = watcher.status
+                    panel += [None, ("label", "PICK CHECK: CAMERA WATCHES"), ("text", st[0].upper() + st[1:])]
+                key = show(colour, f"PICK {n}:  PICK IT" + (" (THE CAMERA WATCHES)" if watcher is not None
+                                                            else ", THEN SAY DONE"), ui.BLUE, panel, 1, target=True)
                 if key == "q":
                     break
-                if key in ("n", "o", "f"):           # o / f: the order or the top faces mode changed, choose again
+                if key in ("n", "o", "f", "w"):      # o / f / w: the order, top faces or check changed: choose again
                     stage = "pick"
                     continue
                 if key == "r":
-                    skipped, passed, failed = [], [], None
+                    passed, failed = [], None
                 if key == "t":                    # pass over this box: the next one in the order
                     passed.append(before.target.copy())
                     failed, attempt = None, 0
                     log(f"pick {n}: passed over, next target")
                     stage, n = "pick", n - 1          # the same pick number for the next box
                     continue
-                done = words[:1] == ["done"] or key == "c"
-                if not done:
-                    continue
-                holding = {"held": True, "empty": False}.get(words[1]) if words[:1] == ["done"] and len(words) > 1 else None
+                if watcher is not None:
+                    # ---- 3. CHECK v2: every frame, until the camera has decided (no "done" needed) ----
+                    outcome = watcher.update(depth, cam.intr)
+                    if outcome is None:
+                        continue
+                    verdict = {"check": "v2", "outcome": outcome, "success": outcome == "picked",
+                               "seconds": round(time.time() - watch_t0, 1),
+                               "shift_mm": None if watcher.shift is None else round(watcher.shift * 1000)}
+                    after = [(colour, depth)]
+                    picked = outcome == "picked"
+                    result_img = check_img = watch_image(colour, watcher, outcome)
+                    fell, watcher = (watcher.drop if outcome == "dropped" else None), None
+                else:
+                    done = words[:1] == ["done"] or key == "c"
+                    if not done:
+                        continue
+                    holding = {"held": True, "empty": False}.get(words[1]) if words[:1] == ["done"] and len(words) > 1 else None
 
-                # ---- 3. CHECK -------------------------------------------------------------------
-                show(colour, f"PICK {n}: CHECKING THE PICK...", ui.BLUE,
-                     [("label", "PICK CHECK"), ("text", f"Comparing {args.check_frames} new frames with before the pick...")], 2,
-                     target=True)
-                after = grab(args.check_frames)
-                verdict = pc.check(before, after, holding)
+                    # ---- 3. CHECK v1: the robot said done; new frames against before the pick ----------
+                    show(colour, f"PICK {n}: CHECKING THE PICK...", ui.BLUE,
+                         [("label", "PICK CHECK"), ("text", f"Comparing {args.check_frames} new frames with before the pick...")], 2,
+                         target=True)
+                    after = grab(args.check_frames)
+                    verdict = pc.check(before, after, holding)
+                    result_img = pc.big_result(pc.draw(before, after, verdict), verdict)
+                    check_img = ui.check_view(pc, before, after, verdict)
+                    picked, fell = PICKED.get(verdict["outcome"]), None
                 write(d, f"after_{time.strftime('%H%M%S')}", after)
-                result_img = pc.big_result(pc.draw(before, after, verdict), verdict)
                 cv2.imwrite(str(d / "check.jpg"), result_img)
-                check_img = ui.check_view(pc, before, after, verdict)
-                picked = PICKED.get(verdict["outcome"])
                 ev = {"event": "result", "pick": n, "attempt": attempt, "picked": picked, "verdict": verdict,
                       "target": result}
                 event(ev, events)
-                log(f"pick {n} (try {attempt}): {pc.RESULT[verdict['outcome']][0]}")
+                log(f"pick {n} (try {attempt}): {result_text(verdict)[0]}")
                 if picked is True:
                     failed, attempt, passed = None, 0, []
                     picked_n += 1
@@ -430,15 +547,14 @@ def main():
                     failed = result
                     failed_n += 1
                     outcomes.append(verdict["outcome"])
-                    if attempt > args.retries:
-                        skipped.append(before.target.copy())
+                    if attempt == args.retries + 1:          # once per box; it is still tried
                         flag = raise_flag(session, n, picker_img, before, result_img)
                         event({"event": "flag", "pick": n,
-                               "reason": f"not picked after {attempt} tries: skipped, taking the next box",
+                               "reason": f"not picked after {attempt} tries: still trying it",
                                "outcomes": outcomes, "target": result, **flag}, events)
-                        log(f"pick {n}: FLAG: gave up on this box after {attempt} tries ({', '.join(outcomes)}); "
+                        log(f"pick {n}: FLAG: not picked after {attempt} tries ({', '.join(outcomes)}); still trying it; "
                             f"photos in {Path(flag['photo']).parent}")
-                        failed, attempt, flag_tries = None, 0, attempt
+                        flag_n, flag_tries = flag_n + 1, attempt
                 history = (history + [(target_crop, {True: ui.GREEN, False: ui.RED}.get(picked, ui.ORANGE))])[-12:]
                 cant_tell_run = cant_tell_run + 1 if picked is None else 0
                 if cant_tell_run >= CANT_TELL:
@@ -450,27 +566,30 @@ def main():
             if stage == "result":
                 cant_tell = ev["picked"] is None and cant_tell_run < CANT_TELL
                 nxt = "waiting for 'done' again" if cant_tell else "new pictures, choosing again" \
-                    if ev["picked"] is None else "skipping this box, next box" if failed is None and \
-                    ev["picked"] is False else "retry" if ev["picked"] is False else "next box"
+                    if ev["picked"] is None else "retry" if ev["picked"] is False else "next box"
                 v = ev["verdict"]
-                title, why, _ = pc.RESULT[v["outcome"]]
-                col = {True: ui.GREEN, False: ui.RED}.get(PICKED.get(v["outcome"]), ui.ORANGE)
-                panel = [("label", "RESULT"), ("title", title, col),
-                         ("text", why),
-                         ("small", f"gone {v['gone']:.0%}  \u00b7  same {v['same']:.0%}  \u00b7  {v['by']}  \u00b7  {len(after)} frames"
-                                   + (f"  \u00b7  {len(v['disturbed'])} other box(es) disturbed" if v["disturbed"] else ""))]
+                title, why, _ = result_text(v)
+                col = {True: ui.GREEN, False: ui.RED}.get(ev["picked"], ui.ORANGE)
+                if v.get("check") == "v2":
+                    small = f"camera watched the pick  \u00b7  {v['seconds']:.1f} s" + \
+                        (f"  \u00b7  face now {v['shift_mm']:+d} mm" if v["shift_mm"] is not None else "")
+                else:
+                    small = f"gone {v['gone']:.0%}  \u00b7  same {v['same']:.0%}  \u00b7  {v['by']}  \u00b7  {len(after)} frames" \
+                        + (f"  \u00b7  {len(v['disturbed'])} other box(es) disturbed" if v["disturbed"] else "")
+                panel = [("label", "RESULT"), ("title", title, col), ("text", why), ("small", small)]
                 status = title
                 if flag_tries:
                     panel += [None, ("title", "FLAG RAISED", ui.RED),
-                              ("text", f"Not picked after {flag_tries} tries: skipped. Photos saved in flags/.")]
-                    status = f"FLAG: PICK {n} SKIPPED AFTER {flag_tries} TRIES"
+                              ("text", f"Not picked after {flag_tries} tries: a person is told (photos in flags/). "
+                                       "It is still tried.")]
+                    status = f"FLAG: PICK {n} NOT PICKED AFTER {flag_tries} TRIES"
                 panel += [None, ("label", "NEXT"), ("text", nxt[0].upper() + nxt[1:]),
                           ("small", f"in {max(shown_until - time.time(), 0):.0f} s  \u00b7  N = now")]
                 key = show(check_img, status, col, panel, 3)
                 if key == "q":
                     break
                 if key == "r":
-                    skipped, passed, failed = [], [], None
+                    passed, failed = [], None
                 if cant_tell and words[:1] == ["done"]:
                     commands.put(cmd)                                 # the robot cleared the view: check again
                     stage = "wait"

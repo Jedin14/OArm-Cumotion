@@ -26,16 +26,23 @@ Requests, one line each; every answer carries "settings":
     pick ux uy uz [saved]  the same, with the up direction (colour camera frame) of now;
               "saved": the accelerometer's saved reading, so one sent with the frames
               (ros_bridge.py's) goes first; without any, the --pitch one (the TF)
-    check [held|empty]   after the pick, with the arm out of the view:
-              --check-frames new frames against the 5 of the last "pick",
-              inside the target's outline -> {"check": verdict, "picked": true /
-              false / null, "message", "title", "why", "outline" (the target's
-              polygon), "overlay" (the newest frame, clean), "picker_view" (the
-              check's own picture: red gone, green unchanged, blue nearer, purple
-              another box), "frames"} (null: can't tell).
-              "replaced" (another box stands where the target was) is settled
-              here by counting the boxes around it (one more SAM run): one fewer
-              -> "success", as many -> "moved". A success forgets the passed boxes
+    check [held|empty]   after the pick, with the arm out of the view: the
+              result of the pick check (2026-11-11: the Pick Check team's new one,
+              box_picker/src/pick_watch.py). From the "pick" on, a thread feeds it
+              every camera frame: the target's pick face (arm in front of it, still
+              there, gone), then once the box has left its spot the whole view, until
+              it settles. "check" waits for its decision, up to CHECK_WAIT_S ->
+              {"check": verdict, "picked": true / false / null, "message", "title",
+              "why", "outline" (the target's polygon), "overlay" (the newest frame,
+              clean), "picker_view" (the check's picture: the pick face in the
+              result's colour, where a dropped box fell outlined), "frames"}.
+              verdict["outcome"]: "success" (left its spot, then nothing new stayed
+              in view), "missed" (the arm came and went, the box is still there),
+              "moved" (knocked or dragged), "dropped" (left its spot, then a new
+              surface stood still in the carton: it fell back in), "blocked" (no
+              decision yet: null). held / empty, the gripper's word, wins over the
+              camera: held -> "success", empty -> "dropped". A success forgets the
+              passed boxes. check_frames is no longer used (kept for the GUI)
     set NAME VALUE       frames (1-15), check_frames (1-10), score (0.20-0.90),
               order (v1 / v2), top_faces (on / off: pick_rules.py -- off, a box
               on a box by its front, a top only as a last resort, "top_only";
@@ -64,6 +71,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 
 import cv2
@@ -71,6 +79,16 @@ import numpy as np
 
 LIMITS = {"frames": (1, 15, int), "check_frames": (1, 10, int), "score": (0.2, 0.9, float)}
 RED = (0, 0, 255)                                       # BGR, the target, as the picker draws it
+CHECK_WAIT_S = 15.0      # "check" waits this long for the pick check's decision (the node waits 20 s)
+# The new pick check's results, in the old check's words (box_model_node / the GUI read "outcome"):
+# outcome -> (picked, title, why, colour BGR)
+RESULT = {"success": (True, "PICK SUCCESS", "the box left its spot and the camera's view", (0, 200, 0)),
+          "missed": (False, "PICK FAILED: MISSED", "the arm came and went, the box is still there", (0, 0, 255)),
+          "moved": (False, "PICK FAILED: BOX MOVED", "the box was knocked or dragged, not picked", (0, 0, 255)),
+          "dropped": (False, "PICK FAILED: DROPPED", "the box was lifted but fell back into the carton", (0, 0, 255)),
+          "blocked": (None, "CAN'T TELL YET", "the pick check has not decided: arm still in view, "
+                                                "or the box has not left its spot", (0, 165, 255))}
+OUTCOME = {"picked": "success", "missed": "missed", "moved": "moved", "dropped": "dropped"}
 
 
 def reply(obj):
@@ -111,26 +129,64 @@ def close_up(img, mask, face_px=None, pad=30):
     return out[max(ys.min() - pad, 0):min(ys.max() + pad, h), max(xs.min() - pad, 0):min(xs.max() + pad, w)]
 
 
-def check_view(pc, before, after, verdict):
-    """The check's own picture (loop_screen.check_view): the target red where it
-    is gone, green where unchanged, blue where nearer, purple where another box
-    now stands; disturbed neighbours outlined in orange."""
-    try:
-        depth, colour = pc.median_frames(after)
-        gone, same, closer, other = pc._changes(before, depth, colour)[:4]
-    except (AttributeError, TypeError, ValueError):     # the check changed: its own drawing
-        return pc.draw(before, after, verdict)
-    img = after[-1][0].copy()
-    tint = img.copy()
-    tint[before.target & gone] = (0, 0, 255)
-    tint[before.target & same] = (0, 200, 0)
-    tint[before.target & closer] = (255, 0, 0)
-    tint[before.target & other] = (255, 0, 200)
-    img = cv2.addWeighted(tint, 0.5, img, 0.5, 0)
-    cv2.drawContours(img, contours(before.target), -1, (0, 220, 255), 2, cv2.LINE_AA)
-    for b in verdict.get("disturbed") or []:
-        cv2.drawContours(img, contours(before.others == b["box"] + 1), -1, (0, 140, 255), 2, cv2.LINE_AA)
+def check_view(colour, watcher, outcome, mask):
+    """The check's picture: the target's outline and its pick face in the result's
+    colour, and for "dropped" where the box fell (purple)."""
+    col = RESULT[outcome][3]
+    img = colour.copy()
+    cv2.drawContours(img, contours(mask), -1, (0, 220, 255), 2, cv2.LINE_AA)
+    cv2.polylines(img, [np.round(watcher.corners_px).astype(np.int32)], True, col, 4)
+    if outcome == "dropped" and watcher.drop is not None:
+        fell = cv2.resize(watcher.drop.astype(np.uint8), (img.shape[1], img.shape[0]),
+                          interpolation=cv2.INTER_NEAREST)
+        cv2.drawContours(img, contours(fell), -1, (200, 0, 130), 3, cv2.LINE_AA)
     return img
+
+
+class Target:
+    """What is kept of the last pick's target."""
+    def __init__(self, target, result):
+        self.target, self.result = target, result        # the box's outline (bool HxW); the answer
+
+
+class LockedCamera:
+    """The camera, read by one thread at a time (the pick check's thread and the requests)."""
+    def __init__(self, cam):
+        self._cam, self._lock = cam, threading.Lock()
+
+    def read(self):
+        with self._lock:
+            return self._cam.read()
+
+    def __getattr__(self, name):                         # intr, accel, meta, close
+        return getattr(self._cam, name)
+
+
+class Watch(threading.Thread):
+    """The pick check on every camera frame, from the "pick" until it has decided."""
+    def __init__(self, cam, watcher):
+        super().__init__(daemon=True)
+        self.cam, self.watcher = cam, watcher
+        self.result = self.error = self.last = None
+        self.frames, self.stopped, self.done = 0, False, threading.Event()
+        self.started = time.time()
+
+    def run(self):
+        try:
+            while not self.stopped:
+                colour, depth = self.cam.read()
+                self.last, self.frames = (colour, depth), self.frames + 1
+                self.result = self.watcher.update(depth, self.cam.intr)
+                if self.result is not None:
+                    break
+        except Exception as exc:                         # noqa: BLE001 - told at the next "check"
+            self.error = exc
+        finally:
+            self.done.set()
+
+    def stop(self):
+        self.stopped = True
+        self.done.wait(5)
 
 
 def outline(mask):
@@ -158,9 +214,10 @@ def up_of(words):
 
 
 class Server:
-    def __init__(self, args, pc, picked_of, detector, cam, up, save):
-        self.args, self.pc, self.picked_of = args, pc, picked_of
+    def __init__(self, args, pw, detector, cam, up, save):
+        self.args, self.pw = args, pw                    # pw: pick_watch, the pick check
         self.detector, self.cam, self.up, self.save = detector, cam, up, save
+        self.watch = None                                # the pick check's thread for the last pick
         self.before, self.before_up = None, up          # the last pick, for "check"
         self.skipped, self.passed = [], []              # outlines never / not now chosen (avoid)
         self.picker_img = self.crop = self.check_img = None
@@ -194,7 +251,8 @@ class Server:
         """"pick ux uy uz": the up direction now (colour camera frame), from the
         camera's accelerometer (the node's) -- else the accelerometer sent with the
         frames, else the one from --pitch (the TF)."""
-        args, detector, cam, pc = self.args, self.detector, self.cam, self.pc
+        args, detector, cam = self.args, self.detector, self.cam
+        self.stop_watch()
         saved = words[3:4] == ["saved"]                  # the node's saved reading, not a live one
         given = up_of(words[:3]) if words else None
         t0 = time.time()
@@ -212,7 +270,13 @@ class Server:
             self.passed.clear()
             result = detector.detect_frames(frames, cam.intr, up_now, avoid=self.skipped)
         t2 = time.time()
-        self.before, self.before_up = pc.remember(detector, frames, result), up_now
+        self.before, self.before_up = None, up_now
+        if result is not None and detector.last is not None and detector.last[2] is not None:
+            box = detector.last[1][detector.last[2]]
+            self.before = Target(box.mask.copy(), result)
+            # The pick check, from the depth of the frame the target came from, on every frame from now on.
+            self.watch = Watch(cam, self.pw.PickWatcher(box.pick, frames[detector.best_frame or 0][1], box.mask))
+            self.watch.start()
         self.picker_img = self.crop = None
         boxes, overlay, face = [], None, None
         if detector.last is not None:
@@ -268,32 +332,51 @@ class Server:
 
     # -- check ----------------------------------------------------------------------
 
+    def stop_watch(self):
+        if self.watch is not None:
+            self.watch.stop()
+            self.watch = None
+
     def check(self, words):
-        """The "check" request: did the last pick take its box?"""
-        pc, cam, before = self.pc, self.cam, self.before
-        if before is None:
+        """The "check" request: did the last pick take its box? The pick check's
+        decision, waiting for it up to CHECK_WAIT_S; not decided by then: null
+        (outcome "blocked"), and a later "check" asks again."""
+        watch, before = self.watch, self.before
+        if before is None or watch is None:
             return {"check": None, "picked": None,
                     "message": "nothing to check: no box was chosen by the last pick"}
         holding = {"held": True, "empty": False}.get(words[0]) if words else None
-        for _ in range(self.args.skip):                  # frames queued while waiting
-            cam.read()
-        after = [cam.read() for _ in range(self.args.check_frames)]
-        verdict = pc.check(before, after, holding, self.detector, cam.intr, self.before_up)
-        cv2.imwrite(self.args.overlay, after[-1][0])     # clean: the GUI draws
+        watch.done.wait(CHECK_WAIT_S)
+        if watch.error is not None:
+            raise watch.error                            # the camera failed: the node restarts the picker
+        w = watch.watcher
+        outcome = OUTCOME[watch.result] if watch.result is not None else "blocked"
+        if holding is True and outcome == "dropped":     # the gripper holds it: trust the gripper
+            outcome = "success"
+        elif holding is False and outcome == "success":  # gone from the view, but not in the gripper
+            outcome = "dropped"
+        picked, title, why, _ = RESULT[outcome]
+        if watch.result is None:
+            why += f" ({w.status})"
+        verdict = {"outcome": outcome, "check": "pick_watch", "status": w.status, "holding": holding,
+                   "seconds": None if watch.result is None else round(time.time() - watch.started, 1),
+                   "shift_mm": None if w.shift is None else round(w.shift * 1000)}
+        colour = watch.last[0] if watch.last is not None else self.cam.read()[0]
+        cv2.imwrite(self.args.overlay, colour)           # clean: the GUI draws
         try:
-            self.check_img = check_view(pc, before, after, verdict)
+            self.check_img = check_view(colour, w, outcome, before.target)
         except Exception as exc:                         # noqa: BLE001
             print(f"check view: {exc}", file=sys.stderr)
             self.check_img = None
-        picked = self.picked_of.get(verdict["outcome"])
         if picked is True:
             self.passed.clear()                          # pick_loop: until the next successful pick
-        title, why, _colour = pc.RESULT[verdict["outcome"]]
+        if watch.result is not None:
+            self.watch = None                            # decided: a second "check" has nothing to check
         return {"check": verdict, "picked": picked,
                 "message": f"{title}: {why}", "title": title, "why": why,
                 "outline": outline(before.target), "overlay": self.args.overlay,
-                "picker_view": self.write("check", self.check_img), "frames": len(after),
-                "size": [int(after[-1][0].shape[1]), int(after[-1][0].shape[0])],
+                "picker_view": self.write("check", self.check_img), "frames": watch.frames,
+                "size": [int(colour.shape[1]), int(colour.shape[0])],
                 "time": time.strftime("%Y-%m-%d %H:%M:%S")}
 
     # -- the window's other keys ------------------------------------------------------
@@ -327,20 +410,24 @@ class Server:
                 return False, f"{name}: a number, please", {}
             v = round(min(max(v, lo), hi), 2)
             setattr(args, name, v)
-            if name == "score":
-                processor = getattr(getattr(detector, "finder", None), "processor", None)
-                if processor is not None:
-                    processor.confidence_threshold = v
+            if name == "score":                          # box_masks runs SAM at LONE_SCORE and splits by score
+                finder = getattr(detector, "finder", None)
+                if hasattr(finder, "score_threshold"):
+                    finder.score_threshold = v
+                elif getattr(finder, "processor", None) is not None:
+                    finder.processor.confidence_threshold = v
             return True, f"{name}: {v}", {}
         if cmd in ("pass", "skip"):
             if self.before is None:
                 return False, f"no target to {cmd}", {}
             (self.passed if cmd == "pass" else self.skipped).append(self.before.target.copy())
+            self.stop_watch()                            # this box isn't being picked now
             return True, ("passed over this box and the boxes under it, until the next successful pick"
                           if cmd == "pass" else "this box is skipped until reset"), {}
         if cmd == "reset":
             n = len(self.skipped) + len(self.passed)
             self.skipped, self.passed = [], []
+            self.stop_watch()
             return True, f"forgot {n} skipped / passed box(es)", {}
         if cmd == "save":
             colour, depth = self.cam.read()
@@ -392,15 +479,14 @@ def main():
 
     sys.path.insert(0, os.getcwd())                    # box_picker/src
     real_stdout, sys.stdout = sys.stdout, sys.stderr   # libraries' output -> stderr
-    import pick_check as pc
+    import pick_watch as pw                            # the pick check (2026-11-11)
     from faces import up_from_accel, up_from_pitch
-    from pick_and_check import PICKED
     from pick_frame import PickDetector
     from rgbd import open_camera, save
     detector = PickDetector(score=args.score, order=args.order, top_faces=args.top_faces)
-    cam = open_camera(args.ros)
+    cam = LockedCamera(open_camera(args.ros))
     up = up_from_pitch(args.pitch)
-    server = Server(args, pc, PICKED, detector, cam, up, save)
+    server = Server(args, pw, detector, cam, up, save)
     server.up_from_accel = up_from_accel
     sys.stdout = real_stdout
     reply({"ready": True, "frames": args.frames, "up": [round(float(v), 3) for v in up],
@@ -430,6 +516,7 @@ def main():
             answer["settings"] = server.settings()
             reply(answer)
     finally:
+        server.stop_watch()
         cam.close()
 
 

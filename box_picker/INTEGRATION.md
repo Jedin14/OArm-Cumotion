@@ -4,21 +4,25 @@
 
 The box picker looks at boxes with an Intel RealSense D455 (colour + depth). It tells the robot **which box to pick next**, **where the centre of the face to grip is** (x, y, z in metres, camera coordinates), and **whether to grip it from the front or from above**.
 
-It never moves the robot. The camera has two jobs: **before** a pick, which box and where; **after** it, whether the pick worked (the box is gone from its place: the **pick check**, made by the Pick Check team). When the pick happens is the robot's to say.
+It never moves the robot. The camera has two jobs: **before** a pick, which box and where; **during** it, whether the pick worked (the **pick check**, made by the Pick Check team). The camera watches the pick itself, so the robot doesn't have to report anything.
 
 ```
 1. PICK   5 frames ──► target {"x_m", "y_m", "z_m", "approach", ...} ──► robot picks it
-2. WAIT   for the robot's "done"
-3. CHECK  3 new frames vs. the 5 from step 1 ──► success: next box
-                                              ──► failed: pick again (a retry; after 2 retries: FLAG with photos, box skipped)
+2. WATCH  every camera frame: arm in view, box gone from its spot, the arm out of the picture again
+          ──► picked: next box
+          ──► missed / moved / dropped (fell back into the carton): pick again
+              (a retry; after 2 retries: a FLAG with photos, once; the box is still tried)
 ```
+
+**What changed since the last package:** the pick check is the Pick Check team's new one (`pick_watch.py`). The robot no longer sends `done`; a box lifted and then dropped back into the carton is now caught (`dropped`, a failed pick, retried); `picked` comes once the arm has carried the box out of the picture. The last box left alone in the carton is now found too (`box_masks.py`).
 
 ## What is in this folder
 
 | Path | What it is |
 |---|---|
-| `src/pick_loop.py` | **Start here.** Pick, check, next, in one long-running process: prints each target as a JSON line on stdout; when the robot says `done`, checks whether the pick worked, then retries or takes the next box. Any language or ROS version can drive it |
-| `src/pick_check.py`, `src/pick_and_check.py` | The pick check, by the Pick Check team (used unchanged; `pick_and_check.py` only for drawing): compares the depth inside the target's outline before and after the pick, no GPU, ~0.1 s |
+| `src/pick_loop.py` | **Start here.** Pick, check, next, in one long-running process: prints each target as a JSON line on stdout, watches the pick, prints the result, then retries or takes the next box. Any language or ROS version can drive it |
+| `src/pick_watch.py` | The pick check, by the Pick Check team (their `pick_check.py`, renamed): follows the pick from the depth on every camera frame, no GPU, a few ms a frame |
+| `src/box_picker.py` | The Pick Check team's Python entry point: `BoxPicker.step(colour, depth, intr, t)` on every frame → the same target / result events (Option C) |
 | `src/loop_screen.py` | `pick_loop.py`'s window: drawing only |
 | `src/pick_server.py` | Pick only, no check: answers each `pick` line on stdin with one target |
 | `src/pick_frame.py` | `PickDetector`: the Python API (`detect_frames`), if you call it from Python 3.11 directly. Also a command-line tool |
@@ -30,7 +34,7 @@ It never moves the robot. The camera has two jobs: **before** a pick, which box 
 | `src/live_pick.py` | Live view with the target drawn on it, for checking by eye |
 | `src/record_rgbd.py` | Records colour + depth frames, to test with later |
 | `src/pick_pipeline.py` | Runs a recording through the picker and saves an overlay image + JSON per answer |
-| `src/test_faces.py`, `src/test_box_masks.py` | Tests (no camera needed) |
+| `src/test_faces.py`, `src/test_box_masks.py`, `src/test_pick_watch.py` | Tests (no camera needed) |
 | `src/setup.sh`, `src/requirements.txt` | Installation |
 | `docs/robot_pick_logic.md` | The cycle, the answer, the picking rules, the assumptions. **Read this next** |
 | `docs/picking_rules.md` | The rules in full, with the reasons |
@@ -62,8 +66,9 @@ The weights come from Meta's Hugging Face repo if this machine has access, else 
 From `src/`:
 
 ```bash
-.venv/bin/python test_faces.py          # no camera, no GPU: "46/46 passed" (23 scenes, clean and noisy)
-.venv/bin/python test_box_masks.py      # "7/7 passed"
+.venv/bin/python test_faces.py          # no camera, no GPU: "48/48 passed" (24 scenes, clean and noisy)
+.venv/bin/python test_box_masks.py      # "18/18 passed"
+.venv/bin/python test_pick_watch.py     # the pick check: "34/34 passed"
 .venv/bin/python pick_frame.py --live --frames 5              # one answer from the camera, as JSON
 .venv/bin/python live_pick.py --frames 5                      # live window with the target drawn (Q quits)
 ```
@@ -84,17 +89,20 @@ export SAM31_CHECKPOINT=/path/to/sam3.1_multiplex.pt
 
 Run it once at start-up and keep it running. It loops by itself:
 
-1. **PICK:** takes 5 new frames, chooses the target, prints a `target` event. The pick check keeps the 5 frames' median depth and the target's outline.
-2. **WAIT:** for the robot's `done` on stdin: the pick is over and the arm is out of view.
-3. **CHECK:** compares 3 new frames (`--check-frames`) with the 5 from step 1 and prints a `result` event:
-   - `picked: true` → back to 1 for the next box.
-   - `picked: false` → back to 1: the picker usually chooses the same box again (a **retry**, `attempt` 2, 3). After 1 + 2 retries on the same box, a **`flag` event** is raised for a person, with three photos (the scene with the target marked, the box close up, the last check showing why it failed), and the box is **skipped**: never chosen again (until `reset`), but it still blocks the boxes behind and under it. The next box is taken.
-   - `picked: null` (can't tell: an arm or hand still in view, or something new appeared) → back to 2: clear the view and write `done` again. After 3 of these in a row, back to 1: new frames and a new choice (if the box was taken, the next box comes).
+1. **PICK:** takes 5 new frames, chooses the target, prints a `target` event. The pick check keeps the depth of the frame the target came from.
+2. **WATCH:** every new camera frame is compared with it (a few ms each), until the pick is decided:
+   - on the target's pick face: something in front of it (the arm), the face still there, or gone (the camera sees past it);
+   - once the box has left its spot: the whole view, until it settles. Change touching the picture's edge is the arm (or a hand) still in view: wait.
+3. **RESULT:** a `result` event:
+   - `picked: true` (`picked`): the box left its spot and nothing new stays in view → back to 1 for the next box.
+   - `picked: false` → back to 1: the picker usually chooses the same box again (a **retry**, `attempt` 2, 3), or for `dropped` the box where it fell. After 1 + 2 retries on the same box, a **`flag` event** is raised for a person, with three photos (the scene with the target marked, the box close up, the last check), once per box. The box is **not skipped**: it is tried again (`attempt` 4, 5, …) as long as the picker chooses it.
+
+There is no "can't tell": if the arm stays in view, the check decides on what it sees after 300 frames (10 s at 30 fps). If the robot doesn't go for the box at all, the loop keeps watching: send `pick` to have it choose again.
 
 ```bash
 cd box_picker/src
 .venv/bin/python pick_loop.py --no-window           # for the robot
-.venv/bin/python pick_loop.py                         # with a live window, for testing: the C key stands in for "done"
+.venv/bin/python pick_loop.py                         # with a live window, for testing: pick the boxes by hand
 .venv/bin/python pick_loop.py --ros                   # camera over ROS 2 instead of USB (see "Camera over ROS 2")
 ```
 
@@ -104,9 +112,8 @@ cd box_picker/src
 | `--ros` | off | frames from ROS 2 topics instead of the D455 on USB |
 | `--order v1` / `v2` | v1 | which box goes first (see "Which box it chooses") |
 | `--top-faces` | off | tops anywhere: every box by the larger of its front and top. Off: a box on another box by its front, a box on the base by the larger (see "Which box it chooses") |
-| `--retries N` | 2 | retries on one box before it is flagged and skipped |
+| `--retries N` | 2 | retries on one box before a flag is raised (once; the box is still tried) |
 | `--frames N` | 5 | frames per target |
-| `--check-frames N` | 3 | new frames the pick check compares with the 5 from before the pick ("Frames per pick success" in the window) |
 | `--score X` | 0.4 | SAM's confidence needed to count as a box (thin boxes standing on end score 0.45–0.6) |
 | `--no-window` | off | no window: stdin / stdout only |
 | `--out DIR` | `outputs/pick_loop` | where each session is saved |
@@ -116,46 +123,43 @@ stdout, one JSON line per event:
 ```json
 {"event": "ready", "session": "outputs/pick_loop/20261026_170000", "retries": 2}
 {"event": "target", "pick": 1, "attempt": 1, "target": {"x_m": -0.275, "y_m": -0.026, "z_m": 0.506, "approach": "front", ...}}
-{"event": "result", "pick": 1, "attempt": 1, "picked": true, "verdict": {"outcome": "success", ...}, "target": {...}}
-{"event": "flag", "pick": 7, "reason": "not picked after 3 tries: skipped, taking the next box", "outcomes": ["missed", "missed", "moved"], "target": {...},
+{"event": "result", "pick": 1, "attempt": 1, "picked": true, "verdict": {"check": "v2", "outcome": "picked", "success": true, "seconds": 6.1, "shift_mm": -112}, "target": {...}}
+{"event": "result", "pick": 2, "attempt": 1, "picked": false, "verdict": {"check": "v2", "outcome": "dropped", "success": false, "seconds": 8.4, "shift_mm": -30}, "target": {...}}
+{"event": "flag", "pick": 7, "reason": "not picked after 3 tries: still trying it", "outcomes": ["missed", "missed", "dropped"], "target": {...},
  "photo": "outputs/pick_loop/<session>/flags/flag_07_target.jpg", "crop": ".../flag_07_crop.jpg", "check_photo": ".../flag_07_check.jpg"}
 {"event": "flag", "pick": 8, "reason": "top face only", "target": {..., "approach": "top", "top_only": true},
  "photo": ".../flags/toponly_08_target.jpg", "crop": ".../flags/toponly_08_crop.jpg"}
-{"event": "no_target", "pick": 9, "skipped": 1}
+{"event": "no_target", "pick": 9}
 ```
 
 stdin, one line at a time:
 
 | Line | Means |
 |---|---|
-| `done` | the pick is over and the arm is out of view: check now |
-| `done held` / `done empty` | the same, with what the gripper reports, so a box that left its place but isn't in the gripper reads as `dropped` |
-| `pick` | choose a new target now |
-| `reset` | forget the skipped boxes |
+| `pick` | choose a new target now (e.g. the robot can't reach this one) |
+| `reset` | forget the boxes passed over with T |
 | `quit` | exit |
 
-`verdict.outcome`:
+The robot sends nothing for a normal pick: no `done`. (A `done` line is accepted and ignored, so old robot code still works.)
 
-| Outcome | `picked` | Means |
-|---|---|---|
-| `success` | true | the box is gone from its place |
-| `replaced` | true | another box now stands where the target was (a neighbour slid or leaned into the gap): most likely taken. With `done held` it reads `success` |
-| `missed` | false | the box is still there |
-| `moved` | false | pushed, tipped, or pulled part way |
-| `dropped` | false | gone from its place, but the gripper says empty (`done empty`) |
-| `wrong_box` | false | the target is still there, a neighbour is gone |
-| `blocked`, `camera_moved`, `unknown` | null | can't tell: something in view, the camera moved, or too little depth on the target |
+`verdict`:
+
+| Field | Means |
+|---|---|
+| `outcome` | `picked` (`picked: true`): the box left its spot, then the view cleared. `missed`: the arm came and went, the box is still there. `moved`: knocked or dragged, neither there nor gone. `dropped`: it left its spot, then a new surface stood still in the carton: the box fell back in. All but `picked` are a failed try |
+| `success` | the same as `picked` |
+| `seconds` | from the target to the result |
+| `shift_mm` | what the camera now sees on the face's pixels, mm from the face (minus = further away). About one box thickness back: a box stands right behind the one picked, or the box was pushed back that far; much further: open space behind it |
 
 Each session is saved under `outputs/pick_loop/<session>/` (frames, overlays, `events.jsonl`).
 
 #### The window (without `--no-window`)
 
-For testing and commissioning. The picture shows the target's pick face framed in red, with a red cross on the grip point. The panel has two tabs; each button can be clicked or pressed as a key.
+For testing and commissioning. The picture shows the target's pick face framed in red, with a red cross on the grip point; the panel shows what the check sees (`waiting for the arm`, `arm in view`, `box left its spot, arm still in view`, ...). Pick the box by hand to try it. The panel has two tabs; each button can be clicked or pressed as a key.
 
 | Tab | Key | Does |
 |---|---|---|
-| PICK | **C** | stands in for the robot's `done`: check now |
-| | **T** | next target: passes over this box (and every box under it, all the way down) until the next successful pick; press again for the one after. With no other box left, back to the first |
+| PICK | **T** | next target: passes over this box (and every box under it, all the way down) until the next successful pick; press again for the one after. With no other box left, back to the first |
 | | **S** | save the current colour + depth to `<session>/snapshots/` |
 | | **A** | the ADVANCED tab |
 | | **Q** / Esc | quit |
@@ -165,16 +169,22 @@ For testing and commissioning. The picture shows the target's pick face framed i
 | | **O** | order v1 / v2, and choose again |
 | | **F** | top faces on / off (as `--top-faces`), and choose again |
 | | **N** | new frames, choose again |
-| | **R** | forget the skipped boxes (the same as `reset`) |
-| | − / + | Frames per target (1–15), SAM confidence (0.20–0.90) and Frames per pick success (1–10), the same as `--frames` / `--score` / `--check-frames`; used from the next target / check on |
+| | **R** | forget the boxes passed over with T (the same as `reset`) |
+| | − / + | Frames per target (1–15) and SAM confidence (0.20–0.90), the same as `--frames` / `--score`; used from the next target on |
 
-The PICK tab shows how long the target took (`found in … s · pictures … s · picker … s`); the result screen shows how many frames the check used.
+The PICK tab shows how long the target took (`found in … s · pictures … s · picker … s`); the result screen shows how long the pick took.
 
-**For the check to work:** the robot base must not move between the `target` event and the check (pixels are compared one to one), and the arm and the box it holds must be out of view when the robot says `done`. No target (`no_target`): the picker tries again every 3 s.
+**For the check to work:**
+- The robot base must not move from the `target` event to the `result` (the depth is compared pixel by pixel).
+- `pick_loop.py` must get **every camera frame** (it counts frames: 5 for a steady state, 10 for a clear view or a drop). Over USB that is 30 a second; over ROS 2 as many as arrive.
+- The arm must leave the picture after the pick, carrying the box. An arm that parks in view delays `picked` up to 10 s.
+- **Nothing may be put into the carton during a pick**: a box added (by hand, or a second box pulled along and let go) looks exactly like a dropped box. If the gripper's vacuum sensor says the box is held, trust the sensor.
 
-Tested on recordings with frames standing in for the camera: box taken → `success`, next box; box never taken → 3 tries, `flag` with its photos, next box; a check that can't tell → `picked: null`, then checked again on the next `done`. Run live with the D455 over USB and over ROS 2 (from another machine on the network), a person standing in for the robot (C key for `done`). **Not yet tested with real robot picks.**
+No target (`no_target`): the picker tries again every 3 s.
 
-### Option A2: `pick_server.py`: pick only
+Tested: the Pick Check team's 34 tests on synthetic scenes (picked, missed, dropped elsewhere and onto its own spot, a top pick dropped, the arm staying in view, a neighbour sliding into the gap), with noise and 10% depth holes; and a recording of hand picks run through `pick_loop.py` with the frames standing in for the camera: 3 `picked`, 1 `dropped` (a person put boxes into the carton during the pick), each followed by the next target. The earlier check (robot says `done`) was run live with the D455 over USB and over ROS 2. **This check has not yet been run live, nor with real robot picks: try a deliberate drop first.**
+
+### Option A2: `pick_server.py`: pick only, no check
 
 Run it once at start-up and keep it running. Loading takes ~5 s; after that each answer takes ~2–5 s (5 frames).
 
@@ -252,6 +262,25 @@ result = detector.detect_frames(frames, cam.intr, UP)    # dict or None
 
 Frames from elsewhere (a ROS topic, files): colour BGR `uint8` and depth in **metres** `float32`, **aligned to colour** and the same size, and `Intrinsics(fx, fy, cx, cy)` of the colour camera. Depth 0 means no reading.
 
+### Option C: `box_picker.py`: pick and check from your own Python 3.11 loop
+
+The Pick Check team's entry point, if the robot program runs in the `.venv` and reads the camera itself. Feed it **every** camera frame:
+
+```python
+import sys, time; sys.path.insert(0, "/opt/box_picker/src")
+from box_picker import BoxPicker
+from rgbd import Camera
+
+cam = Camera()
+picker = BoxPicker(accel=cam.accel)              # loads SAM 3.1 once (~6 s); or pitch_deg=20
+while True:
+    colour, depth_m = cam.read()
+    for event in picker.step(colour, depth_m, cam.intr, time.time()):
+        handle(event)                            # {"event": "target", ...} / {"event": "pick_result", "result": ..., "success": ...}
+```
+
+It looks for a target (SAM, 0.3–1 s a frame) only while no pick is being watched, and hands one out once the same box was found in the same place 0.5 s apart. Its events are named `target` and `pick_result` (`result`: picked / missed / moved / dropped, `success`); a failed pick's next target carries `attempt` 2, 3, … with **no limit**, no flags and no skipping: that is left to the caller. `pick_loop.py` (Option A) has all of that, so use it unless you need your own loop.
+
 ## The answer
 
 ```json
@@ -310,7 +339,7 @@ When the camera can't tell whether a box stands *on* a nearer box or *behind* it
 
 **Order v2** (`--order v2`, or O in the window): rules 1–3 as above (a free box: nothing on it, nothing in front of it), then simply the **leftmost**, whatever its height or distance. Predictable, and the arm moves less; but it can take a floor box standing right beside a stack before that stack is cleared, so use it where boxes stand apart or in neat rows, and v1 where they are piled or leaning.
 
-Never the target, in either order: a box nothing holds up (pieces of the carton's rim), and skipped or passed-over boxes, plus every box under them, all the way down.
+Never the target, in either order: a box nothing holds up (pieces of the carton's rim), and boxes passed over with T, plus every box under them, all the way down.
 
 ## Assumptions the robot side must keep
 
@@ -365,11 +394,22 @@ Constants are at the top of `src/faces.py`, each with a comment. The ones most l
 | `NEAREST_TOL_M` | 0.03 | Boxes whose grip points are this close in depth count as "equally near"; then the leftmost |
 | `IN_WAY_M` | 0.015 | A nearer box whose top is this much above another box's bottom is "in the way" |
 | `FLAT_VIEW_DEG` | 10 | A top seen at a flatter angle than this is dropped (its pixels go to the front face) |
-| `SKIP_OVERLAP` | 0.5 | A box whose outline overlaps a skipped box's this much counts as that box (left out) |
+| `SKIP_OVERLAP` | 0.5 | A box whose outline overlaps a box passed over with T this much counts as that box (left out) |
 | `SAME_LENGTH`, `DOUBLE_TOL`, `DOUBLE_REFS` | 0.07, 0.15, 3 | Two boxes pressed together: a front as long as others (7%), twice as thick (15%), with at least 3 others to compare |
 | `MAX_BOX_DEPTH_M` | 0.30 | A box resting on another can stand at most this far behind the lower box's front (the deepest box expected) |
 
-The pick check's thresholds (how much of the outline must be gone for `success`, and so on) are at the top of `src/pick_check.py`, owned by the Pick Check team. `pick_loop.py`'s retries: `--retries` (default 2).
+`pick_loop.py`'s retries: `--retries` (default 2). The pick check's settings are at the top of `src/pick_watch.py` (owned by the Pick Check team):
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `DROP_FRAMES` | 10 | frames a new surface must stand still to be a dropped box |
+| `CLEAR_FRAMES` | 10 | frames with nothing new in view before `picked` |
+| `SETTLE_FRAMES` | 300 | longest wait for the view to settle (10 s at 30 fps); then decided on what is seen |
+| `NEAR_M` | 0.020 | how much nearer than before counts as something new |
+| `DROP_AREA_FRAC`, `MIN_DROP_MM2` | 0.2, 800 | smallest new surface that counts as a box (share of the pick face, and mm²) |
+| `EDGE_BAND_PX` | 64 | border (half-resolution pixels) where change means "arm in view"; covers the D455's left strip with no depth |
+
+In `src/box_masks.py`: `LONE_SCORE` (0.3), the lowest SAM score looked at when no box is found, and `STANDS_OUT_M` (15 mm), how far such an outline must stand in front of the carton's surface.
 
 The text prompt (`"box"`) and SAM's score cut-off are arguments of `PickDetector(prompt=..., score=...)` (0.5 by default there; `pick_loop.py` uses 0.4, `--score`).
 
@@ -385,12 +425,14 @@ After a change, run `test_faces.py`. To check it on real scenes, record frames a
 
 - **Two boxes pressed together** (side by side, or one lying on the other) with their fronts level are drawn as one outline by the AI. When the doubled face is about twice as thick as other boxes of the same length in view (at least 3 of them), it is split in two and the left or top one is picked. Alone, or among boxes of other sizes, it can't be told: check `size_mm`. If a box really is twice as thick as its neighbours of the same length, it is split by mistake; the grip point then lands a quarter of the way across that box, still on it.
 - **A box standing with its narrow end (~2 cm) towards the camera** is sometimes not found as pickable (its big side, seen at a slant, crowds out the narrow face when the faces are fitted). It is then left for later, or `no_target` if it is the last one: turn it, or look again (`pick`).
-- **Skipped boxes are remembered by their place in the picture** (the robot base doesn't move during a session), until `reset` or a restart. A different box put in that place is left out too.
+- **A box that can't be picked is tried again and again.** After 3 failed tries a flag tells a person, but the loop keeps choosing that box until it is gone or moved: a person must deal with it (or the robot sends `pick` to look again).
 - **A box whose pick face runs off the edge of the picture** (e.g. the bottom row when the camera looks over a stack) is gripped at the middle of the part in view, not at its real centre: off by half the hidden part, but still on the box. Better: have the whole box in view.
 - **Face rotation is not returned.** You get the centre and the approach side, but not how the face is turned (a box standing at an angle). It is measured inside (`detector.last`, each face's normal and corners), so it can be added to the answer if the gripper needs it.
 - **Tops seen from a level camera** are measured less well: one pixel is ~2.5 mm front to back, and 1° of tilt error moves the depth 5–6 mm. With the motion sensor's tilt, 170 × 100 tops measured 167–170 × 96–101.
 - **No depth at the picture's sides.** The D455 gives no depth in a band on the left (~40 px at 0.45 m, wider when nearer: part of the left camera's view the right one can't see) and on the right (the colour camera sees a little wider than the depth cameras). A box there is outlined but has no depth, so it isn't picked until it's fully inside. The depth picture (D in the window) shows the bands in black.
 - **Shiny white tops** can have patchy depth (black in the depth picture). The top's width then comes from its outline (all of it at the top's height), so it stays right; a top that is mostly without depth can still come out small in one frame.
+- **A box added to the carton during a pick reads as `dropped`** (see "For the check to work"). So does anything else that appears and stays put in the carton while the box is away.
+- **The last box alone in the carton** is found when SAM gives it at least 0.3 and it stands 15 mm clear of the carton's surface. Not yet tried live with one box left: try it.
 - **Speed**: ~0.3–1 s per frame on an RTX 5060 Ti; more boxes take longer.
 
 ## Versions (pinned)

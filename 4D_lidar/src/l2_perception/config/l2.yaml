@@ -1,0 +1,153 @@
+# Unitree L2, stationary installation. All three nodes read this file.
+# Values here are the defaults; change what your installation needs.
+
+l2_driver:
+  ros__parameters:
+    connection: serial           # serial (Unitree USB adapter, work mode 8) | udp (Ethernet)
+    lidar_ip: 192.168.1.62       # factory default of the L2
+    lidar_port: 6101
+    local_ip: 192.168.1.2        # this computer's address on the lidar network
+    local_port: 6201
+    # when connection = serial (work mode 8). Use the stable /dev/serial/by-id/ name: ttyACM
+    # numbers change with plug order (on this PC /dev/ttyACM0 is an ESP32, not the lidar).
+    serial_port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_593A033327-if00
+    baudrate: 4000000
+    work_mode: -1                # -1 = never write the lidar's (persistent) work mode
+    start_rotation: true         # spin the lidar up when the driver starts
+    stop_rotation_on_exit: true  # ... and down (standby) when it stops
+    frame_id: l2_lidar
+    imu_frame_id: l2_imu
+    cloud_period: 0.1            # [s] scan time per published cloud (10 Hz)
+    range_min: 0.05
+    range_max: 60.0
+    imu_timebase: sequence       # sequence: rebuild IMU instants from the packet counter (robust)
+    transport_latency: -1.0      # [s] subtracted from stamps; -1 = value measured by the SDK
+    wait_for_clock_sync: 30.0    # [s] wait for NTP/PTP before publishing (0 = don't wait)
+    shared_clock_tolerance: 0.02
+    clock:
+      max_drift_ppm: 200.0
+      smoothing_time: 5.0
+      lock_time: 1.0
+    realtime_priority: 0         # >0: SCHED_FIFO for the reader thread (needs rtprio limits)
+    publish_device_orientation: false   # the L2's fused quaternion drifts in yaw; not needed
+    log_period: 30.0
+
+l2_stabilizer:
+  ros__parameters:
+    world_frame: world
+    lidar_frame: l2_lidar
+    calibration_file: ~/.ros/l2/mount.yaml
+    auto_calibrate: true         # if the file is missing: calibrate once and save it
+    calibration:
+      duration: 3.0
+      level_reference: ground    # ground (best, cancels accel bias) | gravity
+      yaw_deg: 0.0               # heading of the world x axis (lidar x projected on the floor)
+      x: 0.0                     # world position of the lidar (z is measured)
+      y: 0.0
+      mount_height: -1.0         # [m] only used if no floor is visible (>0 forces it)
+      ground_distance: 0.04
+      ground_max_tilt_deg: 10.0
+    mount_monitor:
+      threshold_deg: 0.5         # warn if the bracket tilts this much after calibration
+    filter:
+      range_min: 0.3             # removes the lidar's own body / bracket
+      range_max: 40.0
+      crop_min: [-1.0e9, -1.0e9, -1.0e9]   # world-frame box (optional)
+      crop_max: [1.0e9, 1.0e9, 1.0e9]
+    vibration:
+      # OFF on the real L2: its internal gyro shows a 4.3 Hz signal (the head rotation rate)
+      # that is NOT motion of the scan; compensating it measurably blurred surfaces
+      # (3.06 -> 3.28 mm on recorded data). Enable only for a genuinely vibrating mount and
+      # verify with recorded data.
+      enabled: false
+      highpass_time: 0.5         # [s] compensates vibration above ~0.3 Hz
+      bias_time: 30.0
+      bias_init_time: 1.0
+      max_angle_deg: 2.0         # hard bound: compensation can never exceed this
+      max_imu_gap: 0.05
+    max_imu_wait: 0.06           # [s] a cloud waits at most this long for covering IMU data
+
+l2_obstacles:
+  ros__parameters:
+    mode: background             # background | geometric
+    accumulate_time: 0.3         # [s] clouds merged per detection (L2 scan is sparse per cloud)
+    calibration_file: ~/.ros/l2/mount.yaml
+    roi:
+      min: [-30.0, -30.0, -1.0]
+      max: [30.0, 30.0, 3.5]
+    ground:
+      enabled: true
+      z_max: 0.10                # [m] points below this height are ground
+    background:
+      file: ~/.ros/l2/background.npz
+      load_on_start: true
+      auto_learn: true           # learn if no (valid) file: keep the area clear meanwhile
+      learn_time: 30.0
+      voxel_size: 0.10
+      slice_time: 1.0
+      min_slices: 2              # voxel hit in at least this many slices ...
+      min_span: 0.5              # ... spread over at least this fraction of learn_time
+      dilation: 1
+    cluster:
+      voxel_size: 0.20
+      min_points: 8
+      max_extent: 15.0
+    tracker:
+      gate: 1.0
+      min_hits: 3
+      max_missed_time: 0.5
+      publish_unconfirmed: false
+    markers:
+      labels: false              # true: "#id range speed" text above each box in RViz
+
+l2_dense:
+  ros__parameters:
+    # What RViz shows. Each point is routed to one of two layers:
+    #  scene: part of the learned background ->
+    #    l2/points_image: depth-camera style - one point per pixel of a fine grid around the lidar,
+    #      nearest surface, noise averaged, gaps between the L2's scan lines bridged (whole frame)
+    #    l2/points_scene: the raw points (RViz can accumulate them with a long Decay Time)
+    #  live (l2/points_live): people, moving and new objects -> white, short, self-clearing
+    image:
+      enabled: true
+      rate: 1.0                  # [Hz] whole frames (each replaces the previous one)
+      resolution_deg: 0.2        # pixel size: 3.5 mm at 1 m, 1 cm at 3 m (finer -> more gaps)
+      min_hits: 2                # a pixel's surface needs this many hits (skips dust, edge veils)
+      max_gap: 3                 # [px] bridge up to this many empty pixels between scan lines
+      thin_poles: true           # uniform point density near straight up / down
+    publish_rate: 2.0            # [Hz] raw scene batches (l2/points_scene)
+    color_by: height             # height (low red -> yellow -> high green) | range (near red -> far blue)
+    color_z_min: 0.0             # [m] height drawn red / green; both 0 = auto (scene 1..99 %)
+    color_z_max: 0.0
+    color_range_max: 0.0         # [m] distance drawn blue (color_by range, depth image); 0 = auto
+    scan_density: 3700.0         # [points / sr / s] measured L2 scan density (lower bound)
+    # persistent scene map (depth image, l2/points_dense): voxel size grows with range
+    voxel_sizes: [0.005, 0.01, 0.02, 0.04, 0.08]
+    fill_time: 60.0              # [s] the map is gap-free after this long
+    forget_time: 0.0             # [s] drop map voxels not seen this long (0 = 2 x fill_time)
+    min_points: 1
+    calibration_file: ~/.ros/l2/mount.yaml
+    background_file: ~/.ros/l2/background.npz   # l2_obstacles' model (the launch file sets it)
+    live:
+      enabled: true              # false: everything goes into the scene map (no live layer)
+      hold: 3.0                  # [s] max exposure of something standing still
+      cell: 0.15                 # [m] "is it still there?" cell
+      confirm_hits: 4.0          # a cell not hit for 4 expected hit intervals is vacated
+      confirm_min: 0.2           # [s] clamp of that time: near ...
+      confirm_max: 1.5           # [s] ... and far (far away the scan needs longer to look again)
+      box_margin: 0.15           # [m] around tracked obstacle boxes: always live
+      box_below: 0.3             # [m] boxes extended down (feet near the floor)
+      box_min_z: 0.05            # [m] ... but the floor itself (z < this) stays static
+      box_gate: true             # older live points only inside currently tracked boxes
+      box_hold: 0.25             # [s] boxes remembered this long (bridges a missed detection)
+      box_lag: 0.15              # [s] = half of l2_obstacles accumulate_time (boxes are predicted forward)
+    depth_image:
+      enabled: true              # computed only while someone subscribes
+      rate: 2.0                  # [Hz]
+      window: 8.0                # [s] raw points added to the scene map's
+      width: 2048                # 360 deg azimuth (0.18 deg per pixel)
+      height: 512                # rows span the elevation range below
+      auto_elevation: true       # crop rows to the elevations the lidar actually sees
+      elevation_min_deg: -90.0   # used when auto_elevation is false
+      elevation_max_deg: 90.0
+      hole_fill: 2

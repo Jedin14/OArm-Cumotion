@@ -237,7 +237,10 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin, BoxCalMix
         bounds = walls.depth_bounds(averaged) if args.walls_edges == 'depth' and \
             averaged.shape[:2] == (info.height, info.width) else None
         n = self.node.refresh_walls(self.frame[3], args.walls_ahead, args.walls_x_min, bounds)
-        self.say(f'{message}' + ('' if n is None else f'; walls around the picture ({n})')
+        walls_text = ('' if n is None else
+                      '; walls off: the 4D LiDAR sees round the picture' if getattr(
+                          self.node, 'walls_off', False) else f'; walls around the picture ({n})')
+        self.say(f'{message}' + walls_text
                  + f'. {self.next_hint}')
 
     # -- input ----------------------------------------------------------------
@@ -671,6 +674,10 @@ def make_parser():
     parser.add_argument('--top-standoff', type=float, default=0.12,
                         help='TOP DOWN: the tip flies (tool level) to this far above the top, '
                              'the wrist turns down there, then it goes straight down, m')
+    parser.add_argument('--top-x-offset', type=float, default=-0.015,
+                        help='TOP DOWN: the point the tool goes down onto, moved this far along the '
+                             'world x (straight ahead, towards the boxes), m; negative = nearer the '
+                             'robot. -0.015: it went in 1.5 cm too deep (2026-11-06); 0 = as measured')
     parser.add_argument('--vacuum-lean', type=float, default=30,
                         help='TOP DOWN with a tool on: the most the tool may lean off '
                              'straight down (deg). Straight down first, then the smallest '
@@ -766,15 +773,17 @@ def make_parser():
                         help='scaling for the retreat when the straight line out fails')
     parser.add_argument('--held-velocity', type=float, default=0.4,
                         help='velocity scaling (acceleration: its square) for the moves with the '
-                             'box maybe on the cup, until the drop: at 1.0 the yank swung it into '
-                             'the boxes beside it (2026-10-30)')
+                             'box maybe on the cup, until the drop (the retrace out from beside the '
+                             'others): at 1.0 the yank swung it into the boxes beside it '
+                             '(2026-10-30); 0.5 was tried 2026-11-05 and put back (accuracy first)')
     parser.add_argument('--drop-velocity', type=float, default=0.7,
                         help='velocity scaling (acceleration too) for the move from pre_pick to the '
                              'drop pose with the box maybe on the cup: clear of the other boxes by '
                              'then, so faster than --held-velocity (0.4 took 5 s, 2026-11-05)')
-    parser.add_argument('--correct-speed', type=float, default=0.04,
+    parser.add_argument('--correct-speed', type=float, default=0.02,
                         help='tool speed for the correction moves at the approach point and short '
-                             'of the box, m/s (--line-speed until 2026-11-05)')
+                             'of the box, m/s. 0.04 was tried (2026-11-05): the corrections 5 cm '
+                             'short converged slower (5-8 mm left after the first, against < 3.5)')
     parser.add_argument('--held-line-speed', type=float, default=0.03,
                         help='tool speed for the straight lines out with the box maybe on the '
                              'cup, m/s (--fast-line-speed otherwise)')
@@ -797,6 +806,10 @@ def make_parser():
                              "the colour picture have none) or at the picture's edges "
                              "(as before 2026-11-05: more reach, but objects in those bands "
                              "are invisible to the planners)")
+    parser.add_argument('--lidar-walls', choices=('auto', 'always'), default='auto',
+                        help='auto: no unseen-space walls while the Unitree L2 LiDAR works (it '
+                             'sees round the picture; /lidar/status), back on as soon as it does '
+                             'not; always: the walls whatever the LiDAR does')
     parser.add_argument('--walls-ahead', type=float, default=walls.AHEAD,
                         help='the walls start this far in front of the nearest thing seen, m')
     parser.add_argument('--walls-x-min', type=float, default=walls.X_MIN,

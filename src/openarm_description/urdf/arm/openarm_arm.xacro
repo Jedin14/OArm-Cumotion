@@ -15,6 +15,16 @@
       <xacro:property name="reflect" value="-1" />
     </xacro:unless>
 
+    <!-- Encoder zero errors (rad), 2026-11-13: the RIGHT arm's joints 4, 5, 6 read -5.1, +3.0,
+         -5.7 deg off their real angle (fitted on the 82 CAL ARMS postures of 2026-10-16, zero offsets +
+         sag only, +-0.2 deg). Each joint's origin is turned by its error about its own axis, so the
+         model shows where the arm really is for the angles the motors report. Joint 7 cannot be told
+         from those photos. Same values in robot/openarm.urdf; calibration/arm_model.yaml had them
+         taken off its offsets so the pick correction is unchanged. -->
+    <xacro:property name="zero4" value="${-0.089012 if arm_prefix == 'right_' else 0}" />
+    <xacro:property name="zero5" value="${0.052360 if arm_prefix == 'right_' else 0}" />
+    <xacro:property name="zero6" value="${-0.099484 if arm_prefix == 'right_' else 0}" />
+
     <xacro:unless value="${connected_to == ''}">
       <joint name="${prefix}${connected_to}_joint" type="fixed">
         <parent link="${connected_to}"/>
@@ -69,7 +79,7 @@
     <xacro:link_with_sc no_prefix="${no_prefix}" name="link4" kinematics_link="${kinematics_link}" />
 
     <joint name="${prefix}joint4" type="revolute">
-      <xacro:openarm-kinematics name="joint4" config="${kinematics}" />
+      <xacro:openarm-kinematics name="joint4" config="${kinematics}" zp="${zero4}" />
       <parent link="${prefix}link3" />
       <child link="${prefix}link4" />
       <axis xyz="0 1 0" />
@@ -79,7 +89,7 @@
     <xacro:link_with_sc no_prefix="${no_prefix}" name="link5" kinematics_link="${kinematics_link}" inertials="${inertials}" reflect="${reflect}" />
 
     <joint name="${prefix}joint5" type="revolute">
-      <xacro:openarm-kinematics name="joint5" config="${kinematics}" />
+      <xacro:openarm-kinematics name="joint5" config="${kinematics}" zy="${zero5}" />
       <parent link="${prefix}link4" />
       <child link="${prefix}link5" />
       <axis xyz="0 0 1" />
@@ -89,7 +99,7 @@
     <xacro:link_with_sc no_prefix="${no_prefix}" name="link6" kinematics_link="${kinematics_link}" inertials="${inertials}" reflect="${reflect}"/>
 
     <joint name="${prefix}joint6" type="revolute">
-      <xacro:openarm-kinematics name="joint6" config="${kinematics}" />
+      <xacro:openarm-kinematics name="joint6" config="${kinematics}" zr="${zero6}" />
       <parent link="${prefix}link5" />
       <child link="${prefix}link6" />
       <axis xyz="1 0 0" />

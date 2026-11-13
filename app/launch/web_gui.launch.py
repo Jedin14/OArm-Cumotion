@@ -27,13 +27,17 @@ def generate_launch_description():
         LaunchConfiguration(n) for n in
         ('host', 'port', 'approach', 'model', 'click', 'pick_tool', 'order', 'score',
          'walls_edges', 'walls_ahead'))
-    drop_velocity, correct_speed, drop_hold, top_faces = (
-        LaunchConfiguration(n) for n in ('drop_velocity', 'correct_speed', 'drop_hold', 'top_faces'))
+    drop_velocity, correct_speed, drop_hold, top_faces, held_velocity, top_x_offset = (
+        LaunchConfiguration(n) for n in ('drop_velocity', 'correct_speed', 'drop_hold', 'top_faces',
+                                         'held_velocity', 'top_x_offset'))
+    top_near, top_far, top_right, top_left = (
+        LaunchConfiguration(n) for n in ('top_near', 'top_far', 'top_right', 'top_left'))
     gui = ['python3', os.path.join(APP, 'web_gui.py'), '--host', host, '--port', port,
            '--approach', approach, '--pick-tool', tool,
            '--walls-edges', edges, '--walls-ahead', ahead,
            '--drop-velocity', drop_velocity, '--correct-speed', correct_speed,
-           '--drop-hold', drop_hold]
+           '--drop-hold', drop_hold, '--held-velocity', held_velocity,
+           '--top-x-offset', top_x_offset, '--top-zone', top_near, top_far, top_right, top_left]
     env = {'PYTHONPATH': APP + os.pathsep + os.environ.get('PYTHONPATH', ''),
            'PYTHONUNBUFFERED': '1'}
     return LaunchDescription([
@@ -61,9 +65,27 @@ def generate_launch_description():
                               description='speed scaling (0..1) of the move from pre_pick to the '
                                           'drop pose with the box on the cup (0.4 before '
                                           '2026-11-05; the way out beside the boxes stays 0.4)'),
-        DeclareLaunchArgument('correct_speed', default_value='0.04',
-                              description='tool speed of the correction moves, m/s (0.02 before '
-                                          '2026-11-05)'),
+        DeclareLaunchArgument('top_near', default_value='0.38',
+                              description='the zone where a TOP pick works: from this near, m '
+                                          'straight ahead (a box it cannot pick: the base '
+                                          'correction is the shortest move into the zone)'),
+        DeclareLaunchArgument('top_far', default_value='0.47',
+                              description='... to this far, m straight ahead'),
+        DeclareLaunchArgument('top_right', default_value='-0.02',
+                              description='... from this far right, m across (- right)'),
+        DeclareLaunchArgument('top_left', default_value='0.06',
+                              description='... to this far left, m across (+ left)'),
+        DeclareLaunchArgument('top_x_offset', default_value='-0.015',
+                              description='TOP DOWN: where the tool goes down, moved this far along '
+                                          'x (straight ahead), m; negative = nearer the robot '
+                                          '(-0.015: it went in 1.5 cm too deep); 0 = as measured'),
+        DeclareLaunchArgument('held_velocity', default_value='0.4',
+                              description='speed scaling (0..1) of the way back out from beside the '
+                                          'other boxes with the box on the cup (the retrace) -- at '
+                                          '1.0 the yank swung a box into its neighbours'),
+        DeclareLaunchArgument('correct_speed', default_value='0.02',
+                              description='tool speed of the correction moves, m/s (0.04 was '
+                                          'tried 2026-11-05: less accurate)'),
         DeclareLaunchArgument('drop_hold', default_value='1.0',
                               description='seconds at the drop pose with the vacuum off, for the '
                                           'box to let go'),
