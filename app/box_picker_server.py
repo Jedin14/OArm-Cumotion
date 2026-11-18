@@ -44,7 +44,7 @@ Requests, one line each; every answer carries "settings":
               camera: held -> "success", empty -> "dropped". A success forgets the
               passed boxes. check_frames is no longer used (kept for the GUI)
     set NAME VALUE       frames (1-15), check_frames (1-10), score (0.20-0.90),
-              order (v1 / v2), top_faces (on / off: pick_rules.py -- off, a box
+              order (grid / v1 / v2: see below), top_faces (on / off: pick_rules.py -- off, a box
               on a box by its front, a top only as a last resort, "top_only";
               on, the larger of front and top anywhere, as before 5 Nov 2026):
               from the next pick / check on
@@ -64,6 +64,15 @@ Requests, one line each; every answer carries "settings":
 As pick_loop.py (2026-11-03): SAM's score 0.4 (--score; thin boxes standing on
 end score 0.45-0.6), --order v1 (stack tops, highest first, then nearest, then
 leftmost) or v2 (the leftmost free box).
+
+Order grid (2026-11-16, the default): box_picking's v1, in box_picker/v1/ (grid_order.py), for
+boxes of one size stacked in a grid: fallen boxes first, each by its largest face (usually its
+top); then the front layer, the top row first, each row left to right, by the front face; then
+the next layer back. The same SAM 3.1 as the old picker (loaded once) and the same faces.py from
+box_picker/src. Its target carries, besides the old fields: "fallen", "cell" ([layer, row,
+column] from 1; null for a fallen box), "box_size_mm" ([w, h, d]) and "next" (the next 3 picks).
+In "boxes", why_not says where a box is in the order, or "outside the carton in front" (v2: only
+the carton in front is picked from). "set order v1" goes back to the old picker.
 
     .venv/bin/python ../../box_picker_server.py --pitch -4.5 --ros --overlay /tmp/x.jpg
 """
@@ -202,6 +211,72 @@ def outline(mask):
     return [[int(p[0][0]), int(p[0][1])] for p in c]
 
 
+class Orders:
+    """The two pickers behind one detector, with one SAM 3.1: the old one (box_picker/src/
+    pick_frame.py, orders v1 / v2) and the grid one (box_picker/v1/grid_detector.py, order
+    grid). The one that answered last gives last / best_frame / annotate."""
+
+    def __init__(self, old, grid, order):
+        self.old, self.grid, self.order = old, grid, order
+        self.used = grid if order == "grid" else old
+
+    @property
+    def finder(self):
+        return self.old.finder
+
+    @property
+    def top_faces(self):
+        return self.old.top_faces
+
+    @top_faces.setter
+    def top_faces(self, value):
+        self.old.top_faces = value
+
+    @property
+    def last(self):
+        return self.used.last
+
+    @property
+    def best_frame(self):
+        return self.used.best_frame
+
+    def detect_frames(self, frames, intr, up, avoid=()):
+        if self.order == "grid":
+            self.used = self.grid
+        else:
+            self.old.order, self.used = self.order, self.old
+        return self.used.detect_frames(frames, intr, up, avoid=avoid)
+
+    def annotate(self, color):
+        return self.used.annotate(color)
+
+    def grid_picks(self):
+        """Order grid: {box index: (place in the order from 0, the grid picker's pick)} of the
+        last answer; other orders: None."""
+        if self.used is not self.grid or self.grid is None or self.grid.res is None:
+            return None
+        return {p["box"]: (k, p) for k, p in enumerate(self.grid.res["picks"])}
+
+    def left_out(self):
+        """Order grid with v2's carton check: indices of the boxes outside the carton in front."""
+        if self.used is not self.grid or self.grid is None or self.grid.res is None:
+            return set()
+        return set((self.grid.res.get("carton") or {}).get("left_out") or [])
+
+    def carton(self):
+        """Order grid: v2's carton check of the last answer, short and JSON-safe (carton.summary):
+        {"found": true, "boxes_in", "left_out", "near_m"} / {"found": false}; else None."""
+        if self.used is not self.grid or self.grid is None or self.grid.res is None:
+            return None
+        found = self.grid.res.get("carton")
+        if found is None:
+            return None
+        if not found["found"]:
+            return {"found": False}
+        return {"found": True, "boxes_in": found["inside"], "left_out": len(found["left_out"]),
+                "near_m": found["near_m"]}
+
+
 def up_of(words):
     """"ux uy uz" -> a unit vector, or None."""
     if len(words) != 3:
@@ -281,22 +356,37 @@ class Server:
         boxes, overlay, face = [], None, None
         if detector.last is not None:
             points, found, target = detector.last
+            grid = detector.grid_picks() if hasattr(detector, "grid_picks") else None
+            outside = detector.left_out() if hasattr(detector, "left_out") else set()
             for i, b in enumerate(found):
                 why = []
-                face_px = (b.pick.corners_px if b.pick is not None and
-                           b.pick.corners_px is not None else None)
-                if getattr(b, "blocked_by", None):
-                    why.append("a box on it")
-                if getattr(b, "hidden_by", None):
-                    why.append("a box in front")
-                if not b.pick:
-                    why.append("no front or top face to grip")
+                if grid is not None:                     # order grid: its face and place for each box
+                    k, p = grid.get(i, (None, None))
+                    face_px = p["corners_px"] if p is not None else None
+                    kind = p["face"] if p is not None else None
+                    size_mm = [round(float(v)) for v in p["size_mm"]] if p is not None else None
+                    if p is None and i in outside:
+                        why.append("outside the carton in front")
+                    elif p is None:
+                        why.append("not in the order: no face to grip, or nothing holds it up")
+                    elif i != target:
+                        why.append(f"later: number {k + 1} in the order" + (" (fallen box)" if p["fallen"] else ""))
+                else:
+                    face_px = (b.pick.corners_px if b.pick is not None and
+                               b.pick.corners_px is not None else None)
+                    kind = b.pick.kind if b.pick else None
+                    size_mm = [round(float(v)) for v in b.pick.size_mm] if b.pick else None
+                    if getattr(b, "blocked_by", None):
+                        why.append("a box on it")
+                    if getattr(b, "hidden_by", None):
+                        why.append("a box in front")
+                    if not b.pick:
+                        why.append("no front or top face to grip")
                 boxes.append({"bbox": [int(v) for v in b.bbox],
                               "poly": outline(b.mask),
                               "face": ([[round(float(u), 1), round(float(v), 1)] for u, v in face_px]
                                        if face_px is not None else None),
-                              "kind": b.pick.kind if b.pick else None,
-                              "size_mm": [round(float(v)) for v in b.pick.size_mm] if b.pick else None,
+                              "kind": kind, "size_mm": size_mm,
                               "target": i == target, "why_not": why})
             best = frames[detector.best_frame or 0]
             if target is not None and found[target].pick is not None:
@@ -324,7 +414,8 @@ class Server:
             cv2.imwrite(args.overlay, frames[-1][0])
             overlay = args.overlay
         size = [int(frames[0][0].shape[1]), int(frames[0][0].shape[0])] if frames else None
-        return {"target": result, "boxes": boxes, "face": face, "overlay": overlay, "size": size,
+        carton = detector.carton() if hasattr(detector, "carton") else None
+        return {"target": result, "boxes": boxes, "face": face, "overlay": overlay, "size": size, "carton": carton,
                 "picker_view": self.write("picker", self.picker_img), "close_up": self.write("crop", self.crop),
                 "took": {"pictures": round(t1 - t0, 2), "picker": round(t2 - t1, 2)},
                 "up": [round(float(v), 5) for v in up_now], "up_source": up_source,
@@ -391,8 +482,10 @@ class Server:
                 return False, "set NAME VALUE", {}
             name, value = words
             if name == "order":
-                if value not in ("v1", "v2"):
-                    return False, "order is v1 or v2", {}
+                if value not in ("grid", "v1", "v2"):
+                    return False, "order is grid, v1 or v2", {}
+                if value == "grid" and getattr(detector, "grid", None) is None:
+                    return False, "order grid is not installed (box_picker/v1)", {}
                 detector.order = value
                 return True, f"order: {value}", {}
             if name == "top_faces":                      # pick_rules.py
@@ -467,8 +560,12 @@ def main():
     ap.add_argument("--check-frames", type=int, default=3)
     ap.add_argument("--pitch", type=float, default=0.0)
     ap.add_argument("--score", type=float, default=0.4, help="SAM's confidence needed to count as a box")
-    ap.add_argument("--order", choices=["v1", "v2"], default="v1",
-                    help="v1: stack tops (highest first), then nearest, then leftmost; v2: leftmost free box")
+    ap.add_argument("--order", choices=["grid", "v1", "v2"], default="grid",
+                    help="grid: boxes in a grid (box_picker/v1): fallen first, then the front layer, top row, "
+                         "left to right; v1: stack tops (highest first), then nearest, then leftmost; "
+                         "v2: leftmost free box")
+    ap.add_argument("--grid-dir", default="../v1",
+                    help="order grid's folder (box_picker/v1), from the working directory box_picker/src")
     ap.add_argument("--top-faces", action="store_true",
                     help="pick_rules.py: tops anywhere (the larger of front and top, also for a box on "
                          "a box), as before 5 Nov 2026; default: a box on a box by its front")
@@ -478,12 +575,23 @@ def main():
     args = ap.parse_args()
 
     sys.path.insert(0, os.getcwd())                    # box_picker/src
+    # order grid's own files, after src: it uses src's faces.py and box_masks.py (the same box finding)
+    sys.path.append(os.path.abspath(args.grid_dir))
     real_stdout, sys.stdout = sys.stdout, sys.stderr   # libraries' output -> stderr
     import pick_watch as pw                            # the pick check (2026-11-11)
     from faces import up_from_accel, up_from_pitch
     from pick_frame import PickDetector
     from rgbd import open_camera, save
-    detector = PickDetector(score=args.score, order=args.order, top_faces=args.top_faces)
+    old = PickDetector(score=args.score, order=args.order if args.order != "grid" else "v1",
+                       top_faces=args.top_faces)
+    try:
+        from grid_detector import GridDetector
+        grid = GridDetector(finder=old.finder)         # the same SAM 3.1, loaded once
+    except ImportError as exc:
+        if args.order == "grid":
+            raise SystemExit(f"order grid needs box_picker/v1 (--grid-dir {args.grid_dir}): {exc}")
+        grid = None
+    detector = Orders(old, grid, args.order)
     cam = LockedCamera(open_camera(args.ros))
     up = up_from_pitch(args.pitch)
     server = Server(args, pw, detector, cam, up, save)

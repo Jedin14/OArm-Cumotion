@@ -330,7 +330,7 @@ robot_cfg:
         - center: [-0.04467, 0.00035, 0.02749]
           radius: 0.00500
       openarm_left_link7:
-        # the cylinder that replaces the left wrist shell: 30 mm across, joint 7 to the hand (2026-10-26)
+        # the cylinder that replaces the left wrist shell: 30 mm across, joint 7 to the hand (2026-10-26, extended 5 cm 2026-11-16)
         - center: [0.0, 0.0, 0.0075]
           radius: 0.01500
         - center: [0.0, 0.0, 0.0196]
@@ -346,6 +346,14 @@ robot_cfg:
         - center: [0.0, 0.0, 0.0804]
           radius: 0.01500
         - center: [0.0, 0.0, 0.0925]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.1046]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.1168]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.1289]
+          radius: 0.01500
+        - center: [0.0, 0.0, 0.1411]
           radius: 0.01500
       openarm_right_link0:
         - center: [-0.02709, 0.00000, 0.02709]

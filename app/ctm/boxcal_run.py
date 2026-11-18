@@ -23,9 +23,9 @@ import cv2
 import numpy as np
 
 import robot_camera_calibration as rcc
-from ctm import armcal, calib_box as cb, depth_cal
+from ctm import accucal, armcal, calib_box as cb, depth_cal
 from ctm.common import (BACKUP_DIR, BASE_FRAME, SAMPLES_DIR, decode_image, quat_from_matrix,
-                        tool_frame_along)
+                        robot_fingerprint, tool_frame_along)
 from ctm.kinematics import Arm, directions
 
 BOX_POSTURES = 60
@@ -36,6 +36,82 @@ BOX_RMS_PX = 0.8            # after refining the box's geometry: worse is not us
 HOLDOUT = 0.2
 MIN_BOX_MARKERS = 3         # a reading needs this many box markers seen (two leave the tilt loose)
 DEPTH_OK = 0.004            # a depth correction is saved only if it leaves this little (m rms)
+SLIP_MM = 50.0              # AUTO CAL: the box this far off its mounting (hand frame) moved on the cup
+
+
+class SlipWatch:
+    """AUTO CAL: did the box move on the cup? (2026-11-17)
+
+    Each reading's box pose in the HAND frame -- the camera's box through
+    the plain URDF hand pose of the reading's joints -- against the median
+    of the readings on this mounting so far. Off by more than SLIP_MM, two
+    readings in a row that agree with each other: the box moved, and a new
+    mounting ("segment") starts with the first of them. One reading off on
+    its own is a misread: it stays on the mounting (the fit drops what it
+    cannot explain). Readings with fewer than MIN_BOX_MARKERS markers (their
+    tilt is loose) take the current mounting and are not judged.
+
+    Until 2026-11-16 the check compared the box in the CAMERA frame with
+    the mounting's first reading: every new posture moves the box there
+    (median 242 mm on the 10-30 readings), so every reading started its own
+    segment and the fit could never run. In the hand frame the plain URDF's
+    own error is all that moves it: on 10-30 at most 40 mm from the running
+    median, nothing over 50. Smaller slips are left to the fit's drift check
+    (accucal._drift flags a trend over 5 mm)."""
+
+    def __init__(self, kin, limit_mm=SLIP_MM, min_markers=MIN_BOX_MARKERS):
+        self.kin = kin
+        self.limit = float(limit_mm)
+        self.min_markers = int(min_markers)
+        self.segment = 0
+        self.ref = []               # this mounting's box positions in the hand, mm
+        self.suspect = None         # (reading, position): off the mounting, not confirmed
+        self.slips = []             # [(index, mm)]: the confirmed moves
+
+    def position(self, reading):
+        """The box's origin in hand_tcp (plain URDF), mm."""
+        hand = self.kin.tcp(np.asarray(reading['q'], float))
+        box = np.linalg.inv(hand) @ np.asarray(reading['t_wo'], float) \
+            @ np.asarray(reading['cam_box'], float)
+        return 1000.0 * box[:3, 3]
+
+    def place(self, reading):
+        """Set reading['segment'] (a suspect's may still change with the next
+        reading). The box's shift (mm) when this reading confirms a move,
+        else None."""
+        reading['segment'] = self.segment
+        if reading.get('cam_box') is None or int(reading.get('n') or 0) < self.min_markers:
+            return None
+        p = self.position(reading)
+        if not self.ref:
+            self.ref.append(p)
+            return None
+        shift = float(np.linalg.norm(p - np.median(self.ref, axis=0)))
+        if shift <= self.limit:
+            self.suspect = None             # a suspect before this one was a misread
+            self.ref.append(p)
+            return None
+        if self.suspect is not None and \
+                float(np.linalg.norm(p - self.suspect[1])) <= self.limit:
+            first, p0 = self.suspect
+            self.segment += 1
+            first['segment'] = reading['segment'] = self.segment
+            self.ref = [p0, p]
+            self.suspect = None
+            self.slips.append((first.get('index'), shift))
+            return shift
+        self.suspect = (reading, p)         # (an earlier suspect stays where it was)
+        return None
+
+    def finish(self):
+        """At the end: a suspect never confirmed gets a mounting of its own
+        (sharing one with readings it may not belong with would bend the fit;
+        alone, its mount is free and it changes nothing)."""
+        if self.suspect is not None:
+            self.segment += 1
+            self.suspect[0]['segment'] = self.segment
+            self.suspect = None
+        return self.segment + 1
 
 
 def _keep_px(rms):
@@ -171,6 +247,473 @@ class BoxCalMixin:
             if (zz <= zb[vv, uu] + 0.004).all():
                 count += 1 if size < 0.026 else 2      # a big one counts double
         return count
+
+    # -- AUTO CALIBRATE: the one-button run (2026-11-16) -------------------------
+
+    AUTOCAL_POSTURES = 90       # ~60 front + ~30 top-down, more than CAL TIP
+    AUTOCAL_CANDIDATES = 400
+    AUTOCAL_MINUTES = 22        # time cap; fit with what we have after this
+
+    def autocal_box_on(self):
+        """Called from the web UI when the user signals the box is on the cup."""
+        self.answer('box_on')
+
+    def calibrate_auto(self, arm='left', weigh=False):
+        """AUTO CALIBRATE: the one-button run.
+
+        Steps (exposed through self.autocal for the UI):
+          weigh      -- WEIGH TOOL + APPLY WEIGHT (only when weigh=True)
+          wait_box   -- wait for the user to put the box on the cup
+          choose     -- choose postures where the camera sees the box
+          measure    -- move to each posture and read the box
+          fit        -- accucal.fit_auto: choose + fit + cross-validate the model
+          done / failed / aborted
+
+        weigh is off by default (2026-11-17): APPLY WEIGHT rewrites the URDF,
+        but the motors read it only at launch, so the readings after it were
+        still taken with the old gravity compensation. Weigh separately
+        (WEIGH TOOL, APPLY WEIGHT, restart terminal 1), then run this. The
+        model is saved with the robot as it was BEFORE any weighing here, so
+        a model measured that way is not applied after the restart.
+        """
+        import shutil
+        node = self.node
+        report_id = time.strftime('%Y%m%dT%H%M%S')
+        self.autocal = {'step': 'weigh', 'text': '', 'report_id': report_id}
+        self.abort.clear()
+        self.calibrating = True
+        restart_needed = False
+        weigh_text = None
+        # the robot the readings are taken on: as the motors have it now
+        # (a weigh below changes only the URDF on disk until a restart)
+        fingerprint = robot_fingerprint(arm)
+        self.autocal_readings = []          # filled as the run goes (kept on abort)
+
+        try:
+            # -- 1. weigh the tool (arm empty) ------------------------------------
+            if weigh:
+                self.say('AUTO CAL: weighing the tool (arm empty)...')
+                ok, weigh_text, restart_needed = self.weigh_and_apply(arm)
+                if self.abort.is_set():
+                    raise KeyboardInterrupt
+                if ok:
+                    self.say(f'AUTO CAL: {weigh_text}')
+                else:
+                    self.say(f'AUTO CAL: weigh skipped - {weigh_text}')
+                    weigh_text = f'skipped: {weigh_text}'
+            else:
+                weigh_text = 'skipped (weigh=False)'
+
+            # -- 2. return to pre_pick so the box can be mounted squarely --------
+            self.say('AUTO CAL: returning the arm to pre_pick...')
+            self._back_to_pre_pick(arm)
+
+            # -- 3. wait for the box on the cup -----------------------------------
+            self.autocal['step'] = 'wait_box'
+            self.autocal['text'] = 'put the ArUco box on the cup, then press "Box is on the cup"'
+            self.say('AUTO CAL: arm at pre_pick. Put the ArUco calibration box on the cup '
+                     '(cup on the cross of face B), then press "Box is on the cup" in the UI.')
+            self.calib_event.clear()
+            self.calib_answer = None
+            # wait until the user signals or aborts
+            while True:
+                self.calib_event.wait(timeout=2.0)
+                self.calib_event.clear()
+                if self.abort.is_set():
+                    raise KeyboardInterrupt
+                ans = self.calib_answer
+                self.calib_answer = None
+                if ans is not None and ans[0] == 'box_on':
+                    break
+
+            # -- 3. capture the frame and find the box ----------------------------
+            self.autocal['step'] = 'choose'
+            self.autocal['text'] = 'finding the box...'
+            if not self.ensure_pick_mode():
+                self.say('AUTO CAL: could not enter pick mode', True)
+                self.autocal['step'] = 'failed'
+                return
+            # attach a nominal held object so the planner leaves room for it --
+            # BEFORE the capture rebuilds the map, as CAL TIP does, so the map
+            # leaves the box out (2026-11-17: it was attached after, and the
+            # box held at pre_pick could go into the map as an obstacle)
+            tip_off = float(node.args.tip_offsets[arm])
+            nominal = np.eye(4)
+            nominal[:3, 3] = [0.0, 0.0, tip_off - cb.TIP_IN_BOX[2]]
+            node.attach_held(arm, None, None,
+                             exact=(np.eye(3), nominal[:3, 3],
+                                    np.array([cb.SIZE[0], cb.SIZE[0], cb.SIZE[2]])))
+            self.capture()
+            if self.frame is None:
+                self.say('AUTO CAL: no camera frame', True)
+                self.autocal['step'] = 'failed'
+                return
+            info, optical = self.frame[2], self.frame[3]
+            t_wo = node.lookup(BASE_FRAME, optical)
+            self.calib_live = True
+
+            # read the box where the arm is; if not visible, find a posture that shows it
+            first = self.measure_box(arm, t_wo, info, frames=10)
+            if first is None:
+                first = self._show_box(arm, t_wo, info, nominal)
+            if first is None or first['box_in_tcp'] is None:
+                self.say('AUTO CAL: the camera cannot see the box - '
+                         'is it held with face B (the cross) on the cup?', True)
+                self.autocal['step'] = 'failed'
+                return
+            box_in_tcp = first['box_in_tcp']
+            node.attach_held(arm, None, None,
+                             exact=(box_in_tcp[:3, :3], box_in_tcp[:3, 3],
+                                    np.array(cb.SIZE)))
+            self.say(f'AUTO CAL: box seen ({first["n"]} markers, {first["rms"]:.2f} px); '
+                     f'starting the run across the workspace...')
+
+            # -- 4. measure postures (may span multiple box mountings/segments) ----
+            readings = self._autocal_postures(arm, t_wo, info, box_in_tcp, fingerprint)
+
+        except KeyboardInterrupt:
+            # the readings so far are kept (a 22 min run was lost on any stop)
+            kept = self._save_autocal_readings(arm, self.autocal_readings, partial=True)
+            self.say('AUTO CAL: aborted; no model saved'
+                     + (f' - the {len(self.autocal_readings)} readings so far are in {kept}'
+                        if kept else ''), True)
+            self.autocal['step'] = 'aborted'
+            self.autocal['text'] = 'aborted'
+            return
+        finally:
+            self.calibrating = False
+            self.calib_live = False
+            self.calib_view = None
+            node.detach_held(arm)
+            self._back_to_pre_pick(arm)
+
+        if not readings:
+            self.say('AUTO CAL: no box readings collected', True)
+            self.autocal['step'] = 'failed'
+            self.autocal['text'] = 'no readings'
+            return
+
+        # -- 5. fit the model (pure computation, no motion) ----------------------
+        # the readings on disk first: a fit that fails or is refused must not
+        # lose the run (2026-11-17: they were never saved)
+        kept = self._save_autocal_readings(arm, readings)
+        self.autocal['step'] = 'fit'
+        self.autocal['text'] = f'fitting the model from {len(readings)} readings...'
+        self.say(f'AUTO CAL: fitting the model from {len(readings)} readings'
+                 + (f' (kept in {kept})' if kept else '') + '...')
+
+        tip_offset = float(node.args.tip_offsets[arm])
+        # the model in the file scored IN FULL, as it is applied (2026-11-17:
+        # only base, offset and comply were passed -- the 10-30 model then
+        # scored 50.3 mm on its own readings instead of 11.4, so the gate and
+        # the "was X mm" were wrong)
+        current_raw = (armcal.load_model_raw().get(arm) or {})
+        models = getattr(self, 'arm_models', None)
+        in_use = bool(models is not None and models.has(arm))
+
+        try:
+            result = accucal.fit_auto(
+                arm, readings, tip_offset,
+                current=current_raw or None,
+                log=node.get_logger().info,
+            )
+        except ValueError as exc:
+            self.say(f'AUTO CAL: fit failed - {exc}', True)
+            self.autocal.update(step='failed', text=str(exc))
+            return
+        except Exception as exc:                     # noqa: BLE001
+            self.say(f'AUTO CAL: unexpected fit error - {exc}', True)
+            self.autocal.update(step='failed', text=str(exc))
+            return
+
+        variant = result['variant']
+        val = result['val']
+        baseline = result.get('baseline', {})
+        # What a new model has to beat: what the picks use NOW (2026-11-17) --
+        # the model in the file if it is applied, else the plain URDF (a model
+        # the fingerprint check refuses, or --arm-model off, is not used: a
+        # stale one that happens to score well must not block a new one).
+        file_mm = (baseline.get('current') or {}).get('mean_mm')
+        if in_use:
+            cur_mm, cur_name = file_mm, 'the current model'
+        else:
+            cur_mm = (baseline.get('urdf') or {}).get('mean_mm')
+            cur_name = 'the plain URDF, in use now'
+            if file_mm is not None:
+                node.get_logger().info(
+                    f'AUTO CAL: the model in the file scores {file_mm:.1f} mm on these readings '
+                    f'(not applied: {(getattr(models, "refused", None) or {}).get(arm)})')
+        new_mm = val.get('mean_mm')
+
+        # -- 6. decide whether to save -------------------------------------------
+        saved = False
+        why = None
+        if new_mm is None:
+            why = 'cross-validation produced no scores'
+        elif variant == 'urdf' and not in_use:
+            why = (f'the plain URDF, in use now, is as good as any model on held-out postures '
+                   f'({new_mm:.1f} mm): nothing to correct')
+        elif cur_mm is not None and new_mm >= cur_mm:
+            why = (f'the new model ({variant}, {new_mm:.1f} mm) is not better than {cur_name} '
+                   f'({cur_mm:.1f} mm) on held-out postures')
+        else:
+            # save: keep the existing boards (gripper pieces) from the current model file
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            stamp = time.strftime('%Y-%m-%dT%H-%M-%S')
+            if os.path.exists(armcal.MODEL_FILE):
+                shutil.copy(armcal.MODEL_FILE, os.path.join(
+                    BACKUP_DIR, os.path.basename(armcal.MODEL_FILE).replace(
+                        '.yaml', f'.before_autocal_{stamp}.yaml'),
+                ))
+            # keep existing boards (the gripper-piece poses, from CAL ARMS)
+            old_raw = armcal.load_model_raw()
+            old_boards = [np.asarray(b, float)
+                          for b in (old_raw.get(arm) or {}).get('pieces', [])]
+            params = accucal.saveable(result)
+            stats = dict(result['stats'])
+            # with the robot the readings were taken on (before any weighing here)
+            armcal.save_model({arm: (params, old_boards, stats)}, fingerprints={arm: fingerprint})
+            # (re-read in the same --arm-model mode)
+            # (a lambda: its own call line -- rclpy pins one severity to each, and the
+            # start-up ArmModels logged from armcal's line at warn, 2026-11-17 review)
+            self.arm_models = armcal.ArmModels(getattr(models, 'mode', None),
+                                               log=lambda text: node.get_logger().info(text))
+            saved = True
+            why = f'mean {new_mm:.1f} mm on held-out postures'
+            if cur_mm is not None:
+                why += f', was {cur_mm:.1f} mm ({cur_name})'
+            if self.arm_models.has(arm):
+                use = 'Used from the next pick.'
+            elif restart_needed:
+                use = ('NOT applied: it was measured before the new tool weight takes effect - '
+                       'restart terminal 1, then run AUTO CAL again without weighing.')
+            else:
+                use = f'NOT applied: {self.arm_models.status(arm)}'
+            self.say(f'AUTO CAL: saved ({variant}, {why}). {use}')
+
+        if not saved:
+            self.say(f'AUTO CAL: NOT saved - {why}', True)
+
+        # the error-map points for the UI
+        per_point = val.get('per_point') or []
+        points = []
+        for p in per_point:
+            meas = p.get('tip_meas') or []
+            err = p.get('err_mm') or []
+            if len(meas) >= 3 and len(err) >= 3:
+                points.append({
+                    'x': meas[0], 'y': meas[1], 'z': meas[2],
+                    'dx': err[0], 'dy': err[1], 'dz': err[2],
+                    'e': float(np.linalg.norm(err)),
+                    'kind': p.get('kind', 'front'),
+                })
+
+        self.autocal.update(
+            step='done',
+            text='saved' if saved else f'not saved: {why}',
+            measured=len(readings),
+            total=len(readings),
+            eta_s=0,
+            result={
+                'variant': variant,
+                'cv': {k: {'mean_mm': v.get('mean_mm'), 'p90_mm': v.get('p90_mm')}
+                       for k, v in result.get('cv', {}).items()},
+                'val': [val.get('mean_mm'), val.get('p90_mm'), val.get('max_mm')],
+                'baseline': baseline,
+                'compared_with': cur_name,
+                'readings_file': kept,
+                'saved': saved,
+                'why': why,
+                'drift': (result.get('drift') or {}).get('text'),
+                'depth': None,
+                'weigh': weigh_text,
+                'restart_needed': restart_needed,
+            },
+            points=points,
+        )
+
+    def _autocal_postures(self, arm, t_wo, info, box_in_tcp, fingerprint=None):
+        """Like _box_postures but for the auto-cal run: more postures, tracks
+        the autocal state dict (measured/total/eta_s/segments), and handles
+        box slippage by starting a new segment when the box moved on the cup
+        (SlipWatch). Returns a list of reading dicts for accucal.fit_auto --
+        the same list as self.autocal_readings, filled as it goes (an abort
+        keeps what was read)."""
+        node = self.node
+        start = self.pose(arm, 'pre_pick_state') or node.arm_positions(arm)
+        rng = np.random.default_rng(7)
+        cands, where, kinds = [], [], []
+        self.autocal['text'] = 'choosing postures where the camera sees the box...'
+        for tip, axis, roll in self._front_poses(arm, t_wo, info, rng):
+            if self.abort.is_set():
+                raise KeyboardInterrupt
+            if len(cands) >= self.AUTOCAL_CANDIDATES:
+                break
+            quat = quat_from_matrix(tool_frame_along(axis, math.radians(roll)))
+            tcp = node.tcp_for_tip(tip, axis, arm)
+            seeds = node.fast_ik(arm, tcp, quat, start, want=1)
+            sol = node.solve_ik(arm, tcp, quat, seeds[0]) if seeds else None
+            if sol is not None and self.box_visible(arm, sol, box_in_tcp) >= 4:
+                cands.append(np.array(sol))
+                where.append(np.r_[np.asarray(tip) / 0.05, np.asarray(axis) / 0.35])
+                kinds.append('top' if np.asarray(axis)[2] < -0.6 else 'front')
+
+        if len(cands) < 10:
+            self.say(f'AUTO CAL: only {len(cands)} postures show the box - not enough', True)
+            return []
+
+        feats = np.hstack([np.array(cands) / 0.5, np.array(where)])
+        chosen = []
+        for kind in ('front', 'top'):
+            idx = [i for i, k in enumerate(kinds) if k == kind]
+            quota = (self.AUTOCAL_POSTURES - len(chosen)) if kind == 'top' \
+                else self.AUTOCAL_POSTURES // 2
+            if not idx or quota <= 0:
+                continue
+            pick = [idx[0]]
+            dist = np.linalg.norm(feats[idx] - feats[idx[0]], axis=1)
+            while len(pick) < min(quota, len(idx)):
+                nxt = int(np.argmax(dist))
+                pick.append(idx[nxt])
+                dist = np.minimum(dist, np.linalg.norm(feats[idx] - feats[idx[nxt]], axis=1))
+            chosen += pick
+
+        self.say(f'AUTO CAL: {sum(kinds[i] == "front" for i in chosen)} level and '
+                 f'{sum(kinds[i] == "top" for i in chosen)} top-down postures '
+                 f'(of {len(cands)} that show the box)')
+
+        order, here, left = [], np.array(start), set(chosen)
+        while left:
+            nxt = min(left, key=lambda i: np.linalg.norm(cands[i] - here))
+            order.append(nxt)
+            left.discard(nxt)
+            here = cands[nxt]
+
+        self.autocal['step'] = 'measure'
+        self.autocal['total'] = len(order)
+        self.autocal['measured'] = 0
+        self.autocal['segments'] = [0]      # list of segment indices seen so far
+        readings = getattr(self, 'autocal_readings', None)
+        if readings is None:
+            readings = self.autocal_readings = []
+        failed = 0
+        watch = SlipWatch(Arm(arm))         # the plain URDF, as the motors have it
+        tip_off_r = float(node.args.tip_offsets[arm])
+        t_start = time.monotonic()
+        t_end = t_start + 60.0 * self.AUTOCAL_MINUTES
+        for n, i in enumerate(order, start=1):
+            if self.abort.is_set():
+                raise KeyboardInterrupt
+            if time.monotonic() > t_end:
+                self.say(f'AUTO CAL: {self.AUTOCAL_MINUTES} min done - '
+                         f'fitting with {len(readings)}')
+                break
+            done = len(readings)
+            elapsed = time.monotonic() - t_start
+            eta_s = int(elapsed / done * (len(order) - done)) if done else 0
+            self.autocal.update(
+                text=f'posture {n}/{len(order)} ({done} measured)',
+                measured=done,
+                eta_s=eta_s,
+            )
+            before = node.arm_positions(arm)
+            if not node.move_joints(arm, cands[i].tolist(), f'autocal {n}',
+                                    via_home=False, attempts=1):
+                failed += 1
+                if failed == 3:
+                    self.say('AUTO CAL: moves keep failing; waiting for the planner...')
+                    time.sleep(8.0)
+                    node.require_move_group()
+                elif failed >= 6:
+                    self.say(f'AUTO CAL: the planner is not answering - '
+                             f'stopping with {len(readings)}', True)
+                    break
+                continue
+            failed = 0
+            node.settle(arm, cands[i].tolist(), timeout=3.0)
+            time.sleep(0.2)
+            m = self.measure_box(arm, t_wo, info)
+            if m is None:
+                continue
+            reading = {
+                'q': m['q'].tolist(),
+                'seen': m['seen'],
+                'k': m['k'],
+                'd': m['d'],
+                't_wo': m['t_wo'],
+                'cam_box': m['cam_box'].tolist()
+                    if isinstance(m['cam_box'], np.ndarray) else m['cam_box'],
+                'rms': m['rms'],
+                'n': m['n'],
+                'kind': kinds[i],
+                'segment': 0,               # (SlipWatch sets it)
+                'index': n,
+                'dirs': (directions(before, m['q']) if before is not None
+                         else np.zeros(7)).tolist(),
+                # for a replay offline: which arm, tool and robot it was read on
+                'arm': arm, 'tip_offset': tip_off_r, 'fingerprint': fingerprint,
+            }
+            # did the box move on the cup? (2026-11-17: in the hand frame; the
+            # camera-frame check made every reading its own segment)
+            # (a side check: whatever goes wrong in it, the run goes on)
+            try:
+                moved = watch.place(reading)
+            except Exception as exc:                 # noqa: BLE001
+                moved = None
+                reading['segment'] = watch.segment
+                node.get_logger().warn(f'AUTO CAL: slip check failed ({exc})')
+            readings.append(reading)
+            if moved is not None:
+                self.say(f'AUTO CAL: the box moved on the cup ({moved:.0f} mm in the hand, two '
+                         f'readings in a row) - a new mounting from posture '
+                         f'{watch.slips[-1][0]}')
+                self.autocal['segments'] = list(range(watch.segment + 1))
+            # live error-map point: URDF tip minus camera-measured tip
+            try:
+                from ctm.kinematics import Arm as _Arm
+                _kin = getattr(self, '_autocal_kin', None)
+                if _kin is None:
+                    self._autocal_kin = _Arm(arm)
+                    _kin = self._autocal_kin
+                tip_off_v = float(node.args.tip_offsets[arm])
+                hand = _kin.tcp(np.asarray(m['q'], float))
+                tip_urdf = (hand @ np.array([0.0, 0.0, tip_off_v, 1.0]))[:3]
+                world_box = np.asarray(m['t_wo'], float) @ np.asarray(m['cam_box'], float)
+                from ctm import calib_box as _cb
+                tip_meas = (world_box @ np.r_[_cb.TIP_IN_BOX, 1.0])[:3]
+                err = (tip_urdf - tip_meas) * 1000
+                pts = list(self.autocal.get('points') or [])
+                pts.append({
+                    'x': float(tip_meas[0]), 'y': float(tip_meas[1]),
+                    'z': float(tip_meas[2]),
+                    'dx': float(err[0]), 'dy': float(err[1]), 'dz': float(err[2]),
+                    'e': float(np.linalg.norm(err)),
+                    'kind': kinds[i],
+                })
+                self.autocal['points'] = pts
+            except Exception:                        # noqa: BLE001
+                pass
+        self.autocal['segments'] = list(range(watch.finish()))
+        self.autocal['measured'] = len(readings)
+        return readings
+
+    def _save_autocal_readings(self, arm, readings, partial=False):
+        """The run's readings to calibration/armcal_samples/<arm>_autocal_<stamp>.npy
+        (as CAL TIP keeps its own), so a fit that fails or is refused -- or a
+        stop -- does not lose them (2026-11-17). The path, or None (nothing
+        to keep, or it could not be written: the run goes on regardless)."""
+        if not readings:
+            return None
+        stamp = time.strftime('%Y-%m-%dT%H-%M-%S')
+        path = os.path.join(SAMPLES_DIR, f'{arm}_autocal_{stamp}'
+                            + ('_partial' if partial else '') + '.npy')
+        try:
+            os.makedirs(SAMPLES_DIR, exist_ok=True)
+            np.save(path, np.array(list(readings), dtype=object), allow_pickle=True)
+        except Exception as exc:                     # noqa: BLE001
+            self.node.get_logger().error(f'AUTO CAL: readings not saved ({exc})')
+            return None
+        return path
 
     def calibrate_tip_box(self, arm='left'):
         """CAL TIP: the whole run (see the module's docstring)."""
@@ -522,7 +1065,10 @@ class BoxCalMixin:
                 BACKUP_DIR, os.path.basename(armcal.MODEL_FILE).replace(
                     '.yaml', f'.before_boxcal_{stamp}.yaml')))
         armcal.save_model({arm: (p, b, st)})
-        self.arm_models = armcal.ArmModels()
+        # (re-read in the same --arm-model mode, 2026-11-17)
+        # (a lambda: its own call line, as at AUTO CAL above)
+        self.arm_models = armcal.ArmModels(getattr(self.arm_models, 'mode', None),
+                                           log=lambda text: node.get_logger().info(text))
         self.detail = (f'CAL TIP {arm}: tip error on postures NOT used in the fit: mean '
                        f'{np.mean(e_hold):.1f} mm, 90 % under {np.percentile(e_hold, 90):.1f} mm, '
                        f'max {np.max(e_hold):.1f}' + (f' - {kinds_txt}' if kinds_txt else '')

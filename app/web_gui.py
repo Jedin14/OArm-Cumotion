@@ -78,6 +78,28 @@ def view_hits(centres, radii, t_wo, info, margin_px=0.0, near=0.05):
     return np.all(dist >= -r[:, None], axis=1) & (p[:, 2] >= near - r)
 
 
+def _plain(v):
+    """v with numpy numbers and arrays as Python ones, and NaN / inf as None:
+    json.dumps writes NaN, which the page's JSON.parse refuses -- one bad number
+    would stop every update to the page (2026-11-16)."""
+    if isinstance(v, dict):
+        return {(k if isinstance(k, str) else str(k)): _plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple, np.ndarray)):
+        return [_plain(x) for x in v]
+    if isinstance(v, np.generic):
+        v = v.item()
+    if isinstance(v, float) and not np.isfinite(v):
+        return None
+    return v
+
+
+def _round(v, digits):
+    """A number rounded for the page; anything else (None, text) as it is."""
+    if isinstance(v, (int, float, np.number)) and not isinstance(v, bool):
+        return round(float(v), digits) if np.isfinite(v) else None
+    return v
+
+
 class WebStack(pick_stack.PickStack):
     """The pick stack's ROS interface plus every window tool, for the page."""
 
@@ -150,6 +172,11 @@ class WebStack(pick_stack.PickStack):
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.boxes = []               # every box of that frame (pixels)
         self.log = collections.deque(maxlen=80)
+        # whether each arm model is applied, and why not (--arm-model auto refuses a
+        # model fitted for another wrist/tool/camera, 2026-11-17): once, at start
+        for line in getattr(getattr(self, 'arm_models', None), 'notes', None) or []:
+            self.log.append({'t': time.time(), 'text': line,
+                             'error': line.startswith('WARNING')})
         self.error = False
         self.aruco = cv2.aruco.DetectorParameters_create()
         self._found = ((), None)
@@ -250,6 +277,30 @@ class WebStack(pick_stack.PickStack):
             self.node.resume()
             return self._start(lambda: self.calibrate_tip_box(data.get('arm') or 'left'),
                                'CAL TIP')
+        if name == 'auto_cal':
+            # AUTO CALIBRATE (2026-11-16): the one button -- weigh the tool (arm
+            # empty), wait for the box on the cup, measure the whole workspace,
+            # choose the model itself, check it on unseen postures, save if better
+            # (2026-11-17: not weighed unless asked -- a weigh inside the run changes
+            # the URDF masses under the readings, and the saved model's fingerprint
+            # then no longer matches after the restart; WEIGH TOOL separately)
+            weigh = data.get('weigh', False) not in (False, None, 0, '0', 'false', 'off')
+            self.node.resume()
+            return self._start(lambda: self.calibrate_auto('left', weigh=weigh), 'AUTO CALIBRATE')
+        if name == 'autocal_box_on':
+            # pressed while the run waits at pre_pick (it is busy and calibrating
+            # then): the box is on the cup, go on
+            step = (getattr(self, 'autocal', None) or {}).get('step')
+            if step != 'wait_box':
+                if self._autocal_running():
+                    return True, 'the camera has seen the box already: going on'
+                return False, 'the auto calibration is not waiting for the box'
+            self.autocal_box_on()
+            return True, 'box on the cup: going on'
+        if name == 'abort' and self._autocal_running() and not self.calibrating:
+            # (its weighing or the wait for the box: no calibration prompt to answer)
+            self.answer('abort')
+            return True, 'aborting the auto calibration'
         if name == 'dummy_dims':
             # height x width x depth, mm (the GUI's fields)
             try:
@@ -354,7 +405,13 @@ class WebStack(pick_stack.PickStack):
                 return False, 'an arm is still out: RETURN it first'
             if TOOL_ARM.get(self.pick_tool) in self.node.held:
                 return False, 'the arm still holds a box: take it off the cup, then RELEASE'
-            return self._start(self.pick_all, 'PICK ALL')
+            # COUNT (2026-11-17): "Pick N" stops once N boxes are picked; "All" (or no
+            # count, or 0) clears every box it can, as before
+            ok, want = self._pick_count(data.get('count'))
+            if not ok:
+                return False, f'how many boxes? 1 to {self.PICK_ALL_ROUNDS}, or all'
+            return self._start(lambda: self.pick_all(want),
+                               f'PICK {want}' if want else 'PICK ALL')
         if name in ('pick', 'move') and self.retry is not None and self.pick is None:
             return self._start(lambda: self._pick_and_retry(self.try_again), 'trying again')
         if name == 'pick' or name == 'move':
@@ -603,6 +660,39 @@ class WebStack(pick_stack.PickStack):
         except (OSError, ValueError):
             return None
 
+    # -- AUTO CALIBRATE, for the page (2026-11-16) ---------------------------------
+
+    AUTOCAL_RUNNING = ('weigh', 'wait_box', 'choose', 'measure', 'fit')
+    AUTOCAL_POINTS = 150          # error-map points sent (the page redraws them on change only)
+
+    def _autocal_running(self):
+        """The one-button run is going (a step of its own, and its job alive:
+        a job that died leaves its last step behind)."""
+        return bool(self.busy and (getattr(self, 'autocal', None) or {}).get('step')
+                    in self.AUTOCAL_RUNNING)
+
+    def _autocal_state(self):
+        """A copy of the run's progress and result (it writes them from its own
+        thread), in plain numbers, the error map's points capped and rounded --
+        the page gets this 5 times a second."""
+        ac = dict(getattr(self, 'autocal', None) or {})
+        if not ac:
+            return {}
+        mm, metres = {'dx', 'dy', 'dz', 'e'}, {'x', 'y', 'z'}
+        try:
+            points = []
+            for p in list(ac.get('points') or [])[:self.AUTOCAL_POINTS]:
+                if isinstance(p, dict):
+                    points.append({k: (_round(v, 4) if k in metres else
+                                       _round(v, 1) if k in mm else v) for k, v in p.items()})
+            ac['points'] = points
+            ac['running'] = self._autocal_running()
+            return json.loads(json.dumps(_plain(ac), default=str))
+        except Exception as exc:                     # noqa: BLE001 - never the whole page
+            # (a snapshot that raises ends the page's event stream: nothing would update)
+            return {'step': str(ac.get('step')), 'running': self._autocal_running(),
+                    'text': f'{ac.get("text") or ""} (the page could not show the rest: {exc})'}
+
     def tip_arm(self):
         """The arm with a tool on, else left."""
         tools = self.node.args.tools
@@ -628,6 +718,8 @@ class WebStack(pick_stack.PickStack):
         self.retry = None
         self.check_shown = False
         self.node.pick_box = None                        # (no measured face for it)
+        self.node.pick_size = None                       # (nor the box model's size, 2026-11-17)
+        self.node.pick_normal = None
         self.node.pick_face_mm = None
         self.target = self.box = None
         self.node.resume()
@@ -797,7 +889,8 @@ class WebStack(pick_stack.PickStack):
         if self.busy:
             return
         if self.pick is None or self.pick is not getattr(self, 'model_pick', None):
-            self.node.pick_box = self.node.pick_face_mm = None
+            self.node.pick_box = self.node.pick_face_mm = self.node.pick_normal = None
+            self.node.pick_size = None                   # (a point of your own: no box, 2026-11-17)
             return super().move()
         self.in_background(lambda: self._pick_and_retry(self._pick_detected))
 
@@ -829,7 +922,8 @@ class WebStack(pick_stack.PickStack):
         into the world by the TF, the reach check, shown; MOVE picks it."""
         self.retry = self.model_pick = None
         self.picker_shown, self.check_shown = None, False
-        self.node.pick_box = self.node.pick_face_mm = None
+        self.node.pick_box = self.node.pick_face_mm = self.node.pick_normal = None
+        self.node.pick_size = None                       # (prepare_target below clears it too)
         if self.mode != 'pick' and not self.ensure_pick_mode():
             return
         self.capture()
@@ -885,16 +979,58 @@ class WebStack(pick_stack.PickStack):
 
     # -- PICK ALL ----------------------------------------------------------------------
 
-    PICK_ALL_ROUNDS = 200         # at most this many detections in one PICK ALL (a backstop)
+    PICK_ALL_ROUNDS = 200         # at most this many detections in one PICK ALL (a backstop);
+    #                               also the most the page's count may ask for
+    SKIP_FAILED = 'not skipped'   # the look-ahead's fate when the picker refused its skip
     PICK_ALL_PASSES = 3           # rounds over the skipped boxes, while each one takes some
     PICK_ALL_REOFFERS = 3         # a skipped box offered again: skipped again this often per pass
     VIEW_MARGIN_PX = 30           # the picture's edges widened (the lens shows a little more)
     ARM_RADIUS_M = 0.05           # the arm, as a chain of spheres this big
     BOX_UNKNOWN_M = 0.15          # a box on the cup: at least this long (its depth is not seen)
 
-    def pick_all(self):
+    @classmethod
+    def _pick_count(cls, raw):
+        """The page's count for PICK ALL (2026-11-17): (True, None) for every box
+        ("all", 0, or none given), (True, n) for 1..PICK_ALL_ROUNDS, (False, None)
+        for anything else (refused, never guessed: it decides how many boxes move)."""
+        if raw is None or (isinstance(raw, str) and raw.strip().lower() in ('', 'all')):
+            return True, None
+        if isinstance(raw, bool):
+            return False, None
+        try:
+            f = float(raw)
+        except (TypeError, ValueError):
+            return False, None
+        if not np.isfinite(f) or f != int(f):
+            return False, None
+        n = int(f)
+        if n == 0:
+            return True, None
+        return (True, n) if 1 <= n <= cls.PICK_ALL_ROUNDS else (False, None)
+
+    @staticmethod
+    def _enough(run):
+        """PICK N (2026-11-17): N boxes picked -- nothing more is started (no look,
+        no reach check, no pick). Never with "All" (want None)."""
+        want = run.get('want')
+        return bool(want) and run['picked'] >= want
+
+    @staticmethod
+    def _picked_text(run):
+        """"2 of 3 picked" (PICK N) / "2 picked" (All)."""
+        want = run.get('want')
+        return f'{run["picked"]} of {want} picked' if want else f'{run["picked"]} picked'
+
+    def pick_all(self, want=None):
         """PICK ALL: clear every box it can -- the picker's boxes one after another,
         with no MOVE to press: DETECT BOX, the pick, the drop, the next.
+
+        want (2026-11-17, the page's count): stop once that many boxes are picked
+        (_enough: checked before every look, in the look-ahead and before the
+        next pick, so no extra box is started); None: every box it can, as
+        before. A box the camera could not judge but the cup weighed (held)
+        counts as picked ("picked (by weight)"), so an exact count does not
+        take one too many.
 
         A box it cannot pick is never tried: the reach check says no, it is
         skipped (the picker's "skip") and the next one taken. One try per box
@@ -917,10 +1053,11 @@ class WebStack(pick_stack.PickStack):
         pre_pick the arm comes back to, skipping what cannot be picked.
 
         Ends when a round takes nothing, on STOP, with an arm left out or a box
-        still on the cup. The boxes skipped in the last round stay skipped after
-        it: Forget skipped brings them back."""
+        still on the cup -- or with `want` boxes picked. The boxes skipped in the
+        last round stay skipped after it: Forget skipped brings them back."""
         self.base_correction = None
         run = self.picking_all = {'round': 0, 'picked': 0, 'skipped': 0, 'pass': 1,
+                                  'want': want,
                                   'unreachable': [], 'picks': [], 'out_of_reach': [],
                                   'started': time.strftime('%Y-%m-%d %H:%M:%S'),
                                   't0': time.monotonic(), 'last_end': time.monotonic()}
@@ -935,8 +1072,14 @@ class WebStack(pick_stack.PickStack):
                 given_up = []                            # where this round's skipped boxes are
                 tried = []                               # tried: the camera could not tell / dropped
                 go, why, bad = self._next_pickable(run, given_up, tried)
-                while go:
+                while go and not self._enough(run):
                     go, why, bad = self._pick_all_one(run, given_up, tried)
+                if not bad and self._enough(run):
+                    # PICK N (2026-11-17): done as asked -- nothing left half-chosen
+                    # for MOVE (the box just picked is gone)
+                    why = f'{run["picked"]} picked, as asked'
+                    self.box = self.pick = self.check = self.model_pick = None
+                    break
                 if bad or not run['retry'] or run['picked'] == taken or \
                         run['pass'] >= self.PICK_ALL_PASSES:
                     break
@@ -954,6 +1097,10 @@ class WebStack(pick_stack.PickStack):
             self._ahead = None
             self.retry = None
             self.activity = None
+            if self.pick is None:
+                # (2026-11-17) no box left chosen: the box model's size of the last
+                # one must not ride on a later touch (a click, a wall touch)
+                self.node.pick_size = None
         dropped = f', {run["dropped"]} dropped' if run.get('dropped') else ''
         rounds = f' in {run["pass"]} rounds' if run['pass'] > 1 else ''
         left = run.get('out_of_reach') or []
@@ -963,7 +1110,7 @@ class WebStack(pick_stack.PickStack):
         took = f'; {self._duration(rep["total_s"])} in all' + (
             f', {self._duration(rep["per_box_s"])} per box picked (each pick '
             f'{self._duration(rep["pick_s"])})' if rep['per_box_s'] else '')
-        self.say(f'PICK ALL done: {run["picked"]} picked, {run["skipped"]} skipped{dropped}'
+        self.say(f'PICK ALL done: {self._picked_text(run)}, {run["skipped"]} skipped{dropped}'
                  f'{rounds} - {why}{took}' +
                  ('. The skipped boxes stay skipped: Forget skipped (Advanced) brings them back'
                   if run['skipped'] else '') +
@@ -975,10 +1122,12 @@ class WebStack(pick_stack.PickStack):
     def _for_good(why):
         """A reach check's no that taking other boxes cannot change (out of reach,
         the wrist, no posture, too near the camera) -- not "something in the
-        way" or "blocked", nor a check that failed or was stopped."""
+        way" or "blocked", nor a check that failed or was stopped. Nor one that
+        ran out of time (2026-11-17: "... found in 30 s (--plan-budget)" is the
+        search's clock, not the box's place -- the next round looks again)."""
         w = (why or '').lower()
         return bool(w) and not any(k in w for k in ('in the way', 'blocked', 'could not check',
-                                                     'stop'))
+                                                     'stop', 'plan-budget'))
 
     def _next_pickable(self, run, given_up, tried, detect=None, can_wait=True):
         """DETECT BOX until the picker offers a box the reach check can pick
@@ -996,10 +1145,12 @@ class WebStack(pick_stack.PickStack):
         while True:
             if self.halted():
                 return False, 'STOP', True
+            if self._enough(run):                        # PICK N: done -- no look (2026-11-17)
+                return False, f'{run["picked"]} picked, as asked', False
             if run['round'] >= self.PICK_ALL_ROUNDS:
                 return False, f'{self.PICK_ALL_ROUNDS} detections, the most in one PICK ALL', True
             run['round'] += 1
-            self.say(f'PICK ALL {run["round"]}: looking ({run["picked"]} picked, '
+            self.say(f'PICK ALL {run["round"]}: looking ({self._picked_text(run)}, '
                      f'{run["skipped"]} skipped so far)')
             self.retry = None
             self.box = self.pick = self.check = self.model_pick = None   # this look's only
@@ -1227,14 +1378,26 @@ class WebStack(pick_stack.PickStack):
             self._time_pick(run, mine, r, 'still on the cup', t_start)
             return False, 'a box is still on the cup: take it off, then RELEASE', True
         fate = ahead['fate']
+        if fate == self.SKIP_FAILED:
+            # the look-ahead's skip failed already: not tried a second time
+            # (2026-11-17: twice after a Broken pipe, 2026-11-16 17:40:44)
+            self._time_pick(run, mine, r, 'not skipped', t_start)
+            return False, 'the picker did not skip it', True
         if fate is None:                                 # (no look-ahead: decided here)
             picked = False if r.get('outcome') == 'not_started' else r.get('picked')
+            held = (self.last_contact or {}).get('held') is True and \
+                r.get('outcome') != 'not_started'
             fate = self._box_fate(mine, picked, r.get('outcome'), self.last_contact is not None,
-                                  run, given_up, tried, gone=r.get('outcome') == 'dropped')
+                                  run, given_up, tried, gone=r.get('outcome') == 'dropped',
+                                  held=held)
             if fate is None:
                 self._time_pick(run, mine, r, 'not skipped', t_start)
                 return False, 'the picker did not skip it', True
         self._time_pick(run, mine, r, fate, t_start)
+        if self._enough(run):
+            # PICK N (2026-11-17): that was the last one asked for -- the next box
+            # is neither used nor looked for
+            return False, f'{run["picked"]} picked, as asked', False
         if ahead['found'] is not None:
             if ahead['found'][0] == 'wait':              # out of reach, the base may move: from here
                 return self._next_pickable(run, given_up, tried)
@@ -1258,8 +1421,10 @@ class WebStack(pick_stack.PickStack):
                  'face_mm': face, 'xyz': [round(float(v), 3) for v in mine['where']]}
         run['picks'].append(entry)
         run['last_end'] = now
-        self.say(f'PICK ALL: box {entry["n"]} {result} - {entry["seconds"]:.1f} s '
-                 f'({entry["cycle"]:.1f} s since the last box)', result not in ('picked',))
+        count = f' ({self._picked_text(run)})' if run.get('want') else ''
+        self.say(f'PICK ALL: box {entry["n"]} {result}{count} - {entry["seconds"]:.1f} s '
+                 f'({entry["cycle"]:.1f} s since the last box)',
+                 not str(result).startswith('picked'))   # ('picked (by weight)' too)
 
     @staticmethod
     def _duration(seconds):
@@ -1275,10 +1440,10 @@ class WebStack(pick_stack.PickStack):
         is done) and saved as native/logs/pick_all/pick_all_<when>.json and .csv.
         The report."""
         total = time.monotonic() - run['t0']
-        picked = [p for p in run['picks'] if p['result'] == 'picked']
+        picked = [p for p in run['picks'] if str(p['result']).startswith('picked')]
         report = {'id': int(time.time() * 1000), 'started': run['started'],
                   'finished': time.strftime('%Y-%m-%d %H:%M:%S'), 'total_s': round(total, 1),
-                  'picked': run['picked'], 'skipped': run['skipped'],
+                  'picked': run['picked'], 'want': run.get('want'), 'skipped': run['skipped'],
                   'dropped': run.get('dropped', 0), 'rounds': run.get('pass', 1), 'why': why,
                   'ok': not bad, 'per_box_s': round(total / len(picked), 1) if picked else None,
                   'pick_s': (round(sum(p['seconds'] for p in picked) / len(picked), 1)
@@ -1314,19 +1479,30 @@ class WebStack(pick_stack.PickStack):
         if ahead is not None and ahead['arm'] == arm:
             ahead['box'] = 0.0
 
-    def _box_fate(self, mine, picked, outcome, touched, run, given_up, tried, gone=False):
+    def _box_fate(self, mine, picked, outcome, touched, run, given_up, tried, gone=False,
+                  held=False):
         """After its pick: a box taken is counted; one not taken and still in its
         place is skipped (flagged first when the cup touched it: photos for a
         person); one gone from its place without being taken (dropped, knocked
         off) is not -- the picker skips by the place in the picture, and what is
         there now is another box, or the next one behind; one the camera could
         not tell about is remembered -- offered again, it is skipped then.
-        'picked', 'skipped', 'dropped', 'tried', or None (the picker did not skip)."""
+        held (2026-11-17): the cup weighed the box after the press -- one the
+        camera could not tell about is counted as picked then ('picked (by
+        weight)'), so PICK N does not take one too many; it is remembered as
+        tried all the same (offered again: skipped, not picked twice).
+        'picked', 'picked (by weight)', 'skipped', 'dropped', 'tried', or None
+        (the picker did not skip)."""
         if picked is True:
             run['picked'] += 1
             return 'picked'
         if picked is None:
             tried.append(mine['where'])
+            if held:
+                run['picked'] += 1
+                self.say(f'PICK ALL: the camera could not tell ({outcome or "?"}), but the cup '
+                         f'weighed the box - counted as picked (by weight)')
+                return 'picked (by weight)'
             return 'tried'
         if touched:
             self.model_cmd('flag', 15.0)                 # (before the skip: of this box)
@@ -1349,7 +1525,17 @@ class WebStack(pick_stack.PickStack):
         ahead = getattr(self, '_ahead', None)
         if ahead is None or ahead['arm'] != arm or ahead['returning'].is_set():
             return
-        ahead['start'] = [float(v) for v in lt['start']]
+        # (2026-11-17) the pose the arm really comes back to: touch's return_target
+        # (the nominal pre_pick when near it), else where this pick started
+        start = lt['start']
+        target = getattr(self, 'return_target', None)
+        if callable(target):
+            try:
+                start = target(arm, lt)
+            except Exception as exc:                     # noqa: BLE001 - then the old start
+                self.node.get_logger().warn(f'PICK ALL: return_target failed ({exc})')
+                start = lt['start']
+        ahead['start'] = [float(v) for v in (start if start is not None else lt['start'])]
         if holding or lt.get('pressed'):
             held = self.node.held.get(arm) or {}
             ahead['box'] = max([ahead['box_m']] + [float(v) for v in held.get('extents') or []])
@@ -1371,7 +1557,12 @@ class WebStack(pick_stack.PickStack):
                          'finding the next box while it drops')
             contact = self.last_contact                  # this pick's (set at the press)
             holding = {True: 'held', False: 'empty'}.get((contact or {}).get('held'), '')
-            verified = self._out_of_view(ahead, lambda: self.verify_pick(holding, wait=0.0))
+            if contact is None:
+                # never touched: not taken -- no camera check for it (2026-11-17: 49 s
+                # of "waiting for the arm" on a box never touched, 2026-11-16 17:39:55)
+                verified = (False, 'no_contact', 'the arm never touched the box', None)
+            else:
+                verified = self._out_of_view(ahead, lambda: self.verify_pick(holding, wait=0.0))
             ahead['verified'] = verified
             # as finish_pick will read it: never touched = not taken; no camera check:
             # the contact and the weight
@@ -1382,10 +1573,18 @@ class WebStack(pick_stack.PickStack):
             elif outcome == 'no_check':
                 felt = bool(contact.get('felt')) and 'STOPPED' not in contact.get('how', '')
                 picked = felt and contact.get('held') is not False
-            ahead['fate'] = self._box_fate(mine, picked, outcome, contact is not None,
-                                           run, given_up, tried, gone=gone)
-            if ahead['fate'] is None:
+            fate = self._box_fate(mine, picked, outcome, contact is not None, run, given_up,
+                                  tried, gone=gone,
+                                  held=(contact or {}).get('held') is True)
+            # (a failed skip is marked: _pick_all_one must not try it again)
+            ahead['fate'] = self.SKIP_FAILED if fate is None else fate
+            if fate is None:
                 ahead['found'] = (False, 'the picker did not skip it', True)
+                return
+            if self._enough(run):
+                # PICK N (2026-11-17): that was the last one asked for -- no look, no
+                # reach check for a box that will not be picked
+                ahead['found'] = (False, f'{run["picked"]} picked, as asked', False)
                 return
             ahead['found'] = self._next_pickable(run, given_up, tried,
                                                  detect=lambda bc: self._detect_ahead(ahead, bc),
@@ -1571,11 +1770,13 @@ class WebStack(pick_stack.PickStack):
                 'walls_off': bool(getattr(self.node, 'walls_off', False))}
 
     def _pick_all_state(self):
-        """PICK ALL running, for the page: its counts, how long so far, each box's time."""
+        """PICK ALL running, for the page: its counts, how long so far, each box's time
+        -- and want, how many were asked for (None: all; 2026-11-17)."""
         run = self.picking_all
         if not run:
             return None
-        return {'round': run['round'], 'picked': run['picked'], 'skipped': run['skipped'],
+        return {'round': run['round'], 'picked': run['picked'], 'want': run.get('want'),
+                'skipped': run['skipped'],
                 'dropped': run.get('dropped', 0), 'pass': run.get('pass', 1),
                 'elapsed_s': round(time.monotonic() - run['t0'], 1),
                 'picks': list(run.get('picks', []))}
@@ -1733,6 +1934,7 @@ class WebStack(pick_stack.PickStack):
         for arm in ('left', 'right'):
             r = raw.get(arm) or {}
             models[arm] = {'has': self.arm_models.has(arm), 'model': r.get('model'),
+                           'status': getattr(self.arm_models, 'status', lambda a: None)(arm),
                            'rms_px': r.get('rms_px'), 'anchor_mm': r.get('anchor_mm'),
                            'anchors': len(armcal.load_anchors(arm))}
         t = self.target
@@ -1782,6 +1984,7 @@ class WebStack(pick_stack.PickStack):
             'box_cal': ({k: (raw.get('left') or {}).get(k) for k in
                          ('box_tips', 'box_holdout_mm', 'box_holdout_p90_mm')}
                         if (raw.get('left') or {}).get('box_tips') else None),
+            'autocal': self._autocal_state(),
             'camera': color is not None, 'click_only': self.click_only,
             'phase': self.step, 'dummy': self.dummy, 'ns': self.ns,
             'dummy_mm': [round(v, 1) for v in self.DUMMY_MM],

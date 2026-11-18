@@ -30,7 +30,9 @@
   <depend>openarm_can</depend>
   <depend>kdl_parser</depend>
   <depend>orocos_kdl_vendor</depend>
+  <depend>yaml_cpp_vendor</depend>
 
+  <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
   <test_depend>ros2_control_test_assets</test_depend>

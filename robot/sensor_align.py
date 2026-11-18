@@ -1,0 +1,1309 @@
+#!/usr/bin/env python3
+"""SENSOR ALIGN: line the camera's and the LiDAR's world up with the robot RViz draws, by
+hand, live -- then save.
+
+    source native/setup.bash
+    python3 robot/sensor_align.py             (terminal 1 running)
+
+Nothing here moves the arm. What moves is where the robot thinks its sensors are:
+  camera  the D455's mount, camera_joint (world -> camera_bottom_screw_frame), handed to
+          robot_state_publisher at once (as CALIBRATE's APPLY does): tf, the camera's
+          cloud, every click and the next octomap follow
+  LiDAR   the L2's mount on robot/lidar_bridge.py (mount_xyz / mount_rpy_deg; it takes
+          them while running; mount_spin_deg is left as it is)
+
+How (2026-11-16): hold something you can see on the working tip -- the palm of your hand,
+the tip in its centre -- or just look at the arm in the clouds. The yellow ball in RViz
+(display "Sensor align tip", /sensor_align/markers) is where the robot thinks the tip is
+(hand_tcp + the fingertips + the tool, tools.yaml). Move the clouds until the palm sits
+on the ball.
+  Both / Camera / LiDAR   which sensor the buttons move. Both: the two together (one rigid
+                          move of everything seen), so they stay on each other
+  move                    the cloud along the robot's axes (X forward red, Y left green,
+                          Z up blue)
+  turn                    the cloud about the ball, so what already lines up there stays
+  Fit camera to the arm   the camera onto the arm's model as it stands now -- no motion,
+                          hands away: its depth onto the URDF meshes posed by the encoders.
+                          One posture pins down little, so a shift only (what the arm does
+                          not show stays as it is); shift + turn with 3+ links well in view.
+                          It says what it would change and on what; you apply it or not
+  Fit LiDAR to camera     the L2's mount onto what the camera sees (walls, boxes, table):
+                          point-to-plane ICP of ~2.5 s of its scans; the camera stays
+  (fits and nudges: Undo takes them back)
+Readouts, every 2 s, higher is better:
+  camera vs arm     of the arm model the camera can see, how much its depth agrees within
+                    15 mm (OVERLAY's number), and how much nearer or farther it sees the arm
+  LiDAR vs camera   the bridge's own: of its points in the camera's view, how many sit at
+                    the camera's depth
+If the camera agrees with the arm and the palm is still off the ball, the camera is right
+and the tool is not where the URDF draws it (tools.yaml, openarm_hand.xacro).
+
+SAVE: the camera into v10.urdf.xacro (+ a new V in cam_org.txt) and a rebuild of
+openarm_description; the LiDAR into launch_everything.launch.py's lidar_* defaults.
+Backups in old_version/calibration_backups/. Unsaved, changes last until terminal 1
+restarts (or REVERT). The arm model (calibration/arm_model.yaml) was fitted through the
+camera as it was: after moving the camera, run the Auto calibrate again.
+"""
+
+import datetime
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import warnings
+from collections import deque
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+WS = os.path.dirname(HERE)
+sys.path.insert(0, os.path.join(WS, 'app'))
+
+XACRO = os.path.join(WS, 'src/openarm_description/urdf/robot/v10.urdf.xacro')
+CAM_ORG = os.path.join(WS, 'calibration/cam_org.txt')
+LAUNCH = os.path.join(WS, 'robot/launch_everything.launch.py')
+TOOLS = os.path.join(WS, 'calibration/tools.yaml')
+BACKUPS = os.path.join(WS, 'old_version/calibration_backups')
+BUILD = [os.path.join(WS, 'native/build_ws.sh'), '--packages-select', 'openarm_description']
+
+DEPTH_TOPIC = '/camera/camera/aligned_depth_to_color/image_raw'
+INFO_TOPIC = '/camera/camera/color/camera_info'
+FINGERTIP_BEYOND_TCP = 0.0154          # ctm/common.py: the closed fingertips beyond hand_tcp
+SCREW_FRAME = 'camera_bottom_screw_frame'
+CAMERA_JOINT = re.compile(r'(<joint\s+name="camera_joint"[^>]*>\s*)(<origin\b[^>]*/>)')
+LIDAR_KEYS = ('lidar_x', 'lidar_y', 'lidar_z', 'lidar_roll', 'lidar_pitch', 'lidar_yaw',
+              'lidar_spin')
+ARM_LINKS = ('link3', 'link4', 'link5', 'link6', 'link7', 'hand', 'left_finger', 'right_finger')
+FALLBACK_PIVOT = np.array([0.40, 0.0, 0.55])   # no tf for the tip: about the work area
+FIT_SCHEDULE = (0.06, 0.05, 0.04, 0.035, 0.03, 0.025, 0.02, 0.018, 0.015, 0.012, 0.01,
+                0.01, 0.008, 0.008, 0.006, 0.006, 0.006, 0.006)
+
+
+# -- poses ---------------------------------------------------------------------------------
+
+def rpy_matrix(roll, pitch, yaw):
+    """3x3, fixed-axis roll about x, then pitch about y, then yaw about z (URDF / tf2)."""
+    cr, sr, cp, sp, cy, sy = (math.cos(roll), math.sin(roll), math.cos(pitch),
+                              math.sin(pitch), math.cos(yaw), math.sin(yaw))
+    return np.array([[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                     [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                     [-sp, cp * sr, cp * cr]])
+
+
+def rot_z(angle):
+    c, s = math.cos(angle), math.sin(angle)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def axis_angle(axis, angle):
+    k = np.asarray(axis, float)
+    k = k / np.linalg.norm(k)
+    kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + math.sin(angle) * kx + (1 - math.cos(angle)) * kx @ kx
+
+
+def _wrap(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def rpy_near(R, ref=(0.0, 0.0, 0.0)):
+    """(roll, pitch, yaw) rad of R in rpy_matrix's convention: of its two solutions the one
+    nearest ref, each angle kept within 180 deg of ref's -- so the L2, set as pitch 113 deg,
+    stays written as 113 and not as the same turn spelt 67 / roll + 180 / yaw + 180."""
+    pitch = math.asin(float(np.clip(-R[2, 0], -1.0, 1.0)))
+    if abs(math.cos(pitch)) < 1e-6:                 # straight up or down: roll and yaw blur
+        roll = ref[0]
+        yaw = math.atan2(-R[0, 1], R[1, 1]) + (roll if pitch < 0 else -roll)
+        a = b = (roll, pitch, yaw)
+    else:
+        roll, yaw = math.atan2(R[2, 1], R[2, 2]), math.atan2(R[1, 0], R[0, 0])
+        a = (roll, pitch, yaw)
+        b = (_wrap(roll + math.pi), _wrap(math.pi - pitch), _wrap(yaw + math.pi))
+    best = min((a, b), key=lambda s: sum(abs(_wrap(x - r)) for x, r in zip(s, ref)))
+    return tuple(r + _wrap(x - r) for x, r in zip(best, ref))
+
+
+def pose(R, t):
+    m = np.eye(4)
+    m[:3, :3], m[:3, 3] = R, t
+    return m
+
+
+def change(a, b):
+    """(mm, deg) from pose a to pose b."""
+    if a is None or b is None:
+        return 0.0, 0.0
+    c = (np.trace(a[:3, :3].T @ b[:3, :3]) - 1.0) / 2.0
+    return (1000.0 * float(np.linalg.norm(b[:3, 3] - a[:3, 3])),
+            math.degrees(math.acos(float(np.clip(c, -1.0, 1.0)))))
+
+
+def nudge_matrix(move=None, turn=None, centre=None):
+    """The world-frame move: a shift (3,) m, or a turn (axis, rad) about centre."""
+    d = np.eye(4)
+    if move is not None:
+        d[:3, 3] = move
+    if turn is not None:
+        R = axis_angle(*turn)
+        c = np.asarray(centre, float)
+        d[:3, :3], d[:3, 3] = R, c - R @ c
+    return d
+
+
+def quat_matrix(x, y, z, w):
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                     [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+
+def tip_offset(arm, path=None):
+    """The working tip beyond hand_tcp along its +Z: the fingertips and the tool, if on."""
+    import yaml
+    try:
+        with open(path or TOOLS) as handle:
+            t = (yaml.safe_load(handle) or {}).get(arm) or {}
+    except OSError:
+        t = {}
+    return FINGERTIP_BEYOND_TCP + (float(t.get('length', 0.0)) if t.get('on') else 0.0)
+
+
+# -- the files ------------------------------------------------------------------------------
+
+def _backup(path, stamp):
+    os.makedirs(BACKUPS, exist_ok=True)
+    dst = os.path.join(BACKUPS, f'{os.path.basename(path)}.before_sensoralign_{stamp}')
+    shutil.copy2(path, dst)
+    return dst
+
+
+def _attr(tag, name, default):
+    m = re.search(rf'\b{name}="([^"]*)"', tag)
+    return [float(v) for v in (m.group(1) if m else default).split()]
+
+
+def save_camera(T, ref, when, stamp):
+    """The camera mount into v10.urdf.xacro (xacro:sensor_d455) and cam_org.txt, as a new
+    V. -> (tag, text)."""
+    x, y, z = (float(v) for v in T[:3, 3])
+    r, p, yw = rpy_near(T[:3, :3], ref)
+    origin = f'<origin xyz="{x:.5f} {y:.5f} {z:.5f}" rpy="{r:.5f} {p:.5f} {yw:.5f}"/>'
+    with open(XACRO) as handle:
+        xacro = handle.read()
+    m = re.search(r'(<xacro:sensor_d455[^>]*>)(.*?)(</xacro:sensor_d455>)', xacro, re.S)
+    if m is None:
+        raise RuntimeError(f'no xacro:sensor_d455 in {XACRO}; nothing written')
+    old = re.search(r'<origin\b[^>]*/>', m.group(2))
+    prev = None
+    if old:
+        prev = pose(rpy_matrix(*_attr(old.group(0), 'rpy', '0 0 0')),
+                    _attr(old.group(0), 'xyz', '0 0 0'))
+    mm, deg = change(prev, T)
+    with open(CAM_ORG) as handle:
+        cam_org = handle.read()
+    versions = [int(n) for n in re.findall(r'^V(\d+)\b', cam_org, re.M)]
+    tag = f'V{1 + max(versions or [3])}'
+    body = (f'\n    <!-- {tag}: set by hand {when} with robot/sensor_align.py (live, the clouds\n'
+            f'         against the arm; {mm:.1f} mm / {deg:.2f} deg from the one before).'
+            f' History in cam_org.txt. -->\n    {origin}\n  ')
+    xacro = xacro[:m.start()] + m.group(1) + body + m.group(3) + xacro[m.end():]
+    # how the user measures it: from the arm origin (link0, V7: 0.0126, +/-, 0.7344; the
+    # centre between the arms y=0.0062) -- as camera_calibration.apply_calibration
+    from_arm = (f'{1000 * (x - 0.0126):.2f} mm in front of and {1000 * (0.7344 - z):.2f} mm '
+                f'below the arm origin, {1000 * (y - 0.0062):+.2f} mm to the left')
+    summary = (f'current ({tag}):    {origin}\n\n{from_arm}\n'
+               f'X = {1000 * x:.2f} mm, Y = {1000 * y:.2f} mm, Z = {1000 * z:.2f} mm\n'
+               f'roll = {math.degrees(r):.2f} deg, pitch = {math.degrees(p):.2f} deg, '
+               f'yaw = {math.degrees(yw):.2f} deg\n'
+               f'Set by hand with robot/sensor_align.py ({when}): the clouds moved onto the arm '
+               f'and the tip as RViz draws them.\n')
+    cam_org = re.sub(r'current \(V\d+\):.*?(?=\nhistory:)', lambda _m: summary.rstrip('\n') + '\n',
+                     cam_org, count=1, flags=re.S)
+    cam_org = (cam_org.rstrip('\n') + f'\n\n{tag}\n  {origin}\n  {from_arm}\n'
+               f'  set by hand {when} with robot/sensor_align.py: {mm:.1f} mm / {deg:.2f} deg '
+               f'from the version before\n')
+    for path, text in ((XACRO, xacro), (CAM_ORG, cam_org)):
+        _backup(path, stamp)
+        with open(path, 'w') as handle:
+            handle.write(text)
+    return tag, f'camera {tag} ({mm:.1f} mm / {deg:.2f} deg from the file)'
+
+
+def save_lidar(xyz, rpy_deg, spin, prev, T, when, stamp):
+    """The LiDAR mount into launch_everything.launch.py: its lidar_* defaults and the
+    fallbacks in lidar_nodes. -> text."""
+    with open(LAUNCH) as handle:
+        src = handle.read()
+    values = [f'{v:.4f}' for v in xyz] + [f'{v:.2f}' for v in rpy_deg] + [f'{spin:.2f}']
+    for key, val in zip(LIDAR_KEYS, values):
+        src, n = re.subn(rf"(DeclareLaunchArgument\('{key}', default_value=')[^']*(')",
+                         lambda m, v=val: m.group(1) + v + m.group(2), src)
+        if n != 1:
+            raise RuntimeError(f"no DeclareLaunchArgument('{key}', default_value=...) in "
+                               f'{LAUNCH}; nothing written')
+        src = re.sub(rf"(f\('{key}', )[-+0-9.eE]+(\))", lambda m, v=val: m.group(1) + v + m.group(2),
+                     src)
+    mm, deg = change(prev, T)
+    note = (f"        # {when}: set by hand with robot/sensor_align.py (live; {mm:.1f} mm / "
+            f"{deg:.2f} deg from the values before).\n")
+    anchor = "        DeclareLaunchArgument('lidar_x',"
+    src = src.replace(anchor, note + anchor, 1)
+    _backup(LAUNCH, stamp)
+    with open(LAUNCH, 'w') as handle:
+        handle.write(src)
+    return f'LiDAR ({mm:.1f} mm / {deg:.2f} deg)'
+
+
+def depth_points(depth, info, stride=2, near=0.25, far=1.2):
+    """Optical-frame points of a depth image (m), without the flying pixels at edges (the
+    local-range test of robot_camera_calibration.arm_points)."""
+    import cv2
+    import robot_camera_calibration as rcc
+    k, d = rcc.intrinsics(info)
+    valid = (depth > near) & (depth < far)
+    local_max = cv2.dilate(np.where(valid, depth, 0).astype(np.float32), np.ones((5, 5)))
+    local_min = cv2.erode(np.where(valid, depth, 10).astype(np.float32), np.ones((5, 5)))
+    mask = valid & ((local_max - local_min) < 0.012)
+    sub = np.zeros_like(mask)
+    sub[::stride, ::stride] = mask[::stride, ::stride]
+    v, u = np.nonzero(sub)
+    if not len(u):
+        return np.zeros((0, 3))
+    rays = cv2.undistortPoints(np.stack([u, v], 1).astype(np.float64).reshape(-1, 1, 2),
+                               k, d).reshape(-1, 2)
+    z = depth[v, u].astype(np.float64)
+    return np.column_stack([rays * z[:, None], z])
+
+
+def _so3_exp(w):
+    angle = float(np.linalg.norm(w))
+    return np.eye(3) if angle < 1e-12 else axis_angle(w, angle)
+
+
+def camera_surface(depth, info, t_wo, stride=2, near=0.3, far=3.0):
+    """The camera's depth as a surface in world: (points, normals, kd-tree). Normals from the
+    image grid; pixels at depth edges (a neighbour > 3 cm off) left out."""
+    import cv2
+    from scipy.spatial import cKDTree
+    import robot_camera_calibration as rcc
+    k, dist = rcc.intrinsics(info)
+    d = depth[::stride, ::stride].astype(np.float64)
+    h, w = d.shape
+    v, u = np.mgrid[0:h, 0:w]
+    px = np.stack([u.ravel() * stride, v.ravel() * stride], 1).astype(np.float64)
+    rays = cv2.undistortPoints(px.reshape(-1, 1, 2), k, dist).reshape(h, w, 2)
+    P = np.dstack([rays * d[..., None], d])
+    c = P[1:-1, 1:-1]
+    dx, dy = P[1:-1, 2:] - P[1:-1, :-2], P[2:, 1:-1] - P[:-2, 1:-1]
+    n = np.cross(dx, dy)
+    norm = np.linalg.norm(n, axis=2)
+    dc = d[1:-1, 1:-1]
+    nb = np.stack([d[1:-1, 2:], d[1:-1, :-2], d[2:, 1:-1], d[:-2, 1:-1]])
+    ok = ((dc > near) & (dc < far) & (np.abs(nb - dc).max(0) < 0.03) & (nb > near).all(0)
+          & (norm > 1e-12))
+    pts, nrm = c[ok], n[ok] / norm[ok][:, None]
+    pts_w = pts @ t_wo[:3, :3].T + t_wo[:3, 3]
+    nrm_w = nrm @ t_wo[:3, :3].T
+    return pts_w, nrm_w, cKDTree(pts_w)
+
+
+def in_camera_view(q_w, t_wo, info, shape, near=0.3, far=3.0):
+    """Which world points fall inside the camera's image, in range."""
+    import robot_camera_calibration as rcc
+    t_ow = np.linalg.inv(t_wo)
+    pc = q_w @ t_ow[:3, :3].T + t_ow[:3, 3]
+    keep = (pc[:, 2] > near) & (pc[:, 2] < far)
+    idx = np.flatnonzero(keep)
+    out = np.zeros(len(q_w), bool)
+    if len(idx):
+        px, _z = rcc.project(pc[idx], info)
+        h, w = shape
+        out[idx] = (px[:, 0] >= 0) & (px[:, 0] < w) & (px[:, 1] >= 0) & (px[:, 1] < h)
+    return out
+
+
+def surface_agreement(q_w, surf, gate=0.03):
+    """Of the points with camera surface within 10 cm, the share within `gate` of it (along
+    its normal)."""
+    pts_w, nrm_w, tree = surf
+    dist, j = tree.query(q_w, distance_upper_bound=0.10)
+    ok = np.isfinite(dist)
+    if not ok.any():
+        return 0.0, 0
+    r = np.abs(np.einsum('ij,ij->i', q_w[ok] - pts_w[j[ok]], nrm_w[j[ok]]))
+    return float(np.mean(r < gate)), int(ok.sum())
+
+
+LIDAR_FIT_GATES = (0.20, 0.15, 0.12, 0.10, 0.08, 0.06, 0.05, 0.04, 0.035, 0.03, 0.03, 0.025,
+                   0.025, 0.025)
+
+
+def fit_lidar_to_camera(cloud, T_lid, surf, info, t_wo, shape, with_bias=True):
+    """The L2's mount onto the camera's surface: point-to-plane ICP of its points (its own
+    frame, as published: the bridge's range trim already in them) that fall in the camera's
+    view, Huber-weighted, turning about their centre; a range bias rides along so the mount
+    does not take it (the bridge's range trim keeps doing that job). -> dict."""
+    pts_w, nrm_w, tree = surf
+    cloud = np.asarray(cloud, np.float64)
+    cloud = cloud[np.isfinite(cloud).all(1) & (np.linalg.norm(cloud, axis=1) > 0.2)]
+    view = in_camera_view(cloud @ T_lid[:3, :3].T + T_lid[:3, 3], t_wo, info, shape)
+    p = cloud[view]
+    if len(p) < 300:
+        raise RuntimeError(f'only {len(p)} LiDAR points in the camera\'s view')
+    ray = p / np.linalg.norm(p, axis=1)[:, None]
+    T, bias = T_lid.copy(), 0.0
+    for gate in LIDAR_FIT_GATES:
+        q = (p + bias * ray) @ T[:3, :3].T + T[:3, 3]
+        dist, j = tree.query(q, distance_upper_bound=gate)
+        ok = np.isfinite(dist)
+        if ok.sum() < 150:
+            raise RuntimeError(f'only {int(ok.sum())} LiDAR points near the camera\'s surface')
+        q, m, n = q[ok], pts_w[j[ok]], nrm_w[j[ok]]
+        c = q.mean(0)
+        r = np.einsum('ij,ij->i', q - m, n)
+        jac = np.hstack([np.cross(q - c, n), n, np.einsum('ij,ij->i', ray[ok] @ T[:3, :3].T, n)[:, None]])
+        w = np.where(np.abs(r) < 0.01, 1.0, 0.01 / np.maximum(np.abs(r), 1e-9))
+        a = jac * w[:, None]
+        hess = a.T @ jac
+        # damped: what the scene does not pin down (a slide along a wall) stays put
+        if not with_bias:
+            hess[6, :], hess[:, 6], hess[6, 6] = 0.0, 0.0, 1.0
+            a[:, 6] = 0.0
+        x = -np.linalg.solve(hess + np.diag(np.diag(hess)) * 0.05 + np.eye(7) * 1e-6,
+                             a.T @ r)
+        R = _so3_exp(x[:3])
+        T = pose(R @ T[:3, :3], R @ (T[:3, 3] - c) + c + x[3:6])
+        bias += float(x[6])
+    q0 = p @ T_lid[:3, :3].T + T_lid[:3, 3]
+    q1 = (p + bias * ray) @ T[:3, :3].T + T[:3, 3]
+    mm, deg = change(T_lid, T)
+    ht = hess[3:6, 3:6]
+    eig, vec = np.linalg.eigh(ht)
+    names = ('forward/back (X)', 'left/right (Y)', 'up/down (Z)')
+    blind = sorted({names[int(np.argmax(np.abs(vec[:, i])))] for i in range(3)
+                    if eig[i] < 0.03 * eig.max()})
+    return {'lid': T, 'from': T_lid, 'mm': mm, 'deg': deg, 'points': int(len(p)),
+            'bias_cm': 100.0 * bias, 'before': surface_agreement(q0, surf)[0],
+            'after': surface_agreement(q1, surf)[0], 'blind': blind}
+
+
+CAMERA_SHIFT_GATES = (0.05, 0.04, 0.03, 0.025, 0.02, 0.015, 0.012, 0.01, 0.008, 0.008, 0.008)
+
+
+def fit_camera_shift(obs, t_wo, mp, mn):
+    """Shift only: the world move of the camera that puts its arm points on the model
+    (point-to-plane, Huber), damped so a direction the arm does not pin down -- along a
+    cylinder, say -- stays as it is. -> (shift (3,) m, the 3x3 normal matrix)."""
+    from scipy.spatial import cKDTree
+    tree = cKDTree(mp)
+    base = obs @ t_wo[:3, :3].T + t_wo[:3, 3]
+    shift, hess = np.zeros(3), np.zeros((3, 3))
+    for gate in CAMERA_SHIFT_GATES:
+        q = base + shift
+        dist, j = tree.query(q, distance_upper_bound=gate)
+        ok = np.isfinite(dist)
+        if ok.sum() < 100:
+            raise RuntimeError('too few depth points near the arm model')
+        n = mn[j[ok]]
+        r = np.einsum('ij,ij->i', q[ok] - mp[j[ok]], n)
+        w = np.where(np.abs(r) < 0.004, 1.0, 0.004 / np.maximum(np.abs(r), 1e-9))
+        hess = (n * w[:, None]).T @ n
+        g = (n * w[:, None]).T @ r
+        shift = shift - np.linalg.solve(hess + np.eye(3) * 0.02 * np.trace(hess) / 3, g)
+    return shift, hess
+
+
+def cloud_xyz(msg):
+    """(N, 3) float64 x y z of a PointCloud2 with float32 x / y / z fields."""
+    offs = {f.name: f.offset for f in msg.fields}
+    raw = np.frombuffer(bytes(msg.data), np.uint8).reshape(-1, msg.point_step)
+    dt = np.dtype('>f4' if msg.is_bigendian else '<f4')
+    return np.stack([raw[:, offs[k]:offs[k] + 4].copy().view(dt)[:, 0] for k in 'xyz'],
+                    1).astype(np.float64)
+
+
+def decode_depth(msg):
+    if msg.encoding in ('16UC1', 'mono16'):
+        return np.frombuffer(bytes(msg.data), np.uint16).reshape(
+            msg.height, msg.step // 2)[:, :msg.width].astype(np.float32) / 1000.0
+    if msg.encoding == '32FC1':
+        return np.frombuffer(bytes(msg.data), np.float32).reshape(
+            msg.height, msg.step // 4)[:, :msg.width].copy()
+    raise ValueError(f'depth encoding {msg.encoding}')
+
+
+# -- ROS ------------------------------------------------------------------------------------
+
+def make_node():
+    """The ROS side: tf, the services, the depth, the LiDAR's status, the tip ball."""
+    import rclpy
+    from rclpy.callback_groups import ReentrantCallbackGroup
+    from rclpy.node import Node
+    from rclpy.qos import DurabilityPolicy, QoSProfile
+    from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+    from rcl_interfaces.srv import GetParameters, SetParameters
+    from rclpy.qos import ReliabilityPolicy
+    from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+    from std_msgs.msg import String
+    from std_srvs.srv import Empty, Trigger
+    from tf2_ros import Buffer, TransformListener
+    from visualization_msgs.msg import Marker, MarkerArray
+
+    class Sensors(Node):
+
+        def __init__(self):
+            super().__init__('sensor_align')
+            cb = ReentrantCallbackGroup()
+            self.tf = Buffer()
+            self.tf_listener = TransformListener(self.tf, self)
+            c = lambda kind, name: self.create_client(kind, name, callback_group=cb)
+            self.rsp_get = c(GetParameters, '/robot_state_publisher/get_parameters')
+            self.rsp_set = c(SetParameters, '/robot_state_publisher/set_parameters')
+            self.lid_get = c(GetParameters, '/lidar_bridge/get_parameters')
+            self.lid_set = c(SetParameters, '/lidar_bridge/set_parameters')
+            self.clear_client = c(Empty, '/clear_octomap')
+            self.refresh_client = c(Trigger, '/octomap_gater/refresh')
+            self.lock = threading.Lock()
+            self.depths = deque(maxlen=6)
+            self.info = None
+            self.status = None
+            self.create_subscription(Image, DEPTH_TOPIC, self._on_depth, 2, callback_group=cb)
+            self.create_subscription(CameraInfo, INFO_TOPIC, self._on_info, 2, callback_group=cb)
+            self.create_subscription(
+                String, '/lidar/status', self._on_status,
+                QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL), callback_group=cb)
+            self.clouds = deque(maxlen=60)
+            self.fit_clouds = deque(maxlen=60)
+            self.create_subscription(
+                PointCloud2, '/lidar/cloud', self._on_cloud,
+                QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT), callback_group=cb)
+            # 2026-11-17: the bridge's cloud NOT filtered by the camera (a newer bridge only);
+            # /lidar/cloud lacks the very points that sit on the camera's surfaces
+            self.create_subscription(
+                PointCloud2, '/lidar/cloud_fit', self._on_fit_cloud,
+                QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT), callback_group=cb)
+            self.markers = self.create_publisher(MarkerArray, '/sensor_align/markers', 2)
+            self.tip_arm = 'left'
+            self.create_timer(0.5, self._publish_markers, callback_group=cb)
+
+        # the inputs
+        def _on_depth(self, msg):
+            with self.lock:
+                self.depths.append(msg)
+
+        def _on_cloud(self, msg):
+            with self.lock:
+                self.clouds.append((time.monotonic(), msg))
+
+        def _on_fit_cloud(self, msg):
+            with self.lock:
+                self.fit_clouds.append((time.monotonic(), msg))
+
+        def clouds_since(self, since, frame):
+            """xyz (N,3) of each /lidar/cloud in `frame` that arrived after `since`."""
+            with self.lock:
+                msgs = [m for t, m in self.fit_clouds if t > since and m.header.frame_id == frame]
+                if not msgs:                        # (an older bridge: the filtered cloud)
+                    msgs = [m for t, m in self.clouds if t > since and m.header.frame_id == frame]
+            return [cloud_xyz(m) for m in msgs if m.width * m.height > 0]
+
+        def _on_info(self, msg):
+            self.info = msg
+
+        def _on_status(self, msg):
+            try:
+                self.status = (json.loads(msg.data), time.monotonic())
+            except ValueError:
+                pass
+
+        def depth(self, count=3):
+            """Per-pixel median of the last `count` depth frames (m), and the newest frame's
+            optical frame; (None, None) with none."""
+            with self.lock:
+                frames = list(self.depths)[-count:]
+            if not frames:
+                return None, None
+            stack = np.stack([decode_depth(m) for m in frames])
+            stack[stack <= 0] = np.nan
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                d = np.nan_to_num(np.nanmedian(stack, axis=0), nan=0.0)
+            return d, frames[-1].header.frame_id
+
+        def lookup(self, target, source):
+            import rclpy.time
+            try:
+                t = self.tf.lookup_transform(target, source, rclpy.time.Time())
+            except Exception:
+                return None
+            q, p = t.transform.rotation, t.transform.translation
+            return pose(quat_matrix(q.x, q.y, q.z, q.w), [p.x, p.y, p.z])
+
+        def tip(self, arm=None):
+            arm = arm or self.tip_arm
+            m = self.lookup('world', f'openarm_{arm}_hand_tcp')
+            return None if m is None else m[:3, 3] + m[:3, 2] * tip_offset(arm)
+
+        # the services
+        def call(self, client, request, timeout=5.0):
+            if not client.wait_for_service(timeout_sec=min(2.0, timeout)):
+                return None
+            done = threading.Event()
+            future = client.call_async(request)
+            future.add_done_callback(lambda _f: done.set())
+            if not done.wait(timeout):
+                return None
+            return future.result()
+
+        def robot_description(self):
+            got = self.call(self.rsp_get, GetParameters.Request(names=['robot_description']), 10.0)
+            if got is None or not got.values or not got.values[0].string_value:
+                return None
+            return got.values[0].string_value
+
+        def set_robot_description(self, urdf):
+            value = ParameterValue(type=ParameterType.PARAMETER_STRING, string_value=urdf)
+            done = self.call(self.rsp_set, SetParameters.Request(
+                parameters=[Parameter(name='robot_description', value=value)]), 10.0)
+            return bool(done is not None and done.results and done.results[0].successful)
+
+        def lidar_mount(self):
+            """(xyz, rpy_deg, spin_deg, types) from lidar_bridge, or None."""
+            got = self.call(self.lid_get, GetParameters.Request(
+                names=['mount_xyz', 'mount_rpy_deg', 'mount_spin_deg']), 5.0)
+            if got is None or len(got.values) != 3:
+                return None
+            v = got.values
+            arr = lambda p: list(p.double_array_value if p.type == ParameterType.PARAMETER_DOUBLE_ARRAY
+                                 else p.integer_array_value)
+            spin = (v[2].double_value if v[2].type == ParameterType.PARAMETER_DOUBLE
+                    else float(v[2].integer_value))
+            xyz, rpy = arr(v[0]), arr(v[1])
+            if len(xyz) != 3 or len(rpy) != 3:
+                return None
+            return ([float(a) for a in xyz], [float(a) for a in rpy], float(spin),
+                    (v[0].type, v[1].type))
+
+        def set_lidar_mount(self, xyz, rpy_deg):
+            dbl = lambda vals: ParameterValue(type=ParameterType.PARAMETER_DOUBLE_ARRAY,
+                                              double_array_value=[float(a) for a in vals])
+            done = self.call(self.lid_set, SetParameters.Request(parameters=[
+                Parameter(name='mount_xyz', value=dbl(xyz)),
+                Parameter(name='mount_rpy_deg', value=dbl(rpy_deg))]), 5.0)
+            if done is None or not done.results:
+                return False, 'lidar_bridge did not answer'
+            bad = [r.reason for r in done.results if not r.successful]
+            return (not bad), '; '.join(bad)
+
+        def rebuild_map(self):
+            """Clear MoveIt's octomap and fill it again through the sensors as they are now."""
+            cleared = self.call(self.clear_client, Empty.Request(), 5.0) is not None
+            refreshed = self.call(self.refresh_client, Trigger.Request(), 5.0)
+            return cleared, bool(refreshed is not None and refreshed.success)
+
+        # the ball on the tip
+        def _publish_markers(self):
+            arms = ('left', 'right')
+            out = MarkerArray()
+            for arm in arms:
+                for i, (size, alpha) in enumerate(((0.016, 0.95), (0.030, 0.25))):
+                    m = Marker()
+                    m.header.frame_id = f'openarm_{arm}_hand_tcp'
+                    m.ns, m.id = f'tip_{arm}', i
+                    m.type = Marker.SPHERE
+                    m.action = Marker.ADD if arm == self.tip_arm else Marker.DELETE
+                    m.pose.position.z = tip_offset(arm)
+                    m.pose.orientation.w = 1.0
+                    m.scale.x = m.scale.y = m.scale.z = size
+                    m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.85, 0.0, alpha
+                    m.frame_locked = True
+                    out.markers.append(m)
+            self.markers.publish(out)
+
+    return Sensors()
+
+
+# -- the mounts -----------------------------------------------------------------------------
+
+class Aligner:
+    """Both mounts: as found, as wanted, as last given to the robot, as last saved."""
+
+    def __init__(self, node):
+        self.node = node
+        self.lock = threading.Lock()
+        self.cam = self.cam_start = self.cam_saved = self.cam_applied = None
+        self.cam_ref = (0.0, 0.0, 0.0)            # rad, the rpy spelling to stay near
+        self.lid = self.lid_start = self.lid_saved = self.lid_applied = None
+        self.lid_ref = (0.0, 0.0, 0.0)            # deg
+        self.spin = 0.0                           # deg, kept as it is
+        self.undo = []
+        self.problems = {'camera': 'not read yet', 'lidar': 'not read yet'}
+        self.cam_metric = 'camera vs arm: loading the robot model...'
+        self.lid_metric = 'LiDAR vs camera: no status yet'
+        self.surface = None
+        self.surface_note = ''
+        self.stop = False
+        self._last_lidar_write = 0.0
+        self._last_try = {'camera': 0.0, 'lidar': 0.0}
+
+    # reading
+    def load_camera(self):
+        urdf = self.node.robot_description()
+        if urdf is None:
+            self.problems['camera'] = 'robot_state_publisher is not answering (terminal 1?)'
+            return False
+        m = CAMERA_JOINT.search(urdf)
+        if m is None:
+            self.problems['camera'] = 'no camera_joint in robot_description'
+            return False
+        rpy = _attr(m.group(2), 'rpy', '0 0 0')
+        T = pose(rpy_matrix(*rpy), _attr(m.group(2), 'xyz', '0 0 0'))
+        with self.lock:
+            self.cam = self.cam_start = self.cam_saved = self.cam_applied = T
+            self.cam_ref = tuple(rpy)
+        self.problems['camera'] = ''
+        return True
+
+    def load_lidar(self):
+        got = self.node.lidar_mount()
+        if got is None:
+            self.problems['lidar'] = 'lidar_bridge is not answering (lidar:=off, or not up yet)'
+            return False
+        xyz, rpy, spin, _types = got
+        T = pose(rpy_matrix(*np.radians(rpy)) @ rot_z(math.radians(spin)), xyz)
+        with self.lock:
+            self.lid = self.lid_start = self.lid_saved = self.lid_applied = T
+            self.lid_ref, self.spin = tuple(rpy), spin
+        self.problems['lidar'] = ''
+        return True
+
+    def camera_values(self, T=None):
+        T = self.cam if T is None else T
+        if T is None:
+            return None
+        return T[:3, 3].copy(), rpy_near(T[:3, :3], self.cam_ref)
+
+    def lidar_values(self, T=None):
+        """(xyz m, rpy deg) for lidar_bridge: R = rpy(rpy) * rot_z(spin), spin kept."""
+        T = self.lid if T is None else T
+        if T is None:
+            return None
+        R = T[:3, :3] @ rot_z(-math.radians(self.spin))
+        rpy = np.degrees(rpy_near(R, np.radians(self.lid_ref)))
+        return T[:3, 3].copy(), [float(a) for a in rpy]
+
+    # moving
+    def nudge(self, which, move=None, turn=None):
+        """which: 'both' / 'camera' / 'lidar'; move (3,) m in world; turn (axis, rad) about
+        the tip. -> the pivot used (None: the fallback)."""
+        tip = self.node.tip()
+        d = nudge_matrix(move, turn, FALLBACK_PIVOT if tip is None else tip)
+        self.apply_world(which, d)
+        return tip
+
+    def apply_world(self, which, d):
+        with self.lock:
+            self.undo.append((self.cam, self.lid))
+            if which in ('both', 'camera') and self.cam is not None:
+                self.cam = d @ self.cam
+            if which in ('both', 'lidar') and self.lid is not None:
+                self.lid = d @ self.lid
+
+    def undo_last(self):
+        with self.lock:
+            if self.undo:
+                self.cam, self.lid = self.undo.pop()
+
+    def revert(self):
+        with self.lock:
+            self.undo.append((self.cam, self.lid))
+            self.cam, self.lid = self.cam_start, self.lid_start
+
+    def dirty(self):
+        same = lambda a, b: (a is None and b is None) or (
+            a is not None and b is not None and np.allclose(a, b, atol=1e-7))
+        return not same(self.cam, self.cam_saved), not same(self.lid, self.lid_saved)
+
+    def settled(self):
+        """Everything wanted has been given to the robot."""
+        with self.lock:
+            return ((self.cam is None or self.cam_applied is self.cam) and
+                    (self.lid is None or self.lid_applied is self.lid))
+
+    # giving it to the robot
+    def apply_once(self):
+        now = time.monotonic()
+        for kind, loader in (('camera', self.load_camera), ('lidar', self.load_lidar)):
+            start = self.cam_start if kind == 'camera' else self.lid_start
+            if start is None and now - self._last_try[kind] > 3.0:
+                self._last_try[kind] = now
+                loader()
+        with self.lock:
+            cam, lid = self.cam, self.lid
+            cam_due = cam is not None and cam is not self.cam_applied
+            lid_due = (lid is not None and lid is not self.lid_applied
+                       and now - self._last_lidar_write > 0.3)
+        if cam_due:
+            ok, why = self.write_camera(cam)
+            with self.lock:
+                if ok:
+                    self.cam_applied = cam
+            self.problems['camera'] = '' if ok else why
+        if lid_due:
+            self._last_lidar_write = now
+            xyz, rpy = self.lidar_values(lid)
+            ok, why = self.node.set_lidar_mount(xyz, rpy)
+            with self.lock:
+                if ok:
+                    self.lid_applied = lid
+                    self.lid_ref = tuple(rpy)
+            self.problems['lidar'] = '' if ok else f'lidar_bridge refused: {why}'
+
+    def write_camera(self, T):
+        (x, y, z), (r, p, yw) = self.camera_values(T)
+        origin = f'<origin xyz="{x:.6f} {y:.6f} {z:.6f}" rpy="{r:.6f} {p:.6f} {yw:.6f}"/>'
+        urdf = self.node.robot_description()
+        if urdf is None:
+            return False, 'robot_state_publisher is not answering'
+        new, n = CAMERA_JOINT.subn(lambda m: m.group(1) + origin, urdf, count=1)
+        if n != 1:
+            return False, 'no camera_joint in robot_description'
+        if not self.node.set_robot_description(new):
+            return False, 'robot_state_publisher refused the new robot_description'
+        self.cam_ref = (r, p, yw)
+        return True, ''
+
+    def apply_loop(self):
+        while not self.stop:
+            try:
+                self.apply_once()
+            except Exception as exc:              # keep going; say it
+                self.problems['camera'] = self.problems['camera'] or f'error: {exc}'
+            time.sleep(0.15)
+
+    def wait_settled(self, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.settled():
+                return True
+            time.sleep(0.05)
+        return False
+
+    # the readouts
+    def load_surface(self):
+        try:
+            import robot_camera_calibration as rcc
+            urdf = None
+            while urdf is None and not self.stop:
+                urdf = self.node.robot_description()
+                if urdf is None:
+                    time.sleep(2.0)
+            if urdf is not None:
+                self.surface = rcc.RobotSurface(urdf)
+        except Exception as exc:
+            self.surface_note = f'no robot model: {exc}'
+
+    def arm_poses(self):
+        return {f'openarm_{arm}_{s}': self.node.lookup('world', f'openarm_{arm}_{s}')
+                for arm in ('left', 'right') for s in ARM_LINKS}
+
+    def camera_vs_arm(self):
+        import robot_camera_calibration as rcc
+        if self.surface is None:
+            return self.surface_note or 'camera vs arm: loading the robot model (a minute the first time)...'
+        depth, optical = self.node.depth(3)
+        info = self.node.info
+        if depth is None or info is None:
+            return 'camera vs arm: no depth frames'
+        t_wo = self.node.lookup('world', optical)
+        if t_wo is None:
+            return f'camera vs arm: no tf for {optical}'
+        mp, mn = self.surface.posed(self.arm_poses())
+        idx = rcc.visible(mp, mn, t_wo, info, depth.shape)
+        if len(idx) < 200:
+            return 'camera vs arm: the arms are not in view'
+        t_ow = np.linalg.inv(t_wo)
+        pc = mp[idx] @ t_ow[:3, :3].T + t_ow[:3, 3]
+        px, z = rcc.project(pc, info)
+        u = np.clip(px[:, 0].astype(int), 0, depth.shape[1] - 1)
+        v = np.clip(px[:, 1].astype(int), 0, depth.shape[0] - 1)
+        d = depth[v, u]
+        seen = (d > 0.1) & (d > z - 0.05)
+        if seen.sum() < 200:
+            return 'camera vs arm: the arms are hardly in view'
+        agree = 100.0 * float(np.mean(np.abs(d[seen] - z[seen]) < 0.015))
+        text = (f'camera vs arm: {agree:.0f}% of the arm it sees within 15 mm '
+                f'({int(seen.sum())} points)')
+        near = seen & (np.abs(d - z) < 0.05)
+        if near.sum() > 50:
+            gap = 1000.0 * float(np.median(d[near] - z[near]))
+            text += f'; it sees the arm {abs(gap):.0f} mm {"farther" if gap > 0 else "nearer"} than drawn'
+        return text
+
+    def lidar_text(self):
+        st = self.node.status
+        if st is None:
+            return 'LiDAR vs camera: no /lidar/status (lidar:=off?)'
+        s, when = st
+        age = time.monotonic() - when
+        if age > 5.0:
+            return f'LiDAR vs camera: status {age:.0f} s old (bridge down?)'
+        agree = s.get('camera_agree_pct')
+        parts = [f'LiDAR vs camera: {agree}% of its points in the camera view at the camera '
+                 f'depth' if agree is not None else 'LiDAR vs camera: no points in the camera view',
+                 f'on the robot {s.get("robot_points")}']
+        if not s.get('ok'):
+            parts.append(f'NOT ok: {s.get("why")}')
+        return '; '.join(parts)
+
+    def metrics_loop(self):
+        while not self.stop:
+            try:
+                self.cam_metric = self.camera_vs_arm()
+            except Exception as exc:
+                self.cam_metric = f'camera vs arm: {exc}'
+            try:
+                self.lid_metric = self.lidar_text()
+            except Exception as exc:
+                self.lid_metric = f'LiDAR vs camera: {exc}'
+            time.sleep(2.0)
+
+    # the camera onto the arm, here
+    def fit_camera_here(self):
+        """The camera onto the posed arm model, from the camera as it is now. -> dict (the
+        proposed camera mount, how much better, what it was fitted on), or raises with why
+        not.
+
+        One posture pins down little: on 2026-11-16 the camera saw only the left tool and
+        link7 (436 points on a cylinder) and a free fit 'found' 104 mm / 22 deg. So: a SHIFT
+        only, damped where the arm gives no grip (along a cylinder); shift + turn only with
+        3 or more links well in view, and only when it is small (40 mm / 4 deg) and better."""
+        import robot_camera_calibration as rcc
+        from scipy.spatial import cKDTree
+        if self.surface is None:
+            raise RuntimeError('the robot model is still loading')
+        if self.cam is None:
+            raise RuntimeError('no camera mount')
+        if not self.wait_settled(5.0):
+            raise RuntimeError('the last change has not reached the robot yet')
+        time.sleep(0.6)                            # depth frames through the camera as it is
+        depth, optical = self.node.depth(6)
+        info = self.node.info
+        if depth is None or info is None:
+            raise RuntimeError('no depth frames')
+        t_wo = self.node.lookup('world', optical)
+        t_ws = self.node.lookup('world', SCREW_FRAME)
+        if t_wo is None or t_ws is None:
+            raise RuntimeError(f'no tf for {optical} / {SCREW_FRAME}')
+        if change(t_ws, self.cam)[0] > 0.5:
+            raise RuntimeError('tf does not show the camera as set yet; try again')
+        t_so = np.linalg.inv(t_ws) @ t_wo
+        poses = self.arm_poses()
+        mp, mn = self.surface.posed(poses)
+        owner = np.concatenate([[name] * len(self.surface.links[name][0])
+                                for name, p in poses.items()
+                                if name in self.surface.links and p is not None])
+        obs = rcc.near_model(depth_points(depth, info), t_wo, mp, radius=0.06)
+        if len(obs) < 300:
+            raise RuntimeError(f'only {len(obs)} depth points on or near the arm: bring an arm '
+                               'into view (more of it is better), hands away')
+        _d, j = cKDTree(mp).query(obs @ t_wo[:3, :3].T + t_wo[:3, 3])
+        names, counts = np.unique(owner[j], return_counts=True)
+        links = sorted(zip(counts.tolist(), names.tolist()), reverse=True)
+        well = [n for c, n in links if c >= 150]
+        observations = [(obs, mp, mn)]
+        before = rcc.alignment_error(observations, t_wo)
+        shift, hess = fit_camera_shift(obs, t_wo, mp, mn)
+        eig, vec = np.linalg.eigh(hess)
+        unseen = [vec[:, i] for i in range(3) if eig[i] < 0.05 * eig.max()]
+        axis_names = ('forward/back (X)', 'left/right (Y)', 'up/down (Z)')
+        blind = sorted({axis_names[int(np.argmax(np.abs(v)))] for v in unseen})
+        t_shift = t_wo.copy()
+        t_shift[:3, 3] += shift
+        cam = self.cam.copy()
+        cam[:3, 3] += shift
+        out = {'mode': 'shift', 'cam': cam, 'from': self.cam, 'points': len(obs),
+               'before': before, 'after': rcc.alignment_error(observations, t_shift),
+               'links': links, 'blind': blind, 'tool_share': 0.0}
+        hand = sum(c for c, n in links if n.endswith(('_hand', 'finger')))
+        out['tool_share'] = hand / max(1, len(obs))
+        if len(well) >= 3 and len(obs) >= 1500:
+            t_new, _stats = rcc.fit_camera(observations, t_wo, info, depth.shape,
+                                           schedule=FIT_SCHEDULE)
+            cam_full = t_new @ np.linalg.inv(t_so)
+            mm, deg = change(self.cam, cam_full)
+            after = rcc.alignment_error(observations, t_new)
+            if mm <= 40.0 and deg <= 4.0 and after[0] < out['after'][0]:
+                out.update(mode='shift + turn', cam=cam_full, after=after, blind=[])
+        out['mm'], out['deg'] = change(self.cam, out['cam'])
+        return out
+
+    def take_fit(self, fit, which):
+        """Apply a camera fit; with 'both', the LiDAR by the same world move."""
+        d = fit['cam'] @ np.linalg.inv(fit['from'])
+        self.apply_world('both' if which == 'both' else 'camera', d)
+
+    # the LiDAR onto the camera, here
+    def fit_lidar_here(self):
+        """The L2's mount onto what the camera sees now (fit_lidar_to_camera), from ~2.5 s
+        of its clouds. -> dict, or raises with why not."""
+        if self.lid is None:
+            raise RuntimeError('no LiDAR mount (lidar_bridge not answering)')
+        if not self.wait_settled(5.0):
+            raise RuntimeError('the last change has not reached the robot yet')
+        # a mount change restarts the bridge's range trim (0, then ~10 s back to the
+        # camera): clouds from before it has settled would be off along their rays
+        settle = 12.0 - (time.monotonic() - self._last_lidar_write)
+        if settle > 0:
+            time.sleep(settle)
+        st = self.node.status[0] if self.node.status else {}
+        frame = st.get('frame', 'l2_lidar')
+        since = time.monotonic()
+        time.sleep(2.6)
+        clouds = self.node.clouds_since(since, frame)
+        if not clouds:
+            raise RuntimeError(f'no /lidar/cloud in {frame} for 2.6 s (is the LiDAR ok?)')
+        depth, optical = self.node.depth(6)
+        info = self.node.info
+        if depth is None or info is None:
+            raise RuntimeError('no depth frames')
+        t_wo = self.node.lookup('world', optical)
+        if t_wo is None:
+            raise RuntimeError(f'no tf for {optical}')
+        surf = camera_surface(depth, info, t_wo)
+        cloud = np.vstack(clouds)
+        # the mount alone (the bridge's range trim re-learns the range bias after a change);
+        # the same fit with a range bias free says how firmly the scene pins the mount down:
+        # on 2026-11-16 the two differed by 3 cm at the left hand
+        fit = fit_lidar_to_camera(cloud, self.lid, surf, info, t_wo, depth.shape, with_bias=False)
+        alt = fit_lidar_to_camera(cloud, self.lid, surf, info, t_wo, depth.shape, with_bias=True)
+        tip = self.node.tip()
+        at = FALLBACK_PIVOT if tip is None else tip
+        moved = lambda T: T[:3, :3] @ np.linalg.inv(self.lid[:3, :3]) @ (at - self.lid[:3, 3]) + T[:3, 3]
+        fit['spread_mm'] = 1000.0 * float(np.linalg.norm(moved(fit['lid']) - moved(alt['lid'])))
+        fit['alt_bias_cm'] = alt['bias_cm']
+        fit['scans'] = len(clouds)
+        return fit
+
+    def take_lidar_fit(self, fit):
+        self.apply_world('lidar', fit['lid'] @ np.linalg.inv(fit['from']))
+
+    # saving
+    def save(self, rebuild=True):
+        """Write what changed. -> (texts, build result or None)."""
+        cam_dirty, lid_dirty = self.dirty()
+        now = datetime.datetime.now()
+        when, stamp = now.strftime('%Y-%m-%dT%H:%M'), now.strftime('%Y%m%d-%H%M%S')
+        texts, build = [], None
+        with self.lock:
+            cam, lid = self.cam, self.lid
+        if cam_dirty and cam is not None:
+            _tag, text = save_camera(cam, self.cam_ref, when, stamp)
+            texts.append(text)
+            with self.lock:
+                self.cam_saved = cam
+            if rebuild:
+                r = subprocess.run(BUILD, capture_output=True, text=True)
+                build = (r.returncode == 0, (r.stdout + r.stderr)[-800:])
+        if lid_dirty and lid is not None:
+            xyz, rpy = self.lidar_values(lid)
+            texts.append(save_lidar(xyz, rpy, self.spin, self.lid_saved, lid, when, stamp))
+            with self.lock:
+                self.lid_saved = lid
+        return texts, build
+
+
+# -- the window -----------------------------------------------------------------------------
+
+def run_gui(node, al):
+    import tkinter as tk
+    from tkinter import messagebox
+
+    root = tk.Tk()
+    root.title('Sensor align: camera + LiDAR onto the robot')
+    which = tk.StringVar(value='both')
+    arm = tk.StringVar(value='left')
+    step_mm = tk.StringVar(value='2')
+    step_deg = tk.StringVar(value='0.25')
+    say = tk.StringVar(value='Hold your palm on the tip (or look at the arm), then move the '
+                             'clouds onto the yellow ball in RViz.')
+    busy = {'on': False}
+    pad = dict(padx=4, pady=2)
+
+    top = tk.Frame(root)
+    top.pack(fill='x', **pad)
+    tk.Label(top, text='Move:').pack(side='left')
+    for value, text in (('both', 'Both (camera + LiDAR together)'), ('camera', 'Camera'),
+                        ('lidar', 'LiDAR')):
+        tk.Radiobutton(top, text=text, variable=which, value=value).pack(side='left')
+    tk.Label(top, text='   Tip ball on:').pack(side='left')
+    for value in ('left', 'right'):
+        tk.Radiobutton(top, text=value, variable=arm, value=value,
+                       command=lambda: setattr(node, 'tip_arm', arm.get())).pack(side='left')
+
+    pads = tk.Frame(root)
+    pads.pack(fill='x', **pad)
+
+    def do_move(axis, sign):
+        al.nudge(which.get(), move=sign * float(step_mm.get()) / 1000.0 * np.eye(3)[axis])
+
+    def do_turn(axis, sign):
+        tip = al.nudge(which.get(), turn=(np.eye(3)[axis], sign * math.radians(float(step_deg.get()))))
+        if tip is None:
+            say.set('no tf for the tip: that turn was about a point in the work area '
+                    f'{FALLBACK_PIVOT.tolist()} instead')
+
+    move_box = tk.LabelFrame(pads, text='Move the cloud (robot frame)')
+    move_box.pack(side='left', fill='y', **pad)
+    for row, (minus, plus, axis) in enumerate((('back', 'forward  (X, red)', 0),
+                                              ('right', 'left  (Y, green)', 1),
+                                              ('down', 'up  (Z, blue)', 2))):
+        tk.Button(move_box, text=f'◀ {minus}', width=8,
+                  command=lambda a=axis: do_move(a, -1)).grid(row=row, column=0, **pad)
+        tk.Button(move_box, text=f'{plus} ▶', width=16,
+                  command=lambda a=axis: do_move(a, +1)).grid(row=row, column=1, **pad)
+    tk.Label(move_box, text='step, mm').grid(row=3, column=0)
+    tk.OptionMenu(move_box, step_mm, '0.5', '1', '2', '5', '10', '20').grid(row=3, column=1,
+                                                                          sticky='w')
+
+    turn_box = tk.LabelFrame(pads, text='Turn the cloud about the tip ball')
+    turn_box.pack(side='left', fill='y', **pad)
+    for row, (name, axis) in enumerate((('about X (red, forward)', 0),
+                                        ('about Y (green, left)', 1),
+                                        ('about Z (blue, up)', 2))):
+        tk.Button(turn_box, text='↺ −', width=4,
+                  command=lambda a=axis: do_turn(a, -1)).grid(row=row, column=0, **pad)
+        tk.Button(turn_box, text='↻ +', width=4,
+                  command=lambda a=axis: do_turn(a, +1)).grid(row=row, column=1, **pad)
+        tk.Label(turn_box, text=name).grid(row=row, column=2, sticky='w')
+    tk.Label(turn_box, text='step, deg').grid(row=3, column=0, columnspan=2)
+    tk.OptionMenu(turn_box, step_deg, '0.05', '0.1', '0.25', '0.5', '1', '2').grid(
+        row=3, column=2, sticky='w')
+
+    readout = tk.Frame(root)
+    readout.pack(fill='x', **pad)
+    cam_l = tk.Label(readout, anchor='w', justify='left', font=('TkFixedFont', 10))
+    lid_l = tk.Label(readout, anchor='w', justify='left', font=('TkFixedFont', 10))
+    met_c = tk.Label(readout, anchor='w', justify='left', fg='#1a5e1a')
+    met_l = tk.Label(readout, anchor='w', justify='left', fg='#1a5e1a')
+    for w in (cam_l, lid_l, met_c, met_l):
+        w.pack(fill='x')
+
+    def background(work, done):
+        """work() in a thread, then done(result or exception) in the window."""
+        if busy['on']:
+            return
+        busy['on'] = True
+
+        def run():
+            try:
+                out = work()
+            except Exception as exc:               # handed to done
+                out = exc
+            root.after(0, lambda: (busy.__setitem__('on', False), done(out)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def on_fit():
+        say.set('fitting the camera onto the arm (a few seconds; hands away)...')
+
+        def done(fit):
+            if isinstance(fit, Exception):
+                say.set(f'fit: {fit}')
+                return
+            (b_med, b_in), (a_med, a_in) = fit['before'], fit['after']
+            on = ', '.join(f'{n.replace("openarm_", "")} {c}' for c, n in fit['links'][:5])
+            text = (f'The camera onto the arm, {fit["mode"]} ({fit["points"]} depth points: {on}):\n\n'
+                    f'moves {fit["mm"]:.1f} mm' + (f' and turns {fit["deg"]:.2f} deg' if fit['deg'] > 0.005 else '')
+                    + f'\narm gap (median) {b_med:.1f} -> {a_med:.1f} mm\n'
+                    f'within 5 mm {100 * b_in:.0f}% -> {100 * a_in:.0f}%\n'
+                    + (f'not seen from this posture, left as it was: {", ".join(fit["blind"])}\n'
+                       if fit['blind'] else '')
+                    + ('\nMost of these points are on the hand/tool. Its URDF shape is a plain '
+                       'cylinder: if the real one differs, this shift is the tool\'s, not the '
+                       "camera's. Better with more of the arm in view.\n"
+                       if fit['tool_share'] > 0.5 else '')
+                    + ('\nThe LiDAR moves with it (Both).\n' if which.get() == 'both' else '')
+                    + '\nApply?')
+            if a_med >= b_med:
+                say.set(f'fit found nothing better (gap {b_med:.1f} -> {a_med:.1f} mm); not applied')
+                return
+            if messagebox.askyesno('Fit camera to the arm', text):
+                al.take_fit(fit, which.get())
+                say.set(f'fit applied: {fit["mm"]:.1f} mm / {fit["deg"]:.2f} deg (Undo takes it back)')
+            else:
+                say.set('fit not applied')
+        background(al.fit_camera_here, done)
+
+    def on_lidar_fit():
+        say.set('fitting the LiDAR onto the camera (~3 s of its scans; up to 12 s more after a '
+                'LiDAR change, for its range trim to settle)...')
+
+        def done(fit):
+            if isinstance(fit, Exception):
+                say.set(f'LiDAR fit: {fit}')
+                return
+            text = (f'The LiDAR onto what the camera sees ({fit["points"]} of its points in the '
+                    f'camera view, {fit["scans"]} scans):\n\n'
+                    f'moves {fit["mm"]:.1f} mm and turns {fit["deg"]:.2f} deg\n'
+                    f'within 3 cm of the camera\'s surface {100 * fit["before"]:.0f}% -> '
+                    f'{100 * fit["after"]:.0f}%\n'
+                    + (f'the scene hardly pins down: {", ".join(fit["blind"])} (left nearly as it was)\n'
+                       if fit['blind'] else '')
+                    + (f'\nWEAK: let the L2\'s ranges carry a bias ({fit["alt_bias_cm"]:+.1f} cm) and the '
+                       f'answer at the tip moves {fit["spread_mm"]:.0f} mm -- what the camera sees does '
+                       'not pin the LiDAR down that well. Check the arm and the walls in RViz; '
+                       'Undo if worse.\n' if fit['spread_mm'] > 15 else
+                       f'firm: within {fit["spread_mm"]:.0f} mm whether or not its ranges carry a bias\n')
+                    + ('\nLarge: check it in RViz, Undo if worse.\n'
+                       if fit['mm'] > 60 or fit['deg'] > 6 else '')
+                    + '\nThe camera stays. Apply to the LiDAR?')
+            if fit['after'] <= fit['before']:
+                say.set(f'LiDAR fit found nothing better ({100 * fit["before"]:.0f}% -> '
+                        f'{100 * fit["after"]:.0f}%); not applied')
+                return
+            if messagebox.askyesno('Fit LiDAR to the camera', text):
+                al.take_lidar_fit(fit)
+                say.set(f'LiDAR fit applied: {fit["mm"]:.1f} mm / {fit["deg"]:.2f} deg (Undo takes it back)')
+            else:
+                say.set('LiDAR fit not applied')
+        background(al.fit_lidar_here, done)
+
+    def on_map():
+        say.set('rebuilding the octomap through the sensors as they are now...')
+
+        def done(out):
+            if isinstance(out, Exception):
+                say.set(f'map: {out}')
+                return
+            cleared, refreshed = out
+            say.set(f'octomap: {"cleared" if cleared else "NOT cleared (move_group?)"}, '
+                    f'{"refilled" if refreshed else "NOT refilled (octomap:=static gater?)"}')
+        background(lambda: (al.wait_settled(3.0), node.rebuild_map())[1], done)
+
+    def on_save():
+        cam_dirty, lid_dirty = al.dirty()
+        if not (cam_dirty or lid_dirty):
+            say.set('nothing changed since the last save')
+            return
+        what = ' and '.join(n for n, d in (('the camera (v10.urdf.xacro, cam_org.txt; then a '
+                                            'rebuild of openarm_description)', cam_dirty),
+                                           ('the LiDAR (launch_everything.launch.py)', lid_dirty))
+                            if d)
+        if not messagebox.askyesno('Save', f'Write {what}?\n\nBackups go to '
+                                           'old_version/calibration_backups/.'):
+            return
+        say.set('saving...')
+
+        def done(out):
+            if isinstance(out, Exception):
+                say.set(f'save failed: {out}')
+                return
+            texts, build = out
+            msg = 'saved: ' + ', '.join(texts)
+            if build is not None:
+                msg += ('; openarm_description rebuilt' if build[0] else
+                        '; REBUILD FAILED: run native/build_ws.sh --packages-select openarm_description')
+            if cam_dirty:
+                msg += '. Camera moved: run the Auto calibrate again (the arm model saw the old camera)'
+            say.set(msg)
+        background(al.save, done)
+
+    def on_close():
+        cam_dirty, lid_dirty = al.dirty()
+        if cam_dirty or lid_dirty:
+            answer = messagebox.askyesnocancel(
+                'Unsaved changes', 'Save before closing?\n\nYes: save.\nNo: put both sensors back '
+                'as they were when this opened.\nCancel: stay.')
+            if answer is None:
+                return
+            if answer:
+                try:
+                    texts, build = al.save()
+                    if build is not None and not build[0]:
+                        messagebox.showwarning('Rebuild', 'saved, but the rebuild failed: run '
+                                               'native/build_ws.sh --packages-select openarm_description')
+                except Exception as exc:
+                    messagebox.showerror('Save failed', str(exc))
+                    return
+            else:
+                al.revert()
+                al.wait_settled(5.0)
+        al.stop = True
+        root.destroy()
+
+    buttons = tk.Frame(root)
+    buttons.pack(fill='x', **pad)
+    for text, cmd in (('Undo', al.undo_last), ('Revert to start', al.revert),
+                      ('Fit camera to the arm', on_fit), ('Fit LiDAR to the camera', on_lidar_fit),
+                      ('Rebuild octomap', on_map), ('Save', on_save)):
+        tk.Button(buttons, text=text, command=cmd).pack(side='left', **pad)
+    tk.Label(root, textvariable=say, anchor='w', justify='left', wraplength=900,
+             fg='#0b3d91').pack(fill='x', **pad)
+
+    def refresh():
+        cv, lv = al.camera_values(), al.lidar_values()
+        cam_dirty, lid_dirty = al.dirty()
+        if cv is None:
+            cam_l.config(text=f'camera: {al.problems["camera"]}')
+        else:
+            (x, y, z), rpy = cv
+            mm, deg = change(al.cam_start, al.cam)
+            cam_l.config(text=(f'camera  x {1000 * x:7.1f}  y {1000 * y:7.1f}  z {1000 * z:7.1f} mm   '
+                               f'roll {math.degrees(rpy[0]):6.2f}  pitch {math.degrees(rpy[1]):6.2f}  '
+                               f'yaw {math.degrees(rpy[2]):6.2f}   {mm:5.1f} mm / {deg:4.2f} deg '
+                               f'from start{"  UNSAVED" if cam_dirty else ""}'
+                               + (f'   ({al.problems["camera"]})' if al.problems['camera'] else '')))
+        if lv is None:
+            lid_l.config(text=f'LiDAR:  {al.problems["lidar"]}')
+        else:
+            (x, y, z), rpy = lv
+            mm, deg = change(al.lid_start, al.lid)
+            lid_l.config(text=(f'LiDAR   x {1000 * x:7.1f}  y {1000 * y:7.1f}  z {1000 * z:7.1f} mm   '
+                               f'roll {rpy[0]:6.2f}  pitch {rpy[1]:6.2f}  yaw {rpy[2]:6.2f}  '
+                               f'spin {al.spin:.1f}   {mm:5.1f} mm / {deg:4.2f} deg from start'
+                               f'{"  UNSAVED" if lid_dirty else ""}'
+                               + (f'   ({al.problems["lidar"]})' if al.problems['lidar'] else '')))
+        met_c.config(text=al.cam_metric)
+        met_l.config(text=al.lid_metric)
+        root.after(400, refresh)
+
+    root.protocol('WM_DELETE_WINDOW', on_close)
+    refresh()
+    root.mainloop()
+
+
+def main():
+    import rclpy
+    from rclpy.executors import MultiThreadedExecutor
+    if not os.environ.get('DISPLAY'):
+        print('sensor_align needs a display (run it on beast\'s desktop, or ssh -X)')
+        return 1
+    rclpy.init()
+    node = make_node()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    threading.Thread(target=executor.spin, daemon=True).start()
+    al = Aligner(node)
+    al.load_camera()
+    al.load_lidar()
+    for target in (al.apply_loop, al.metrics_loop, al.load_surface):
+        threading.Thread(target=target, daemon=True).start()
+    try:
+        run_gui(node, al)
+    finally:
+        al.stop = True
+        executor.shutdown(timeout_sec=1.0)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

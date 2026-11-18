@@ -121,7 +121,7 @@
                 ee_kinematics_link="${xacro.load_yaml('$(find openarm_description)/config/hand/openarm_hand/kinematics_link.yaml')}"
                 ee_inertials="${xacro.load_yaml('$(find openarm_description)/config/hand/openarm_hand/inertials.yaml')}"
                 rpy_ee="$(arg rpy_ee)"
-                xyz_ee="$(arg xyz_ee)"
+                xyz_ee="0 -0.0 0.1501"
                 tcp_xyz="$(arg tcp_xyz)"
                 tcp_rpy="$(arg tcp_rpy)"
                 description_pkg="$(arg description_pkg)"

@@ -88,9 +88,9 @@
   />
   <xacro:include filename="$(find realsense2_description)/urdf/_d455.urdf.xacro" />
   <xacro:sensor_d455 parent="world" name="camera">
-    <!-- V7: the V4 tape position, orientation fine-tuned by CALIBRATE (the arms were
-         moved instead, see right_arm_base_xyz). History in cam_org.txt. -->
-    <origin xyz="0.01233 0.000 0.53131" rpy="0.02056 -0.07726 -0.01912"/>
+    <!-- V10: set by hand 2026-11-16T17:20 with robot/sensor_align.py (live, the clouds
+         against the arm; 8.0 mm / 0.00 deg from the one before). History in cam_org.txt. -->
+    <origin xyz="0.01598 0.02000 0.52425" rpy="0.01931 -0.01182 -0.01906"/>
   </xacro:sensor_d455>
 
 

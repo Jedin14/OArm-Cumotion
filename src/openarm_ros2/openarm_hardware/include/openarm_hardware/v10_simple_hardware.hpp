@@ -30,6 +30,7 @@
 #include "hardware_interface/hardware_info.hpp"
 #include "hardware_interface/system_interface.hpp"
 #include "hardware_interface/types/hardware_interface_return_values.hpp"
+#include "openarm_hardware/mit_law.hpp"
 #include "openarm_hardware/visibility_control.h"
 #include "rclcpp/macros.hpp"
 #include "rclcpp_lifecycle/state.hpp"
@@ -138,6 +139,14 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   // Below this position error the integral holds instead of growing: inside
   // the static-friction band it can only wind up, not move the joint. rad.
   const double INTEGRAL_DEADBAND = 0.0005;
+  // Cap on the velocity feed-forward (2026-11-17), rad/s. Not a speed limit
+  // -- the trajectory sets the speed -- only a bound on what kd x dq can add
+  // if a velocity command is ever garbage. cuMotion's legs peak around
+  // 2.5 rad/s (the 1.97 rad drop move in 1.54 s); above the cap the feed-
+  // forward is only partial, i.e. the old lag for the excess, nothing worse.
+  const std::vector<double> VFF_MAX = {4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0};
+  // How often a changing motor status is logged at most, per joint, s.
+  static constexpr double STATUS_LOG_PERIOD = 1.0;
 
   const double GRIPPER_JOINT_0_POSITION = 0.044; 
   const double GRIPPER_JOINT_1_POSITION = 0.0;
@@ -151,6 +160,11 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   std::string arm_prefix_;
   bool hand_;
   bool can_fd_;
+  // calibration/motor_gains_<arm>.yaml (hardware param "gains_file"; empty:
+  // none). See gains_file.hpp.
+  std::string gains_file_;
+  // How the effective law came about, for the activation log.
+  std::string gains_source_;
 
   // OpenArm instance
   std::unique_ptr<openarm::can::socket::OpenArm> openarm_;
@@ -172,8 +186,39 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   // holds its place on friction alone -- so the motor's own word for it is
   // the only honest source, and it is already in every feedback frame.
   std::vector<double> status_states_;
+  // The integral's torque per arm joint, N m, exported as the
+  // "integral_torque" state interface (2026-11-17): how much of the hold is
+  // the integral's trim, on /dynamic_joint_states.
+  std::vector<double> integral_torque_states_;
+  // The position command of the cycle before, per joint: the integral holds
+  // while it moves (mit_law.hpp).
+  std::vector<double> prev_pos_commands_;
+
+  // The control law per arm joint (mit_law.hpp): compiled from the constants
+  // above, then the gains file applied. Fixed after on_init.
+  std::vector<mit_law::JointLaw> laws_;
+  mit_law::LawFlags law_flags_;
+  std::vector<mit_law::JointMemory> law_memory_;
+
+  // Motor status watch (2026-11-17), while active only: a motor that stops
+  // driving mid-run (the 463 mrad hold of 17:39:39 was never explained, and
+  // the status was not logged) is reported, at most once per
+  // STATUS_LOG_PERIOD per joint. It only logs; it changes nothing.
+  bool watch_status_ = false;
+  std::vector<int> status_seen_;     // the last status read
+  std::vector<int> status_shown_;    // the last status logged (or the baseline)
+  std::vector<int> status_changes_;  // changes since the last log
+  std::vector<std::chrono::steady_clock::time_point> status_logged_at_;
 
   // Helper methods
+  // Build laws_/law_flags_ from the constants and the gains file; log what
+  // happened to the file.
+  void load_control_law();
+  // Log the effective law (on_activate).
+  void log_control_law() const;
+  // Baseline for the status watch, from what the motors say now.
+  void start_status_watch();
+  void watch_status();
   void return_to_zero();
   // Seed the command buffers from the measured state, so activating the
   // hardware does not move the arm. See the definition.
@@ -188,7 +233,7 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   std::unique_ptr<KDL::ChainDynParam> kdl_dyn_param_;
   KDL::JntArray kdl_q_;
   KDL::JntArray kdl_gravity_torque_;
-  std::vector<double> integral_errors_;
+  // (The integral's store now lives in law_memory_[i].integral.)
 
   // Gripper mapping functions
   double joint_to_motor_radians(double joint_value);

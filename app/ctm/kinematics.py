@@ -299,3 +299,260 @@ def directions(before, after, still=0.005):
     out[np.abs(step) < still] = 0.0
     return out
 
+
+# -- batched rows and straight lines, for the fast reach check (2026-11-17) ----
+# ik_batch asks one pose from many seeds; the reach check asks hundreds of poses
+# (every way in, every roll) at once, and then whether the straight lines in and
+# onto the box stay solvable all the way -- the question MoveIt's Cartesian path
+# answers one 50 ms timeout per failed waypoint (55.7 s of a 12 min run went on
+# failed lines, 2026-11-16). Plain URDF, joint limits, no collisions: these only
+# throw out what cannot work; MoveIt still checks what is flown.
+
+
+def _chain(arm):
+    """The arm's steps folded for speed: [(fixed rotation 3x3, fixed shift 3,
+    joint axis 3)] per joint and the fixed (rotation, shift) after the last --
+    the plain URDF, as frames_batch with geom None. Kept on the Arm."""
+    got = arm.__dict__.get('_folded')
+    if got is not None:
+        return got
+    joints, pending = [], np.eye(4)
+    for fixed, axis in arm.steps:
+        pending = pending @ fixed
+        if axis is not None:
+            joints.append((pending[:3, :3].copy(), pending[:3, 3].copy(),
+                           np.asarray(axis, float) / np.linalg.norm(axis)))
+            pending = np.eye(4)
+    arm._folded = (joints, (pending[:3, :3].copy(), pending[:3, 3].copy()))
+    return arm._folded
+
+
+def _fk_jacobian(arm, q):
+    """hand_tcp poses (N, 4, 4) and geometric Jacobians (N, 6, 7) at q (N, 7):
+    frames_batch's chain, the rotation kept as three column arrays and each
+    joint turned by Rodrigues on them -- about 4x faster for the thousands of
+    rows the reach check asks at once (13 -> ~3 ms for 8832 rows)."""
+    q = np.atleast_2d(np.asarray(q, float))
+    n = len(q)
+    joints, (tail_r, tail_p) = _chain(arm)
+    cols = [np.zeros((n, 3)) for _ in range(3)]          # the columns of R (world <- link)
+    for i in range(3):
+        cols[i][:, i] = 1.0
+    p = np.zeros((n, 3))
+    origins, axes = [], []
+    for k, (fr, fp, axis) in enumerate(joints):
+        p = p + cols[0] * fp[0] + cols[1] * fp[1] + cols[2] * fp[2]
+        cols = [cols[0] * fr[0, j] + cols[1] * fr[1, j] + cols[2] * fr[2, j] for j in range(3)]
+        a = cols[0] * axis[0] + cols[1] * axis[1] + cols[2] * axis[2]
+        origins.append(p)
+        axes.append(a)
+        c_, s_ = np.cos(q[:, k])[:, None], np.sin(q[:, k])[:, None]
+        m = int(np.argmax(np.abs(axis)))
+        if abs(abs(axis[m]) - 1.0) < 1e-12:
+            # about a link axis (every OpenArm joint): only the other two columns turn
+            s_ = s_ if axis[m] > 0 else -s_
+            i, j = (m + 1) % 3, (m + 2) % 3
+            cols[i], cols[j] = cols[i] * c_ + cols[j] * s_, cols[j] * c_ - cols[i] * s_
+        else:
+            # R @ rot(axis, q): each column c -> c cos + (a x c) sin + a (a.c)(1 - cos)
+            cols = [c * c_ + np.cross(a, c) * s_
+                    + a * (np.einsum('ni,ni->n', a, c)[:, None] * (1 - c_)) for c in cols]
+    p = p + cols[0] * tail_p[0] + cols[1] * tail_p[1] + cols[2] * tail_p[2]
+    cols = [cols[0] * tail_r[0, j] + cols[1] * tail_r[1, j] + cols[2] * tail_r[2, j]
+            for j in range(3)]
+    t = np.zeros((n, 4, 4))
+    t[:, :3, 0], t[:, :3, 1], t[:, :3, 2], t[:, :3, 3] = cols[0], cols[1], cols[2], p
+    t[:, 3, 3] = 1.0
+    jac = np.empty((n, 6, 7))
+    for k, (origin, a) in enumerate(zip(origins, axes)):
+        jac[:, :3, k] = np.cross(a, p - origin)
+        jac[:, 3:, k] = a
+    return t, jac
+
+
+def _pose_error(t, targets):
+    """(N, 6) error of poses t against targets: position (m) and the small-angle
+    rotation vector (rad); and (N,) position / rotation error norms -- the
+    rotation as ik_batch measures it (the matrices' Frobenius distance)."""
+    p_err = targets[:, :3, 3] - t[:, :3, 3]
+    r_rel = targets[:, :3, :3] @ np.transpose(t[:, :3, :3], (0, 2, 1))
+    w_err = 0.5 * np.stack([r_rel[:, 2, 1] - r_rel[:, 1, 2], r_rel[:, 0, 2] - r_rel[:, 2, 0],
+                            r_rel[:, 1, 0] - r_rel[:, 0, 1]], axis=1)
+    pos = np.linalg.norm(p_err, axis=1)
+    rot = np.linalg.norm(t[:, :3, :3] - targets[:, :3, :3], axis=(1, 2))
+    return np.concatenate([p_err, w_err], axis=1), pos, rot
+
+
+def _dls(jac, err, damping=1e-4, cap=None):
+    """Damped least-squares joint step (N, 7), each row's largest joint step
+    capped to `cap` rad (a far seed otherwise overshoots into a joint limit).
+    J^T (J J^T + damping)^-1 e -- the same step as ik_batch's (J^T J +
+    damping)^-1 J^T e, a 6x6 solve instead of 7x7 (a third faster)."""
+    jt = np.transpose(jac, (0, 2, 1))
+    dq = (jt @ np.linalg.solve(jac @ jt + damping * np.eye(6), err[:, :, None]))[:, :, 0]
+    if cap is not None:
+        big = np.max(np.abs(dq), axis=1, keepdims=True)
+        dq = dq * np.minimum(1.0, cap / np.maximum(big, 1e-12))
+    return dq
+
+
+def joint_margin(q, limits):
+    """(N, 7) how far each joint is from its nearer limit, rad."""
+    lo, hi = np.array(limits, float).T
+    q = np.asarray(q, float)
+    return np.minimum(q - lo, hi - q)
+
+
+def ik_batch_rows(arm, targets, seeds, limits, iters=30, tol=1e-4, rot_tol=1e-3,
+                  all_seeds=False, cap=0.4, give_up=None):
+    """Plain-URDF IK for many poses at once: row i of `targets` (N, 4, 4) is
+    solved from every seed of row i of `seeds` ((N, S, 7), or (S, 7): the same
+    seeds for every row) -- damped least squares, joints clipped to `limits`
+    every iteration (as KDL keeps them), rows dropped from the batch once they
+    have converged (pos < tol m, rotation < rot_tol).
+
+    Returns the best seed's answer per row: (q (N, 7), ok (N,), err (N,)) --
+    best = converged with the most room to its joint limits (a posture with
+    room to move), else the smallest error. all_seeds=True: every seed's
+    answer instead, (q (N, S, 7), ok (N, S), err (N, S)). err = position error
+    (m) + rotation error.
+
+    give_up: [(iterations, metres)] -- a seed still that far off after that many
+    iterations is dropped (left unconverged): most random seeds end on a joint
+    limit and never converge, and iterating them is most of the time. The
+    reach check uses ((8, 0.05), (16, 0.01)): 85 instead of 215 ms for 384
+    poses x 23 seeds, the same poses solved but 0-5 of ~200 (2026-11-17)."""
+    targets = np.asarray(targets, float).reshape(-1, 4, 4)
+    n = len(targets)
+    seeds = np.asarray(seeds, float)
+    if seeds.ndim == 2:
+        seeds = np.broadcast_to(seeds[None], (n,) + seeds.shape)
+    s = seeds.shape[1]
+    lo, hi = np.array(limits, float).T
+    q = np.clip(seeds.reshape(n * s, 7), lo, hi)
+    goal = np.repeat(targets, s, axis=0)
+    pos = np.full(n * s, np.inf)
+    rot = np.full(n * s, np.inf)
+    active = np.arange(n * s)
+    for it in range(iters + 1):
+        if not active.size:
+            break
+        t, jac = _fk_jacobian(arm, q[active])
+        err, p, r = _pose_error(t, goal[active])
+        pos[active], rot[active] = p, r
+        if it == iters:
+            break
+        left = ~((p < tol) & (r < rot_tol))
+        for after, far in (give_up or ()):
+            if it >= after:
+                left &= p <= far
+        active, jac, err = active[left], jac[left], err[left]
+        if active.size:
+            q[active] = np.clip(q[active] + _dls(jac, err, cap=cap), lo, hi)
+    ok = (pos < tol) & (rot < rot_tol)
+    err = pos + rot
+    if all_seeds:
+        return q.reshape(n, s, 7), ok.reshape(n, s), err.reshape(n, s)
+    q, ok, err = q.reshape(n, s, 7), ok.reshape(n, s), err.reshape(n, s)
+    room = joint_margin(q.reshape(-1, 7), limits).min(axis=1).reshape(n, s)
+    score = np.where(ok, room, -1e3 - err)
+    best = np.argmax(score, axis=1)
+    rows = np.arange(n)
+    return q[rows, best], ok[rows, best], err[rows, best]
+
+
+def _log_rot(r):
+    """(N, 3) rotation vectors of rotations r (N, 3, 3)."""
+    cos = np.clip((np.trace(r, axis1=1, axis2=2) - 1.0) / 2.0, -1.0, 1.0)
+    ang = np.arccos(cos)
+    w = np.stack([r[:, 2, 1] - r[:, 1, 2], r[:, 0, 2] - r[:, 2, 0], r[:, 1, 0] - r[:, 0, 1]],
+                 axis=1)
+    s = np.sin(ang)
+    out = np.where((s > 1e-9)[:, None], w * (ang / np.maximum(2.0 * s, 1e-12))[:, None], 0.5 * w)
+    # (near 180 deg the skew part vanishes: the axis from the symmetric part)
+    for i in np.flatnonzero((s <= 1e-4) & (ang > 3.0)):
+        b = (r[i] + np.eye(3)) / 2.0
+        j = int(np.argmax(np.diag(b)))
+        axis = b[:, j] / np.sqrt(max(b[j, j], 1e-12))
+        out[i] = axis / np.linalg.norm(axis) * ang[i]
+    return out
+
+
+def _exp_rot(w):
+    """(N, 3, 3) rotations of rotation vectors w (N, 3)."""
+    a = np.linalg.norm(w, axis=1)
+    k = w / np.maximum(a, 1e-12)[:, None]
+    kx = np.zeros((len(w), 3, 3))
+    kx[:, 0, 1], kx[:, 0, 2], kx[:, 1, 2] = -k[:, 2], k[:, 1], -k[:, 0]
+    kx[:, 1, 0], kx[:, 2, 0], kx[:, 2, 1] = k[:, 2], -k[:, 1], k[:, 0]
+    s_, c_ = np.sin(a)[:, None, None], np.cos(a)[:, None, None]
+    return np.eye(3) + s_ * kx + (1 - c_) * (kx @ kx)
+
+
+def line_walk(arm, q0, T0, T1, step=0.002, limits=None, max_dq_per_mm=0.03, iters=4,
+              tol=1e-4, rot_tol=1e-3):
+    """Walk hand_tcp in a straight line from T0 to T1 ((N, 4, 4) or one (4, 4)
+    for every row), row i starting from the joints q0[i] (N, 7), which should
+    put it at T0: every `step` m one warm-started damped-least-squares solve
+    (up to `iters` iterations, from the step before), joints clipped to their
+    limits, as MoveIt's Cartesian path tracks its line with KDL. A row fails at
+    the first step that does not converge or that moves any joint more than
+    max_dq_per_mm rad per mm of the line -- the app's JUMP, 0.15 rad per 5 mm
+    step (robot.py): a branch flip or a joint run onto its limit.
+
+    Returns (ok (N,), q_end (N, 7), margin (N,), path (K + 1, N, 7)): q_end the
+    last good joints (the end for an ok row), margin the least room any joint
+    had to its limit along the good part (rad), path every step's joints (NaN
+    from where a row failed)."""
+    if limits is None:
+        raise ValueError('line_walk needs the joint limits')
+    q = np.array(q0, float).reshape(-1, 7)
+    n = len(q)
+    T0 = np.broadcast_to(np.asarray(T0, float), (n, 4, 4))
+    T1 = np.broadcast_to(np.asarray(T1, float), (n, 4, 4))
+    lo, hi = np.array(limits, float).T
+    q = np.clip(q, lo, hi)
+    p0, p1 = T0[:, :3, 3], T1[:, :3, 3]
+    r0 = T0[:, :3, :3]
+    w = _log_rot(np.transpose(r0, (0, 2, 1)) @ T1[:, :3, :3])   # in T0's frame
+    length = np.linalg.norm(p1 - p0, axis=1)
+    turn = np.linalg.norm(w, axis=1)
+    # one step count for all rows (a shorter row takes shorter steps); a turn in
+    # place goes in 0.5 deg steps
+    k_all = int(max(1, np.ceil(max(float(np.max(length, initial=0.0)) / step,
+                                   float(np.max(turn, initial=0.0)) / np.radians(0.5)))))
+    step_mm = np.maximum(length / k_all * 1000.0, step * 1000.0 * (length < 1e-9))
+    path = np.full((k_all + 1, n, 7), np.nan)
+    # the start must be where it says
+    t, _j = _fk_jacobian(arm, q)
+    _e, p, r = _pose_error(t, np.array(T0))
+    alive = (p < 10 * tol) & (r < 10 * rot_tol)
+    path[0, alive] = q[alive]
+    margin = np.where(alive, joint_margin(q, limits).min(axis=1), -np.inf)
+    for k in range(1, k_all + 1):
+        idx = np.flatnonzero(alive)
+        if not idx.size:
+            break
+        f = k / k_all
+        goal = np.empty((len(idx), 4, 4))
+        goal[:, 3] = (0.0, 0.0, 0.0, 1.0)
+        goal[:, :3, 3] = p0[idx] + f * (p1[idx] - p0[idx])
+        goal[:, :3, :3] = r0[idx] @ _exp_rot(f * w[idx])
+        qa = q[idx].copy()
+        for it in range(iters + 1):
+            t, jac = _fk_jacobian(arm, qa)
+            err, p, r = _pose_error(t, goal)
+            conv = (p < tol) & (r < rot_tol)
+            if it == iters or conv.all():
+                break
+            dq = _dls(jac, err, cap=0.15)
+            dq[conv] = 0.0
+            qa = np.clip(qa + dq, lo, hi)
+        jump = np.max(np.abs(qa - q[idx]), axis=1)
+        good = conv & (jump <= max_dq_per_mm * step_mm[idx] + 1e-12)
+        alive[idx[~good]] = False
+        g = idx[good]
+        q[g] = qa[good]
+        path[k, g] = qa[good]
+        margin[g] = np.minimum(margin[g], joint_margin(qa[good], limits).min(axis=1))
+    return alive, q, margin, path

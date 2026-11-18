@@ -48,8 +48,11 @@
       - openarm_left_joint6
       - openarm_left_joint7
     interface_name: position
+    # 2026-11-17: velocity too, as in openarm_v10_bimanual_controllers.yaml
+    # (the trajectory's velocity becomes the motor's velocity target).
     command_interfaces:
       - position
+      - velocity
     state_interfaces:
       - position
       - velocity
@@ -80,8 +83,11 @@
       - openarm_right_joint6
       - openarm_right_joint7
     interface_name: position
+    # 2026-11-17: velocity too, as in openarm_v10_bimanual_controllers.yaml
+    # (the trajectory's velocity becomes the motor's velocity target).
     command_interfaces:
       - position
+      - velocity
     state_interfaces:
       - position
       - velocity

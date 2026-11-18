@@ -1,0 +1,61 @@
+# LEFT arm motor control law, read by openarm_hardware (v10_simple_hardware.cpp)
+# once, when the hardware starts: edit, then restart terminal 1 (the stack).
+# Created 2026-11-17 (precision review of the 2026-11-16 17:21-17:40 run).
+#
+# The driver log says what it used, at activation:
+#   left_ control law: velocity feed-forward on, integral freeze on (...); gains file ... (profile off)
+#   openarm_left_joint1: kp 100.0 kd 5.50 ki 20.0 i_cap 8.00 Nm, ...
+#
+# All or nothing: an unknown key (a typo), a wrong type, a value outside the
+# bounds or the wrong `arm`, and NONE of this file is used -- the driver logs an
+# ERROR ("... REJECTED (why): compiled law") and runs the compiled law, which has
+# velocity feed-forward and the integral freeze ON and the profile OFF. The
+# profile below is checked even while it is off. `colcon test --packages-select
+# openarm_hardware` checks this file too. No file at all: the compiled law, with
+# a warning.
+#
+# Bounds (the file cannot lift them): kp joints 1-4 <= 100 (the compiled value),
+# kp joints 5-7 <= 30, kd <= 5.0, ki <= 100, i_cap <= the compiled caps
+# (8 8 6 6 1.5 1.5 1.5 Nm), gate_in/gate_out <= 0.005 rad with gate_out >= gate_in,
+# freeze_rate 0.002..0.5 rad/s, freeze_hold 0..2 s.
+
+arm: left
+
+# --- always applied when this file is accepted --------------------------------
+# The trajectory controller's velocity goes to the motor as its velocity
+# target. Off: the motor's velocity target is 0 and its damping brakes every
+# move -- the arm lags (kd/kp) x speed, about 190 mrad on joint 7 in the drop
+# move. (Also needs the controller yaml's command_interfaces [position,
+# velocity]; with [position] only nothing writes the velocity and this does
+# nothing.)
+velocity_feedforward: true
+# The integral holds while the command moves, and runs again once the command
+# has been still for freeze_hold. Off: it integrates the lag during every move
+# and pushes the joint past the target afterwards (j7 69 mrad, 17:36:02).
+integral_freeze_while_moving: true
+freeze_rate: 0.01     # rad/s: the command counts as moving above this
+freeze_hold: 0.15     # s
+# Drop a velocity that comes with a position command standing exactly still
+# (the JTC holds a finished trajectory's last point velocity and all). Off: a
+# held non-zero velocity pushes the joint kd x v / kp off target for good.
+zero_velocity_when_held: true
+
+# --- the gains profile: used ONLY when profile_enabled is true -----------------
+# A faster integral (KI 20 -> 60 on joints 1-4: time constant 5 s -> 1.7 s) with
+# a hysteresis gate against hunting: it stops at |error| <= gate_in and starts
+# again only at |error| >= gate_out. Keys left out keep the compiled values
+# (kp 100 100 100 100 10 10 10, kd 5.5 5.0 1.4 0.8 1.4 1.2 1.0,
+# ki 20 20 20 20 10 10 10, gates 0.0005).
+# To try it: profile_enabled: true, restart terminal 1, then the 60 s rest check
+# (python3 app/tools/arm_check.py --arm left --seconds 60): peak-to-peak under
+# 2 mrad on joints 1-4 and 6 mrad on 5-7, no buzz. Otherwise back to false.
+# A later second step, only after that: wrist kp 15, then 20, with kd 1.0.
+profile_enabled: true    # 2026-11-17 17:40: on -- j1 stopped 25-50 mrad short of every target with ki 20
+joints:
+  joint1: {ki: 60.0, gate_in: 0.001, gate_out: 0.002}
+  joint2: {ki: 60.0, gate_in: 0.001, gate_out: 0.002}
+  joint3: {ki: 60.0, gate_in: 0.001, gate_out: 0.002}
+  joint4: {ki: 60.0, gate_in: 0.001, gate_out: 0.002}
+  joint5: {kp: 10.0, ki: 20.0, gate_in: 0.001, gate_out: 0.003}
+  joint6: {kp: 10.0, ki: 20.0, gate_in: 0.001, gate_out: 0.003}
+  joint7: {kp: 10.0, ki: 20.0, gate_in: 0.001, gate_out: 0.003}

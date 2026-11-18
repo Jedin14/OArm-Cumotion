@@ -30,6 +30,8 @@ find_package(rclcpp_lifecycle REQUIRED)
 find_package(OpenArmCAN REQUIRED)
 find_package(kdl_parser REQUIRED)
 find_package(orocos_kdl_vendor REQUIRED)
+# calibration/motor_gains_<arm>.yaml (2026-11-17, gains_file.hpp)
+find_package(yaml_cpp_vendor REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
   src/v10_simple_hardware.cpp
@@ -43,6 +45,7 @@ target_include_directories(
 
 target_link_libraries(${PROJECT_NAME}
   OpenArmCAN::openarm_can
+  yaml-cpp
 )
 
 ament_target_dependencies(${PROJECT_NAME}
@@ -52,6 +55,7 @@ ament_target_dependencies(${PROJECT_NAME}
   rclcpp_lifecycle
   kdl_parser
   orocos_kdl_vendor
+  yaml_cpp_vendor
 )
 
 pluginlib_export_plugin_description_file(hardware_interface openarm_hardware.xml)
@@ -78,6 +82,23 @@ ament_export_dependencies(
   rclcpp
   kdl_parser
   orocos_kdl_vendor
+  yaml_cpp_vendor
 )
+
+# The control law and the gains-file checks, without hardware (2026-11-17):
+#   colcon test --packages-select openarm_hardware
+# Both are header-only and need neither CAN nor ROS.
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_mit_law test/test_mit_law.cpp)
+  if(TARGET test_mit_law)
+    target_include_directories(test_mit_law PRIVATE include)
+    target_link_libraries(test_mit_law yaml-cpp)
+    # So the test also checks the workspace's calibration/motor_gains_*.yaml
+    # (skipped when they are not there).
+    target_compile_definitions(test_mit_law PRIVATE
+      OPENARM_CALIBRATION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../calibration")
+  endif()
+endif()
 
 ament_package()

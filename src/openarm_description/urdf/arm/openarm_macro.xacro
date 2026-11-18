@@ -113,7 +113,7 @@
       velocity="${limits.velocity}" />
   </xacro:macro>
   
-  <xacro:macro name="openarm-kinematics" params="name config offset:=none reflect:=1 zr:=0 zp:=0 zy:=0">
+  <xacro:macro name="openarm-kinematics" params="name config offset:=none reflect:=1">
     <xacro:property name="kinematics" value="${config[name]['kinematic']}" lazy_eval="false" />
     <xacro:if value="${offset != 'none'}">
       <xacro:property name="offset" value="${offset[name]['kinematic_offset']}" lazy_eval="false" />
@@ -124,7 +124,7 @@
     <xacro:unless value="${offset != 'none'}">
       <origin
         xyz="${kinematics.x} ${kinematics.y} ${kinematics.z}"
-        rpy="${reflect*kinematics.roll + zr} ${reflect*kinematics.pitch + zp} ${reflect*kinematics.yaw + zy}" />
+        rpy="${reflect*kinematics.roll} ${reflect*kinematics.pitch} ${reflect*kinematics.yaw}" />
     </xacro:unless>
   </xacro:macro>
 

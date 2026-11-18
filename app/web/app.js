@@ -12,7 +12,9 @@ const ALWAYS = new Set(['stop', 'markers', 'view', 'dummy_size', 'tip_check', 'a
   // the vacuum by hand: also mid-pick (OFF lets go of the box)
   'vacuum',
   // a setting: may be switched off while DETECT BOX looks (then it waits for MOVE)
-  'bypass']);
+  'bypass',
+  // AUTO CALIBRATE waiting for the box: pressed while it runs (renderAutocal enables it)
+  'autocal_box_on']);
 let S = null;                 // the last state from beast
 const NUDGES = ['left', 'right', 'up', 'down', 'in', 'out'];
 let lastLog = 0;
@@ -93,12 +95,18 @@ document.addEventListener('click', (e) => {
   if (name === 'tool') {
     return act('tool', { arm: b.dataset.arm, step: b.dataset.step ? Number(b.dataset.step) : 0 });
   }
+  if (name === 'auto_cal') return act('auto_cal', { weigh: $('acWeigh').checked });
   if (name === 'order') return act('order', { value: b.dataset.value });
   if (name === 'top_faces') return act('top_faces', { value: b.dataset.value });
   if (name === 'pick_all') {
     try {
       if (window.Notification && Notification.permission === 'default') Notification.requestPermission();
     } catch (_) { /* in-page only */ }
+    // COUNT (2026-11-17): Pick N sends the stepper's number; All sends "all"
+    if (b.dataset.count === 'all') return act('pick_all', { count: 'all' });
+    const n = pickCount();
+    setPickCount(n);                    // (the field as sent, remembered)
+    return act('pick_all', { count: n });
   }
   if (name === 'vacuum') {
     if (S && S.vacuum === (b.dataset.value === 'on')) return;
@@ -264,13 +272,18 @@ function render(s) {
   $('teachSheet').setAttribute('aria-hidden', !s.teaching);
   setText($('teachTitle'), s.anchor_mode ? 'Anchor: put the tip exactly on the point'
     : 'Teach: nudge the tip onto the spot');
-  const cal = s.calibrating || s.confirming;
+  // (AUTO CALIBRATE: the sheet all through its run -- also while it weighs or waits for the box)
+  const ac = s.autocal || {};
+  const acRun = !!ac.running;
+  const cal = s.calibrating || s.confirming || acRun;
   $('stage').classList.toggle('sheet-up', s.teaching || cal);
   $('calSheet').classList.toggle('open', cal && !s.teaching);
   $('calSheet').setAttribute('aria-hidden', !cal);
   $('calConfirm').hidden = !s.confirming;
-  setText($('calTitle'), s.confirming ? 'Is the outline on marker 11?' : 'Calibrating');
+  setText($('calTitle'), s.confirming ? 'Is the outline on marker 11?'
+    : acRun ? `Auto calibration · ${AC_STEP[ac.step] || ac.step}` : 'Calibrating');
   setText($('calSub'), s.confirming ? 'Confirm and the arms start; nothing has moved yet'
+    : acRun && ac.step === 'wait_box' ? 'Put the ArUco box on the cup (cup on the cross of face B), then press Box is on the cup'
     : (s.status || 'Keep the view clear') + ' · Abort stops after the current move');
   setText($('teachSub'), `${s.status ? s.status + ' · ' : ''}1 mm a press, Shift 5 mm · arrows, + / −, Enter saves`);
 
@@ -381,10 +394,18 @@ function render(s) {
 
   // pick all, bypass
   setPressed($('tgBypass'), s.bypass);
-  setText($('pickAllLabel'), s.pick_all
-    ? `Picking all · ${s.pick_all.picked} picked${s.pick_all.skipped ? `, ${s.pick_all.skipped} skipped` : ''}` +
-      `${s.pick_all.dropped ? `, ${s.pick_all.dropped} dropped` : ''}`
-    : 'Pick all');
+  // (2026-11-17) the count: progress on the Pick N button while it runs (the
+  // card below has the skipped and dropped), else the number to pick
+  const pa = s.pick_all;
+  setText($('pickAllLabel'), pa
+    ? (pa.want ? `Picking ${pa.picked}/${pa.want}` : `Picking all · ${pa.picked}`)
+    : `Pick ${pickCount()}`);
+  const countOff = !!(s.busy || s.teaching || s.calibrating);
+  if ($('pickCount').disabled !== countOff) $('pickCount').disabled = countOff;
+  document.querySelectorAll('[data-count-step]').forEach((b) => {
+    if (b.disabled !== countOff) b.disabled = countOff;
+  });
+  $('pickAllCount').hidden = s.click_only;
 
   // advanced: the vacuum
   setPressed($('vacOn'), s.vacuum);
@@ -406,7 +427,7 @@ function render(s) {
   // busy: only what is safe stays live
   document.querySelectorAll('[data-action]').forEach((b) => {
     const name = b.dataset.action;
-    if (name === 'view' || name === 'apply') return;
+    if (name === 'view' || name === 'apply' || name === 'autocal_box_on') return;   // (set elsewhere)
     const off = (s.busy || s.teaching || s.calibrating) && !ALWAYS.has(name)
       && !(name === 'topdown' && !s.busy);
     if (b.disabled !== off) b.disabled = off;
@@ -415,6 +436,7 @@ function render(s) {
   $('btnMove2').disabled = move.disabled;             // (the Advanced tab's MOVE: the same)
   $('btnMove2').dataset.tone = move.dataset.tone || '';
   $('btnRelease').disabled = !heldArms.length || s.busy;
+  renderAutocal(s);
 
   // activity
   const list = $('log');
@@ -472,6 +494,33 @@ function dur(sec) {
   return sec < 60 ? `${Number(sec).toFixed(1)} s` : `${Math.floor(sec / 60)} min ${Math.round(sec % 60)} s`;
 }
 
+// the count (2026-11-17): how many boxes Pick N picks, 1..200 (beast refuses
+// anything else), remembered in this browser; nothing is sent until Pick N / All
+const COUNT_MAX = 200;
+function clampCount(v) {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) ? Math.min(COUNT_MAX, Math.max(1, n)) : 1;
+}
+function pickCount() { return clampCount($('pickCount').value); }
+function setPickCount(v, save = true) {
+  const n = clampCount(v);
+  if ($('pickCount').value !== String(n)) $('pickCount').value = String(n);
+  if (save) { try { localStorage.setItem('pickCount', String(n)); } catch (_) { /* private window */ } }
+  if (!(S && S.pick_all)) setText($('pickAllLabel'), `Pick ${n}`);
+}
+document.querySelectorAll('[data-count-step]').forEach((b) => b.addEventListener('click', () => {
+  if (!b.disabled) setPickCount(pickCount() + Number(b.dataset.countStep));
+}));
+// typing: the label follows; the field itself is tidied once done (Enter, leaving it)
+$('pickCount').addEventListener('input', () => {
+  if (!(S && S.pick_all)) setText($('pickAllLabel'), `Pick ${pickCount()}`);
+});
+$('pickCount').addEventListener('change', () => setPickCount($('pickCount').value));
+try {
+  const saved = localStorage.getItem('pickCount');
+  if (saved) setPickCount(saved, false);
+} catch (_) { /* private window */ }
+
 let timesKey = '';
 function renderTimes(picks) {
   const key = picks.map((p) => p.n + p.result).join(',');
@@ -481,7 +530,9 @@ function renderTimes(picks) {
   body.innerHTML = '';
   for (const p of picks) {
     const tr = document.createElement('tr');
-    const tone = ['picked', 'skipped', 'dropped', 'tried'].includes(p.result) ? p.result : 'bad';
+    // ('picked (by weight)': the camera could not tell, the cup weighed it -- picked)
+    const tone = String(p.result).startsWith('picked') ? 'picked'
+      : ['skipped', 'dropped', 'tried'].includes(p.result) ? p.result : 'bad';
     const cells = [p.n, p.result, dur(p.seconds), dur(p.cycle), p.at];
     cells.forEach((v, i) => {
       const td = document.createElement('td');
@@ -493,6 +544,10 @@ function renderTimes(picks) {
   }
 }
 
+// (2026-11-17) a run or its report: "Pick 3" / "Pick all", "2 of 3 picked" / "2 picked"
+const runName = (r) => (r.want ? `Pick ${r.want}` : 'Pick all');
+const pickedText = (r) => (r.want ? `${r.picked} of ${r.want} picked` : `${r.picked} picked`);
+
 function renderPickAll(s) {
   const run = s.pick_all, rep = s.pick_all_report;
   const card = $('pickAllCard'), badge = $('pickAllBadge');
@@ -502,17 +557,17 @@ function renderPickAll(s) {
   state.dataset.tone = s.base_wait ? 'edge' : run ? 'busy' : s.click_only || s.busy ? 'idle' : 'ok';
   if (run) {
     card.hidden = false;
-    setText($('pickAllTitle'), 'Pick all · running');
+    setText($('pickAllTitle'), `${runName(run)} · running`);
     setText(badge, dur(run.elapsed_s)); badge.dataset.tone = 'busy';
-    setText($('pickAllSummary'), `${run.picked} picked, ${run.skipped} skipped`
+    setText($('pickAllSummary'), `${pickedText(run)}, ${run.skipped} skipped`
       + (run.dropped ? `, ${run.dropped} dropped` : '') + (run.pass > 1 ? ` · round ${run.pass}` : ''));
     renderTimes(run.picks || []);
     setText($('pickAllFile'), '');
   } else if (rep) {
     card.hidden = false;
-    setText($('pickAllTitle'), `Pick all · done ${String(rep.finished).slice(-8)}`);
+    setText($('pickAllTitle'), `${runName(rep)} · done ${String(rep.finished).slice(-8)}`);
     setText(badge, dur(rep.total_s)); badge.dataset.tone = rep.ok ? 'ok' : 'edge';
-    setText($('pickAllSummary'), `${rep.picked} picked, ${rep.skipped} skipped`
+    setText($('pickAllSummary'), `${pickedText(rep)}, ${rep.skipped} skipped`
       + (rep.dropped ? `, ${rep.dropped} dropped` : '') + (rep.rounds > 1 ? ` in ${rep.rounds} rounds` : '')
       + ` · total ${dur(rep.total_s)}` + (rep.per_box_s ? ` · ${dur(rep.per_box_s)} per box picked` : '')
       + ` · ${rep.why}`);
@@ -526,18 +581,19 @@ function renderPickAll(s) {
   if (reportSeen === undefined) { reportSeen = id; return; }
   if (id != null && id !== reportSeen) {
     reportSeen = id;
-    const text = `${rep.picked} picked, ${rep.skipped} skipped`
+    const text = `${pickedText(rep)}, ${rep.skipped} skipped`
       + (rep.dropped ? `, ${rep.dropped} dropped` : '') + ` in ${dur(rep.total_s)}`
       + (rep.per_box_s ? ` (${dur(rep.per_box_s)} per box)` : '') + ` – ${rep.why}`;
+    const title = `${runName(rep)} ${rep.ok ? 'done' : 'stopped'}`;
     $('doneBanner').classList.toggle('bad', !rep.ok);
-    setText($('doneTitle'), rep.ok ? 'Pick all done' : 'Pick all stopped');
+    setText($('doneTitle'), title);
     setText($('doneText'), text);
     $('doneBanner').hidden = false;
-    document.title = (rep.ok ? '✓ Pick all done · ' : '! Pick all stopped · ') + BASE_TITLE;
+    document.title = `${rep.ok ? '✓' : '!'} ${title} · ` + BASE_TITLE;
     chime(rep.ok);
     try {                                   // (only where the browser allows it: https / localhost)
       if (window.Notification && Notification.permission === 'granted') {
-        new Notification(rep.ok ? 'Pick all done' : 'Pick all stopped', { body: text });
+        new Notification(title, { body: text });
       }
     } catch (_) { /* in-page only */ }
   }
@@ -721,6 +777,222 @@ function renderPicker(s) {
   setText($('setScore'), st.score == null ? '–' : Number(st.score).toFixed(2));
   setText($('setCheck'), st.check_frames == null ? '–' : String(st.check_frames));
   setText($('btnForget'), `Forget skipped${tally.skipped || tally.passed ? ` (${(tally.skipped || 0) + (tally.passed || 0)})` : ''}`);
+}
+
+// -- AUTO CALIBRATE: the one button, its progress, result and error map (2026-11-16) --
+
+const AC_STEP = {
+  weigh: 'weighing the tool', wait_box: 'waiting for the box', choose: 'choosing postures',
+  measure: 'measuring', fit: 'fitting the model', done: 'done', failed: 'failed', aborted: 'aborted',
+};
+const AC_RUNNING = ['weigh', 'wait_box', 'choose', 'measure', 'fit'];
+const AC_MODEL = {
+  urdf: 'URDF (no correction)', rigid: 'Rigid (base only)', zeros: 'Joint zeros',
+  'zeros+sag': 'Joint zeros + sag',
+};
+const AC_ORDER = ['urdf', 'rigid', 'zeros', 'zeros+sag'];      // simplest first, as the run chooses
+// |error| in 4 mm bins, one hue: larger is lighter on dark, darker on light (both
+// checked with the dataviz validator: monotone, visible steps, the first clears the map)
+const AC_BINS = [4, 8, 12, 16];
+const AC_RAMP = {
+  dark: ['#256abf', '#3987e5', '#6da7ec', '#9ec5f4', '#cde2fb'],
+  light: ['#6da7ec', '#3987e5', '#256abf', '#184f95', '#0d366b'],
+};
+const lightScheme = window.matchMedia ? window.matchMedia('(prefers-color-scheme: light)') : null;
+function acColour(e) {
+  const ramp = AC_RAMP[lightScheme && lightScheme.matches ? 'light' : 'dark'];
+  let i = 0;
+  while (i < AC_BINS.length && e >= AC_BINS[i]) i++;
+  return ramp[i];
+}
+const mm1 = (v) => (v == null || !isFinite(v) ? '–' : `${Number(v).toFixed(1)} mm`);
+const signed = (v) => (v == null || !isFinite(v) ? '–' : `${v >= 0 ? '+' : ''}${Number(v).toFixed(1)}`);
+const eta = (sec) => (sec < 90 ? `${Math.round(sec)} s` : `${Math.round(sec / 60)} min`);
+// [mean, p90, max]: the run sends lists; {mean_mm, p90_mm, max_mm} is read too
+const triple = (v) => (Array.isArray(v) ? v : v && typeof v === 'object'
+  ? [v.mean_mm ?? v.mean, v.p90_mm ?? v.p90, v.max_mm ?? v.max] : [v, null, null]);
+const esc = (t) => String(t ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+let acProgKey = '', acResKey = '', acMapKey = '', acEndSeen, acWaitShown = false;
+if (lightScheme && lightScheme.addEventListener) {
+  lightScheme.addEventListener('change', () => { acMapKey = ''; if (S) renderAutocal(S); });
+}
+
+function renderAutocal(s) {
+  const ac = s.autocal || {};
+  const step = ac.step || null;
+  const running = !!ac.running;                 // (beast: busy, and a step of the run)
+  const waiting = running && step === 'wait_box';
+  const r = ac.result || null;
+  // Box is on the cup: only while it waits -- busy and calibrating then, so not
+  // by the busy rule in render() (it skips this button)
+  for (const id of ['btnBoxOn', 'calBoxOn']) {
+    const b = $(id);
+    if (b.hidden !== !waiting) b.hidden = !waiting;
+    if (b.disabled !== !waiting) b.disabled = !waiting;
+  }
+  $('btnAutoCal').hidden = waiting;
+  setText($('btnAutoCal'), running ? 'Auto calibrating…' : 'Auto calibrate');
+  $('acWeigh').disabled = !!s.busy;
+  const stale = AC_RUNNING.includes(step) && !running;   // its job ended without a last word
+  const [label, tone] = waiting ? ['put the box on', 'edge']
+    : running ? [AC_STEP[step] || step, 'busy']
+    : step === 'done' ? (r && r.saved ? ['saved', 'ok'] : ['not saved', 'edge'])
+    : step === 'failed' || stale ? ['failed', 'bad']
+    : step === 'aborted' ? ['aborted', 'edge'] : ['ready', 'idle'];
+  setText($('acBadge'), label);
+  $('acBadge').dataset.tone = tone;
+
+  // it waits for you: say so once, also from another tab
+  if (waiting && !acWaitShown) {
+    acWaitShown = true;
+    chime(true);
+    document.title = '! Put the box on the cup · ' + BASE_TITLE;
+  } else if (!waiting && acWaitShown) {
+    acWaitShown = false;
+    if (document.title.startsWith('! Put the box')) document.title = BASE_TITLE;
+  }
+
+  // progress
+  const segs = Array.isArray(ac.segments) ? ac.segments.length : Number(ac.segments) || 1;
+  const progKey = JSON.stringify([step, running, ac.text, ac.measured, ac.total, segs, ac.eta_s]);
+  if (progKey !== acProgKey) {
+    acProgKey = progKey;
+    $('acProgress').hidden = !(running || step === 'failed' || step === 'aborted' || stale);
+    setText($('acStep'), ac.text || AC_STEP[step] || '');
+    $('acStep').classList.toggle('bad', step === 'failed' || stale);
+    const total = Number(ac.total) || 0;
+    const n = Math.max(0, Math.min(Number(ac.measured) || 0, total));
+    $('acBarWrap').hidden = !total;
+    $('acBarWrap').setAttribute('aria-valuemax', String(total));
+    $('acBarWrap').setAttribute('aria-valuenow', String(n));
+    $('acBar').style.transform = `scaleX(${total ? n / total : 0})`;
+    const parts = [];
+    if (total) parts.push(`${n} of ${total} postures measured`);
+    if (running && ac.eta_s > 0) parts.push(`about ${eta(ac.eta_s)} left`);
+    if (segs > 1) parts.push(`the box moved on the cup ${segs - 1}× (accounted for)`);
+    setText($('acCounts'), parts.join(' · '));
+  }
+
+  // the result
+  const resKey = JSON.stringify(r);
+  if (resKey !== acResKey) {
+    acResKey = resKey;
+    $('acResult').hidden = !r;
+    if (r) renderAutocalResult(r);
+  }
+
+  // the error map
+  const pts = ac.points || [];
+  const mapKey = JSON.stringify(pts);
+  if (mapKey !== acMapKey) {
+    acMapKey = mapKey;
+    $('acMaps').hidden = !pts.length;
+    $('acMaps').innerHTML = pts.length ? autocalMaps(pts) : '';
+  }
+
+  // the end: a chime and a toast once per run -- not for one that ended before the page opened
+  const end = ['done', 'failed', 'aborted'].includes(step) ? `${ac.report_id}|${step}|${ac.text}` : null;
+  if (acEndSeen === undefined) { acEndSeen = end; return; }
+  if (end && end !== acEndSeen) {
+    acEndSeen = end;
+    const ok = step === 'done';
+    chime(ok);
+    toast(ok ? `Auto calibration done: ${r && r.saved ? 'saved' : 'not saved, the old one stays'}`
+      : `Auto calibration ${step}`, !ok);
+  }
+}
+
+function renderAutocalResult(r) {
+  // every model's cross-validated error, the chosen one marked
+  const cv = r.cv || {};
+  const names = AC_ORDER.filter((k) => k in cv).concat(Object.keys(cv).filter((k) => !AC_ORDER.includes(k)));
+  const body = $('acCvBody');
+  body.innerHTML = '';
+  for (const k of names) {
+    const [mean, p90] = triple(cv[k]);
+    const tr = document.createElement('tr');
+    const chosen = k === r.variant;
+    if (chosen) {
+      tr.className = 'chosen';
+      tr.title = 'Chosen: the simplest model within 10 % (+0.3 mm) of the best';
+    }
+    [`${chosen ? '✓ ' : ''}${AC_MODEL[k] || k}`, mm1(mean), mm1(p90)].forEach((v) => {
+      const td = document.createElement('td');
+      td.textContent = v;
+      tr.appendChild(td);
+    });
+    body.appendChild(tr);
+  }
+  const [vm, vp, vx] = triple(r.val);
+  setText($('acVal'), r.val == null ? '' : `Chosen: ${AC_MODEL[r.variant] || r.variant || '?'} – ${mm1(vm)} `
+    + `mean, 90 % under ${mm1(vp)}, worst ${mm1(vx)}, on postures it was not fitted to.`);
+  const b = r.baseline || {};
+  const bu = triple(b.urdf)[0], bc = triple(b.current)[0];
+  setText($('acBaseline'), bu == null && bc == null ? '' : `Before, on the same postures: plain URDF ${mm1(bu)}`
+    + (bc != null ? `, the old model ${mm1(bc)}.` : ' (there was no old model).'));
+  setText($('acSaved'), r.saved ? `Saved${r.why ? ': ' + r.why : ''}. Used from the next pick.`
+    : `Not saved${r.why ? ': ' + r.why : ''}. The old calibration stays.`);
+  $('acSaved').dataset.tone = r.saved ? 'ok' : 'edge';
+  $('acNotes').innerHTML = [['Box on the cup', r.drift], ['Depth', r.depth], ['Tool weight', r.weigh]]
+    .filter(([, t]) => t).map(([k, t]) => `<div><b>${k}:</b> ${esc(t)}</div>`).join('');
+  $('acRestart').hidden = !r.restart_needed;
+}
+
+function autocalMaps(pts) {
+  // world metres. Top view: the robot at the bottom facing up, x ahead 0..0.75,
+  // y +-0.4 (left is left). Side view: x ahead to the right, height z 0.2..1.0 up.
+  // Each tip measured, coloured by |error| (4 mm bins); its line is the error
+  // (model minus camera) 4x magnified. Hover a point for its numbers.
+  const K = 180, L = 4 * K / 1000, Z0 = 0.2, Z1 = 1.0;     // K: map units a metre, L: a mm
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo + 4), hi - 4);
+  const top = { w: 0.8 * K, h: 0.75 * K, at: (p) => [0.4 * K - p.y * K, 0.75 * K - p.x * K],
+    err: (p) => [-(p.dy || 0) * L, -(p.dx || 0) * L] };
+  const side = { w: 0.75 * K, h: (Z1 - Z0) * K, at: (p) => [p.x * K, (Z1 - p.z) * K],
+    err: (p) => [(p.dx || 0) * L, -(p.dz || 0) * L] };
+  const tip = (p) => `${p.kind || '?'} · x ${fmt(p.x)} y ${fmt(p.y)} z ${fmt(p.z)} m · error `
+    + (p.e == null ? 'not fitted yet' : `${mm1(p.e)} (dx ${signed(p.dx)}, dy ${signed(p.dy)}, dz ${signed(p.dz)})`);
+  const view = (v, label, extra) => {
+    const lines = [], marks = [];
+    for (const p of pts) {
+      if (p.x == null) continue;
+      const [u0, w0] = v.at(p);
+      const u = clamp(u0, 0, v.w).toFixed(1), w = clamp(w0, 0, v.h).toFixed(1);   // (across, down)
+      const has = p.e != null;
+      if (has) {
+        const [du, dw] = v.err(p);
+        lines.push(`<line x1="${u}" y1="${w}" x2="${(+u + du).toFixed(1)}" y2="${(+w + dw).toFixed(1)}" class="acmap-err"/>`);
+      }
+      const fill = has ? `fill="${acColour(Math.abs(p.e))}"` : 'class="acmap-open"';
+      const mark = p.kind === 'top'
+        ? `<rect x="${(u - 3.5).toFixed(1)}" y="${(w - 3.5).toFixed(1)}" width="7" height="7" rx="1" ${fill}/>`
+        : `<circle cx="${u}" cy="${w}" r="4" ${fill}/>`;
+      marks.push(`<g class="acmap-pt"><title>${esc(tip(p))}</title><circle cx="${u}" cy="${w}" r="8" class="acmap-hit"/>${mark}</g>`);
+    }
+    return `<figure><svg viewBox="0 0 ${v.w} ${v.h}" class="acmap" role="img" aria-label="${label}">
+        <rect x="0.5" y="0.5" width="${v.w - 1}" height="${v.h - 1}" rx="6" class="acmap-frame"/>${extra}
+        ${lines.join('')}${marks.join('')}</svg><figcaption>${label}</figcaption></figure>`;
+  };
+  const cx = 0.4 * K;
+  const topExtra = `<line x1="${cx}" y1="4" x2="${cx}" y2="${top.h - 8}" class="acmap-axis"/>
+    <rect x="${cx - 16}" y="${top.h - 7}" width="32" height="7" rx="2" class="acmap-robot"/>`;
+  // the numbers under the maps: the mean error vector (mostly up or down: a height
+  // offset), and front against top
+  const fitted = pts.filter((p) => p.e != null);
+  const mean = (k, list) => list.reduce((a, p) => a + (Number(p[k]) || 0), 0) / Math.max(list.length, 1);
+  const byKind = ['front', 'top'].map((k) => [k, fitted.filter((p) => p.kind === k)]).filter(([, l]) => l.length)
+    .map(([k, l]) => `${k} ${mm1(mean('e', l))} (${l.length})`).join(', ');
+  const swatches = AC_BINS.concat([null]).map((hi, i) => {
+    const lo = i ? AC_BINS[i - 1] : 0;
+    return `<span><i style="background:${AC_RAMP[lightScheme && lightScheme.matches ? 'light' : 'dark'][i]}"></i>${hi == null ? `≥${lo}` : `${lo}–${hi}`}</span>`;
+  }).join('');
+  return `<div class="ac-mapgrid">${view(top, 'Top view · x ahead 0–0.75 m, y ±0.4 m', topExtra)}
+      ${view(side, 'Side view · x ahead 0–0.75 m, height 0.2–1.0 m', '')}</div>
+    <div class="ac-legend">${swatches}<span class="muted">mm</span>
+      <span class="ac-shape">● front ■ top</span></div>
+    <div class="why small">${fitted.length ? `Mean error (model − camera): dx ${signed(mean('dx', fitted))}, `
+      + `dy ${signed(mean('dy', fitted))}, dz ${signed(mean('dz', fitted))} mm · by approach: ${byKind}. ` : ''}`
+      + `Each point's line is its error, 4× magnified; hover a point for its numbers.</div>`;
 }
 
 // the dummy size: sent when a field is changed (Enter or leaving it)

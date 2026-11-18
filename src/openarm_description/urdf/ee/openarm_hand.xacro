@@ -11,19 +11,18 @@
     </xacro:unless>
 
 
-    <!-- The LEFT gripper is a plain grey cylinder, 30 mm across, 138.15 mm from
-         the hand mount: 238.25 mm from joint 7, measured, to the working tip
-         (2026-10-26); no fingers. Its collision shape stops at 95.4 mm (the
-         old fingertips): the last 42.75 mm is the tool's collision piece
-         (tools.yaml, ctm/robot.py), which alone may touch at the contact. The
-         finger links and joints stay, without shapes, so the controllers and
-         planners keep the same joints. The right gripper is unchanged. -->
+    <!-- The LEFT gripper is a plain grey cylinder, 30 mm across, 118.15 mm from
+         the hand mount: to the working tip (2026-11-16: shortened by 2 cm); no fingers.
+         Its collision shape stops at 95.4 mm (the old fingertips): the last 22.75 mm is
+         the tool's collision piece (tools.yaml, ctm/robot.py), which alone may touch at
+         the contact. The finger links and joints stay, without shapes, so the controllers
+         and planners keep the same joints. The right gripper is unchanged. -->
     <xacro:if value="${arm_prefix == 'left_'}">
       <link name="${ee_prefix}hand">
         <visual name="${ee_prefix}hand_visual">
-          <origin rpy="0 0 0" xyz="0 0 0.069075"/>
+          <origin rpy="0 0 0" xyz="0 0 0.059075"/>
           <geometry>
-            <cylinder radius="0.015" length="0.13815"/>
+            <cylinder radius="0.015" length="0.11815"/>
           </geometry>
           <material name="grey"><color rgba="0.6 0.6 0.62 1.0"/></material>
         </visual>
@@ -33,7 +32,11 @@
             <cylinder radius="0.015" length="0.0954"/>
           </geometry>
         </collision>
-        <xacro:ee-inertials name="hand" />
+        <inertial>
+          <origin rpy="0 0 0" xyz="-0.00754 0.00703 -0.00852"/>
+          <mass value="0.2431"/>
+          <inertia ixx="1.181e-03" ixy="0" ixz="0" iyy="1.181e-03" iyz="0" izz="2.735e-05"/>
+        </inertial>
       </link>
     </xacro:if>
     <xacro:unless value="${arm_prefix == 'left_'}">
@@ -61,10 +64,18 @@
 
     <xacro:if value="${arm_prefix == 'left_'}">
       <link name="${ee_prefix}left_finger">
-        <xacro:ee-inertials name="left_finger"/>
+        <inertial>
+          <origin rpy="0 0 0" xyz="0.00000 0.00000 0.00000"/>
+          <mass value="0.0010"/>
+          <inertia ixx="4.856e-06" ixy="0" ixz="0" iyy="4.856e-06" iyz="0" izz="1.125e-07"/>
+        </inertial>
       </link>
       <link name="${ee_prefix}right_finger">
-        <xacro:ee-inertials name="right_finger"/>
+        <inertial>
+          <origin rpy="0 0 0" xyz="0.00000 0.00000 0.00000"/>
+          <mass value="0.0010"/>
+          <inertia ixx="4.856e-06" ixy="0" ixz="0" iyy="4.856e-06" iyz="0" izz="1.125e-07"/>
+        </inertial>
       </link>
     </xacro:if>
     <xacro:unless value="${arm_prefix == 'left_'}">

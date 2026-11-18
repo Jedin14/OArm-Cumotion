@@ -140,7 +140,14 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin, BoxCalMix
         self.mode = None              # 'navigation' / 'pick' / None (see ctm/modes.py)
         self.next_hint = 'Click a point, then MOVE.'   # what to do next (the GUI: detect a box)
         self.pick_tool = node.args.pick_tool   # vacuum (left only) / finger (right only) / auto
-        self.arm_models = armcal.ArmModels()   # CALIBRATE ARMS results, if any
+        # CALIBRATE ARMS results, if any -- applied per --arm-model (2026-11-17: auto =
+        # only a model fitted on this robot as it is now; ctm/armcal.py ArmModels)
+        # (its one line per arm goes to the node's log -- the terminal -- and the
+        # web GUI's log shows arm_models.notes at start, 2026-11-17)
+        # (a lambda: rclpy pins one severity to each call line, and ArmModels logs from
+        # one line -- AUTO CAL's reload logs at info, 2026-11-17 review)
+        self.arm_models = armcal.ArmModels(getattr(node.args, 'arm_model', None) or 'auto',
+                                           log=lambda text: node.get_logger().warn(text))
         self.buttons = {}             # name -> (x0, y0, x1, y1) in window pixels
         self.status = 'capturing...'
         self.detail = ''
@@ -639,6 +646,17 @@ class App(TouchMixin, CameraCalibrationMixin, ModesMixin, ArmCalMixin, BoxCalMix
         cv2.destroyAllWindows()
 
 
+def on_off(parser, flag, default, text):
+    """An on/off option (2026-11-17): `--flag on|off`, and `--no-flag` for off.
+    The value stays the string 'on'/'off' (read it with an _on() helper: 'off' is a
+    true string)."""
+    dest = flag[2:].replace('-', '_')
+    parser.add_argument(flag, dest=dest, choices=('on', 'off'), default=default,
+                        help=f'{text} (default {default})')
+    parser.add_argument('--no-' + flag[2:], dest=dest, action='store_const', const='off',
+                        help=f'the same as {flag} off')
+
+
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--arm', choices=['auto', 'left', 'right'], default='auto',
@@ -670,7 +688,7 @@ def make_parser():
                              'down to this that the arm reaches with the whole line in clear, '
                              'm. Under 3 cm (only when nothing further out works) the tool may be '
                              'near the box: the flight there is checked with the tool counted up '
-                             'to its last 30 %%')
+                             'to its last 15 %%')
     parser.add_argument('--top-standoff', type=float, default=0.12,
                         help='TOP DOWN: the tip flies (tool level) to this far above the top, '
                              'the wrist turns down there, then it goes straight down, m')
@@ -727,9 +745,10 @@ def make_parser():
                         help='fingertip error at the approach worth correcting, m')
     parser.add_argument('--corrections', type=int, default=1,
                         help='correction moves at the approach point, at most')
-    parser.add_argument('--plan-budget', type=float, default=30.0,
+    parser.add_argument('--plan-budget', type=float, default=None,
                         help='seconds the reach check may search; nothing by then: not from '
-                             'here (the pick stack then asks the wheels: base_adjust)')
+                             'here (the pick stack then asks the wheels: base_adjust). '
+                             'Default 10 with --reach-search fast, 30 with full')
     parser.add_argument('--edge', choices=['try', 'adjust'], default='try',
                         help='a point reachable only at the edge of reach (no room to correct '
                              'the tool): try it, or count it as not reachable from here '
@@ -754,11 +773,86 @@ def make_parser():
     parser.add_argument('--held-min-g', type=float, default=30.0,
                         help='weight on the cup (from the joint torques, held still before '
                              'and after the press) that counts as holding the box, g')
+    parser.add_argument('--near-corrections', type=int, default=0,
+                        help='sideways correction moves 3 cm short of the box, at most (was 2 '
+                             'until 2026-11-13). 0: from 5 cm short the way in is one straight '
+                             'line -- nothing moves sideways next to the neighbouring boxes')
+    parser.add_argument('--face-first', action=argparse.BooleanOptionalAction, default=True,
+                        help='FRONT pick of a detected box: try the approach square on to its '
+                             'measured face first, before the ones along the camera\'s view')
+    parser.add_argument('--direct-path', action=argparse.BooleanOptionalAction, default=False,
+                        help='FRONT: when no straight line in works from any approach point '
+                             '(--standoff down to --min-standoff), fly a planned path straight to '
+                             '3 cm in front of the face (checked with the tool counted up to its '
+                             'last 15 %%), then only the press. OFF since 2026-11-13: tried once, a box at the edge of '
+                             'reach arrived 22 mm off 3 cm from it, and the tool pushed its neighbours')
     parser.add_argument('--short-corrections', type=int, default=3,
                         help='correction moves 5 cm short of the box, at most (each ~1.5 s)')
     parser.add_argument('--short-tolerance', type=float, default=0.004,
                         help='fingertip error 5 cm short worth another correction, m (the '
                              '25 mm cup centred within 4 mm still seals)')
+    # -- precision (2026-11-17): each new behaviour with its switch back ---------
+    parser.add_argument('--correct-mode', choices=('settle', 'hybrid', 'cartesian'),
+                        default='settle',
+                        help='FRONT picks, how the arrival out at the approach and 5 cm short is '
+                             'handled. settle: let the arm settle onto its command and measure it, '
+                             'no encoder-based corrections (they measured servo error and added it '
+                             'to the command for good: offsets up to 40 mm, 8-13 s a pick, '
+                             '2026-11-16); hybrid: settle, then at most one correction 5 cm short '
+                             '(60 %%, capped to --correction-room); cartesian: the corrections as '
+                             'before. TOP DOWN always cartesian')
+    parser.add_argument('--approach-settle', type=float, default=2.5,
+                        help='settle/hybrid: the longest wait for the arm to settle at the '
+                             'approach point, s')
+    parser.add_argument('--short-settle', type=float, default=3.0,
+                        help='settle/hybrid: the same 5 cm short of the box, s')
+    parser.add_argument('--abort-joint-err', type=float, default=0.10,
+                        help='after the approach and 5 cm short: any joint further than this off '
+                             'its command and the arm does not go in, it comes back, rad')
+    on_off(parser, '--stored-segments', 'on',
+           'fly the straight line in and the press exactly as the reach check verified them '
+           '(re-checked if the map changed); off: planned again from where the arm is')
+    on_off(parser, '--press-hand-free', 'on',
+           'the press along the tool\'s own axis may have the hand touch the map too (only '
+           'where the exempt tool went first; checked coaxial within --press-coax-deg/-mm); '
+           'off: only the fingers and the tool, as before')
+    parser.add_argument('--press-coax-deg', type=float, default=3.0,
+                        help='a press is coaxial within this angle of the tool axis, deg')
+    parser.add_argument('--press-coax-mm', type=float, default=3.0,
+                        help='... and this far sideways of it, mm')
+    parser.add_argument('--reach-search', choices=('fast', 'full'), default='fast',
+                        help='FRONT reach check. fast: every way in judged in numbers first, '
+                             'move_group asked only about the best few (ctm/reach_fast.py, ~2-4 s); '
+                             'full: the search as before (13-32 s a box)')
+    parser.add_argument('--limit-margin', type=float, default=0.10,
+                        help='fast reach check: a way in is first choice only with this much room '
+                             'from every joint limit at the approach, 3 cm short and the face, rad')
+    on_off(parser, '--free-roll', 'on',
+           'fast reach check: also every 15 deg of roll about each approach axis')
+    parser.add_argument('--arm-model', choices=armcal.MODES, default='auto',
+                        help='the CALIBRATE ARMS model (calibration/arm_model.yaml). auto: only '
+                             'an arm\'s model fitted on this robot as it is now (hand mount, tool, '
+                             'camera, masses); on: whatever is in the file (as before 2026-11-17); '
+                             'off: the plain URDF')
+    parser.add_argument('--return-to', choices=('nominal', 'measured'), default='nominal',
+                        help='after a pick: back to the nominal pre_pick_state (when it started '
+                             'within 0.15 rad of it), or to the posture it started from')
+    on_off(parser, '--skip-empty-drop', 'on',
+           'nothing held and the cup never pressed: straight back to pre_pick, not via the drop')
+    parser.add_argument('--lead-in-max', type=float, default=0.10,
+                        help='a plan that starts this far from where the arm is (any joint) is led '
+                             'in onto its start by a collision-checked joint move; further: '
+                             'refused and planned again, rad (never more than 0.10)')
+    parser.add_argument('--held-size', choices=('model', 'off'), default='model',
+                        help='the box on the cup in the planners: held_object/size, else the size '
+                             'the box model measured (model); off: only held_object/size')
+    parser.add_argument('--held-depth-mm', type=float, default=150.0,
+                        help='--held-size model: the depth taken when the model did not see it, mm')
+    parser.add_argument('--held-margin-mm', type=float, default=10.0,
+                        help='--held-size model: added to each side of the held box, mm')
+    on_off(parser, '--map-recheck', 'on',
+           'a plan checked before the map was rebuilt is checked again against the new map '
+           'before it is flown (or planned again); off: flown as it was checked')
     parser.add_argument('--no-auto-apply', action='store_true',
                         help='CALIBRATE stops at the result; APPLY writes it')
     parser.add_argument('--calib-points-per-arm', type=int, default=6,
@@ -825,6 +919,11 @@ def finish_args(args):
     """What the options imply: each arm's tools and working tip."""
     # each arm's working tip beyond hand_tcp: the fingertips, plus its tool
     args.tools = tl.load()
+    # the reach check's budget: the fast search decides in ~2-4 s, and "not from here"
+    # should not wait 30 s for it (2026-11-17); the full search keeps its 30 s
+    if getattr(args, 'plan_budget', None) is None:
+        args.plan_budget = 10.0 if getattr(args, 'reach_search', 'fast') == 'fast' else 30.0
+    args.lead_in_max = min(float(getattr(args, 'lead_in_max', 0.10)), 0.10)
     for arm in ('left', 'right'):
         length = getattr(args, f'tool_extension_{arm}')
         if length is not None:

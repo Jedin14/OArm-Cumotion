@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Stop launch_everything (and the web GUI) when Ctrl-C does not: asks every node to
+# stop, waits, then kills what is left, including a `ros2 launch` that hangs waiting
+# for children that already exited (seen 2026-11-17). Run from any terminal on beast.
+NODES='/ros2 launch |lib/controller_manager/(ros2_control_node|spawner)|/move_group |cumotion_|octomap_gater\.py|lidar_bridge\.py|l2_driver|realsense2_camera_node|boot_pre_pick\.py|vacuum_bridge\.py|box_model_node\.py|web_gui\.py|lib/rviz2/rviz2|lib/robot_state_publisher/|lib/tf2_ros/static_transform_publisher'
+list() { pgrep -f "$NODES" | grep -vxE "$$|$PPID" ; }
+[ -z "$(list)" ] && { echo "nothing running"; exit 0; }
+echo "asking to stop: $(list | xargs -r ps -o comm= -p | sort | uniq -c | tr -s ' ' | tr '\n' ',')"
+list | xargs -r kill -INT 2>/dev/null
+for i in $(seq 1 20); do sleep 0.5; [ -z "$(list)" ] && { echo "all stopped"; exit 0; }; done
+echo "still running after 10 s, killing: $(list | xargs -r ps -o comm= -p | tr '\n' ' ')"
+list | xargs -r kill -9 2>/dev/null
+sleep 1; [ -z "$(list)" ] && echo "all stopped" || { echo "LEFT:"; list | xargs -r ps -o pid,stat,cmd -p; }

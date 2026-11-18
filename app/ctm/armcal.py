@@ -20,7 +20,8 @@ Held-out postures (not used in the fit) then say how good it is, in mm.
 Afterwards no strip is needed: before each touch the model says where the
 tip will really be for the chosen joints, and the target is shifted so that
 it lands on the click (model_correction). Saved in arm_model.yaml; rerun
-after moving the camera, an arm or a gripper.
+after moving the camera, an arm or a gripper. (Since 2026-11-17 each model
+carries the robot it was fitted on, and ArmModels applies it only there.)
 """
 
 import datetime
@@ -31,7 +32,7 @@ import numpy as np
 import yaml
 
 from ctm import board as bd
-from ctm.common import CALIB_DIR, plain
+from ctm.common import CALIB_DIR, fingerprint_diff, fingerprint_text, plain, robot_fingerprint
 from ctm.kinematics import Arm, rotvec, tcp_batch
 
 MODEL_FILE = os.path.join(CALIB_DIR, 'arm_model.yaml')
@@ -390,11 +391,17 @@ def drop_outliers(arm, samples, params, boards, t_wo, info):
 
 # -- the saved model ------------------------------------------------------------
 
-def save_model(models):
+def save_model(models, fingerprints=None):
     """models: {arm: (params, boards, stats)}; an arm not in it keeps what
-    the file has."""
+    the file has. Each saved arm carries the robot it was fitted on
+    (common.robot_fingerprint: hand mount, tool, camera, masses) and when
+    (2026-11-17): ArmModels applies it only on that robot. fingerprints:
+    {arm: fingerprint} when the readings were taken on another one than now
+    (AUTO CAL takes it before it weighs the tool), else the robot as it is."""
     data = {}
+    now = datetime.datetime.now().isoformat(timespec='seconds')
     for arm, (params, boards, stats) in models.items():
+        fingerprint = (fingerprints or {}).get(arm) or robot_fingerprint(arm)
         data[arm] = plain({'base': params['base'].tolist(), 'offset': params['offset'].tolist(),
                            'comply': params['comply'].tolist(),
                            'backlash': params['backlash'].tolist(),
@@ -404,8 +411,9 @@ def save_model(models):
                            **({kk: params[kk].tolist() for kk in ('tip_delta', 'anchor_shift')
                                if kk in params}),
                            'pieces': [b.tolist() for b in boards],
-                           **stats})
-    data['when'] = datetime.datetime.now().isoformat(timespec='seconds')
+                           **stats,
+                           'fitted': now, 'fingerprint': fingerprint})
+    data['when'] = now
     old = load_model_raw()
     for arm in ('left', 'right'):
         if arm not in data and arm in old:
@@ -423,15 +431,54 @@ def load_model_raw():
         return {}
 
 
-class ArmModels:
-    """The calibrated arms, and the correction a touch needs from them."""
+MODES = ('auto', 'on', 'off')     # --arm-model
 
-    def __init__(self):
+
+class ArmModels:
+    """The calibrated arms, and the correction a touch needs from them.
+
+    Which models are applied (2026-11-17), mode:
+        auto  an arm's model only if it was fitted on this robot: its
+              fingerprint (common.robot_fingerprint, saved with it) matches
+              the hand mount, tool, camera and masses as they are now. A
+              model without one (saved before 2026-11-17) is refused too --
+              what it was fitted for cannot be checked. The default.
+        on    every model in the file, with a warning for one that does not
+              match (the way back to before 2026-11-17)
+        off   none: the plain URDF for both arms
+    A model not applied is as if it were not in the file: has() False, no
+    correction, tag() None (so TEACH samples taught on it stay unused), no
+    pieces. What was decided is logged once per process and kept in notes
+    (one line per arm, for the GUI).
+
+    mode None: the mode last asked for in this process (click_to_move
+    --arm-model), 'auto' before that -- a reload that does not say (APPLY
+    WEIGHT, CAL ARMS, REFIT re-create the models) must not undo 'on' or
+    'off' behind the user's back."""
+
+    default_mode = 'auto'
+    _said = set()                    # log lines already given in this process
+
+    def __init__(self, mode=None, log=None):
+        if mode is None:
+            mode = ArmModels.default_mode
+        if mode not in MODES:
+            raise ValueError(f'arm model mode {mode!r}: one of {", ".join(MODES)}')
+        ArmModels.default_mode = mode
+        self.mode = mode
         raw = load_model_raw()
         self.when = raw.get('when')
-        self.params = {}
+        self.params = {}             # the APPLIED models only
+        self.refused = {}            # arm -> why its model is not applied
+        self.notes = []              # what was decided, one line per arm (the GUI)
+        self._status = {}
+        self.fitted = {}             # arm -> when its model was saved
+        self.fingerprint_now = {}    # arm -> the robot as it is now
         for arm in ('left', 'right'):
-            if arm in raw:
+            if arm not in raw or not isinstance(raw[arm], dict):
+                continue
+            self.fitted[arm] = raw[arm].get('fitted') or self.when
+            if self._decide(arm, raw[arm]):
                 self.params[arm] = {kk: np.asarray(raw[arm][kk], float)
                                     for kk in ('base', 'offset', 'comply', 'backlash', 'geom',
                                                'hysteresis', 'tip_delta', 'anchor_shift')
@@ -441,15 +488,73 @@ class ArmModels:
         # the real tip off the pieces live (TOP DOWN, at the hover point)
         # (only for the pieces as they are now: a model fitted with another
         # layout -- the old flat pieces -- does not know where these faces are)
+        # (and only with the model applied: the pieces were fitted with it)
         self.pieces = {arm: [np.asarray(b, float) for b in raw[arm]['pieces']]
-                       for arm in ('left', 'right') if arm in raw and 'pieces' in raw[arm]
+                       for arm in self.params if 'pieces' in raw[arm]
                        and len(raw[arm]['pieces']) == len(bd.pieces(arm))}
+        for line in self.notes:
+            if line not in ArmModels._said:
+                ArmModels._said.add(line)
+                try:
+                    (log or (lambda text: print(text, flush=True)))(line)
+                except ValueError:
+                    # rclpy: "Logger severity cannot be changed between calls" -- a
+                    # node logger's method passed directly is attributed to THIS line,
+                    # so a second ArmModels with another severity raised here and the
+                    # new model was never applied (AUTO CAL, 2026-11-17 review). A log
+                    # line must never stop the model being taken: printed instead
+                    print(line, flush=True)
+
+    def _decide(self, arm, entry):
+        """Apply this arm's model (True), or not (False, why in refused);
+        either way its line in notes."""
+        name = f'{arm} arm model ({str(self.fitted.get(arm) or "undated").replace("T", " ")})'
+        stored = entry.get('fingerprint')
+        why = None
+        if self.mode != 'off':
+            now = robot_fingerprint(arm)
+            self.fingerprint_now[arm] = now
+            if not isinstance(stored, dict) or not stored:
+                why = ('it carries no fingerprint (saved before 2026-11-17), so what it was '
+                       f'fitted for is unknown and cannot be checked against this robot (now '
+                       f'{fingerprint_text(now)})')
+            else:
+                diff = fingerprint_diff(stored, now)
+                if diff:
+                    why = (f'fitted for {fingerprint_text(stored)} - not this robot: '
+                           f'{"; ".join(diff)}')
+        if self.mode == 'off':
+            self.refused[arm] = 'arm models off (--arm-model off)'
+            line = f'{name} NOT applied - arm models are off (--arm-model off); the plain URDF'
+        elif why is None:
+            line = f'{name} applied - fitted on this robot ({fingerprint_text(stored)})'
+        elif self.mode == 'on':
+            line = f'WARNING: {name} applied although {why} (--arm-model on)'
+        else:
+            self.refused[arm] = why
+            # (the right arm's model went stale with the camera move too: the
+            # finger picks run on the plain URDF then, as the vacuum ones)
+            line = (f'{name} NOT applied - {why}; the plain URDF is used'
+                    + (' (finger picks too)' if arm == 'right' else '')
+                    + ('. Run AUTO CAL' if arm == 'left' else '. Re-run CAL ARMS for it')
+                    + ', or --arm-model on to use it anyway')
+        self.notes.append(line)
+        self._status[arm] = line
+        return arm not in self.refused
 
     def has(self, arm):
+        """Whether this arm's model is applied (not merely in the file)."""
         return arm in self.params
 
+    def status(self, arm):
+        """One line on this arm's model: applied or not, and why."""
+        return self._status.get(arm, f'{arm} arm: no model in {os.path.basename(MODEL_FILE)}; '
+                                     f'the plain URDF')
+
     def tag(self, arm):
-        """What TEACH samples taught on top of this arm's model are marked with."""
+        """What TEACH samples taught on top of this arm's model are marked with
+        (None when it is not applied: a sample taught on it does not apply
+        either)."""
         return self.when if arm in self.params else None
 
     def tip_shift(self, arm, q, tip_offset, dirs=None):

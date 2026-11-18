@@ -2,6 +2,8 @@
 
 import math
 import os
+import re
+import xml.etree.ElementTree as ET
 
 import cv2
 import numpy as np
@@ -28,7 +30,19 @@ TCP_IN_HAND = 0.08     # hand -> hand_tcp along the hand's Z (openarm_hand_argum
 
 # Farthest hand_tcp gets from openarm_<arm>_link1 (fixed): 0.668 / 0.673 m over
 # 300 random joint sets each, from move_group's FK (2026-10-07).
+# (kept as it was for code that does not say which arm: arm_reach(arm) below)
 ARM_REACH = 0.675
+# Per arm (2026-11-17): the left wrist got the 5 cm bracket (hand mount 150.1 mm
+# from joint 7, was 100.1), so its hand_tcp now gets 0.7256 m from link1 (300k
+# random joint sets of robot/openarm.urdf; 0.6757 on the chain before). With
+# 0.675 the reach pre-check called left targets 0.675-0.725 m out "out of
+# reach". The right arm is unchanged.
+ARM_REACH_BY_ARM = {'left': 0.725, 'right': 0.675}
+
+
+def arm_reach(arm):
+    """Farthest hand_tcp gets from openarm_<arm>_link1, m."""
+    return ARM_REACH_BY_ARM.get(arm, ARM_REACH)
 
 
 SCREW_FRAME = 'camera_bottom_screw_frame'      # what the URDF origin positions
@@ -221,3 +235,132 @@ def arm_joints(arm):
 def gripper_links(arm):
     return [f'openarm_{arm}_hand', f'openarm_{arm}_left_finger',
             f'openarm_{arm}_right_finger']
+
+
+# -- what an arm model is valid for (2026-11-17) ----------------------------------
+# An arm model (calibration/arm_model.yaml) fits one robot: one wrist chain,
+# one tool, one camera pose and one set of URDF masses (its sag terms use the
+# gravity torques). The 10-30 left model was still applied on 11-16, after
+# the 5 cm bracket, a tool 2 cm shorter, the camera moved V7 -> V10 and the
+# tool re-weighed: it put every pick 11-36 mm off the click and tilted the
+# tool 4-9 deg, and no log line showed it. So a model now carries the
+# fingerprint of the robot it was fitted on, and armcal.ArmModels applies it
+# only on that robot.
+FINGERPRINT_TOL = {'hand_mount': 0.001, 'tip_offset': 0.001, 'mass': 0.005}   # m, m, kg
+
+
+def robot_fingerprint(arm, urdf_path=None, tool=None, cam_org=None):
+    """The robot as an arm model of `arm` depends on it: {'hand_mount': link7
+    -> hand xyz (m), 'masses': {'link7', 'hand'} (kg) -- both from
+    robot/openarm.urdf; 'tool': m past the fingertips (0 when off) and
+    'tip_offset': m past hand_tcp -- from tools.yaml (or `tool`, {'on',
+    'length'}); 'camera': the 'current' origin line of cam_org.txt}. A part
+    that cannot be read is left out, and a missing part never matches."""
+    fp = {}
+    try:
+        root = ET.parse(urdf_path or OPENARM_URDF).getroot()
+        for joint in root.findall('joint'):
+            child = joint.find('child')
+            if child is not None and child.get('link') == f'openarm_{arm}_hand':
+                origin = joint.find('origin')
+                xyz = (origin.get('xyz') if origin is not None else None) or '0 0 0'
+                fp['hand_mount'] = [float(v) for v in xyz.split()]
+        masses = {}
+        for link in root.findall('link'):
+            for key in ('link7', 'hand'):
+                mass = link.find('inertial/mass') if link.get('name') == f'openarm_{arm}_{key}' \
+                    else None
+                if mass is not None:
+                    masses[key] = float(mass.get('value'))
+        if len(masses) == 2:
+            fp['masses'] = masses
+    except (OSError, ET.ParseError, TypeError, ValueError):
+        pass
+    if tool is None:
+        from ctm import tools as tl              # (here: ctm.tools imports this module)
+        tool = tl.load().get(arm)
+    if tool is not None:
+        fp['tool'] = float(tool['length']) if tool.get('on') else 0.0
+        fp['tip_offset'] = FINGERTIP_BEYOND_TCP + fp['tool']
+    try:
+        with open(cam_org or CAM_ORG) as handle:
+            for line in handle:
+                if line.strip().startswith('current'):
+                    fp['camera'] = ' '.join(line.split())
+                    break
+    except OSError:
+        pass
+    return fp
+
+
+def _fp_mount(xyz):
+    try:
+        x, y, z = (float(v) for v in xyz)
+    except (TypeError, ValueError):
+        return 'unknown'
+    if abs(x) < 5e-4 and abs(y) < 5e-4:
+        return f'{z:.4f} m'
+    return f'({x:.4f}, {y:.4f}, {z:.4f}) m'
+
+
+def _fp_tool(length):
+    try:
+        length = float(length)
+    except (TypeError, ValueError):
+        return 'unknown'
+    return 'off' if length <= 0.0 else f'{1000.0 * length:.2f} mm'
+
+
+def _fp_camera(line):
+    if not line:
+        return 'unknown'
+    version = re.search(r'\((V\d+)\)', str(line))
+    if version:
+        return version.group(1)
+    xyz = re.search(r'xyz="([^"]+)"', str(line))
+    return f'at {xyz.group(1)}' if xyz else str(line)
+
+
+def _fp_masses(masses):
+    try:
+        return f'link7 {float(masses["link7"]):.3f} + hand {float(masses["hand"]):.3f} kg'
+    except (KeyError, TypeError, ValueError):
+        return 'unknown'
+
+
+def fingerprint_text(fp):
+    """'hand mount 0.1501 m / tool 22.75 mm / camera V10 / link7 ... kg'."""
+    fp = fp or {}
+    return (f'hand mount {_fp_mount(fp.get("hand_mount"))} / tool {_fp_tool(fp.get("tool"))} / '
+            f'camera {_fp_camera(fp.get("camera"))} / {_fp_masses(fp.get("masses"))}')
+
+
+def fingerprint_diff(old, new):
+    """How two robot_fingerprint()s differ, in words ([] if they match): the
+    hand mount and the tip within 1 mm, each mass within 5 g, the camera line
+    exactly (spacing aside). A part missing on either side differs."""
+    old, new = old or {}, new or {}
+    tol = FINGERPRINT_TOL
+    out = []
+
+    def close(a, b, limit):
+        try:
+            a, b = np.asarray(a, float), np.asarray(b, float)
+            return a.shape == b.shape and a.size > 0 and float(np.max(np.abs(a - b))) <= limit
+        except (TypeError, ValueError):
+            return False
+
+    if not close(old.get('hand_mount'), new.get('hand_mount'), tol['hand_mount']):
+        out.append(f'hand mount {_fp_mount(old.get("hand_mount"))} '
+                   f'(now {_fp_mount(new.get("hand_mount"))})')
+    if not close(old.get('tip_offset'), new.get('tip_offset'), tol['tip_offset']):
+        out.append(f'tool {_fp_tool(old.get("tool"))} (now {_fp_tool(new.get("tool"))})')
+    a, b = old.get('camera'), new.get('camera')
+    if not a or not b or ' '.join(str(a).split()) != ' '.join(str(b).split()):
+        out.append(f'camera {_fp_camera(a)} (now {_fp_camera(b)})')
+    a, b = old.get('masses') or {}, new.get('masses') or {}
+    if not all(close(a.get(k) if isinstance(a, dict) else None,
+                     b.get(k) if isinstance(b, dict) else None, tol['mass'])
+               for k in ('link7', 'hand')):
+        out.append(f'masses {_fp_masses(a)} (now {_fp_masses(b)})')
+    return out

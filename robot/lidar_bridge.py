@@ -15,7 +15,9 @@ robot's frames, the cloud merged with the D455's, and whether it is working.
                                                       unseen-space walls while it is ok, and puts
                                                       them back if not
                                  the housing          a collision box in the planning scene, so
-                                                      no plan swings an arm into the LiDAR
+                                                      no plan swings an arm into the LiDAR --
+                                                      where the L2 physically is (housing_xyz),
+                                                      not where an alignment puts its mount
 
 The driver hangs l2_imu on l2_lidar itself; this node hangs l2_lidar on the robot.
 (Not the user's l2_stabilizer: it hangs l2_lidar on a 'world' of its own, the floor
@@ -212,10 +214,22 @@ def camera_sees_through(pts, depth, K, R, t, tol=0.04):
     return out
 
 
-def camera_covers(pts, depth, K, R, t, tol=0.04):
+def camera_covers(pts, depth, K, R, t, tol=0.04, behind=None, edge_px=0, front=None):
     """Bool mask (N) of the points the depth camera speaks for: in its picture, with a
     depth there, and not behind that surface (by more than tol) -- in front of it (seen
-    through: false) or at it (the camera has that surface, and better)."""
+    through: false) or at it (the camera has that surface, and better).
+    behind (m, default tol): how far behind the camera's surface it still speaks for
+    them (2026-11-17: the L2 sat 4-8 cm behind the camera's box faces, so with 4 cm its
+    faces stayed in the map as a second, wrong surface). edge_px: points up to this
+    many pixels outside the picture are judged by its edge pixel (a box at the edge of
+    the picture had LiDAR-only voxels in front of it).
+    A depth the camera did NOT measure there -- borrowed from a neighbour (fill_holes
+    marks it negative) or an edge pixel standing in for a point outside the picture --
+    speaks only for points AT that surface: from `front` (default tol) in front of it to
+    `behind` behind it. The camera never saw through there, so a LiDAR point further in
+    front is the only word on something there (a thin, dark or shiny object, one too
+    near for the camera) and stays (2026-11-17 review: a pole 25 cm in front of the
+    stack, in a 10 px camera hole, was taken out of the map)."""
     out = np.zeros(len(pts), bool)
     if not len(pts):
         return out
@@ -227,11 +241,36 @@ def camera_covers(pts, depth, K, R, t, tol=0.04):
     u = K[0, 0] * pc[idx, 0] / z[idx] + K[0, 2]
     v = K[1, 1] * pc[idx, 1] / z[idx] + K[1, 2]
     h, w = depth.shape
-    inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    e = max(0, int(edge_px))
+    inside = (u >= -e) & (u < w + e) & (v >= -e) & (v < h + e)
     idx = idx[inside]
-    d = depth[v[inside].astype(int), u[inside].astype(int)]
-    out[idx] = (d > 0.15) & (z[idx] < d + tol)
+    uu, vv = u[inside], v[inside]
+    ui = np.clip(uu.astype(int), 0, w - 1)
+    vi = np.clip(vv.astype(int), 0, h - 1)
+    raw = depth[vi, ui]
+    d = np.abs(raw)
+    borrowed = (raw < 0) | (uu < 0) | (uu >= w) | (vv < 0) | (vv >= h)
+    back = tol if behind is None else behind
+    ahead = tol if front is None else front
+    zi = z[idx]
+    out[idx] = (d > 0.15) & (zi < d + back) & (~borrowed | (zi >= d - ahead))
     return out
+
+
+def fill_holes(depth, px):
+    """The depth picture with each hole (0) given the NEAREST depth within px pixels
+    around it (still 0 where there is none), NEGATIVE: borrowed, not measured there --
+    camera_covers lets it speak only for points at that surface. For camera_first
+    only: the D455 has no depth along box edges, and the LiDAR's points that fell there
+    were never judged -- their +-3-5 cm scatter put voxels 3-4 cm in front of a box
+    face and blocked every way in (2026-11-17 17:46, box at x 0.408)."""
+    if px <= 0 or not (depth <= 0).any():
+        return depth
+    from scipy.ndimage import minimum_filter
+    big = np.where(depth > 0.15, depth, np.inf).astype(np.float32)
+    near = minimum_filter(big, size=2 * int(px) + 1, mode='nearest')
+    out = np.where(depth > 0.15, depth, np.where(np.isfinite(near), -near, 0.0))
+    return out.astype(np.float32)
 
 
 def camera_range_error(pts, dirs, depth, K, R, t, window=0.08):
@@ -540,6 +579,15 @@ class LidarBridge(Node):
         p('body_pad_camera', 0.03)          # ... the camera's (it is the more exact)
         # where the camera has a depth, it speaks and the LiDAR does not
         p('camera_first', True)
+        p('camera_first_behind', 0.12)      # m: LiDAR points this far behind a camera surface
+                                            # are dropped too (2026-11-17: the L2 sat 4-8 cm
+                                            # behind the camera's faces; 0.04 = as before)
+        p('camera_first_fill_px', 25)       # px: camera holes this near a depth count as that
+                                            # depth for camera_first (0: off, as before)
+        p('camera_first_fill_front', 0.05)  # m: ... but only for LiDAR points at most this far
+                                            # in front of it (and camera_first_behind behind):
+                                            # the camera never saw through a hole, or past the
+                                            # picture's edge (2026-11-17 review)
         # no fog: only points that repeat along their view line
         p('steady_filter', True)
         p('steady_cell_deg', 2.0)
@@ -547,11 +595,27 @@ class LidarBridge(Node):
         p('steady_tol', 0.03)
         p('steady_min', 4)
         p('housing_size', [0.09, 0.09, 0.08])
+        # where the L2 physically IS, for its housing box -- not the mount above, which is a
+        # calibration and moves with every alignment: 2026-11-16 one by hand put it 6.4 cm left
+        # (y 0.067) and the box into the left arm's base (openarm_left_link0 painted red,
+        # MoveIt: in collision). The 11-13 body fit: ~26 mm clear of both arm bases and the body.
+        # housing_xyz [] = the box follows the mount, as before.
+        p('housing_xyz', [-0.028, 0.003, 0.8829])
+        p('housing_rpy_deg', [2.2, 113.4, 0.8])
+        p('housing_spin_deg', 161.3)
         # its ranges follow the camera's where both see the same surface (see the top)
         p('range_trim', True)
         p('range_trim_max', 0.05)           # m
         p('range_trim_gain', 0.3)           # of the measured difference, a second
         p('range_trim_min_points', 300)
+        # no specks in the air (2026-11-16: single voxels floating in front of the boxes
+        # blocked the arm's straight lines in): a point goes on only with at least
+        # density_min others within density_radius among the last density_window s
+        p('density_filter', True)
+        p('density_radius', 0.03)
+        p('density_min', 8)                 # (replayed 2026-11-16: specks 134 -> 52, 10% of points)
+        p('density_window', 2.0)
+        self.dense_hist = []                # (monotonic, the passed points of a scan)
         self.trim = 0.0                     # m, added to every range
         self.trim_hist = []                 # (monotonic, range errors of the points on the camera's surface)
         self.frame = self.get_parameter('frame').value
@@ -594,6 +658,11 @@ class LidarBridge(Node):
         self.pub_work = self.create_publisher(PointCloud2, '/lidar/cloud_work', 5)
         self.pub_octo = self.create_publisher(PointCloud2, '/lidar/cloud_octomap', 5)
         self.pub_merged = self.create_publisher(PointCloud2, '/merged_cloud', 2)
+        # for fitting the mount (sensor_align.py): steady, not the robot, but NOT judged by
+        # the camera -- /lidar/cloud drops what the camera covers, so a fit on it only saw
+        # the points that disagree with the camera (2026-11-17). Also while not trusted:
+        # a wrong mount is exactly when it is needed.
+        self.pub_fit = self.create_publisher(PointCloud2, '/lidar/cloud_fit', 2)
         self.pub_status = self.create_publisher(String, '/lidar/status', latched)
         topic = self.get_parameter('in_topic').value
         # best effort takes a reliable publisher's messages too
@@ -765,6 +834,20 @@ class LidarBridge(Node):
                     except ValueError:
                         pass
 
+    def filled_depth(self, depth):
+        """fill_holes(depth, camera_first_fill_px), once per depth picture."""
+        px = int(self.get_parameter('camera_first_fill_px').value)
+        cached = getattr(self, '_filled', (None, None, None))
+        if cached[0] is depth and cached[1] == px:
+            return cached[2]
+        try:
+            out = fill_holes(depth, px)
+        except Exception as exc:            # noqa: BLE001 - no scipy: as before
+            self.get_logger().warn(f'camera hole fill off ({exc})', throttle_duration_sec=60.0)
+            out = depth
+        self._filled = (depth, px, out)
+        return out
+
     def depth_view(self):
         """(depth in metres, K, R, t) of the D455's latest depth picture -- R, t take
         mount_parent points into its optical frame -- or None: none fresh, no tf."""
@@ -843,8 +926,13 @@ class LidarBridge(Node):
             tol = float(self.get_parameter('camera_tol').value)
             through = camera_sees_through(p, view[0], view[1], view[2], view[3], tol)
             seen_n = camera_agreement(p[near_ok], view[0], view[1], view[2], view[3], tol)[0]
-            hide = (camera_covers(p, view[0], view[1], view[2], view[3], tol)
-                    if self.get_parameter('camera_first').value else through)
+            if self.get_parameter('camera_first').value:
+                hide = camera_covers(p, self.filled_depth(view[0]), view[1], view[2], view[3],
+                                     tol, max(tol, float(self.get_parameter('camera_first_behind').value)),
+                                     int(self.get_parameter('camera_first_fill_px').value),
+                                     front=float(self.get_parameter('camera_first_fill_front').value))
+            else:
+                hide = through
             if not self.get_parameter('drop_seen_through').value:
                 through = np.zeros(len(p), bool)
                 hide = hide if self.get_parameter('camera_first').value else through
@@ -855,11 +943,29 @@ class LidarBridge(Node):
             errs = camera_range_error(p[sel], (xyz[sel] / np.maximum(rng[sel], 1e-3)[:, None]) @ R.T,
                                       view[0], view[1], view[2], view[3])
         keep = real & in_work & ~hide
+        # specks: too few neighbours (this scan and the last density_window s)
+        if self.get_parameter('density_filter').value and keep.any():
+            from scipy.spatial import cKDTree
+            span = float(self.get_parameter('density_window').value)
+            with self.lock:
+                self.dense_hist = [(a, q) for a, q in self.dense_hist if now - a < span]
+                past = [q for _a, q in self.dense_hist]
+                self.dense_hist.append((now, p[real & ~hide]))
+            idx = np.where(real & ~hide)[0]
+            pool = np.concatenate(past + [p[idx]]) if past else p[idx]
+            counts = np.array([len(c) for c in cKDTree(pool).query_ball_point(
+                p[idx], float(self.get_parameter('density_radius').value))]) - 1
+            lone = np.zeros(len(p), bool)
+            lone[idx[counts < int(self.get_parameter('density_min').value)]] = True
+            real = real & ~lone
+            keep = keep & ~lone
         reach_n = int((real & ~through & in_box(p, self.reach)).sum())
         # passed on only while the LiDAR is trusted (the last status ok): otherwise nothing
         show = self.trusted
         nothing = np.zeros(len(p), bool)
         self.pub_cloud.publish(select_points(out, real & ~hide if show else nothing))
+        if self.pub_fit.get_subscription_count():
+            self.pub_fit.publish(select_points(out, real))
         work = select_points(out, keep if show else nothing)
         self.pub_work.publish(work)
         if self.get_parameter('octomap_live').value:
@@ -1058,6 +1164,19 @@ class LidarBridge(Node):
         if not getattr(self, '_housing_done', False):
             self.add_housing()
 
+    def housing_pose(self):
+        """(t, R) of the L2 itself for its box: housing_xyz / housing_rpy_deg /
+        housing_spin_deg when set (where it physically is), else the mount."""
+        try:
+            xyz = [float(v) for v in self.get_parameter('housing_xyz').value]
+            rpy = [float(v) for v in self.get_parameter('housing_rpy_deg').value]
+            spin = float(self.get_parameter('housing_spin_deg').value)
+        except (TypeError, ValueError):
+            xyz = []
+        if len(xyz) != 3 or len(rpy) != 3:
+            return self.t, self.R
+        return (np.array(xyz), rpy_matrix(*[math.radians(v) for v in rpy]) @ rot_z(spin))
+
     def add_housing(self):
         """A box around the LiDAR in the planning scene (MoveIt; cuMotion takes the
         scene's objects with every plan), so no move swings an arm into it. Again
@@ -1065,6 +1184,7 @@ class LidarBridge(Node):
         if not self.scene.service_is_ready():
             return
         size = [float(v) for v in self.get_parameter('housing_size').value]
+        t, R = self.housing_pose()
         obj = CollisionObject()
         obj.header.frame_id = self.parent
         obj.id = HOUSING_ID
@@ -1072,9 +1192,9 @@ class LidarBridge(Node):
         obj.primitives.append(SolidPrimitive(type=SolidPrimitive.BOX, dimensions=size))
         pose = Pose()
         # the box's centre: half its height up the LiDAR's own Z from its origin
-        c = self.t + self.R @ np.array([0.0, 0.0, size[2] / 2.0])
+        c = t + R @ np.array([0.0, 0.0, size[2] / 2.0])
         pose.position.x, pose.position.y, pose.position.z = (float(v) for v in c)
-        q = quat_from_matrix(self.R)
+        q = quat_from_matrix(R)
         pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = \
             (float(v) for v in q)
         obj.primitive_poses.append(pose)

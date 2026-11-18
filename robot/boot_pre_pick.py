@@ -19,6 +19,16 @@ then the right arm at 15 % speed, then the left).
 
 Turn it off (boot_pre_pick:=false) when something else parks the arms:
 two nodes driving the arms at once would fight.
+
+The world first (2026-11-16, the user: "don't move the hand without knowing the world;
+wait for the LiDAR, then move to navigation with obstacle avoidance"): nothing moves
+until /lidar/status says ok (the L2 spun up, its window clean, its points matching the
+camera -- ~30-60 s after launch) and the octomap has been filled from the camera AND
+the LiDAR (/octomap_gater/refresh). No LiDAR within --world-timeout: the arms stay
+where they are (--without-lidar: the camera's map alone). Every motion is then
+planned and checked against that map, both arms together, before it runs -- the
+cuMotion fallback too (plan, check, execute; it used to execute unchecked). The
+unchecked lift off the stand is only done when the arm touches nothing but itself.
 """
 
 import argparse
@@ -32,7 +42,12 @@ import rclpy
 import yaml
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes, RobotTrajectory
-from moveit_msgs.srv import GetStateValidity
+from moveit_msgs.msg import PlanningSceneComponents
+from moveit_msgs.srv import GetPlanningScene, GetStateValidity
+from rclpy.qos import DurabilityPolicy, QoSProfile
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
+import json
 from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -47,6 +62,9 @@ ARRIVED = 0.02            # rad: an arm this close to its target is left alone
 UNSTICK = 0.15            # share of the way to the target, to lift an arm off the stand
 UNSTICK_TIME = 1.5        # s for that
 SAMPLE = 0.05             # s: merged trajectory resolution and check spacing
+# links that never move with the arms: their touching the map (the stand's coarse mesh in
+# its own voxels) is not a collision of the motion (click_to_move allows the same)
+STATIC_LINKS = ('openarm_body_link0', 'openarm_left_link0', 'openarm_right_link0')
 
 
 def wait(future, timeout):
@@ -98,6 +116,64 @@ class BootPrePick(Node):
         self.move_client = ActionClient(self, MoveGroup, '/move_action')
         self.execute_client = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
         self.validity = self.create_client(GetStateValidity, '/check_state_validity')
+        self.scene = self.create_client(GetPlanningScene, '/get_planning_scene')
+        self.refresh = self.create_client(Trigger, '/octomap_gater/refresh')
+        self.lidar = None                            # the last /lidar/status (dict)
+        self.create_subscription(String, '/lidar/status', self._on_lidar,
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+
+    def _on_lidar(self, msg):
+        try:
+            self.lidar = json.loads(msg.data)
+        except ValueError:
+            pass
+
+    # -- the world, before anything moves -------------------------------------
+
+    def octomap_bytes(self):
+        """Size of the planning scene's octomap (bytes; 0 if none / no answer)."""
+        if not self.scene.wait_for_service(timeout_sec=5.0):
+            return 0
+        req = GetPlanningScene.Request()
+        req.components.components = PlanningSceneComponents.OCTOMAP
+        res = wait(self.scene.call_async(req), 10.0)
+        return len(res.scene.world.octomap.octomap.data) if res is not None else 0
+
+    def know_world(self, deadline):
+        """Wait for the LiDAR (ok), then fill the octomap from the camera and the LiDAR.
+        True when the map has the world in it; False: do not move."""
+        log = self.get_logger()
+        if not self.args.without_lidar:
+            log.info('waiting for the LiDAR (/lidar/status ok) before moving the arms...')
+            said = 0.0
+            while not (self.lidar or {}).get('ok'):
+                if time.monotonic() > deadline:
+                    why = (self.lidar or {}).get('why') or 'no /lidar/status at all'
+                    log.error(f'the LiDAR is not ok after {self.args.world_timeout:.0f} s ({why}): '
+                              'the arms are NOT moved -- they do not know the world around them. '
+                              'Move them from the GUI once it is ok, or relaunch with '
+                              'boot_pre_pick:=false')
+                    return False
+                if time.monotonic() - said > 15.0:
+                    said = time.monotonic()
+                    why = (self.lidar or {}).get('why')
+                    log.info('  still waiting for the LiDAR' + (f': {why}' if why else ''))
+                time.sleep(0.5)
+            log.info(f'LiDAR ok (camera agreement {self.lidar.get("camera_agree_pct")}%)')
+        before = self.octomap_bytes()
+        if self.refresh.wait_for_service(timeout_sec=3.0):
+            res = wait(self.refresh.call_async(Trigger.Request()), 5.0)
+            log.info(f'octomap refresh: {res.message if res else "no answer"}')
+        else:
+            log.info('no /octomap_gater (octomap:=live): the map fills by itself')
+        time.sleep(self.args.octomap_settle)
+        after = self.octomap_bytes()
+        if after < self.args.min_octomap_bytes:
+            log.error(f'the octomap is still (almost) empty ({after} bytes, was {before}): the '
+                      'arms are NOT moved')
+            return False
+        log.info(f'octomap filled ({after} bytes, was {before}): planning against it')
+        return True
 
     # -- inputs ---------------------------------------------------------------
 
@@ -168,6 +244,18 @@ class BootPrePick(Node):
         res = result.result
         return res.error_code.val, res.planned_trajectory.joint_trajectory
 
+    @staticmethod
+    def real_contacts(res):
+        """The contacts of a validity answer that are collisions of the motion: not a
+        static link touching the map."""
+        out = []
+        for c in res.contacts:
+            pair = {c.contact_body_1, c.contact_body_2}
+            if '<octomap>' in pair and pair & set(STATIC_LINKS):
+                continue
+            out.append((c.contact_body_1, c.contact_body_2))
+        return out
+
     def collision_free(self, jt):
         """Every SAMPLE-s state of the merged motion, both arms together."""
         if not self.validity.wait_for_service(timeout_sec=5.0):
@@ -178,10 +266,9 @@ class BootPrePick(Node):
             req.robot_state.joint_state.name = list(jt.joint_names)
             req.robot_state.joint_state.position = list(p.positions)
             res = wait(self.validity.call_async(req), 2.0)
-            if res is None or not res.valid:
-                bodies = sorted({(c.contact_body_1, c.contact_body_2)
-                                 for c in (res.contacts if res else [])})[:3]
-                self.get_logger().warn(f'merged motion collides at {seconds(p):.2f} s: {bodies}')
+            if res is None or (not res.valid and (self.real_contacts(res) or not res.contacts)):
+                bodies = sorted(set(self.real_contacts(res)) if res else [])[:3]
+                self.get_logger().warn(f'motion collides at {seconds(p):.2f} s: {bodies}')
                 return False
         return True
 
@@ -208,8 +295,17 @@ class BootPrePick(Node):
         res = wait(self.validity.call_async(req), 2.0)
         if res is None or res.valid:
             return False
-        bodies = sorted({(c.contact_body_1, c.contact_body_2) for c in res.contacts})[:3]
-        self.get_logger().info(f'{arm}: starts touching {bodies or "something"}')
+        bodies = sorted(set(self.real_contacts(res)))
+        if not bodies:
+            return False
+        self.get_logger().info(f'{arm}: starts touching {bodies[:3]}')
+        # lifted unchecked only off the robot itself (the stand): never when it touches
+        # something in the world -- then it stays and says so
+        if any(not (a.startswith('openarm_') and b.startswith('openarm_')) for a, b in bodies):
+            self.get_logger().error(f'{arm}: it touches something in the world ({bodies[:3]}): '
+                                    'not lifted, not moved')
+            self.blocked = True
+            return False
         return True
 
     def unstick(self, goals):
@@ -221,6 +317,7 @@ class BootPrePick(Node):
         The first UNSTICK of the way to the target, slowly and unchecked,
         lifts the hand forward, away from the stand -- the same way the
         planned move would have started anyway."""
+        self.blocked = False
         stuck = [arm for arm in goals if self.in_collision(arm)]
         if not stuck:
             return False
@@ -257,6 +354,16 @@ class BootPrePick(Node):
                  f'({seconds(merged.points[-1]):.1f} s, velocity {self.args.velocity:.2f})')
         return self.execute(merged)
 
+    def checked_move(self, arm, positions):
+        """cuMotion plans (plan only), the plan is checked against the map state by
+        state, then executed. A MoveIt error code (FAILURE if the check fails)."""
+        code, jt = self.send(self.goal(arm, positions, 'cumotion', plan_only=True))
+        if code != MoveItErrorCodes.SUCCESS or jt is None or not jt.points:
+            return code
+        if not self.collision_free(jt):
+            return MoveItErrorCodes.FAILURE
+        return MoveItErrorCodes.SUCCESS if self.execute(jt) else MoveItErrorCodes.FAILURE
+
     def one_by_one(self, goals, deadline):
         """Fallback: one cuMotion goal per arm, retried while it warms up."""
         log = self.get_logger()
@@ -264,8 +371,8 @@ class BootPrePick(Node):
         for arm, positions in goals.items():
             tries = 0
             while True:
-                log.info(f'{arm}: moving to {self.args.state} with cuMotion')
-                code, _jt = self.send(self.goal(arm, positions, 'cumotion', plan_only=False))
+                log.info(f'{arm}: planning to {self.args.state} with cuMotion')
+                code = self.checked_move(arm, positions)
                 if code == MoveItErrorCodes.SUCCESS:
                     log.info(f'{arm}: at {self.args.state}')
                     break
@@ -273,7 +380,7 @@ class BootPrePick(Node):
                 if code in (MoveItErrorCodes.PLANNING_FAILED, MoveItErrorCodes.FAILURE) \
                         and tries >= 2:
                     log.info(f'{arm}: no direct path to {self.args.state}; going via home')
-                    home, _ = self.send(self.goal(arm, HOME, 'cumotion', plan_only=False))
+                    home = self.checked_move(arm, HOME)
                     if home == MoveItErrorCodes.SUCCESS:
                         continue
                 if time.monotonic() > deadline:
@@ -310,7 +417,13 @@ class BootPrePick(Node):
             goals[arm] = target
         if not goals:
             return True
+        world_deadline = time.monotonic() + self.args.world_timeout
+        if not self.know_world(world_deadline):
+            return False
+        deadline = max(deadline, time.monotonic() + 60.0)
         self.unstick(goals)
+        if getattr(self, 'blocked', False):
+            return False
         if self.together(goals):
             log.info(f'at {self.args.state} {time.monotonic() - start:.1f} s after start')
             return True
@@ -333,6 +446,15 @@ def main():
     parser.add_argument('--timeout', type=float, default=180.0,
                         help='give up this many seconds after start')
     parser.add_argument('--retry', type=float, default=3.0)
+    parser.add_argument('--world-timeout', type=float, default=180.0,
+                        help='how long to wait for the LiDAR (/lidar/status ok) before giving up '
+                             'without moving, s')
+    parser.add_argument('--without-lidar', action='store_true',
+                        help='do not wait for the LiDAR: plan against the camera\'s map alone')
+    parser.add_argument('--octomap-settle', type=float, default=2.5,
+                        help='after the refresh: time for move_group to take the frames in, s')
+    parser.add_argument('--min-octomap-bytes', type=int, default=2000,
+                        help='an octomap smaller than this is taken as empty: no move')
     args, _ros = parser.parse_known_args()
 
     rclpy.init()

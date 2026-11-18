@@ -441,6 +441,30 @@ kbd {
 .cmap-box { fill: var(--warn); stroke: #fff; stroke-width: 1.5; }
 .pickall-start .why { font-size: 0.8rem; color: var(--text-2); }
 .pickall-start .toggle { white-space: nowrap; }
+/* Pick all's count (2026-11-17): [- n +] [Pick n] [All] in one row; a narrow
+   phone: the stepper on its own row, the two buttons side by side under it */
+.pickall-count {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: stretch;
+}
+.pickall-count[hidden] { display: none; }
+.pickall-count .btn { min-width: 0; }
+.pickall-count .btn span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pickall-count .stepper { height: 48px; }
+.pickall-count .stepper button { width: 32px; }
+.pickall-count .stepper input { width: 2.6em; }      /* 3 digits: up to 200 */
+.stepper input {
+  width: 3.2em; height: 100%; padding: 0; border: 0; background: transparent; color: var(--text);
+  text-align: center; font: 600 0.95rem ui-monospace, Menlo, monospace;
+  -moz-appearance: textfield; appearance: textfield;
+}
+.stepper input::-webkit-outer-spin-button,
+.stepper input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.stepper input:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.stepper button:disabled, .stepper input:disabled { opacity: 0.4; cursor: not-allowed; }
+@media (max-width: 380px) {
+  .pickall-count { grid-template-columns: 1fr 1fr; }
+  .pickall-count .stepper { grid-column: 1 / -1; justify-self: center; }
+}
 .tab { font-size: 0.76rem; white-space: nowrap; padding: 0 2px; }
 
 /* Pick all waiting for the base: the alert (below the top bar: never over STOP) */
@@ -634,3 +658,43 @@ kbd {
 }
 .sublabel { font-size: 0.72rem; font-weight: 600; color: var(--text-3); margin-top: 2px; }
 .setting { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 0.86rem; }
+
+/* AUTO CALIBRATE: the one button, its progress, result and error map (2026-11-16) */
+.autocal .why { font-size: 0.8rem; color: var(--text-2); }
+.autocal .why:empty { display: none; }
+.autocal .why[data-tone="ok"] { color: var(--good); }
+.autocal .why[data-tone="edge"] { color: var(--warn); }
+.autocal .actions { grid-template-columns: 1fr; }
+.check { display: inline-flex; align-items: center; gap: 8px; font-size: 0.86rem; font-weight: 600; cursor: pointer; }
+.check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.check:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
+.ac-progress { display: flex; flex-direction: column; gap: 6px; }
+.ac-step { font-size: 0.86rem; font-weight: 600; }
+.ac-step.bad { color: var(--bad); }
+.ac-bar { height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
+.ac-bar span {
+  display: block; height: 100%; background: var(--accent); border-radius: inherit;
+  transform-origin: left center; transform: scaleX(0); transition: transform 250ms var(--ease-out);
+}
+.ac-result { display: flex; flex-direction: column; gap: 6px; }
+.ac-cv tr.chosen td { font-weight: 700; color: var(--text); }
+.ac-cv tr.chosen td:first-child { color: var(--good); }
+.ac-cv tbody td:not(:first-child), .ac-cv thead th:not(:first-child) { text-align: right; }
+#acNotes div + div { margin-top: 2px; }
+.ac-maps { display: flex; flex-direction: column; gap: 6px; }
+.ac-mapgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.ac-mapgrid figure { margin: 0; display: flex; flex-direction: column; gap: 3px; }
+.ac-mapgrid figcaption { font-size: 0.68rem; color: var(--text-3); line-height: 1.25; }
+.acmap { width: 100%; height: auto; display: block; }
+.acmap-frame { fill: var(--raised-2); stroke: var(--line-strong); }
+.acmap-axis { stroke: var(--line-strong); stroke-dasharray: 3 3; }
+.acmap-robot { fill: var(--text-3); }
+.acmap-err { stroke: var(--text-2); stroke-width: 1; stroke-linecap: round; }
+.acmap-pt circle:not(.acmap-hit), .acmap-pt rect { stroke: var(--raised-2); stroke-width: 1; }
+.acmap-pt circle.acmap-open, .acmap-pt rect.acmap-open { fill: none; stroke: var(--text-3); stroke-width: 1.2; }
+.acmap-hit { fill: transparent; stroke: none; }
+.acmap-pt:hover circle:not(.acmap-hit), .acmap-pt:hover rect { stroke: var(--text); stroke-width: 1.5; }
+.ac-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 0.72rem; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.ac-legend span { display: inline-flex; align-items: center; gap: 4px; }
+.ac-legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.ac-legend .ac-shape { margin-left: auto; }

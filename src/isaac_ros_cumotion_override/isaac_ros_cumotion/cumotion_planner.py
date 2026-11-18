@@ -637,6 +637,14 @@ class CumotionActionServer(Node):
             time_d = rclpy.time.Duration(seconds=i * dt).to_msg()
             traj_pt.time_from_start = time_d
             cmd_traj.points.append(traj_pt)
+        # The last point stands still. cuRobo's last state is never exactly at
+        # 0 rad/s, and the controller (allow_nonzero_velocity_at_trajectory_end)
+        # takes it as it is: with a velocity command the arm would carry on past
+        # the goal (2026-11-17; click_to_move's execute() zeroes it as well).
+        if cmd_traj.points:
+            last = cmd_traj.points[-1]
+            last.velocities = [0.0] * len(last.velocities)
+            last.accelerations = [0.0] * len(last.accelerations)
         cmd_traj.joint_names = js.joint_names
         cmd_traj.header.stamp = self.get_clock().now().to_msg()
         traj.joint_trajectory = cmd_traj

@@ -10,7 +10,17 @@
              hand:=^|false
              left_arm_prefix:=^|left_
              right_arm_prefix:=^|right_
-             can_fd:=^|true">
+             can_fd:=^|true
+             left_gains_file:=^|/workspaces/isaac_ros-dev/calibration/motor_gains_left.yaml
+             right_gains_file:=^|/workspaces/isaac_ros-dev/calibration/motor_gains_right.yaml">
+
+    <!-- gains_file (2026-11-17): the driver's control-law switches and its
+         opt-in gains profile (openarm_hardware gains_file.hpp). Read once when
+         the hardware starts. A missing file is not an error: the driver runs
+         its compiled law (velocity feed-forward and the integral freeze on, no
+         profile) and warns. A file it rejects: the same, with an ERROR. Empty:
+         no file. The default is the workspace's calibration/ directory, by the
+         container path every launch file here uses (a symlink natively). -->
 
     <!-- Left Arm Hardware Interface -->
     <ros2_control name="openarm_left_hardware_interface" type="system">
@@ -27,6 +37,7 @@
             <param name="arm_prefix">${left_arm_prefix}</param>
             <param name="hand">${hand}</param>
             <param name="can_fd">${can_fd}</param>
+            <param name="gains_file">${left_gains_file}</param>
           </xacro:unless>
         </hardware>
 
@@ -78,6 +89,7 @@
             <param name="arm_prefix">${right_arm_prefix}</param>
             <param name="hand">${hand}</param>
             <param name="can_fd">${can_fd}</param>
+            <param name="gains_file">${right_gains_file}</param>
           </xacro:unless>
         </hardware>
 

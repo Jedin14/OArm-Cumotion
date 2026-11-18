@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <title>OpenArm Control</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <!-- the camera: everything is clicked here -->
+    <main class="stage" id="stage">
+      <img id="video" class="video" alt="Head camera" draggable="false">
+      <!-- what the box picker found / the pick check, drawn over the picture -->
+      <svg id="scene" class="scene" aria-hidden="true"></svg>
+      <div class="verdict" id="verdict" role="status" aria-live="polite">
+        <span class="verdict-icon" id="verdictIcon"></span>
+        <span class="verdict-text"><strong id="verdictTitle"></strong><span id="verdictWhy"></span></span>
+      </div>
+      <div class="ripples" id="ripples" aria-hidden="true"></div>
+
+      <header class="chrome top">
+        <div class="chips">
+          <span class="chip state" id="armState" data-tone="idle">connecting</span>
+          <span class="chip" id="viewChip">LIVE</span>
+          <span class="chip subtle" id="approachChip">FRONT</span>
+          <span class="chip warn" id="haltChip" hidden>STOPPED</span>
+          <span class="chip subtle" id="clickChip" hidden>CLICK ONLY</span>
+          <span class="chip subtle" id="fpsChip" title="Colour frames a second from the camera">– fps</span>
+          <span class="chip subtle" id="lidarChip" title="The Unitree L2 4D LiDAR. Working: the green walls are off (it sees round the camera's picture). Not working: the walls are used">LIDAR –</span>
+        </div>
+        <div class="segmented" role="tablist" aria-label="Picture">
+          <button role="tab" data-action="view" data-value="live" id="viewLive">Live</button>
+          <button role="tab" data-action="view" data-value="captured" id="viewCaptured">Captured</button>
+        </div>
+        <button class="stop" data-action="stop" title="Stop all motion (Esc)">
+          <span class="stop-dot"></span>STOP
+        </button>
+      </header>
+
+      <footer class="chrome bottom">
+        <div class="status" id="status" aria-live="polite">Connecting to beast…</div>
+        <div class="detail" id="detail"></div>
+      </footer>
+
+      <!-- held touch: TEACH / ANCHOR nudges -->
+      <section class="sheet" id="teachSheet" aria-hidden="true" aria-label="Nudge the tip">
+        <div class="sheet-head">
+          <div>
+            <div class="sheet-title" id="teachTitle">Nudge the tip onto the spot</div>
+            <div class="sheet-sub" id="teachSub">1 mm a press, Shift 5 mm · arrows, + / −, Enter saves</div>
+          </div>
+        </div>
+        <div class="nudge">
+          <div class="pad">
+            <button class="key up" data-action="up" aria-label="Up">↑</button>
+            <button class="key left" data-action="left" aria-label="Left">←</button>
+            <button class="key right" data-action="right" aria-label="Right">→</button>
+            <button class="key down" data-action="down" aria-label="Down">↓</button>
+          </div>
+          <div class="depth">
+            <button class="key" data-action="in" aria-label="In">In +</button>
+            <button class="key" data-action="out" aria-label="Out">Out −</button>
+          </div>
+          <div class="sheet-actions">
+            <button class="btn primary" data-action="save">Save</button>
+            <button class="btn" data-action="skip">Skip</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- CAL ARMS wall check / running calibration -->
+      <section class="sheet" id="calSheet" aria-hidden="true" aria-label="Calibration">
+        <div class="sheet-head">
+          <div>
+            <div class="sheet-title" id="calTitle">Calibrating</div>
+            <div class="sheet-sub" id="calSub">Keep the view clear</div>
+          </div>
+          <div class="sheet-actions">
+            <button class="btn primary" data-action="confirm" id="calConfirm">Confirm</button>
+            <!-- AUTO CALIBRATE waiting at pre_pick for the box (also on the Calibrate tab) -->
+            <button class="btn primary" data-action="autocal_box_on" id="calBoxOn" hidden>Box is on the cup</button>
+            <button class="btn danger" data-action="abort">Abort</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- the controls -->
+    <aside class="panel">
+      <nav class="tabs" role="tablist" aria-label="Sections">
+        <button role="tab" class="tab" data-tab="pick" aria-selected="true">Pick</button>
+        <button role="tab" class="tab model-tab" data-tab="pickall">Pick all</button>
+        <button role="tab" class="tab" data-tab="calibrate">Calibrate</button>
+        <button role="tab" class="tab" data-tab="advanced">Advanced</button>
+        <button role="tab" class="tab" data-tab="system">System</button>
+        <span class="tab-indicator" id="tabIndicator"></span>
+      </nav>
+
+      <div class="panes">
+        <!-- PICK -->
+        <section class="pane" data-pane="pick">
+          <div class="group">
+            <div class="label">Arms</div>
+            <div class="segmented wide">
+              <button data-action="navigation" id="modeNav">Navigation <kbd>N</kbd></button>
+              <button data-action="pre_pick" id="modePick">Pre-pick <kbd>P</kbd></button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="label">Gripper</div>
+            <div class="segmented wide">
+              <button data-action="pick_tool" data-value="vacuum" id="tlVacuum" title="Vacuum: the left arm picks every box; the right arm is never moved for a pick">Vacuum · left</button>
+              <button data-action="pick_tool" data-value="finger" id="tlFinger" title="Fingers: the right arm picks every box; the left arm is never moved for a pick">Finger · right</button>
+            </div>
+          </div>
+
+          <div class="group click-only" id="grpApproach">
+            <div class="label">Approach</div>
+            <div class="segmented wide">
+              <button data-action="topdown" data-when="front" id="apFront">Front</button>
+              <button data-action="topdown" data-when="top" id="apTop">Top down <kbd>D</kbd></button>
+            </div>
+          </div>
+
+          <div class="card target" id="targetCard">
+            <div class="card-row">
+              <span class="label">Target</span>
+              <span class="badge" id="targetBadge" data-tone="idle">none</span>
+            </div>
+            <div class="xyz" id="targetXyz">Detect a box: the model picks it, FRONT or TOP</div>
+            <div class="why" id="targetWhy"></div>
+            <div class="why" id="targetBox"></div>
+          </div>
+
+          <!-- a box it cannot pick from here: where the robot should move (shown, not sent) -->
+          <div class="card basecorr" id="baseCorrPick" hidden></div>
+
+          <!-- the box picker's own window (pick_loop.py), as a card -->
+          <div class="card picker model-group" id="pickerCard">
+            <div class="card-row">
+              <span class="label">Box picker</span>
+              <span class="badge" id="tiltBadge" data-tone="idle" title="The camera's tilt the picker uses: from its accelerometer (gravity), else the TF">tilt –</span>
+            </div>
+            <div class="tally" id="pickerTally"></div>
+            <div class="closeup-row" id="closeUpRow" hidden>
+              <img id="closeUp" class="closeup" alt="The target box, close up, its pick face boxed in red">
+              <div class="closeup-info">
+                <div class="coords" title="The grip point in the colour camera's frame">
+                  <span><small>X right</small><b id="camX">–</b></span>
+                  <span><small>Y down</small><b id="camY">–</b></span>
+                  <span><small>Z away</small><b id="camZ">–</b></span>
+                </div>
+                <div class="dots" id="tryDots" aria-label="Tries on this box"></div>
+              </div>
+            </div>
+            <div class="why" id="pickerAgree"></div>
+            <div class="why" id="pickerTook"></div>
+            <div class="actions">
+              <button class="btn" data-action="next_target" id="btnNext" title="Pass over this box, and every box under it, until the next successful pick; press again for the one after. With no other box left, back to the first">Next target <kbd>T</kbd></button>
+              <button class="btn" data-action="skip_box" id="btnSkip" title="Never choose this box again, until Forget skipped (it still blocks the boxes behind and under it)">Skip box</button>
+              <button class="btn" data-action="check_now" id="btnCheckNow" title="The pick check now, as if the robot said done: new frames against the last detection (a box taken by hand, or to look again)">Check now <kbd>H</kbd></button>
+              <button class="btn" data-action="snapshot_save" id="btnSnap" title="Save the colour + depth picture now, with the tilt (box_picker/src/outputs/gui/…/snapshots): pick_pipeline.py --capture replays it">Save picture <kbd>S</kbd></button>
+            </div>
+            <div class="history" id="history" aria-label="The last picks"></div>
+            <div class="why" id="pickerLast"></div>
+          </div>
+
+          <div class="card result" id="resultCard" hidden>
+            <div class="card-row">
+              <span class="label">Last pick</span>
+              <span class="badge" id="resultBadge" data-tone="idle">–</span>
+            </div>
+            <div class="why" id="resultWhy"></div>
+            <div class="why" id="resultNumbers"></div>
+            <div class="flag" id="resultFlag" hidden></div>
+          </div>
+
+          <div class="actions">
+            <button class="btn primary big" data-action="move" id="btnMove"><span id="moveLabel">Move</span> <kbd>M</kbd></button>
+            <button class="btn model" data-action="detect" id="btnDetect" title="The box picker looks at 5 frames and shows every box it found and the one it will pick (FRONT or TOP). Bypass on: picked at once if it can be; off: nothing moves until MOVE">Detect box <kbd>Space</kbd></button>
+            <button class="btn" data-action="recapture">Recapture <kbd>R</kbd></button>
+            <button class="btn danger-soft" data-action="return" id="btnReturn" hidden>Return arm <kbd>B</kbd></button>
+          </div>
+
+          <div class="group" id="grpAuto">
+            <div class="toggles">
+              <button class="toggle" data-action="bypass" id="tgBypass" aria-pressed="true" title="On: DETECT BOX picks the box at once when the reach check says it can be picked -- no MOVE to press. Off: it waits for MOVE">
+                <span class="knob"></span>Bypass (no Move)
+              </button>
+            </div>
+          </div>
+
+          <div class="group click-only" id="grpOptions">
+            <div class="label">Options</div>
+            <div class="toggles">
+              <button class="toggle" data-action="teach" id="tgTeach" aria-pressed="false">
+                <span class="knob"></span>Teach <kbd>T</kbd>
+              </button>
+              <button class="toggle" data-action="pieces" id="tgPieces" aria-pressed="false">
+                <span class="knob"></span>ArUco ext
+              </button>
+            </div>
+          </div>
+
+
+          <div class="card held">
+            <div class="card-row">
+              <span class="label">Held object</span>
+              <span class="badge" id="heldBadge" data-tone="idle">empty</span>
+            </div>
+            <div class="xyz" id="heldSize">No size on /beast_arm/held_object/size</div>
+            <div class="why">Attached to the tool at contact, so the way back keeps it clear; released at the drop.</div>
+            <div class="dims" id="dummyDims">
+              <label>H <input type="number" min="5" max="600" step="1" id="dimH" value="170"></label>
+              <span>×</span>
+              <label>W <input type="number" min="5" max="600" step="1" id="dimW" value="100"></label>
+              <span>×</span>
+              <label>D <input type="number" min="5" max="600" step="1" id="dimD" value="25"></label>
+              <span class="muted small">mm</span>
+            </div>
+            <div class="actions two">
+              <button class="toggle" data-action="dummy_size" id="tgDummy" aria-pressed="false">
+                <span class="knob"></span>Dummy size
+              </button>
+              <button class="btn" data-action="release" id="btnRelease" disabled>Release</button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="label">Tools past the fingertips</div>
+            <div class="tool" data-arm="left">
+              <button class="toggle" data-action="tool" data-arm="left" aria-pressed="false">
+                <span class="knob"></span>Left
+              </button>
+              <div class="stepper">
+                <button data-action="tool" data-arm="left" data-step="-0.001" aria-label="Shorter">−</button>
+                <span class="len" id="lenLeft">0 mm</span>
+                <button data-action="tool" data-arm="left" data-step="0.001" aria-label="Longer">+</button>
+              </div>
+            </div>
+            <div class="tool" data-arm="right">
+              <button class="toggle" data-action="tool" data-arm="right" aria-pressed="false">
+                <span class="knob"></span>Right
+              </button>
+              <div class="stepper">
+                <button data-action="tool" data-arm="right" data-step="-0.001" aria-label="Shorter">−</button>
+                <span class="len" id="lenRight">0 mm</span>
+                <button data-action="tool" data-arm="right" data-step="0.001" aria-label="Longer">+</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- CALIBRATE -->
+        <section class="pane" data-pane="calibrate" hidden>
+          <!-- AUTO CALIBRATE (2026-11-16): everything from one button -- the tool's
+               weight, the box over the whole workspace, the model chosen and checked -->
+          <div class="card autocal" id="autocalCard">
+            <div class="card-row">
+              <span class="label">Auto calibration (one button)</span>
+              <span class="badge" id="acBadge" data-tone="idle">ready</span>
+            </div>
+            <div class="why">Needs the ArUco box (<a href="/sheets/calib_box_sheets.pdf" target="_blank">the box sheets</a>
+              at 100 % on a 170×100×25 mm box), about 30 min, and the space round the left arm clear.
+              It weighs the tool first with the arm <b>empty</b> (nothing on the cup), then asks for the box:
+              put it on the cup, cup on the cross of face B, and press <b>Box is on the cup</b>
+              (it goes on by itself once the camera sees the box). Then it moves through ~90 postures over the
+              whole workspace, chooses the arm model itself &ndash; or none, if the plain URDF is as good &ndash;
+              checks it on postures it was not fitted to, and saves it only if it is better than now.
+              The depth camera is checked on the box too.</div>
+            <label class="check"><input type="checkbox" id="acWeigh" checked> Weigh the tool first</label>
+            <div class="actions">
+              <button class="btn primary big" data-action="auto_cal" id="btnAutoCal">Auto calibrate</button>
+              <button class="btn primary big" data-action="autocal_box_on" id="btnBoxOn" hidden>Box is on the cup</button>
+            </div>
+            <div class="ac-progress" id="acProgress" hidden>
+              <div class="ac-step" id="acStep"></div>
+              <div class="ac-bar" role="progressbar" aria-label="Postures measured" aria-valuemin="0" id="acBarWrap"><span id="acBar"></span></div>
+              <div class="why small" id="acCounts"></div>
+            </div>
+            <div class="ac-result" id="acResult" hidden>
+              <div class="sublabel">Tip error on postures each model was not fitted to</div>
+              <table class="models ac-cv" aria-label="Cross-validated tip error of each model">
+                <thead><tr><th>Model</th><th>Mean</th><th>90 %</th></tr></thead>
+                <tbody id="acCvBody"></tbody>
+              </table>
+              <div class="why" id="acVal"></div>
+              <div class="why" id="acBaseline"></div>
+              <div class="why" id="acSaved"></div>
+              <div class="why small" id="acNotes"></div>
+              <div class="flag" id="acRestart" hidden>Restart terminal 1 (run_launch_everything.sh) so the motors use the measured tool weight.</div>
+            </div>
+            <div class="ac-maps" id="acMaps" hidden></div>
+          </div>
+
+          <div class="group">
+            <div class="card-row">
+              <div class="label">Live markers</div>
+              <button class="toggle small" data-action="markers" id="tgMarkers" aria-pressed="true">
+                <span class="knob"></span><kbd>K</kbd>
+              </button>
+            </div>
+            <div class="marker-ids" id="markerIds"><span class="muted">none in view</span></div>
+          </div>
+
+          <div class="card">
+            <div class="card-row">
+              <span class="title">Arm model</span>
+              <span class="muted small" id="modelWhen"></span>
+            </div>
+            <table class="models">
+              <thead><tr><th></th><th>Model</th><th>Fit</th><th>Anchors</th></tr></thead>
+              <tbody>
+                <tr><th>Left</th><td id="mLeftModel">–</td><td id="mLeftFit">–</td><td id="mLeftAnch">–</td></tr>
+                <tr><th>Right</th><td id="mRightModel">–</td><td id="mRightFit">–</td><td id="mRightAnch">–</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="group">
+            <div class="label">Arm calibration</div>
+            <div class="hint">Folded pieces on both grippers, marker 11 on the wall 50 cm ahead. About 35–40 min.</div>
+            <div class="actions two">
+              <button class="btn primary" data-action="cal_arms">Cal arms <kbd>F</kbd></button>
+              <button class="btn" data-action="overlay" id="btnOverlay">Overlay <kbd>O</kbd></button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="label">Tip anchors</div>
+            <div class="hint">Touch a point exactly and save it; 3–4 at different spots, then refit.</div>
+            <div class="actions two">
+              <button class="toggle" data-action="anchor" id="tgAnchor" aria-pressed="false">
+                <span class="knob"></span>Anchor <kbd>A</kbd>
+              </button>
+              <button class="btn" data-action="refit">Refit <kbd>E</kbd></button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="label">Tool weight (gravity compensation)</div>
+            <div class="hint">Nothing on the cup, arm at pre-pick. Weigh tool: 16 still postures, the motors' torques give the real mass after joint 7 (~3 min). Apply weight writes it into the URDF; then restart run_launch_everything.sh.</div>
+            <div class="actions two">
+              <button class="btn" data-action="weigh_tool">Weigh tool</button>
+              <button class="btn" data-action="apply_weight">Apply weight</button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="label">Box calibration without weighing</div>
+            <div class="hint">The same run as <b>Auto calibrate</b> above, without weighing the tool first: box already on the cup (cup on the cross of face B), arm at pre-pick. It starts as soon as the camera sees the box. Arm model and depth correction are saved only if they are better than now.</div>
+            <div class="actions">
+              <button class="btn big" data-action="box_cal">Calibrate with the box (no weighing)</button>
+            </div>
+            <details class="hint">
+              <summary>Depth with the ChArUco board (optional)</summary>
+              <b>Not needed &ndash; the auto calibration measures depth on the box.</b> Only to double-check the depth camera by hand:
+              print <a href="/sheets/charuco_board.pdf" target="_blank">the A4 board</a> at 100 % (flat, on card), hold it 35–60 cm from the camera, all of it in view; Capture; move it (another distance, side, tilt), 3–5 times; Fit.
+              <div class="actions two">
+                <button class="btn" data-action="depth_capture" id="btnDepthCap">Depth: capture</button>
+                <button class="btn" data-action="depth_fit" id="btnDepthFit">Depth: fit</button>
+              </div>
+            </details>
+            <div class="hint" id="autoCalStatus"></div>
+          </div>
+
+          <div class="group">
+            <div class="label">Camera tip check</div>
+            <div class="hint">Measures where the camera sees the tool's tip, against the arm model. Every touch does this by itself before going in; this shows it on the picture (cyan: the tool's end, green: tip seen, orange: tip by the model).</div>
+            <div class="actions">
+              <button class="btn" data-action="tip_check">Tip check <kbd>I</kbd></button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="label">Camera pose</div>
+            <div class="hint">After the camera has moved. Apply writes the result.</div>
+            <div class="actions two">
+              <button class="btn" data-action="calibrate">Calibrate <kbd>C</kbd></button>
+              <button class="btn" data-action="apply" id="btnApply" disabled>Apply</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- SYSTEM -->
+        <section class="pane" data-pane="advanced" hidden>
+          <div class="card advanced model-group" id="pickerAdvanced">
+            <div class="label">Box picker</div>
+            <div class="why">What the picker's own window has. The settings count from the next detection or check on.</div>
+            <div class="sublabel">View</div>
+            <div class="toggles">
+              <button class="toggle" data-action="depth_view" id="tgDepth" aria-pressed="false" title="The depth picture instead of the colour one: red near, blue far, black no reading (the bands at the sides have no depth)">
+                <span class="knob"></span>Depth picture <kbd>D</kbd>
+              </button>
+              <button class="toggle" data-action="picker_view" id="tgPickerView" aria-pressed="false" title="The picker's own drawing in the captured view: every box it found, its faces and grip points; after a pick, the check's (red gone, green unchanged, blue nearer, purple another box)">
+                <span class="knob"></span>Picker's view <kbd>V</kbd>
+              </button>
+            </div>
+            <div class="sublabel">Which box first</div>
+            <div class="segmented wide" role="radiogroup" aria-label="Order">
+              <button data-action="order" data-value="v1" id="ordV1" title="Boxes on a box first, the highest top first, then the nearest, then the leftmost: for piled or leaning boxes">v1 · stack tops</button>
+              <button data-action="order" data-value="v2" id="ordV2" title="The leftmost free box (nothing on it, nothing in front), whatever its height or distance: for boxes standing apart or in neat rows">v2 · leftmost</button>
+            </div>
+            <div class="sublabel">Face of a box on a box</div>
+            <div class="segmented wide" role="radiogroup" aria-label="Faces">
+              <button data-action="top_faces" data-value="off" id="facesFront" title="The picker's rules (pick_rules.py, 5 Nov): a box standing or lying on another box is gripped by its FRONT; its top only if no front was found (flagged: TOP ONLY). A box on the base: the larger of front and top">Front on a box</button>
+              <button data-action="top_faces" data-value="on" id="facesLarger" title="As before 5 Nov: every box by the larger of its front and top, wherever it is">Larger face</button>
+            </div>
+            <div class="setting">
+              <span>Frames per target</span>
+              <div class="stepper">
+                <button data-action="picker_setting" data-key="frames" data-step="-1" aria-label="Fewer">−</button>
+                <span class="len" id="setFrames">–</span>
+                <button data-action="picker_setting" data-key="frames" data-step="1" aria-label="More">+</button>
+              </div>
+            </div>
+            <div class="setting">
+              <span>SAM confidence</span>
+              <div class="stepper">
+                <button data-action="picker_setting" data-key="score" data-step="-1" aria-label="Lower">−</button>
+                <span class="len" id="setScore">–</span>
+                <button data-action="picker_setting" data-key="score" data-step="1" aria-label="Higher">+</button>
+              </div>
+            </div>
+            <div class="setting">
+              <span>Frames per pick check</span>
+              <div class="stepper">
+                <button data-action="picker_setting" data-key="check_frames" data-step="-1" aria-label="Fewer">−</button>
+                <span class="len" id="setCheck">–</span>
+                <button data-action="picker_setting" data-key="check_frames" data-step="1" aria-label="More">+</button>
+              </div>
+            </div>
+            <div class="actions">
+              <button class="btn model" data-action="detect" title="New frames, choose again">Look again</button>
+              <button class="btn" data-action="forget_skipped" id="btnForget" title="Forget the skipped and passed-over boxes: they can be chosen again">Forget skipped</button>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="hint">For testing: a point you type instead of the box model's. Normal picking uses Detect box on the Pick tab.</div>
+          </div>
+
+          <div class="card advanced" id="vacuumCard">
+            <div class="label">Vacuum</div>
+            <div class="segmented wide" role="radiogroup" aria-label="Vacuum">
+              <button data-action="vacuum" data-value="on" id="vacOn" aria-pressed="false" title="Switch the left arm's vacuum on (/beast_arm/vacuum true)">On</button>
+              <button data-action="vacuum" data-value="off" id="vacOff" aria-pressed="true" title="Switch the vacuum off: a box on the cup drops">Off</button>
+            </div>
+            <div class="hint" id="vacStatus">–</div>
+          </div>
+
+          <div class="card advanced" id="advanced">
+            <div class="label">Move to coordinates</div>
+            <div class="why">Camera coordinates, metres: the colour camera's frame, as the box picker gives
+              them (x right, y down, z forward). Checked first; MOVE picks it.</div>
+            <div class="dims">
+              <label>X <input type="number" step="0.001" id="mX" placeholder="0.000"></label>
+              <label>Y <input type="number" step="0.001" id="mY" placeholder="0.000"></label>
+              <label>Z <input type="number" step="0.001" min="0.15" max="2" id="mZ" placeholder="0.450"></label>
+              <span class="muted small">m</span>
+            </div>
+            <div class="actions two">
+              <div class="segmented" role="radiogroup" aria-label="Approach">
+                <button type="button" class="local" data-approach="front" id="mFront" aria-pressed="true">Front</button>
+                <button type="button" class="local" data-approach="top" id="mTop" aria-pressed="false">Top</button>
+              </div>
+              <div class="segmented" role="radiogroup" aria-label="Arm">
+                <button type="button" class="local" data-marm="left" id="mLeft" aria-pressed="true" title="Left arm: the vacuum">Left</button>
+                <button type="button" class="local" data-marm="right" id="mRight" aria-pressed="false" title="Right arm: the fingers">Right</button>
+              </div>
+            </div>
+            <button class="btn" data-action="manual_target" id="btnManual">Check target</button>
+          </div>
+
+          <div class="actions">
+            <button class="btn primary big" data-action="move" id="btnMove2">Move <kbd>M</kbd></button>
+          </div>
+        </section>
+
+        <section class="pane" data-pane="pickall" hidden>
+          <div class="card pickall-start">
+            <div class="card-row">
+              <span class="label">Pick all</span>
+              <span class="badge" id="pickAllState" data-tone="idle">ready</span>
+            </div>
+            <div class="why">Clears every box it can, one after another: detect, pick, drop, the next &ndash;
+              no Move to press. A box not taken gets one more round later. A box out of reach is
+              skipped, or &ndash; with No base movement off &ndash; it asks for the base to be moved
+              and picks it once it is in place. <b>STOP</b> (Esc) ends it.</div>
+            <button class="btn primary big model" data-action="pick_all" id="btnPickAll"><span id="pickAllLabel">Pick all</span></button>
+            <div class="toggles">
+              <button class="toggle" data-action="no_base_move" id="tgNoBaseMove" aria-pressed="true" title="On: a box it cannot reach from here is skipped. Off: Pick all stops at it, shows how to move the base, and picks it by itself once the box is in place">
+                <span class="knob"></span>No base movement
+              </button>
+            </div>
+            <div class="why small" id="noBaseMoveHint"></div>
+          </div>
+
+          <div class="card basecorr" id="baseCorrAll" hidden></div>
+
+          <!-- its time record, live while it runs, then the last run's -->
+          <div class="card pickall" id="pickAllCard" hidden>
+            <div class="card-row">
+              <span class="label" id="pickAllTitle">Pick all</span>
+              <span class="badge" id="pickAllBadge" data-tone="idle">–</span>
+            </div>
+            <div class="why" id="pickAllSummary"></div>
+            <table class="times" id="pickAllTimes" aria-label="Each box's time">
+              <thead><tr><th>#</th><th>Box</th><th title="From the arm leaving to the pick's result">Pick</th><th title="Since the last box was done: the pick and any waiting before it">Since last</th><th>At</th></tr></thead>
+              <tbody></tbody>
+            </table>
+            <div class="why small" id="pickAllFile"></div>
+          </div>
+
+        </section>
+
+        <section class="pane" data-pane="system" hidden>
+          <div class="card">
+            <div class="title">ROS interface</div>
+            <dl class="kv">
+              <dt>arm_state</dt><dd id="sysState">–</dd>
+              <dt>arm_action/phase</dt><dd id="sysPhase">–</dd>
+              <dt>arm_action/status</dt><dd id="sysResult">–</dd>
+              <dt>held_object/state</dt><dd id="sysHeld">–</dd>
+              <dt>pick_target</dt><dd id="sysTarget">–</dd>
+              <dt>camera</dt><dd id="sysCamera">–</dd>
+            </dl>
+            <pre class="cli">ros2 topic pub --once /beast_arm/arm_action std_msgs/msg/String "{data: ready_to_pick}"
+ros2 topic pub --once /beast_arm/arm_state/cmd std_msgs/msg/String "{data: pre_pick}"
+ros2 topic pub --once /beast_arm/held_object/size pick_interfaces/msg/ObjectSize "{height_mm: 170, width_mm: 100, depth_mm: 25}"
+ros2 topic pub --once /beast_arm/stop std_msgs/msg/Empty
+ros2 topic echo /beast_arm/status</pre>
+          </div>
+          <div class="card">
+            <div class="title">Keys</div>
+            <div class="keys">
+              <span><kbd>M</kbd> move</span><span><kbd>Space</kbd> detect</span>
+              <span><kbd>R</kbd> recapture</span><span><kbd>D</kbd> top down (--click)</span>
+              <span><kbd>T</kbd> teach (--click)</span><span><kbd>B</kbd> return</span>
+              <span><kbd>N</kbd> navigation</span><span><kbd>P</kbd> pre-pick</span>
+              <span><kbd>F</kbd> cal arms</span><span><kbd>C</kbd> camera</span>
+              <span><kbd>O</kbd> overlay</span><span><kbd>K</kbd> markers</span>
+              <span><kbd>A</kbd> anchor</span><span><kbd>E</kbd> refit</span>
+              <span><kbd>I</kbd> tip check</span>
+              <span><kbd>D</kbd> depth picture</span><span><kbd>V</kbd> picker's view</span>
+              <span><kbd>T</kbd> next target</span><span><kbd>S</kbd> save picture</span>
+              <span><kbd>H</kbd> check now</span>
+              <span><kbd>L</kbd> live / captured</span><span><kbd>Esc</kbd> STOP</span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="log" id="logWrap">
+        <button class="log-head" id="logToggle" aria-expanded="true">
+          <span>Activity</span><span class="chev">⌄</span>
+        </button>
+        <ol class="log-list" id="log"></ol>
+      </div>
+    </aside>
+  </div>
+
+  <div class="base-alert" id="baseAlert" role="alert" hidden>
+    <div class="ba-head"><b>Move the base</b><span id="baseAlertWhy"></span></div>
+    <div class="ba-moves" id="baseAlertMoves"></div>
+    <div class="ba-note" id="baseAlertNote"></div>
+    <div class="ba-actions">
+      <button class="btn" data-action="base_try" title="Check the reach now, as the robot stands">Try now</button>
+      <button class="btn" data-action="base_skip" title="Give up on this box and go on with the next">Skip box</button>
+    </div>
+  </div>
+  <div class="done-banner" id="doneBanner" role="alert" hidden>
+    <div class="done-text"><b id="doneTitle">Pick all done</b><span id="doneText"></span></div>
+    <button class="btn" id="doneClose">OK</button>
+  </div>
+  <div class="toasts" id="toasts" aria-live="assertive"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -75,9 +75,9 @@ def lidar_nodes(context):
     nodes.append(ExecuteProcess(
         cmd=['python3', '/workspaces/isaac_ros-dev/robot/lidar_bridge.py', '--ros-args',
              '-p', 'in_topic:=/l2/cloud', '-p', 'imu_topic:=/l2/imu',
-             '-p', f"mount_xyz:=[{f('lidar_x', -0.028)}, {f('lidar_y', 0.003)}, {f('lidar_z', 0.8829)}]",
-             '-p', f"mount_rpy_deg:=[{f('lidar_roll', 2.2)}, {f('lidar_pitch', 113.4)}, {f('lidar_yaw', 0.8)}]",
-             '-p', f"mount_spin_deg:={f('lidar_spin', 161.3)}",
+             '-p', f"mount_xyz:=[{f('lidar_x', -0.0625)}, {f('lidar_y', 0.0592)}, {f('lidar_z', 0.8666)}]",
+             '-p', f"mount_rpy_deg:=[{f('lidar_roll', 3.19)}, {f('lidar_pitch', 114.16)}, {f('lidar_yaw', -0.13)}]",
+             '-p', f"mount_spin_deg:={f('lidar_spin', 161.30)}",
              '-p', f"tilt_from_imu:={'false' if cfg.get('lidar_tilt', 'measured') != 'imu' else 'true'}",
              '-p', f"octomap_live:={'false' if cfg.get('octomap', 'live') == 'static' else 'true'}"],
         output='screen', additional_env={'PYTHONUNBUFFERED': '1'}, name='lidar_bridge',
@@ -154,17 +154,20 @@ def generate_launch_description():
         # two arms' bases (0.0126, 0.0062, 0.7344), 2.8 mm in front. Turned (2026-11-12, as the
         # user set it in RViz, then levelled on the room against gravity as the D455 measures it in
         # the robot frame -- the robot leans ~5 deg forward -- walls square, 2026-11-12): blue (dome) forward 30 deg below level, red up-forward leaning left, green right
-        DeclareLaunchArgument('lidar_x', default_value='-0.028'),
-        DeclareLaunchArgument('lidar_y', default_value='0.003'),
-        DeclareLaunchArgument('lidar_z', default_value='0.8829'),
-        DeclareLaunchArgument('lidar_roll', default_value='2.2'),
-        DeclareLaunchArgument('lidar_pitch', default_value='113.4',
+        # 2026-11-16T16:55: set by hand with robot/sensor_align.py (live; 76.0 mm / 2.03 deg from the values before).
+        # 2026-11-16T16:58: set by hand with robot/sensor_align.py (live; 38.0 mm / 0.00 deg from the values before).
+        # 2026-11-16T17:20: set by hand with robot/sensor_align.py (live; 8.0 mm / 0.00 deg from the values before).
+        DeclareLaunchArgument('lidar_x', default_value='-0.0625'),
+        DeclareLaunchArgument('lidar_y', default_value='0.0592'),
+        DeclareLaunchArgument('lidar_z', default_value='0.8666'),
+        DeclareLaunchArgument('lidar_roll', default_value='3.19'),
+        DeclareLaunchArgument('lidar_pitch', default_value='114.16',
                               description='deg, + = its top (the dome, blue) tipped forward from upright: '
                                           '120 = the dome 30 deg below level, toward the box'),
-        DeclareLaunchArgument('lidar_yaw', default_value='0.8',
+        DeclareLaunchArgument('lidar_yaw', default_value='-0.13',
                               description='deg, its X turned left of straight ahead (about the '
                                           "robot's vertical; which side of it faces where: lidar_spin)"),
-        DeclareLaunchArgument('lidar_spin', default_value='161.3',
+        DeclareLaunchArgument('lidar_spin', default_value='161.30',
                               description='deg, then turned about its own Z (blue in RViz, the dome '
                                           'axis): which side faces where (with pitch ~120: 180 = red up-forward; '
                                           'less = red turned to the left)'),
@@ -316,13 +319,29 @@ def generate_launch_description():
         declare_vacuum,
         declare_vacuum_port,
         *declare_lidar,
+        DeclareLaunchArgument('level_pitch', default_value='0.0',
+                              description="deg: how far the robot's frame leans against gravity (the "
+                                          "'level' frame RViz looks in; see below)"),
+        DeclareLaunchArgument('level_roll', default_value='0.0'),
         demo_launch,
         cumotion_node,
+        # the boot walk waits for the LiDAR and a filled octomap before anything moves
+        # (boot_pre_pick.py); with lidar:=off, for the camera's map alone
         ExecuteProcess(
             cmd=['python3', '/workspaces/isaac_ros-dev/robot/boot_pre_pick.py'],
             output='screen',
             additional_env={'PYTHONUNBUFFERED': '1'},
-            condition=IfCondition(LaunchConfiguration('boot_pre_pick')),
+            condition=IfCondition(PythonExpression([
+                "'", LaunchConfiguration('boot_pre_pick'), "' == 'true' and '",
+                LaunchConfiguration('lidar'), "' != 'off'"])),
+        ),
+        ExecuteProcess(
+            cmd=['python3', '/workspaces/isaac_ros-dev/robot/boot_pre_pick.py', '--without-lidar'],
+            output='screen',
+            additional_env={'PYTHONUNBUFFERED': '1'},
+            condition=IfCondition(PythonExpression([
+                "'", LaunchConfiguration('boot_pre_pick'), "' == 'true' and '",
+                LaunchConfiguration('lidar'), "' == 'off'"])),
         ),
         # It catches every serial error itself (unplugged: it reopens the port);
         # respawned only if it dies anyway, else the vacuum would stay as it was.
@@ -341,6 +360,18 @@ def generate_launch_description():
     # (the old 4d:=true TF bridge, robot_tf_bringup, is not started any more: it hung
     # unilidar_lidar 25 cm in front of base_link, which Unitree's stock L2 driver also parents)
     launch_nodes.append(OpaqueFunction(function=lidar_nodes))
+
+    # 'level': a frame for LOOKING (RViz's Fixed Frame), with gravity straight down. The robot's own
+    # frame ('world') leans against the room: the D455's accelerometer through its calibrated TF has
+    # up at (-0.092, -0.004, 0.996) in it (5.3 deg), and the ceiling in the L2's cloud is tilted
+    # 4.6 deg the same way (2026-11-13). Nothing plans in 'level': MoveIt, the octomap, the walls and
+    # the pick stack stay in 'world'. level_pitch / level_roll (deg) turn world inside it; 0 0 = as before.
+    launch_nodes.append(Node(
+        package='tf2_ros', executable='static_transform_publisher', name='level_frame',
+        arguments=['--x', '0', '--y', '0', '--z', '0',
+                   '--roll', PythonExpression(['str(', LaunchConfiguration('level_roll'), ' * 0.017453293)']),
+                   '--pitch', PythonExpression(['str(', LaunchConfiguration('level_pitch'), ' * 0.017453293)']),
+                   '--yaw', '0', '--frame-id', 'level', '--child-frame-id', 'world']))
 
 
     # 3. Add the RealSense Camera Node

@@ -15,6 +15,7 @@ import warnings
 import numpy as np
 import yaml
 from control_msgs.action import GripperCommand
+from control_msgs.msg import DynamicJointState
 from geometry_msgs.msg import Pose, PoseStamped
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (AllowedCollisionEntry, AllowedCollisionMatrix,
@@ -33,7 +34,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image, JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import String
+from std_msgs.msg import String, UInt32
 from std_srvs.srv import Empty, Trigger
 from tf2_ros import Buffer, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -70,6 +71,10 @@ PIECES_SLOTS = 14                           # spheres reserved per pieces link i
 # spheres on the reserved openarm_<arm>_tool link (openarm.yml), off with no tool.
 HAND_TCP_Z = 0.08                           # hand -> hand_tcp along z (openarm.urdf)
 TOOL_DIAMETER = 0.030                       # the left gripper is one 30 mm cylinder to its tip
+# The arms whose hand collision is no wider than that tool (a coaxial cylinder,
+# robot/openarm.urdf), so press_touching may exempt the hand (2026-11-17 review:
+# the right hand is the hand.stl plate, 57 x 168 mm)
+HAND_COAXIAL_ARMS = ('left',)
 TOOL_SLOTS = 4                              # spheres reserved per tool link in openarm.yml
 
 
@@ -97,6 +102,28 @@ HELD_SLOTS = 32
 
 def held_id(arm):
     return f'held_{arm}'
+
+
+def hand_press_ok(node, arm):
+    """May this arm's hand be exempt in a coaxial press at all: only if it is no
+    wider than the exempt tool in front of it, so the hand sweeps only where the
+    tool went first -- the left arm (its hand collision is a 30 mm cylinder,
+    robot/openarm.urdf) with its 30 mm tool on (node.args.tools, tools.yaml). The
+    right hand is the 57 x 168 mm hand.stl plate and has no tool: pressed with it
+    exempt, its wings swept up to ~5 cm of unchecked space beside the line
+    (2026-11-17 review)."""
+    if arm not in HAND_COAXIAL_ARMS:
+        return False
+    tool = (getattr(node.args, 'tools', None) or {}).get(arm) or {}
+    return bool(tool.get('on')) and float(tool.get('length', TOOL_DIAMETER) or 0.0) > 0.0
+
+
+def _gate(node):
+    """The node's _scene_gate (see ClickToMove.__init__); made on first use for a
+    node built without __init__ (the offline test harnesses)."""
+    gate = node.__dict__.get('_scene_gate')
+    return gate if gate is not None else node.__dict__.setdefault('_scene_gate',
+                                                                   threading.RLock())
 
 
 def held_geometry(size_hwd, tip_offset, rot_tcp_world):
@@ -163,6 +190,42 @@ START_MOVE_M = 0.003      # ... nor before the arm is rolling: moved this far, a
 STUCK_S = 0.35
 STUCK_M = 0.001
 
+# Lead-ins (execute(lead=True)): a plan made a moment ago starts where the arm
+# WAS; the arm is a few hundredths of a radian off that by the time it runs
+# (still settling after a "successful" leg, the integral overshooting). A
+# fresh plan executed from a stale start was refused with code -4 or made the
+# controller jump (2026-11-16 run, 17:21-17:40). Under LEAD_IN_FROM the start
+# is taken as it is; up to --lead-in-max (never over LEAD_IN_CAP, whatever the
+# flag says) a short joint move onto the plan's first point is put in front --
+# only when every state of that move is collision-checked clear; further off
+# the plan is refused and planned again from where the arm is (2026-11-17).
+LEAD_IN_FROM = 0.002
+LEAD_IN_CAP = 0.10
+# A trajectory's last point should not move. cuRobo's never ends at exactly
+# 0 rad/s, and a line cut at a joint jump ended mid-motion: the controller
+# (allow_nonzero_velocity_at_trajectory_end) ends such a move with a jolt, and
+# with a velocity command to the motors it would carry on past the end
+# (2026-11-17: zeroed in execute(), warned over END_VELOCITY_WARN rad/s).
+END_VELOCITY_WARN = 0.05
+# The arrival of every executed trajectory, per joint, at +0/+0.5/+1/+2 s
+# (execute(), 2026-11-17): which joints carry the error, and whether they
+# creep in or overshoot -- the logs only ever had the worst joint.
+ARRIVAL_TIMES = (0.0, 0.5, 1.0, 2.0)
+ARRIVAL_KEEP = 500
+
+
+def joint_error_text(vec):
+    """Per-joint error (rad) as one short log string in mrad: 'j1 +12 j2 -3 ...'
+    ('n/a' without one)."""
+    if vec is None:
+        return 'n/a'
+    return ' '.join(f'j{i + 1} {1000.0 * float(v):+.0f}' if v is not None else f'j{i + 1} ?'
+                    for i, v in enumerate(vec))
+
+
+def _seconds(point):
+    return point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
+
 
 class ClickToMove(Node):
     def __init__(self, args):
@@ -174,6 +237,15 @@ class ClickToMove(Node):
         self.halt = threading.Event()
         self.active_goals = {}          # id(handle) -> (handle, arms) (handles are not hashable)
         self._acm_lock = threading.RLock()  # the collision matrix: read, change, write back
+        # The octomap exemptions live in move_group's ONE collision matrix: while a
+        # thread holds one (fingers_touching, press_touching, held_leaving), no other
+        # thread's validity check, IK, straight line or OMPL plan may run -- it would
+        # be answered under that exemption (2026-11-17 review: PICK ALL's look-ahead
+        # checked the next box under press_touching while the touch checked its drop
+        # legs: the hand, tool and held box unchecked against the map). Held for an
+        # exemption's whole life and for each such question; re-entrant, so a thread
+        # asks freely inside its own exemption. Taken before _acm_lock, never after.
+        self._scene_gate = threading.RLock()
         # one MoveGroup goal at a time: PICK ALL plans the next box while the arm
         # drops the last one, and cuMotion aborts a second plan ("Planner is
         # busy") -- MoveIt 2.5.9 itself runs two goals side by side (2026-11-05)
@@ -214,6 +286,35 @@ class ClickToMove(Node):
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.marker_pub = self.create_publisher(MarkerArray, '/click_to_move/marker', latched)
         self.target_pub = self.create_publisher(PoseStamped, '/click_to_move/target', 1)
+        # Which map a check was made against (2026-11-17): the 17:35 pick of
+        # 2026-11-16 flew a plan checked at 17:32, after three map rebuilds with
+        # the LiDAR mount moved. Bumped on every new /octomap_gater/version
+        # (each refresh, by whoever asked: sensor_align.py too) and by
+        # rebuild_octomap() itself (octomap:=live has no gater). A count of
+        # changes seen here, not the gater's own number -- that restarts at 0
+        # with the gater -- so only "same or not" means anything.
+        self.map_version = 0
+        self._gater_version = None
+        self.create_subscription(UInt32, '/octomap_gater/version', self._on_map_version, latched,
+                                 callback_group=cb)
+        # Each motor's own status (the driver's "status" state interface, on
+        # /dynamic_joint_states): logged when it changes. Nothing decides from
+        # the codes yet -- the Damiao meanings are not confirmed -- but a change
+        # since the start of a touch is reason enough to stop (2026-11-17; the
+        # 463 mrad hold at 17:39 of 2026-11-16 had no motor status to explain it).
+        self.motor_status = {}            # joint -> last status value
+        self.motor_status_changes = {}    # joint -> how many times it changed
+        self._status_warned = {}
+        self.create_subscription(DynamicJointState, '/dynamic_joint_states',
+                                 self._on_dynamic_joints, 10, callback_group=cb)
+        # What each arm's controller was last told to hold: execute()'s final
+        # point, hold_here()'s measured joints, the pose move_joints() reached;
+        # None while a goal runs or after one failed (2026-11-17: pick mode
+        # told from this, not from where the sagging arm settled).
+        self.last_goal = {}
+        self.last_settle = None           # settle(): {'worst', 'vec', 'status', ...}
+        self._goal_seq = {}               # arm -> goals sent (an arrival log stops at the next)
+        self._arrival_lock = threading.Lock()
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -265,6 +366,48 @@ class ClickToMove(Node):
     def latest(self):
         with self.lock:
             return self.color, self.depth, self.info
+
+    def _on_map_version(self, msg):
+        if msg.data != self._gater_version:          # (any new value: a new map)
+            self._gater_version = msg.data
+            self.bump_map_version()
+
+    def bump_map_version(self):
+        """The octomap is (being) rebuilt: checks made before now are stale."""
+        with self.lock:
+            self.map_version += 1
+            return self.map_version
+
+    def _on_dynamic_joints(self, msg):
+        now = time.monotonic()
+        for name, iv in zip(msg.joint_names, msg.interface_values):
+            names = list(iv.interface_names)
+            if 'status' not in names:
+                continue
+            value = float(iv.values[names.index('status')])
+            old = self.motor_status.get(name)
+            if old is not None and (value == old or (math.isnan(value) and math.isnan(old))):
+                continue
+            self.motor_status[name] = value
+            if old is None:
+                continue
+            self.motor_status_changes[name] = self.motor_status_changes.get(name, 0) + 1
+            if now - self._status_warned.get(name, -10.0) > 1.0:     # (a flicker: once a second)
+                self._status_warned[name] = now
+                self.get_logger().warn(f'{name}: motor status {old:g} -> {value:g}')
+
+    def arm_status(self, arm):
+        """This arm's 7 motor status values (None where unknown), or None if no
+        motor reports one (fake hardware). Compare two of them to see a change."""
+        out = [self.motor_status.get(n) for n in arm_joints(arm)]
+        return None if all(v is None for v in out) else out
+
+    def _on(self, name, default=True):
+        """An on/off option from args (a bool, or 'on'/'off'), `default` if unset."""
+        value = getattr(self.args, name, default)
+        if isinstance(value, str):
+            return value.strip().lower() not in ('off', 'false', 'no', '0', '')
+        return bool(value)
 
     def _on_lidar_status(self, msg):
         try:
@@ -516,6 +659,25 @@ class ClickToMove(Node):
         ray /= max(np.linalg.norm(ray), 1e-9)
         up = np.array([0.0, 0.0, 1.0])
         out = []
+        # FIRST, when the picker measured the box's face (pick_normal, world): square on
+        # to it, level -- straight along its normal (--face-first, 2026-11-13). The cup
+        # seats flat, the tool passes the neighbours' faces at a right angle and never
+        # sweeps across them, and it is usually the one that works: with only the
+        # camera's line of sight first, the picks that went were found as "turn -15 /
+        # -30" after two rings of failures (7-30 s of checks, 2026-11-13).
+        normal = getattr(self, 'pick_normal', None)
+        if normal is not None and getattr(self.args, 'face_first', True):
+            into = np.array(normal, dtype=float)
+            into[2] = 0.0
+            if np.linalg.norm(into) > 0.5:
+                into /= np.linalg.norm(into)
+                if into @ ray < 0:
+                    into = -into                     # into the face, away from the camera
+                if into @ ray > math.cos(math.radians(50.0)):   # (else: not this face's)
+                    for deg in (0, 90, -90, 180):
+                        out.append((f'square on roll {deg:+d}', into,
+                                    quat_from_matrix(tool_frame_along(into, math.radians(deg))),
+                                    -1))
         for tilt, base in ((0, 0), (10, 3), (20, 4)):
             for ring, yaw in ((0, 0), (1, 15), (1, -15), (2, 30), (2, -30)):
                 axis = rot_about(up, math.radians(yaw)) @ ray
@@ -604,34 +766,40 @@ class ClickToMove(Node):
         """Clear the map and let the gater pass fresh depth frames into it."""
         if self.clear_client.wait_for_service(timeout_sec=2.0):
             self.wait(self.clear_client.call_async(Empty.Request()), 5.0)
+        self.bump_map_version()                      # (no gater: this is all that says so)
         if not self.refresh_client.wait_for_service(timeout_sec=2.0):
             return 'octomap cleared; no /octomap_gater (octomap:=live refills it by itself)'
         result = self.wait(self.refresh_client.call_async(Trigger.Request()), 5.0)
         # The gater passes its frames at camera rate; give move_group a moment
         # to integrate them before anything is checked against the map.
         time.sleep(self.args.octomap_settle)
+        self.bump_map_version()                      # and again once it is filled
         return f'octomap rebuilt ({result.message})' if result else 'octomap refresh timed out'
 
-    def allow_grippers_in_octomap(self, touching=None, held_free=None):
+    def allow_grippers_in_octomap(self, touching=None, held_free=None, hand_free=None):
         """What may touch <octomap>: the links that never move (stand, camera,
         arm bases) always; and the two fingers of the arm `touching`, only
         while it makes contact (fingers_touching()). Nothing else -- the
         hand and fingers used to be exempt all the time, so the checks let
         the gripper pass through OTHER objects on the way to the one clicked
-        (2026-10-09).
+        (2026-10-09). The hand of the arm `hand_free` too, only inside a
+        coaxial press (press_touching(), 2026-11-17).
 
         The matrix is read, extended and sent back whole: a diff carrying an
         ACM replaces it wholesale, and a partial one would throw away every
         disable_collisions entry from the SRDF (see pick_place_orchestrator's
         current_acm).
         """
-        with self._acm_lock:                         # one read-modify-write at a time
-            return self._allow_grippers_in_octomap(touching, held_free)
+        with _gate(self), self._acm_lock:      # one read-modify-write at a time
+            return self._allow_grippers_in_octomap(touching, held_free, hand_free)
 
-    def _allow_grippers_in_octomap(self, touching=None, held_free=None):
+    def _allow_grippers_in_octomap(self, touching=None, held_free=None, hand_free=None):
         if touching is None:                         # an outer fingers_touching() holds
             touching = next((a for a, n in self.__dict__.get('_touch_hold', {}).items()
                              if n > 0), None)
+        if hand_free is None:                        # an outer press_touching() holds
+            hand_free = next((a for a, n in self.__dict__.get('_press_hold', {}).items()
+                              if n > 0), None)
         if not (self.scene_query.wait_for_service(timeout_sec=5.0)
                 and self.scene_apply.wait_for_service(timeout_sec=5.0)):
             return False, 'planning scene services unavailable; gripper not exempted'
@@ -665,6 +833,13 @@ class ClickToMove(Node):
         # it there until the next capture (held_leaving())
         if held_free:
             fingers.append(held_id(held_free))
+        # the hand itself, in a straight press along the tool (press_touching):
+        # its 30 mm cylinder ends 22.75 mm behind the tip, so at 3-20 mm past
+        # the face it met the face's own 2 cm voxels and the press "did not
+        # solve" (17:35:53, 2026-11-16) -- coaxial, it sweeps only space the
+        # exempt tool swept first
+        if hand_free:
+            fingers.append(f'openarm_{hand_free}_hand')
         # the tools and held boxes too: checked like the gripper, free only at
         # the contact
         for name in (tool_id('left'), tool_id('right'), held_id('left'), held_id('right')):
@@ -693,7 +868,8 @@ class ClickToMove(Node):
             return False, 'move_group refused the gripper/octomap exemption'
         return True, ('stand, camera and arm bases may touch the octomap'
                       + (f'; the {touching} fingers too, for the contact' if touching else
-                         '; the arms and grippers are all checked'))
+                         '; the arms and grippers are all checked')
+                      + (f'; the {hand_free} hand too, for the press' if hand_free else ''))
 
     @contextlib.contextmanager
     def fingers_touching(self, arm):
@@ -701,31 +877,107 @@ class ClickToMove(Node):
         few cm onto the clicked surface). Revoked on the way out, always --
         but not while an outer one still holds (nested: an approach point
         closer than NEAR keeps the tool exempt for the whole touch)."""
-        hold = self.__dict__.setdefault('_touch_hold', {})
-        with self._acm_lock:
-            hold[arm] = hold.get(arm, 0) + 1
-        try:
-            ok, message = self.allow_grippers_in_octomap(touching=arm)
-            if not ok:
-                self.get_logger().warn(f'{arm} fingers: {message}')
-            yield ok
-        finally:
+        with _gate(self):                       # (exemptions one thread at a time)
+            hold = self.__dict__.setdefault('_touch_hold', {})
             with self._acm_lock:
-                hold[arm] -= 1
-            self._revoke()
+                hold[arm] = hold.get(arm, 0) + 1
+            try:
+                ok, message = self.allow_grippers_in_octomap(touching=arm)
+                if not ok:
+                    self.get_logger().warn(f'{arm} fingers: {message}')
+                yield ok
+            finally:
+                with self._acm_lock:
+                    hold[arm] -= 1
+                self._revoke()
+
+    def hand_press_ok(self, arm):
+        """May this arm's hand be exempt in a coaxial press at all (hand_press_ok())."""
+        return hand_press_ok(self, arm)
+
+    @contextlib.contextmanager
+    def press_touching(self, arm):
+        """fingers_touching(), and this arm's HAND may touch the octomap too:
+        for the straight press along the tool only -- the caller makes sure it
+        is one (press_is_coaxial()). Its own nesting count; revoked on the way
+        out like fingers_touching (an outer fingers_touching keeps the fingers,
+        not the hand). --no-press-hand-free, or an arm whose hand is wider than
+        its tool (hand_press_ok): just fingers_touching (2026-11-17)."""
+        with _gate(self):                       # (exemptions one thread at a time)
+            if not self._on('press_hand_free', True) or not hand_press_ok(self, arm):
+                with self.fingers_touching(arm) as ok:
+                    yield ok
+                return
+            hold = self.__dict__.setdefault('_touch_hold', {})
+            press = self.__dict__.setdefault('_press_hold', {})
+            with self._acm_lock:
+                hold[arm] = hold.get(arm, 0) + 1
+                press[arm] = press.get(arm, 0) + 1
+            try:
+                ok, message = self.allow_grippers_in_octomap(touching=arm, hand_free=arm)
+                if not ok:
+                    self.get_logger().warn(f'{arm} press: {message}')
+                yield ok
+            finally:
+                with self._acm_lock:
+                    hold[arm] -= 1
+                    press[arm] -= 1
+                self._revoke()
+
+    def press_is_coaxial(self, arm, target, quat, max_deg=None, max_mm=None, near=0.03,
+                         past=0.02):
+        """Is a straight press of hand_tcp from where it is now to `target`
+        (world, m) at `quat` along the tool's own axis -- so that the hand,
+        exempt in press_touching(), only sweeps where the exempt tool went
+        first? (ok, why). Within max_deg (--press-coax-deg) the line and the
+        commanded tool z, and the measured tool z and the commanded one; within
+        max_mm (--press-coax-mm) of the line sideways; no longer than
+        near + past + 5 mm (near, past in m: the start short of the face, the
+        distance past it). Not coaxial if the tool cannot be seen (no tf)."""
+        max_deg = float(getattr(self.args, 'press_coax_deg', 3.0) if max_deg is None else max_deg)
+        max_mm = float(getattr(self.args, 'press_coax_mm', 3.0) if max_mm is None else max_mm)
+        if not hand_press_ok(self, arm):
+            return False, f'the {arm} hand is wider than its tool: never exempt (fingers only)'
+        m = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+        if m is None:
+            return False, 'no tf for the tool'
+        z = matrix_from_quat(*quat)[:, 2]
+        z = z / max(float(np.linalg.norm(z)), 1e-9)
+        v = np.asarray(target, float) - m[:3, 3]
+        length = float(np.linalg.norm(v))
+        along = float(v @ z)
+        side = float(np.linalg.norm(v - along * z))
+        angle = (math.degrees(math.acos(max(-1.0, min(1.0, along / length))))
+                 if length > 0.0005 else 0.0)          # (already there: no direction)
+        tilt = math.degrees(math.acos(max(-1.0, min(1.0, float(m[:3, 2] @ z)))))
+        longest = float(near) + float(past) + 0.005
+        numbers = (f'{angle:.1f} deg off the tool axis, {1000 * side:.1f} mm sideways, tool '
+                   f'{tilt:.1f} deg off, {1000 * length:.0f} mm long')
+        if length > 0.0005 and along <= 0.0:
+            return False, f'not coaxial: the press goes backwards ({numbers})'
+        if angle > max_deg:
+            return False, f'not coaxial: {numbers} (max {max_deg:g} deg)'
+        if side > max_mm / 1000.0:
+            return False, f'not coaxial: {numbers} (max {max_mm:g} mm sideways)'
+        if tilt > max_deg:
+            return False, f'not coaxial: {numbers} (tool max {max_deg:g} deg)'
+        if length > longest:
+            return False, f'not coaxial: {numbers} (max {1000 * longest:.0f} mm long)'
+        return True, f'coaxial: {numbers}'
 
     @contextlib.contextmanager
     def held_leaving(self, arm):
         """While inside: the box this arm holds may overlap the octomap -- the
         straight way out of the spot it was picked from, where the map still
         has it. Revoked on the way out, always."""
-        ok, message = self.allow_grippers_in_octomap(held_free=arm)
-        if not ok:
-            self.get_logger().warn(f'{arm} held box: {message}')
-        try:
-            yield ok
-        finally:
-            self._revoke()
+        with _gate(self):                       # (exemptions one thread at a time)
+            ok, message = self.allow_grippers_in_octomap(held_free=arm)
+            if not ok:
+                self.get_logger().warn(f'{arm} held box: {message}')
+            try:
+                yield ok
+            finally:
+                self._revoke()
 
     def _revoke(self):
         """Back to the octomap checks as they were before an exemption (an
@@ -834,24 +1086,71 @@ class ClickToMove(Node):
         the planning scene as it is now -- the held box included? (A way back
         that is replayed rather than planned was checked without the box.)
         None if move_group cannot say."""
-        if not hasattr(self, '_validity'):
-            self._validity = self.create_client(GetStateValidity, '/check_state_validity')
-        if not self._validity.wait_for_service(timeout_sec=3.0):
-            return None
         jt = trajectory.joint_trajectory
         points = list(jt.points)[::every] + list(jt.points)[-1:]
-        for p in points:
-            req = GetStateValidity.Request()
-            req.group_name = f'{arm}_arm'
-            req.robot_state = RobotState(is_diff=True)
-            req.robot_state.joint_state.name = list(jt.joint_names)
-            req.robot_state.joint_state.position = [float(v) for v in p.positions]
-            res = self.wait(self._validity.call_async(req), 3.0)
+        return self._states_valid(f'{arm}_arm', list(jt.joint_names),
+                                  [p.positions for p in points])
+
+    def _validity_client(self):
+        if not hasattr(self, '_validity'):
+            self._validity = self.create_client(GetStateValidity, '/check_state_validity')
+        return self._validity if self._validity.wait_for_service(timeout_sec=3.0) else None
+
+    def _state_validity(self, group, names, positions):
+        """move_group's GetStateValidity for these joints (the rest of the
+        robot, the tool and a held box as they are now), or None."""
+        client = self._validity_client()
+        if client is None:
+            return None
+        req = GetStateValidity.Request()
+        req.group_name = group
+        req.robot_state = RobotState(is_diff=True)
+        req.robot_state.joint_state.name = list(names)
+        req.robot_state.joint_state.position = [float(v) for v in positions]
+        with _gate(self):                       # (not under another thread's exemption)
+            return self.wait(client.call_async(req), 3.0)
+
+    def _states_valid(self, group, names, states):
+        """True if every state is valid, False at the first that is not, None
+        if move_group cannot say."""
+        for q in states:
+            res = self._state_validity(group, names, q)
             if res is None:
                 return None
             if not res.valid:
                 return False
         return True
+
+    def segment_is_clear(self, arm, q_from, q_to, step=0.01):
+        """Is the straight joint-space move from q_from to q_to (this arm's 7
+        joints) clear, every `step` rad of the joint that moves most, the end
+        included? True/False, or None if move_group cannot say. The start is
+        not asked: the arm is there already (a lead-in from a state in the map
+        would otherwise never be allowed off it -- every next state is asked).
+        For lead-ins (execute(lead=True)), 2026-11-17: before, up to 0.06 rad
+        was led in unchecked."""
+        return self._segment_clear(f'{arm}_arm', arm_joints(arm), q_from, q_to, step)
+
+    def _segment_clear(self, group, names, q_from, q_to, step=0.01):
+        a, b = np.asarray(q_from, float), np.asarray(q_to, float)
+        if a.shape != b.shape or a.shape[0] != len(names):
+            return None
+        n = max(1, int(math.ceil(float(np.max(np.abs(b - a))) / max(step, 1e-4) - 1e-9)))
+        return self._states_valid(group, names, [a + (b - a) * (k / n) for k in range(1, n + 1)])
+
+    def state_contacts(self, arm, joints):
+        """What collides at these joints of this arm, for the logs: [(body 1,
+        body 2, (x, y, z) world)] -- [] if the state is valid, None if
+        move_group cannot say (2026-11-17: the refused lines in only ever said
+        "blocked by something in the map", never by what)."""
+        res = self._state_validity(f'{arm}_arm', arm_joints(arm), joints)
+        if res is None:
+            return None
+        if res.valid:
+            return []
+        return [(c.contact_body_1, c.contact_body_2,
+                 (float(c.position.x), float(c.position.y), float(c.position.z)))
+                for c in res.contacts]
 
     def refresh_walls(self, optical, ahead=None, x_min=None, bounds=None):
         """After a capture: walls in the planning scene where the camera cannot
@@ -1142,7 +1441,7 @@ class ClickToMove(Node):
             time.sleep(0.1)
         return False, 'robot_state_publisher took the URDF but tf did not change'
 
-    def settle(self, arm, expected, timeout=None):
+    def settle(self, arm, expected, timeout=None, min_wait=0.0, tol=0.002, stopped_below=None):
         """Wait for the arm to reach `expected` joints, or to stop; return the
         worst joint error, rad.
 
@@ -1154,30 +1453,53 @@ class ClickToMove(Node):
         a 3 s timeout the arm was often still creeping when measured, and
         correcting on top of the creep made the corrections diverge (12.9 ->
         7.3 -> 10.0 -> 15.7 mm, 2026-10-06).
+
+        2026-11-17: `tol` is the "arrived" band (2 mrad as before); with
+        `min_wait` s the "stopped" exit is ignored until then -- a joint held
+        by friction looks stopped, then moves again once the integral breaks
+        it free. What it found is kept in self.last_settle: {'worst' rad,
+        'vec' (measured - expected per joint, rad, or None), 'status' (how it
+        ended: 'arrived', 'stopped', 'timeout' or 'no joints'), 'seconds',
+        'motor' (arm_status() at the end)}; joint_error_text(vec) for the log.
+
+        2026-11-17 17:40: with `stopped_below` (rad), "stopped" counts only while every
+        joint is within it: j1 stops ~30 mrad short on friction, sticks, then slips on
+        as the integral grows -- a stick read as "stopped" measured it too early.
         """
         timeout = self.args.settle_time if timeout is None else timeout
-        deadline = time.monotonic() + timeout
-        worst = None
+        t_start = time.monotonic()
+        deadline = t_start + timeout
+        worst, vec, status = None, None, 'no joints'
         history = collections.deque()
         while True:
             now = time.monotonic()
             here = self.arm_positions(arm)
             if here is not None and expected is not None:
-                worst = max(abs(a - b) for a, b in zip(here, expected))
-                if worst < 0.002:
+                vec = [float(a - b) for a, b in zip(here, expected)]
+                worst = max(abs(v) for v in vec)
+                if worst < tol:
+                    status = 'arrived'
                     break
             if here is not None:
                 history.append((now, here))
                 while len(history) > 1 and now - history[1][0] >= 0.5:
                     history.popleft()
-                if now - history[0][0] >= 0.5 and max(
-                        abs(a - b) for a, b in zip(here, history[0][1])) < 0.0005:
+                if now - history[0][0] >= 0.5 and now - t_start >= min_wait and max(
+                        abs(a - b) for a, b in zip(here, history[0][1])) < 0.0005 and (
+                        stopped_below is None or worst is None or worst < stopped_below):
+                    status = 'stopped'
                     break
             if now > deadline:
+                status = 'timeout' if here is not None else 'no joints'
                 break
             time.sleep(0.05)
+        self.last_settle = {'arm': arm, 'worst': worst, 'vec': vec, 'status': status,
+                            'seconds': round(time.monotonic() - t_start, 2),
+                            'motor': self.arm_status(arm)}
         time.sleep(0.15)                 # robot_state_publisher's tf catches up
         return worst
+
+    joint_error_text = staticmethod(joint_error_text)   # (node.joint_error_text(vec) too)
 
     @contextlib.contextmanager
     def planning_cache(self):
@@ -1201,7 +1523,10 @@ class ClickToMove(Node):
             return None if got is TIMED_OUT else got
         held = tuple(sorted(a for a, n in self.__dict__.get('_touch_hold', {}).items()
                             if n > 0))                   # what may touch the octomap
-        key = (kind, held) + key
+        # (the hand too, in press_touching: a fingers-only answer is not one for a press)
+        pressed = tuple(sorted(a for a, n in self.__dict__.get('_press_hold', {}).items()
+                               if n > 0))
+        key = (kind, held, pressed) + key
         rec = stats.setdefault(kind, [0, 0, 0.0])
         rec[0] += 1
         if key in cache:
@@ -1228,6 +1553,10 @@ class ClickToMove(Node):
         ik.ik_link_name = f'openarm_{arm}_hand_tcp'
         ik.avoid_collisions = True
         ik.timeout.nanosec = int(0.05 * 1e9)       # solvable poses solve in a few ms; failures cost the whole timeout
+        # A diff on the current state: without it MoveIt clears the attached
+        # bodies (conversions.cpp, robotStateMsgToRobotState), so every IK was
+        # solved without the tool and the held box (2026-11-17)
+        ik.robot_state.is_diff = True
         ik.robot_state.joint_state.name = arm_joints(arm)
         ik.robot_state.joint_state.position = [float(v) for v in seed]
         pose = PoseStamped()
@@ -1236,7 +1565,8 @@ class ClickToMove(Node):
         (pose.pose.orientation.x, pose.pose.orientation.y,
          pose.pose.orientation.z, pose.pose.orientation.w) = map(float, quat)
         ik.pose_stamped = pose
-        result = self.wait(self.ik_client.call_async(req), 3.0)
+        with _gate(self):                       # (not under another thread's exemption)
+            result = self.wait(self.ik_client.call_async(req), 3.0)
         if result is None:
             self.require_move_group()
             return TIMED_OUT
@@ -1368,7 +1698,8 @@ class ClickToMove(Node):
             (target.orientation.x, target.orientation.y,
              target.orientation.z, target.orientation.w) = map(float, q)
             req.waypoints.append(target)
-        result = self.wait(self.cartesian_client.call_async(req), 10.0)
+        with _gate(self):                       # (not under another thread's exemption)
+            result = self.wait(self.cartesian_client.call_async(req), 10.0)
         if result is None:
             self.require_move_group()
             return TIMED_OUT
@@ -1386,6 +1717,11 @@ class ClickToMove(Node):
                                        f'at step {k}/{n}; cut there')
                 del points[k:]
                 fraction *= (k - 1) / max(1, n - 1)      # the share of the line before it
+                # the new end was a point mid-line: it must not move on (2026-11-17)
+                last = points[-1] if points else None
+                if last is not None:
+                    last.velocities = [0.0] * len(last.velocities)
+                    last.accelerations = [0.0] * len(last.accelerations)
                 break
         final = None
         if points:
@@ -1417,7 +1753,14 @@ class ClickToMove(Node):
         The way back is then the way in -- already checked, and nothing to
         plan (cuMotion's optimiser can fail the reverse of a move it just
         planned, near the edge of reach: 3/3 in simulation, 2026-10-07).
-        False if the arm is not near the path's end, or it did not run."""
+        False if the arm is not near the path's end, or it did not run.
+
+        2026-11-17 review: the lead-in onto the path's end obeys the rule every
+        other lead-in does (execute(lead=True)): at most --lead-in-max (never over
+        LEAD_IN_CAP), and only if segment_is_clear() says True -- else False, and
+        the caller plans the way back from where the arm is. It used to lead in
+        up to 0.4 rad unchecked; after a refused approach or a bad arrival that
+        drove the arm onto the approach pose (toward the box) before coming back."""
         jt = trajectory.joint_trajectory
         if not jt.points:
             return False
@@ -1429,8 +1772,21 @@ class ClickToMove(Node):
         seconds = lambda p: p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
         end = np.array(jt.points[-1].positions)
         gap = float(np.max(np.abs(np.array(now) - end)))
-        if gap > 0.4:                # TEACH nudges can move it ~0.3 rad off the path
+        limit = getattr(self.args, 'lead_in_max', LEAD_IN_CAP)
+        limit = min(float(LEAD_IN_CAP if limit is None else limit), LEAD_IN_CAP)
+        if gap > limit:
+            self.get_logger().warn(f'{label}: the arm is {gap:.3f} rad off the path it came '
+                                   f'(lead-in max {limit:.2f}) - not retraced, planned instead')
             return False
+        if gap > 0.002:
+            arms = [a for a in ('left', 'right') if any(f'_{a}_' in n for n in names)]
+            clear = self._segment_clear(f'{arms[0]}_arm' if arms else '', names, now, end)
+            if clear is not True:
+                self.get_logger().warn(f'{label}: the way onto the path it came ({gap:.3f} rad) '
+                                       + ('is not clear' if clear is False
+                                          else 'cannot be checked')
+                                       + ' - not retraced, planned instead')
+                return False
         lead = max(0.3, gap / 0.3) if gap > 0.002 else 0.0     # <= 0.3 rad/s onto the path
         scale = min(1.0, max(0.05, float(scale)))
         total = seconds(jt.points[-1]) / scale
@@ -1543,6 +1899,7 @@ class ClickToMove(Node):
         p.time_from_start.nanosec = 50_000_000       # 50 ms: from where it is, so no jump
         jt.points.append(p)
         self.hold_pubs[arm].publish(jt)
+        self.last_goal[arm] = list(p.positions)      # what it holds now (2026-11-17)
         return True
 
     def stop_motion(self):
@@ -1566,34 +1923,166 @@ class ClickToMove(Node):
             self.halt.clear()
             self.get_logger().info('STOP cleared: moves allowed again')
 
-    def execute(self, trajectory, label, timeout=60.0, watch=None):
+    def execute(self, trajectory, label, timeout=60.0, watch=None, lead=False, max_lead=None):
         """Execute a planned trajectory through move_group. (ok, stopped)
 
         `watch()` is polled every 10 ms while it runs; when it returns True
         the goal is cancelled -- the controller then holds where the arm is --
         and (True, True) is returned. That is how a guarded move stops on
         contact.
+
+        2026-11-17: the last point's velocities and accelerations are always
+        made 0 (in the trajectory given). lead=True: for a plan that starts
+        where the arm WAS -- if the arm is more than LEAD_IN_FROM off its first
+        point, a lead-in (lead_in()) onto it, only up to max_lead rad
+        (--lead-in-max, never over LEAD_IN_CAP) and only if segment_is_clear()
+        says True; otherwise refused. guarded_line() never leads in (its
+        timing starts with the line). Once it has run: self.last_goal[arm] is
+        its last point, and the arrival is logged (arrivals.jsonl).
         """
+        ok, stopped, _code, _why = self._execute(trajectory, label, timeout, watch, lead,
+                                                 max_lead)
+        return ok, stopped
+
+    def _execute(self, trajectory, label, timeout=60.0, watch=None, lead=False, max_lead=None):
+        """execute(), and the MoveIt code and why it ended: (ok, stopped, code,
+        why) -- why one of 'done', 'contact', 'stop', 'lead', 'rejected',
+        'timeout', 'failed'."""
+        failure = MoveItErrorCodes.FAILURE
         if self.halt.is_set():
             self.get_logger().error(f'{label}: STOP is on - not moving')
-            return False, False
+            return False, False, failure, 'stop'
+        jt = trajectory.joint_trajectory
+        names = list(jt.joint_names)
+        arms = [a for a in ('left', 'right') if any(f'_{a}_' in n for n in names)]
+        if jt.points:
+            self._zero_end(jt, label)
+        if lead and jt.points:
+            led, why = self._with_lead(trajectory, label, names, arms, max_lead)
+            if led is None:
+                self.get_logger().error(f'{label}: {why} - not moving')
+                return False, False, MoveItErrorCodes.CONTROL_FAILED, 'lead'
+            if led is not trajectory:
+                timeout += _seconds(led.joint_trajectory.points[1])
+                self.get_logger().info(f'{label}: {why}')
+                trajectory = led
         if not self.execute_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().error('/execute_trajectory unavailable')
-            return False, False
+            return False, False, failure, 'rejected'
         handle = self.wait(self.execute_client.send_goal_async(
             ExecuteTrajectory.Goal(trajectory=trajectory)), 10.0)
         if handle is None or not handle.accepted:
             self.get_logger().error(f'{label}: trajectory rejected')
-            return False, False
-        names = list(trajectory.joint_trajectory.joint_names)
-        arms = [a for a in ('left', 'right') if any(f'_{a}_' in n for n in names)]
+            return False, False, failure, 'rejected'
+        for arm in arms:                             # moving: the old goal no longer holds
+            self.last_goal[arm] = None
+            self._goal_seq[arm] = self._goal_seq.get(arm, 0) + 1
         self.active_goals[id(handle)] = (handle, arms)
         try:
-            return self._execute_wait(handle, label, timeout, watch, arms)
+            ok, stopped, code, why = self._execute_wait(handle, label, timeout, watch, arms)
         finally:
             self.active_goals.pop(id(handle), None)
+        if ok and not stopped and trajectory.joint_trajectory.points:
+            final = [float(v) for v in trajectory.joint_trajectory.points[-1].positions]
+            goals = {}
+            for arm in arms:
+                if all(n in names for n in arm_joints(arm)):
+                    goals[arm] = [final[names.index(n)] for n in arm_joints(arm)]
+                    self.last_goal[arm] = goals[arm]
+            self._log_arrival(label, goals)
+        return ok, stopped, code, why
+
+    def _zero_end(self, jt, label):
+        """The last point stands still (see END_VELOCITY_WARN)."""
+        last = jt.points[-1]
+        moving = max((abs(float(v)) for v in last.velocities), default=0.0)
+        if moving > END_VELOCITY_WARN:
+            self.get_logger().warn(f'{label}: the trajectory ends moving ({moving:.2f} rad/s); '
+                                   f'stopped at its end instead')
+        last.velocities = [0.0] * len(last.velocities)
+        last.accelerations = [0.0] * len(last.accelerations)
+
+    def _with_lead(self, trajectory, label, names, arms, max_lead=None):
+        """(the trajectory to run, what was done) for execute(lead=True): the
+        same one when the arm is on its start, a led-in copy when it is a
+        little off and the way onto it is clear -- (None, why not) otherwise."""
+        limit = getattr(self.args, 'lead_in_max', LEAD_IN_CAP) if max_lead is None else max_lead
+        limit = min(float(LEAD_IN_CAP if limit is None else limit), LEAD_IN_CAP)
+        led, gap = self.lead_in(trajectory)
+        if led is None:
+            return None, 'no joint states for a lead-in'
+        if gap <= LEAD_IN_FROM:
+            return trajectory, 'on its start'
+        if gap > limit:
+            return None, (f'the arm is {gap:.3f} rad off the start of the plan (lead-in max '
+                          f'{limit:.2f})')
+        pts = led.joint_trajectory.points
+        group = f'{arms[0]}_arm' if arms else ''
+        clear = self._segment_clear(group, names, pts[0].positions, pts[1].positions)
+        if clear is not True:
+            return None, ('the lead-in onto the plan ' + ('is not clear' if clear is False
+                                                           else 'cannot be checked')
+                          + f' ({gap:.3f} rad)')
+        return led, f'led in {gap:.3f} rad onto the plan (checked)'
+
+    def _log_arrival(self, label, goals):
+        """How each arm arrives at its goal: measured - commanded per joint,
+        mrad, at ARRIVAL_TIMES after the trajectory ended, and its motor status
+        -- one line per arm in native/logs/arrivals.jsonl (the last ARRIVAL_KEEP
+        kept). Stops early, marked, when the next goal for the arm is sent.
+        Diagnostics only: in its own thread, never decides anything."""
+        if not goals:
+            return
+        t0 = time.monotonic()
+        seq = {arm: self._goal_seq.get(arm, 0) for arm in goals}
+        stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+
+        def run():
+            recs = {arm: {'time': stamp, 'label': label, 'arm': arm,
+                          'goal': [round(v, 4) for v in goal], 'err_mrad': {},
+                          'worst_mrad': {}, 'motor': self.arm_status(arm)}
+                    for arm, goal in goals.items()}
+            for at in ARRIVAL_TIMES:
+                delay = t0 + at - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                for arm, goal in goals.items():
+                    rec = recs[arm]
+                    if 'cut_at' in rec:
+                        continue
+                    if self._goal_seq.get(arm, 0) != seq[arm]:
+                        rec['cut_at'] = at            # the next goal started: not an arrival
+                        continue
+                    here = self.arm_positions(arm)
+                    if here is None:
+                        continue
+                    err = [round(1000.0 * (h - g), 1) for h, g in zip(here, goal)]
+                    rec['err_mrad'][f'{at:g}'] = err
+                    rec['worst_mrad'][f'{at:g}'] = max(abs(e) for e in err)
+            for arm in goals:
+                end = self.arm_status(arm)
+                if end != recs[arm]['motor']:
+                    recs[arm]['motor_end'] = end
+            self._append_arrivals([json.dumps(r) for r in recs.values()])
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _append_arrivals(self, lines):
+        path = os.path.join(WS, 'native', 'logs', 'arrivals.jsonl')
+        with self._arrival_lock:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                old = open(path).read().splitlines() if os.path.exists(path) else []
+                keep = (old + lines)[-ARRIVAL_KEEP:]
+                tmp = path + '.tmp'
+                with open(tmp, 'w') as f:
+                    f.write('\n'.join(keep) + '\n')
+                os.replace(tmp, path)
+            except (OSError, ValueError):
+                pass
 
     def _execute_wait(self, handle, label, timeout, watch, arms=()):
+        """(ok, stopped, code, why), see _execute()."""
         future = handle.get_result_async()
         done = threading.Event()
         future.add_done_callback(lambda _f: done.set())
@@ -1602,7 +2091,7 @@ class ClickToMove(Node):
             if self.halt.is_set():
                 self._hold_until_done(handle, done, arms)
                 self.get_logger().error(f'{label}: STOP')
-                return False, False
+                return False, False, MoveItErrorCodes.FAILURE, 'stop'
             try:
                 hit = watch is not None and watch()
             except Exception:                        # noqa: BLE001 - never leave it moving
@@ -1612,17 +2101,17 @@ class ClickToMove(Node):
                 # held at the controller at once; move_group's goal then ends
                 # (its cancel alone never stopped the arm)
                 self._hold_until_done(handle, done, arms, seconds=0.5)
-                return True, True
+                return True, True, MoveItErrorCodes.SUCCESS, 'contact'
             if time.monotonic() > deadline:
                 self._hold_until_done(handle, done, arms, seconds=0.5)
                 self.get_logger().error(f'{label}: timed out; held and cancelled')
                 self.require_move_group()
-                return False, False
+                return False, False, MoveItErrorCodes.TIMED_OUT, 'timeout'
         code = future.result().result.error_code.val
         if code != MoveItErrorCodes.SUCCESS:
             self.get_logger().error(f'{label}: execution failed, code {code}')
-            return False, False
-        return True, False
+            return False, False, code, 'failed'
+        return True, False, code, 'done'
 
     def _hold_until_done(self, handle, done, arms, seconds=2.0):
         """Hold `arms` at their controllers and cancel the goal -- re-sending the
@@ -1736,8 +2225,13 @@ class ClickToMove(Node):
                         tuple(slerp([f]).as_quat()[0])))
         return out
 
-    def guarded_line(self, arm, position, quat, label, needed=None):
+    def guarded_line(self, arm, position, quat, label, needed=None, trajectory=None):
         """Straight line towards `position`, slow, stopping on contact.
+
+        trajectory: that line as planned before (a stored, checked press
+        segment, 2026-11-17) -- flown as it is (a copy, re-timed) instead of
+        planning it from here; only if the arm is within 0.05 rad (MoveIt's
+        start tolerance) of its first point, else (None, False).
 
         Contact is a joint torque rising by more than --contact-torque (and
         6x its resting noise) against 0.3 s before, for 20 ms, AND the tool
@@ -1773,7 +2267,25 @@ class ClickToMove(Node):
             if e is not None:
                 samples.append(e)
             time.sleep(0.01)
-        fraction, trajectory, final = self.cartesian_plan(arm, position, quat)
+        if trajectory is not None:
+            import copy
+            trajectory = copy.deepcopy(trajectory)       # (retime() below changes it)
+            jt = trajectory.joint_trajectory
+            with self.lock:
+                here = [self.joints.get(n) for n in jt.joint_names]
+            off = (float(np.max(np.abs(np.subtract(here, jt.points[0].positions))))
+                   if jt.points and None not in here else None)
+            if off is None or off > 0.05:
+                self.get_logger().warn(f'{label}: the arm is not on the stored line\'s start ('
+                                       + (f'{off:.3f} rad off' if off is not None else
+                                          'no joint states') + ') - not moving in')
+                return None, False
+            fraction = 1.0
+            end = dict(zip(jt.joint_names, jt.points[-1].positions))
+            final = [end.get(n) for n in names]
+            final = None if None in final else [float(v) for v in final]
+        else:
+            fraction, trajectory, final = self.cartesian_plan(arm, position, quat)
         m = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
         length = (float(np.linalg.norm(np.asarray(position) - m[:3, 3]))
                   if m is not None else 0.02)
@@ -1996,6 +2508,15 @@ class ClickToMove(Node):
         return code, trajectory
 
     def _plan_joints_once(self, arm, positions, velocity=None, pipeline='cumotion', start=None):
+        # OMPL checks against move_group's collision matrix: not under another
+        # thread's exemption (_scene_gate). cuMotion checks in its own world (spheres,
+        # not the matrix) -- its 1.3-2.2 s plans would only stall the other thread
+        if pipeline != 'cumotion':
+            with _gate(self):
+                return self._plan_joints_ask(arm, positions, velocity, pipeline, start)
+        return self._plan_joints_ask(arm, positions, velocity, pipeline, start)
+
+    def _plan_joints_ask(self, arm, positions, velocity=None, pipeline='cumotion', start=None):
         goal = self._joint_goal(arm, positions, velocity, pipeline, start=start)
         goal.planning_options.plan_only = True
         with self.move_group_lock:
@@ -2021,6 +2542,7 @@ class ClickToMove(Node):
         """
         code = self._move_joints_once(arm, positions, label, velocity, attempts)
         if code == MoveItErrorCodes.SUCCESS:
+            self._reached(arm, positions)
             return True
         if not via_home:
             return False
@@ -2031,28 +2553,77 @@ class ClickToMove(Node):
         if self._move_joints_once(arm, HOME_JOINTS, f'{label} via home',
                                   velocity) != MoveItErrorCodes.SUCCESS:
             return False
-        return self._move_joints_once(arm, positions, label, velocity) == \
-            MoveItErrorCodes.SUCCESS
+        if self._move_joints_once(arm, positions, label, velocity) == MoveItErrorCodes.SUCCESS:
+            self._reached(arm, positions)
+            return True
+        return False
+
+    def _reached(self, arm, positions):
+        """move_joints() got there: the pose itself is what the controller
+        holds (the plan ends within the 0.01 rad goal tolerance of it) --
+        so pick mode is told from the pose sent, not from the sagging arm."""
+        self.last_goal[arm] = [float(v) for v in positions]
 
     def _move_joints_once(self, arm, positions, label, velocity=None, attempts=None):
         """Joint goal through move_group: cuMotion, and if it finds no path,
         MoveIt's sampling planner (OMPL) -- cuMotion's optimiser misses some
         longer repositioning moves (simulated CALIBRATE ARMS, 2026-10-12: a
-        third of them). Returns the MoveIt code."""
-        goal = self._joint_goal(arm, positions, velocity)
-        goal.planning_options.plan_only = False
-        code = self._send_until_planned(goal, label, attempts)
+        third of them). Returns the MoveIt code.
+
+        2026-11-17: planned, then executed from where the arm is by then
+        (execute(lead=True)) -- no longer one plan-and-execute goal. A plan
+        takes 1.3-2.2 s and the arm was still moving after the last "finished"
+        leg, so the plan's start was stale by the time it ran: code -4."""
+        code = self._plan_then_execute(arm, positions, label, velocity, attempts)
         # CONTROL_FAILED too: a cuMotion plan from a stale start state is
         # refused by the controller, every retry alike; OMPL starts from
         # move_group's own, current state (2026-10-13)
         if code in (MoveItErrorCodes.PLANNING_FAILED, MoveItErrorCodes.FAILURE,
-                    MoveItErrorCodes.CONTROL_FAILED):
-            goal = self._joint_goal(arm, positions, velocity, 'ompl')
-            goal.planning_options.plan_only = False
-            ompl = self._send_until_planned(goal, f'{label} (OMPL)')
+                    MoveItErrorCodes.CONTROL_FAILED) and not self.halt.is_set():
+            ompl = self._plan_then_execute(arm, positions, f'{label} (OMPL)', velocity,
+                                           pipeline='ompl')
             if ompl == MoveItErrorCodes.SUCCESS:
                 self.get_logger().info(f'{label}: cuMotion found no path; OMPL did')
                 return ompl
+        return code
+
+    def _plan_then_execute(self, arm, positions, label, velocity=None, attempts=None,
+                           pipeline='cumotion'):
+        """_send_until_planned()'s retries, as a plan (_plan_joints_once) and
+        then execute(lead=True): a retryable failure is planned again, from
+        where the arm is then (0.6 s after a CONTROL_FAILED -- a lead-in
+        refused counts as one). The MoveIt code."""
+        code = MoveItErrorCodes.FAILURE
+        for attempt in range(1, (attempts or self.args.attempts) + 1):
+            if self.halt.is_set():
+                self.get_logger().error(f'{label}: STOP is on - not moving')
+                return MoveItErrorCodes.FAILURE
+            t0 = time.monotonic()
+            code, trajectory = self._plan_joints_once(arm, positions, velocity, pipeline)
+            if self.halt.is_set():
+                return MoveItErrorCodes.FAILURE
+            if code == MoveItErrorCodes.TIMED_OUT and trajectory is None and \
+                    time.monotonic() - t0 >= self.args.motion_timeout - 0.5:
+                self.get_logger().error(f'{label}: timed out; goal cancelled')
+                return code                          # (move_group never answered: as before)
+            if code == MoveItErrorCodes.SUCCESS:
+                if trajectory is None:
+                    code = MoveItErrorCodes.FAILURE
+                elif not trajectory.joint_trajectory.points:
+                    return code                      # (already there: nothing to run)
+                else:
+                    total = _seconds(trajectory.joint_trajectory.points[-1])
+                    ok, _stopped, code, why = self._execute(trajectory, label,
+                                                            timeout=total + 20.0, lead=True)
+                    if ok:
+                        return MoveItErrorCodes.SUCCESS
+                    if why in ('stop', 'rejected', 'timeout'):
+                        return code                  # (not retried, as before)
+            self.get_logger().warn(f'{label}: MoveIt error {code} (attempt {attempt})')
+            if code not in RETRYABLE:
+                return code
+            if code == MoveItErrorCodes.CONTROL_FAILED:
+                time.sleep(0.6)              # let the arm finish moving; replan from there
         return code
 
     def _joint_goal(self, arm, positions, velocity=None, pipeline='cumotion', start=None):
@@ -2069,11 +2640,13 @@ class ClickToMove(Node):
         req.max_acceleration_scaling_factor = velocity
         req.start_state.is_diff = True
         if start is not None:
-            # From these joints, not from where the arm is. NOT a diff: cuMotion
-            # adds a diff's positions to the current ones (cumotion_planner.py,
-            # execute_callback); MoveIt and cuMotion both take the joints given
-            # and the rest of the robot as it is now
-            req.start_state.is_diff = False
+            # From these joints, not from where the arm is. For cuMotion NOT a diff:
+            # it adds a diff's positions to the current ones (cumotion_planner.py,
+            # execute_callback). For OMPL a diff: MoveIt sets the joints given
+            # absolutely either way, but a NON-diff start state has its attached
+            # bodies cleared (conversions.cpp, robotStateMsgToRobotState) -- OMPL
+            # then planned without the tool and the held box (2026-11-17 review)
+            req.start_state.is_diff = pipeline != 'cumotion'
             req.start_state.joint_state.name = arm_joints(arm)
             req.start_state.joint_state.position = [float(v) for v in start]
         req.workspace_parameters.header.frame_id = BASE_FRAME

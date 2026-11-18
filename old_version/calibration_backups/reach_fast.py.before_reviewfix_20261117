@@ -1,0 +1,957 @@
+"""The fast reach check (--reach-search fast, 2026-11-17): the way in decided
+in numbers first, move_group asked only about the best few.
+
+touch.py's _preplan asks move_group about every candidate: up to 64 ways in x
+5 approach points x 3 seeds, each through collision-aware IK, the arm model's
+optimisation and the straight lines, the first that plans winning. That took
+13-32 s a box on 2026-11-16 (1517 straight lines in 12 minutes, 1079 of them
+failing at 51 ms each on the KDL timeout; the arm model 32 % of the time),
+and "not from here" took the whole 30 s budget.
+
+Here every way in -- node.candidates(), plus every 15 deg of roll about each of
+their axes (--free-roll) -- is judged at once on the plain URDF
+(ctm/kinematics.py: batched IK and warm-started straight-line walks, joint
+limits, the app's 0.15 rad per 5 mm jump limit, no collisions):
+
+  A  an arm posture 3 cm (NEAR) short of the face
+  B  from it the press onto the face and 3-20 mm past
+  C  from it the line back out, as far as the furthest approach point
+  D  (the best 8) room beside the line for corrections, --correction-room
+
+and ranked: room and --limit-margin from every joint limit first (else an
+"edge" plan, used only if nothing better), then how square to the measured face
+(5 deg bins), then joint travel, plus a little for a nearer approach point and
+for joint 7 near its stop. Then, best first until --plan-budget, move_group
+checks what would be flown, at most 4 questions a way in:
+
+  1  ONE straight line from 4 mm beyond the approach point, through it and
+     5 cm short, to 3 cm short -- every link checked. Its first checked
+     waypoint is the approach posture itself (a Cartesian path does not check
+     its own start), so no separate IK question; it is cut into the two
+     segments the touch flies
+  2  (only if the part from 5 to 3 cm short is blocked) that part again with
+     the tool allowed near the box, marked tool_free (touch.py's own fallback
+     there, 2026-10-28)
+  3  the press onto the face and up to 20 mm past (the hand exempt too only for
+     a coaxial press, press_touching), kept as far as it solved if that is at
+     least 3 mm past -- or, if it stopped right at the face, once more to 3 mm
+  4  cuMotion's path to the approach posture
+
+-- the same collision checks as before; the numbers only throw out what cannot
+work. The plan carries the checked segments so the touch can fly exactly them.
+"""
+
+import copy
+import math
+import sys
+import threading
+import time
+
+import numpy as np
+
+from ctm.common import (BASE_FRAME, HOME_JOINTS, arm_joints, matrix_from_quat, quat_from_matrix,
+                        tool_frame_along)
+from ctm.kinematics import (directions, ik_batch_rows, joint_margin, line_walk, tcp_batch)
+
+# As touch.py has them (read from there once it is loaded: it imports this file,
+# so not at import time)
+NEAR = 0.03
+CORRECT_AT = 0.05
+FREE_ROLL_DEG = 15                 # --free-roll: every 15 deg about each candidate axis
+RANDOM_SEEDS = 20                  # plus the start, pre_pick and cuRobo's retract posture
+GIVE_UP = ((8, 0.05), (16, 0.01))  # IK seeds still this far off then: dropped (kinematics)
+PER_CANDIDATE = 2                  # distinct postures (0.2 rad) kept per way in
+WALK_STEP = 0.002                  # m between the numeric line's solves
+ROOM_TOP = 8                       # the room check: for the best this many at a time
+OBLIQUE_BIN = 5.0                  # deg: squareness to the face, in bins
+STANDOFF_COST = 2.0                # rad per m nearer than --standoff (touch.py's cost)
+J7_ROOM = 0.15                     # rad: joint 7 this near its stop costs ...
+J7_COST = 3.0                      # ... this much per rad nearer
+SAME_GOAL = 0.15                   # rad: a goal this near one cuMotion found no path to: skipped
+LINE_STEP = 0.005                  # m: MoveIt's Cartesian waypoints (robot.py max_step)
+# The checked line starts this far beyond the approach point: under one MoveIt
+# step (it puts floor(d / max_step) + 1 waypoints on a segment), so the line's
+# first checked waypoint is exactly the approach posture
+PRE = 0.004
+WAYPOINT_TOL = 0.001               # m: a waypoint is found on the returned line within this
+MIN_PAST = 0.003                   # the press must solve at least this far past the face
+CONTACTS = 3                       # failures per check whose contacts are asked and logged
+DRIFT_WARN = 0.05                  # rad: move_group's posture this far off the numbers': logged
+
+
+def _consts():
+    """(NEAR, CORRECT_AT) as touch.py has them now."""
+    touch = sys.modules.get('ctm.touch')
+    return (float(getattr(touch, 'NEAR', NEAR)), float(getattr(touch, 'CORRECT_AT', CORRECT_AT)))
+
+
+def _on(args, name, default=True):
+    """An on/off option: a bool, or 'on' / 'off' (a CLI choice) -- 'off' is a
+    true string, so getattr alone would read it as on."""
+    value = getattr(args, name, default)
+    if isinstance(value, str):
+        return value.strip().lower() not in ('off', 'false', 'no', '0', '')
+    return bool(value)
+
+
+def _pose(p, rot):
+    m = np.eye(4)
+    m[:3, :3] = rot
+    m[:3, 3] = p
+    return m
+
+
+def _poses(ps, rots):
+    """(N, 4, 4) from positions (N, 3) and rotations (N, 3, 3)."""
+    ps = np.asarray(ps, float).reshape(-1, 3)
+    m = np.zeros((len(ps), 4, 4))
+    m[:, :3, :3] = rots
+    m[:, :3, 3] = ps
+    m[:, 3, 3] = 1.0
+    return m
+
+
+def _kin(node, arm):
+    """The plain-URDF chain (the one node.fast_ik keeps in node._kin)."""
+    from ctm.kinematics import Arm
+    cache = getattr(node, '_kin', None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            node._kin = cache
+        except AttributeError:
+            pass
+    if arm not in cache:
+        cache[arm] = Arm(arm)
+    return cache[arm]
+
+
+def _cached(node, kind, key, ask):
+    """node._cached (the reach check's cache and stats), if it has one."""
+    if hasattr(node, '_cached'):
+        return node._cached(kind, key, ask)
+    return ask()
+
+
+def _note(app, notes, what):
+    notes[what] = notes.get(what, 0) + 1
+    if hasattr(app, '_note'):
+        app._note(what)
+
+
+def _log(node, text, warn=False):
+    # rclpy pins one severity to each call line (ValueError "Logger severity cannot
+    # be changed between calls"), so warn and info must be on separate lines
+    logger = node.get_logger()
+    if warn:
+        logger.warn(text)
+    else:
+        logger.info(text)
+
+
+def _cm(x):
+    return f'{100 * x:.1f}'.rstrip('0').rstrip('.')
+
+
+def _arm_reach(arm):
+    from ctm import common
+    if hasattr(common, 'arm_reach'):
+        return float(common.arm_reach(arm))
+    return float(getattr(common, 'ARM_REACH', 0.675))
+
+
+# -- the numbers ---------------------------------------------------------------
+
+def _roll_of(axis, quat):
+    """The roll (whole deg, 0..359) of a candidate's tool frame about its axis,
+    as tool_frame_along counts it."""
+    rel = tool_frame_along(np.asarray(axis, float), 0.0).T @ matrix_from_quat(*quat)
+    return int(round(math.degrees(math.atan2(rel[1, 0], rel[0, 0])))) % 360
+
+
+def candidates(app, arm, point, origin):
+    """[(label, axis, quat, ring)]: node.candidates (FRONT: square on to the
+    measured face, the camera's line of sight turned and tilted, rolls 0 / 90 /
+    -90 / 180) -- with --free-roll also every FREE_ROLL_DEG of roll about each
+    of their axes. The tool is round: its roll changes only the wrist, and the
+    one roll that leaves joint 7 room is often between the four (2026-11-17)."""
+    node, args = app.node, app.node.args
+    base = list(node.candidates(point, origin, top_down=False, arm=arm))
+    if not _on(args, 'free_roll', True):
+        return base
+    out, have, heads = list(base), {}, []
+    for label, axis, quat, ring in base:
+        key = tuple(np.round(np.asarray(axis, float), 6))
+        if key not in have:
+            have[key] = set()
+            heads.append((label.rsplit(' roll ', 1)[0], np.asarray(axis, float), ring, key))
+        have[key].add(_roll_of(axis, quat))
+    for head, axis, ring, key in heads:
+        for deg in range(-180, 180, FREE_ROLL_DEG):
+            if deg % 360 in have[key]:
+                continue
+            have[key].add(deg % 360)
+            out.append((f'{head} roll {deg:+d}', axis,
+                        quat_from_matrix(tool_frame_along(axis, math.radians(deg))), ring))
+    return out
+
+
+def _seeds(app, arm, start, lim):
+    """IK seeds: the start, pre_pick, cuRobo's retract posture, and RANDOM_SEEDS
+    spread-out postures (the same every time)."""
+    node = app.node
+    lo, hi = lim.T
+    out = []
+    pose = getattr(app, 'pose', None)
+    pre_pick = None
+    if pose is not None:
+        try:
+            pre_pick = pose(arm, 'pre_pick_state')
+        except Exception:                            # noqa: BLE001 - only a seed
+            pre_pick = None
+    for q in (start, pre_pick, (getattr(node, 'retract', None) or {}).get(arm)):
+        if q is not None and len(q) == 7:
+            out.append(np.clip(np.asarray(q, float), lo, hi))
+    store = node.__dict__.setdefault('_fast_seeds', {}) if hasattr(node, '__dict__') else {}
+    if arm not in store:
+        rng = np.random.default_rng(7)
+        store[arm] = rng.uniform(lo + 0.05, hi - 0.05, (RANDOM_SEEDS, 7))
+    return np.vstack(out + [store[arm]])
+
+
+def _face_into(app, point, origin):
+    """The direction into the face the obliquity is measured against: the
+    picker's measured normal (node.pick_normal), turned into the face, if it is
+    this face's (as candidates() takes it); else the camera's line of sight,
+    level. (unit 3-vector, 'face normal' | 'line of sight')"""
+    ray = np.asarray(point, float) - np.asarray(origin, float)
+    ray[2] = 0.0
+    ray /= max(np.linalg.norm(ray), 1e-9)
+    normal = getattr(app.node, 'pick_normal', None)
+    if normal is not None:
+        into = np.asarray(normal, float)
+        if np.linalg.norm(into) > 1e-6:
+            into = into / np.linalg.norm(into)
+            if into @ ray < 0:
+                into = -into
+            flat = np.array([into[0], into[1], 0.0])
+            if np.linalg.norm(flat) > 0.5 and flat @ ray / np.linalg.norm(flat) > math.cos(
+                    math.radians(50.0)):
+                return into, 'face normal'
+    return ray, 'line of sight'
+
+
+def _standoffs(app, near_d):
+    """The approach distances, far to near (touch.py's _standoffs; --direct-path's
+    approach at NEAR itself is not searched here: a flight that ends at the box
+    is not a straight line in)."""
+    args = app.node.args
+    if hasattr(app, '_standoffs'):
+        out = list(app._standoffs())
+    else:
+        far, near = args.standoff, min(args.min_standoff, args.standoff)
+        out, d = [far], far
+        while d - 0.015 > near + 1e-6:
+            d = round(d - 0.015, 4)
+            out.append(d)
+        if out[-1] > near + 1e-6:
+            out.append(near)
+    return sorted({s for s in out if s > near_d + 1e-6}, reverse=True)
+
+
+def _chain_walk(kin, lim, q, start_poses, stops):
+    """Walk each row from start_poses through stops [(key, poses (N, 4, 4))]
+    one after another. {key: (ok (N,), q (N, 7), least margin so far (N,))}."""
+    n = len(q)
+    alive = np.ones(n, bool)
+    margin = joint_margin(q, lim).min(axis=1)
+    q = np.array(q, float)
+    prev = start_poses
+    out = {}
+    for key, poses in stops:
+        idx = np.flatnonzero(alive)
+        if idx.size:
+            ok, q_end, m, _path = line_walk(kin, q[idx], prev[idx], poses[idx], step=WALK_STEP,
+                                            limits=lim)
+            alive[idx[~ok]] = False
+            q[idx] = q_end
+            margin[idx] = np.minimum(margin[idx], m)
+        out[key] = (alive.copy(), q.copy(), margin.copy())
+        prev = poses
+    return out
+
+
+def _out_stops(standoffs):
+    """The outward walk's stops: every approach point and PRE beyond it."""
+    return sorted({round(x, 6) for s in standoffs for x in (s, s + PRE)})
+
+
+def _press_pasts(args):
+    """How far past the face the press may aim: --past-contact, 1 cm, 3 mm (as
+    _solve_standoff_at tries them)."""
+    past = max(float(getattr(args, 'past_contact', 0.02)), MIN_PAST)
+    return sorted(set((past, min(past, 0.01), min(past, MIN_PAST))))
+
+
+def rank(app, arm, aim, point, origin, start):
+    """Every way in to `aim` judged on the plain URDF, best first:
+    (entries, info). An entry is a dict: label, axis, quat, way, contact (the
+    hand_tcp at contact, no arm model), approach, standoff, q_pre / q_above /
+    q_near / q_contact (joints PRE beyond the approach, at it, NEAR short, at
+    the face), beyond (the furthest press past the face that solves, m), ok_b
+    {beyond: bool}, margin (least joint-limit room from the approach to the
+    press's end, rad), posture_margin (at the approach, NEAR and the face),
+    margin_ok (that >= --limit-margin), oblique (deg off the face), cost, room
+    (True: --correction-room, False: only 1 cm, None: not checked yet) and tier
+    (1, 2 = edge, None: not checked yet). info: the counts and seconds."""
+    node, args = app.node, app.node.args
+    t0 = time.monotonic()
+    near_d, _correct_at = _consts()
+    limits = node.joint_limits(arm)
+    info = {'candidates': 0, 'ik': 0, 'lines': 0, 'tier1': 0, 'edge': 0, 'seconds': 0.0,
+            'notes': {}}
+    if limits is None:
+        info['why'] = 'no joint limits (URDF not read)'
+        return [], info
+    lim = np.array(limits, float)
+    kin = _kin(node, arm)
+    tip = float(args.tip_offsets[arm])
+    touch_off = float(getattr(args, 'touch_offset', 0.0))
+    bs = _press_pasts(args)
+    standoffs = _standoffs(app, near_d)
+    limit_margin = float(getattr(args, 'limit_margin', 0.10))
+    start_q = np.asarray(start if start is not None else HOME_JOINTS, float)
+    cands = candidates(app, arm, point, origin)
+    info['candidates'] = len(cands)
+    info['directions'] = len({tuple(np.round(np.asarray(c[1], float), 6)) for c in cands})
+    if not cands or not standoffs:
+        info['seconds'] = time.monotonic() - t0
+        return [], info
+    aim = np.asarray(aim, float)
+    axes = np.array([np.asarray(c[1], float) for c in cands])
+    rots = np.array([matrix_from_quat(*c[2]) for c in cands])
+    way = axes                                       # FRONT: the tip travels along the tool
+    contact = aim - way * touch_off - axes * tip     # node.tcp_for_tip(aim - way * touch_offset)
+    # -- A: a posture NEAR short of the face, up to PER_CANDIDATE distinct ones each
+    seeds = _seeds(app, arm, start, lim)
+    q_a, ok_a, _err = ik_batch_rows(kin, _poses(contact - way * near_d, rots), seeds, lim,
+                                    iters=30, all_seeds=True, give_up=GIVE_UP)
+    room_a = joint_margin(q_a.reshape(-1, 7), lim).min(axis=1).reshape(ok_a.shape)
+    owner, q_near = [], []
+    for c in range(len(cands)):
+        idx = np.flatnonzero(ok_a[c])
+        if not idx.size:
+            info['notes']['reach'] = info['notes'].get('reach', 0) + 1
+            continue
+        chosen = []
+        for i in idx[np.argsort(-room_a[c, idx])]:
+            if all(np.max(np.abs(q_a[c, i] - o)) > 0.2 for o in chosen):
+                chosen.append(q_a[c, i])
+                if len(chosen) >= PER_CANDIDATE:
+                    break
+        owner += [c] * len(chosen)
+        q_near += chosen
+    info['ik'] = len(set(owner))
+    if not owner:
+        info['seconds'] = time.monotonic() - t0
+        return [], info
+    owner, q_near = np.array(owner), np.array(q_near)
+    w_o, r_o, c_o = way[owner], rots[owner], contact[owner]
+    at = lambda d: _poses(c_o - w_o * d, r_o)        # hand_tcp with the tip d short (- past)
+    # -- B: in onto the face and past it; C: out to the approach points (and PRE beyond)
+    press = _chain_walk(kin, lim, q_near, at(near_d), [(0.0, at(0.0))] + [(b, at(-b)) for b in bs])
+    out = _chain_walk(kin, lim, q_near, at(near_d), [(s, at(s)) for s in _out_stops(standoffs)])
+    into, into_from = _face_into(app, point, origin)
+    info['oblique_from'] = into_from
+    lo7, hi7 = lim[6]
+    entries, per_cand = [], {}
+    for r in range(len(owner)):
+        c = int(owner[r])
+        b_ok = {b: bool(press[b][0][r]) for b in bs}
+        if not press[0.0][0][r] or not any(b_ok.values()):
+            info['notes']['press'] = info['notes'].get('press', 0) + 1
+            continue
+        good = [s for s in standoffs if out[round(s + PRE, 6)][0][r]]
+        if not good:
+            info['notes']['line'] = info['notes'].get('line', 0) + 1
+            continue
+        s, b = good[0], max(x for x in bs if b_ok[x])
+        key_s = round(s, 6)
+        q_above, q_contact = out[key_s][1][r], press[0.0][1][r]
+        q_pre = out[round(s + PRE, 6)][1][r]
+        margin = float(min(out[key_s][2][r], press[b][2][r]))
+        posture = float(joint_margin(np.array([q_above, q_near[r], q_contact]), lim).min())
+        j7 = min(min(q[6] - lo7, hi7 - q[6]) for q in (q_above, q_near[r], q_contact))
+        oblique = math.degrees(math.acos(float(np.clip(way[c] @ into, -1.0, 1.0))))
+        travel = float(np.sum(np.abs(q_above - start_q)))
+        cost = (travel + STANDOFF_COST * (standoffs[0] - s)
+                + J7_COST * max(0.0, J7_ROOM - j7))
+        e = {'label': cands[c][0], 'axis': axes[c], 'quat': tuple(cands[c][2]),
+             'ring': cands[c][3], 'way': way[c], 'contact': contact[c],
+             'approach': contact[c] - way[c] * s, 'standoff': s, 'beyond': b, 'ok_b': b_ok,
+             'q_pre': q_pre, 'q_above': q_above, 'q_near': q_near[r], 'q_contact': q_contact,
+             'margin': margin, 'posture_margin': posture, 'margin_ok': posture >= limit_margin,
+             'j7_room': float(j7), 'oblique': oblique, 'travel': travel, 'cost': cost,
+             'room': None, 'tier': None}
+        e['key'] = (0 if e['margin_ok'] else 1, int(oblique // OBLIQUE_BIN), cost)
+        entries.append(e)
+        per_cand.setdefault(c, []).append(e)
+    info['lines'] = len(per_cand)
+    entries.sort(key=lambda e: e['key'])
+    # -- D: room for the corrections, the best ROOM_TOP
+    room_check(app, arm, entries[:ROOM_TOP], lim)
+    for e in entries[:ROOM_TOP]:
+        if e.get('no_room'):
+            info['notes']['room'] = info['notes'].get('room', 0) + 1
+    entries = [e for e in entries if not e.get('no_room')]
+    info['tier1'] = sum(1 for e in entries if e['tier'] == 1)
+    info['edge'] = sum(1 for e in entries if e['tier'] == 2)
+    info['seconds'] = time.monotonic() - t0
+    return order(entries), info
+
+
+def order(entries):
+    """Tier 1 (room-checked) by squareness, then cost; then those not checked
+    yet (as ranked: checked when reached); then the edge ones."""
+    one = sorted((e for e in entries if e['tier'] == 1), key=lambda e: e['key'][1:])
+    unchecked = [e for e in entries if e['tier'] is None]
+    edge = sorted((e for e in entries if e['tier'] == 2), key=lambda e: e['key'])
+    return one + unchecked + edge
+
+
+def room_check(app, arm, entries, lim):
+    """Numeric room for the corrections (touch.py's _line_room, on the URDF):
+    with the approach and the contact moved --correction-room sideways, each of
+    4 ways, the approach still has a posture (from this one), the line in to
+    NEAR and the press to `beyond` still solve; with them moved 1 cm, the line
+    in. Sets e['room'] True (full room), False (only 1 cm: an edge plan) or
+    e['no_room'] (not even that: not used), and e['tier']. Once per entry."""
+    todo = [e for e in entries if e['room'] is None and not e.get('no_room')]
+    if not todo:
+        return
+    node, args = app.node, app.node.args
+    near_d, _c = _consts()
+    kin = _kin(node, arm)
+    sizes = (float(getattr(args, 'correction_room', 0.025)), 0.01)
+    rows = []                                        # (entry index, size index, shift)
+    for i, e in enumerate(todo):
+        side = np.cross(e['way'], [0.0, 0.0, 1.0])
+        if np.linalg.norm(side) < 1e-6:
+            side = np.cross(e['way'], [1.0, 0.0, 0.0])
+        side /= np.linalg.norm(side)
+        up = np.cross(side, e['way'])
+        for k, size in enumerate(sizes):
+            for d in (side, -side, up, -up):
+                rows.append((i, k, size * d))
+    ei = np.array([r[0] for r in rows])
+    size_k = np.array([r[1] for r in rows])
+    rot = np.array([matrix_from_quat(*todo[i]['quat']) for i in ei])
+    shift = np.array([r[2] for r in rows])
+    con = np.array([todo[i]['contact'] for i in ei]) + shift
+    way = np.array([todo[i]['way'] for i in ei])
+    app_p = np.array([todo[i]['approach'] for i in ei]) + shift
+    beyond = np.array([todo[i]['beyond'] for i in ei])
+    seeds = np.array([todo[i]['q_above'] for i in ei])[:, None, :]
+    q0, ok0, _e = ik_batch_rows(kin, _poses(app_p, rot), seeds, lim, iters=20)
+    line_ok = ok0.copy()
+    press_ok = np.zeros(len(rows), bool)
+    idx = np.flatnonzero(line_ok)
+    if idx.size:
+        a_ok, q_n, _m, _p = line_walk(kin, q0[idx], _poses(app_p[idx], rot[idx]),
+                                      _poses(con[idx] - way[idx] * near_d, rot[idx]),
+                                      step=WALK_STEP, limits=lim)
+        line_ok[idx[~a_ok]] = False
+        sel = a_ok & (size_k[idx] == 0)              # the press: for the full room only
+        idx2 = idx[sel]
+        if idx2.size:
+            b_ok, _q, _m, _p = line_walk(kin, q_n[sel],
+                                         _poses(con[idx2] - way[idx2] * near_d, rot[idx2]),
+                                         _poses(con[idx2] + way[idx2] * beyond[idx2, None],
+                                                rot[idx2]),
+                                         step=WALK_STEP, limits=lim)
+            press_ok[idx2[b_ok]] = True
+    for i, e in enumerate(todo):
+        full = bool(np.all((line_ok & press_ok)[(ei == i) & (size_k == 0)]))
+        some = bool(np.all(line_ok[(ei == i) & (size_k == 1)]))
+        if full:
+            e['room'] = True
+        elif some:
+            e['room'] = False
+        else:
+            e['no_room'] = True
+            continue
+        e['tier'] = 1 if (e['room'] and e['margin_ok']) else 2
+
+
+def _with_model(app, arm, e, lim, notes):
+    """The candidate as the planner gets it: with the arm model applied (when
+    one is, arm_models.has), the hand_tcp moved and turned so the REAL tool is
+    on the line -- ArmModels.command once for this way in, cached on (arm,
+    target, quat) only (touch.py's key held the posture too, and missed), and
+    the numbers walked again for the moved poses (milliseconds). Else as
+    ranked. A dict, or None if the model has no joints for it."""
+    node = app.node
+    near_d, _c = _consts()
+    rot = matrix_from_quat(*e['quat'])
+    plain = {'approach': e['approach'], 'contact': e['contact'], 'quat': tuple(e['quat']),
+             'rot': rot, 'q_pre': e['q_pre'], 'q_above': e['q_above'], 'q_near': e['q_near'],
+             'ok_b': e['ok_b'], 'margin': e['margin'], 'model': False}
+    models = getattr(app, 'arm_models', None)
+    if models is None or not models.has(arm):
+        return plain
+    way, s = e['way'], e['standoff']
+    near_pt = e['contact'] - way * near_d
+    r = lambda v, d: tuple(np.round(np.asarray(v, float).ravel(), d))
+    limits = [tuple(x) for x in lim]
+    cmd = _cached(node, 'model', (arm, r(near_pt, 4), r(e['quat'], 4)),
+                  lambda: models.command(arm, near_pt, rot, e['q_near'], limits,
+                                         directions(e['q_above'], e['q_near'])))
+    if cmd is None:
+        _note(app, notes, 'model')
+        return None
+    delta = np.asarray(cmd[0], float) - near_pt
+    rot_c = np.asarray(cmd[1], float)
+    app_c, con_c = e['approach'] + delta, e['contact'] + delta
+    kin = _kin(node, arm)
+    near_c = _pose(con_c - way * near_d, rot_c)[None]
+    q_n, ok, _err = ik_batch_rows(kin, near_c, e['q_near'][None, None, :], lim, iters=20)
+    if not ok[0]:
+        _note(app, notes, 'model')
+        return None
+    outward = _chain_walk(kin, lim, q_n, near_c, [(round(s, 6), _pose(app_c, rot_c)[None]),
+                                                  ('pre', _pose(app_c - way * PRE, rot_c)[None])])
+    stops = [(0.0, _pose(con_c, rot_c)[None])] + \
+        [(b, _pose(con_c + way * b, rot_c)[None]) for b in sorted(e['ok_b'])]
+    inward = _chain_walk(kin, lim, q_n, near_c, stops)
+    ok_b = {b: bool(inward[b][0][0]) for b in e['ok_b']}
+    if not outward['pre'][0][0] or not any(ok_b.values()):
+        _note(app, notes, 'model')
+        return None
+    best = max(b for b in ok_b if ok_b[b])
+    return {'approach': app_c, 'contact': con_c, 'quat': tuple(quat_from_matrix(rot_c)),
+            'rot': rot_c, 'q_pre': outward['pre'][1][0], 'q_above': outward[round(s, 6)][1][0],
+            'q_near': q_n[0], 'ok_b': ok_b,
+            'margin': float(min(outward[round(s, 6)][2][0], inward[best][2][0])), 'model': True}
+
+
+# -- move_group, for the best few ----------------------------------------------
+
+def _rows(arm, traj):
+    """A trajectory's points as this arm's joints, (K, 7) in arm_joints order
+    (move_group may order its joint names otherwise), or None."""
+    if traj is None:
+        return None
+    jt = traj.joint_trajectory
+    names = list(jt.joint_names)
+    try:
+        cols = [names.index(n) for n in arm_joints(arm)]
+    except ValueError:
+        return None
+    if not jt.points:
+        return None
+    return np.array([[p.positions[c] for c in cols] for p in jt.points], float)
+
+
+def _along(kin, rows, way):
+    """How far along `way` each row's hand_tcp is from the first row's (m), by
+    the plain URDF -- differences only, so a small difference between it and
+    move_group's model cancels out."""
+    p = tcp_batch(kin, rows)[:, :3, 3]
+    return (p - p[0]) @ np.asarray(way, float)
+
+
+def _index_at(along, d):
+    """The waypoint `d` along the line, or None if the line has none there."""
+    k = int(np.argmin(np.abs(along - d)))
+    return k if abs(along[k] - d) <= WAYPOINT_TOL else None
+
+
+def _secs(p):
+    return p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
+
+
+def _set_secs(p, t):
+    t = max(0.0, float(t))
+    p.time_from_start.sec = int(t)
+    p.time_from_start.nanosec = int(round((t - int(t)) * 1e9)) % 1000000000
+
+
+def _segment(traj, i0, i1):
+    """Points i0..i1 of a trajectory as one of its own: time from 0 at i0, and
+    standing still at both ends (it is flown on its own, from rest to rest; the
+    touch retimes it)."""
+    seg = copy.deepcopy(traj)
+    pts = seg.joint_trajectory.points[i0:i1 + 1]
+    t0 = _secs(pts[0])
+    for p in pts:
+        _set_secs(p, _secs(p) - t0)
+    for p in (pts[0], pts[-1]):
+        if len(p.velocities):
+            p.velocities = [0.0] * len(p.velocities)
+        if len(p.accelerations):
+            p.accelerations = [0.0] * len(p.accelerations)
+    seg.joint_trajectory.points = pts
+    return seg
+
+
+def _contacts_text(contacts):
+    """WP-2's node.state_contacts answer as words: 'a / b at (x, y, z)'."""
+    words = []
+    for c in list(contacts or [])[:3]:
+        if isinstance(c, (tuple, list)) and len(c) >= 2:
+            a, b = c[0], c[1]
+            pos = c[2] if len(c) > 2 else None
+        else:
+            a = getattr(c, 'contact_body_1', '?')
+            b = getattr(c, 'contact_body_2', '?')
+            p = getattr(c, 'position', None)
+            pos = (p.x, p.y, p.z) if p is not None and hasattr(p, 'x') else None
+        where = (f' at ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})'
+                 if pos is not None and len(pos) == 3 else '')
+        words.append(f'{a} / {b}{where}')
+    return '; '.join(words)
+
+
+def _blocked_at(app, arm, ctx, label, q_last, way, ahead=LINE_STEP):
+    """For the first CONTACTS failures of a check: what the planning scene says
+    collides at the waypoint after the last one that solved (`ahead` further
+    along `way` from q_last, walked numerically; 0: q_last itself), in the log
+    and kept for the "why". Call it inside the same exemption as the failed
+    line."""
+    node = app.node
+    if ctx['contacts_left'] <= 0 or not hasattr(node, 'state_contacts'):
+        return
+    ctx['contacts_left'] -= 1
+    try:
+        q = np.asarray(q_last, float)
+        if ahead > 0:
+            t0 = tcp_batch(ctx['kin'], q[None])[0]
+            t1 = t0.copy()
+            t1[:3, 3] = t0[:3, 3] + np.asarray(way, float) * ahead
+            ok, q_end, _m, _p = line_walk(ctx['kin'], q[None], t0, t1, step=0.001,
+                                          limits=ctx['lim'])
+            q = q_end[0]
+        got = node.state_contacts(arm, [float(v) for v in q])
+    except Exception as exc:                         # noqa: BLE001 - diagnostics only
+        _log(node, f'{arm} fast reach: could not ask what blocks {label} ({exc})', warn=True)
+        return
+    if got is None:
+        text = 'move_group could not say what'
+    elif not got:
+        text = 'nothing at the next waypoint (blocked by the jump limit, or further on?)'
+    else:
+        text = _contacts_text(got)
+        ctx['contacts'].append(f'{label}: {text}')
+    _log(node, f'{arm} fast reach: {label} blocked - {text}')
+
+
+def _near_failed_goal(ctx, q):
+    return any(np.max(np.abs(np.asarray(q) - g)) < SAME_GOAL for g in ctx['failed_goals'])
+
+
+def _try(app, arm, e, ctx, with_path=True):
+    """move_group for one ranked way in (the module's steps 1-4, at most 4
+    questions). The plan dict (touch.py's keys, plus segments, map_version,
+    margin) or None; why it failed goes to the notes and the log."""
+    node, args = app.node, app.node.args
+    near_d, correct_at = _consts()
+    notes, tag = ctx['notes'], f'{e["label"]}, from {_cm(e["standoff"])} cm'
+    m = _with_model(app, arm, e, ctx['lim'], notes)
+    if m is None:
+        return None, 'the arm model has no joints for it'
+    way, quat, rot = np.asarray(e['way'], float), m['quat'], m['rot']
+    app_c, con_c, s = m['approach'], m['contact'], e['standoff']
+    kin = ctx['kin']
+    ctx['tried'] += 1
+    calls = ctx.setdefault('calls', [])
+    calls.append(0)
+
+    def asked():
+        calls[-1] += 1
+
+    # 1. one straight line: PRE beyond the approach -> the approach -> 5 cm short
+    # -> 3 cm short, every link checked against the map
+    in5_d = min(correct_at, s)
+    has5 = s - in5_d > 0.001
+    in5_pt, near_pt = con_c - way * in5_d, con_c - way * near_d
+    via = [(app_c, quat)] + ([(in5_pt, quat)] if has5 else [])
+    asked()
+    fraction, traj, q_end = node.cartesian_plan(arm, near_pt, quat,
+                                                start_joints=[float(v) for v in m['q_pre']],
+                                                via=via)
+    rows = _rows(arm, traj)
+    along = _along(kin, rows, way) if rows is not None else np.zeros(1)
+    i_app = _index_at(along, PRE) if rows is not None and len(rows) > 1 else None
+    if i_app is None:
+        if rows is not None and len(rows) > 1 and along[-1] > PRE - WAYPOINT_TOL:
+            # got past it, but no waypoint where the approach should be: the
+            # line is not the one asked for -- not used
+            _log(node, f'{arm} fast reach: {tag}: the checked line has no waypoint at the '
+                 f'approach point ({1000 * along[-1]:.1f} mm long) - not used', warn=True)
+            _note(app, notes, 'line')
+            return None, 'the checked line does not match the plan'
+        _note(app, notes, 'the approach posture touches something in the map')
+        _blocked_at(app, arm, ctx, f'{tag}: the approach posture', m['q_above'], way, ahead=0.0)
+        return None, 'the approach posture touches something'
+    i5 = _index_at(along, PRE + s - in5_d) if has5 else i_app
+    if i5 is None:
+        _note(app, notes, 'blocked')
+        _blocked_at(app, arm, ctx, f'{tag}: the line in to {_cm(in5_d)} cm', rows[-1], way)
+        return None, f'the line in to {_cm(in5_d)} cm short is blocked'
+    q_above, q5 = rows[i_app], rows[i5]
+    drift = float(np.max(np.abs(q_above - np.asarray(m['q_above'], float))))
+    if drift > DRIFT_WARN:
+        _log(node, f'{arm} fast reach: {tag}: move_group\'s approach posture is {drift:.2f} rad '
+             f'from the numbers\' one')
+    seg_in5 = _segment(traj, i_app, i5) if has5 else None
+    i_near = _index_at(along, PRE + s - near_d)
+    tool_free = False
+    if fraction >= 0.98 and q_end is not None:
+        if i_near is None or i_near != len(rows) - 1:
+            _log(node, f'{arm} fast reach: {tag}: the checked line does not end {_cm(near_d)} cm '
+                 f'short of the face - not used', warn=True)
+            _note(app, notes, 'line')
+            return None, 'the checked line does not match the plan'
+        seg_in3, qn = _segment(traj, i5, i_near), rows[i_near]
+    else:
+        # 2. on to NEAR (3 cm) short with the tool allowed near the box (touch.py's
+        # own fallback there), slow at the touch: tool_free
+        tool_free = True
+        with node.fingers_touching(arm):
+            asked()
+            fr2, traj2, qn2 = node.cartesian_plan(arm, near_pt, quat,
+                                                  start_joints=[float(v) for v in q5])
+            rows2 = _rows(arm, traj2)
+            if fr2 < 0.98 or qn2 is None or rows2 is None:
+                _note(app, notes, 'blocked')
+                _blocked_at(app, arm, ctx, f'{tag}: the line in to {_cm(near_d)} cm (the tool '
+                            f'allowed near the box)', rows2[-1] if rows2 is not None else q5, way)
+                return None, f'the line in to {_cm(near_d)} cm short is blocked'
+        seg_in3, qn = _segment(traj2, 0, len(rows2) - 1), rows2[-1]
+    # 3. the press: straight along the tool from NEAR -- coaxial by construction,
+    # unless the arm model tilted the hand off the line (then the fingers only)
+    coax = math.degrees(math.acos(float(np.clip(rot[:, 2] @ way, -1.0, 1.0))))
+    hand_free = (_on(args, 'press_hand_free', True) and hasattr(node, 'press_touching')
+                 and coax <= float(getattr(args, 'press_coax_deg', 3.0)))
+    exempt = node.press_touching if hand_free else node.fingers_touching
+    b_list = sorted((b for b, ok in m['ok_b'].items() if ok), reverse=True)
+    with exempt(arm):
+        b_aim = b_list[0]
+        asked()
+        fr, tp, _q = node.cartesian_plan(arm, con_c + way * b_aim, quat,
+                                         start_joints=[float(v) for v in qn])
+        prow = _rows(arm, tp)
+        reached = float(_along(kin, prow, way)[-1]) if prow is not None and len(prow) > 1 else 0.0
+        if (reached < near_d + MIN_PAST - 1e-4 and b_aim > MIN_PAST + 1e-6
+                and MIN_PAST in m['ok_b'] and m['ok_b'][MIN_PAST]
+                and reached >= near_d - LINE_STEP and calls[-1] <= 2):
+            # it stopped at the face, between its 5 mm waypoints: the 3 mm press
+            # (touch.py's last try) puts one at 3 mm past
+            b_aim = MIN_PAST
+            asked()
+            fr, tp, _q = node.cartesian_plan(arm, con_c + way * b_aim, quat,
+                                             start_joints=[float(v) for v in qn])
+            prow = _rows(arm, tp)
+            reached = (float(_along(kin, prow, way)[-1]) if prow is not None and len(prow) > 1
+                       else 0.0)
+        if reached < near_d + MIN_PAST - 1e-4:
+            _note(app, notes, 'press')
+            _blocked_at(app, arm, ctx, f'{tag}: the press', prow[-1] if prow is not None else qn,
+                        way)
+            return None, 'the press onto the face does not solve'
+    whole = fr >= 0.98 and reached >= near_d + b_aim - WAYPOINT_TOL
+    beyond = b_aim if whole else math.floor(1000.0 * (reached - near_d) + 1e-6) / 1000.0
+    press_target = con_c + way * b_aim if whole else near_pt + way * reached
+    seg_press = _segment(tp, 0, len(prow) - 1)
+    # the postures move_group will fly, against the joint limits too
+    flown = joint_margin(np.array([q_above, qn, prow[-1]]), ctx['lim']).min()
+    segments = {'seg_in5': seg_in5, 'seg_in3': seg_in3, 'seg_press': seg_press,
+                'press_target': np.asarray(press_target, float), 'press_beyond': float(beyond),
+                'tool_free': tool_free,
+                # (for the touch and the logs: how the press was checked, and from where)
+                'hand_free': bool(hand_free), 'q_in5': [float(v) for v in q5],
+                'q_near': [float(v) for v in qn]}
+    plan = {'label': tag, 'axis': e['axis'], 'way': np.array(way, float), 'quat': quat,
+            'standoff': s, 'approach': app_c, 'contact': con_c,
+            'above': [float(v) for v in q_above], 'beyond': float(beyond),
+            'edge': e['tier'] != 1, 'contact_raw': (e['contact'], tuple(e['quat'])),
+            'level': None, 'trajectory': None, 'segments': segments,
+            'map_version': ctx['map_version'], 'margin': float(min(m['margin'], flown))}
+    if not with_path:
+        return plan, None
+    # 4. the path to the approach posture (cuMotion, then OMPL), around everything
+    if _near_failed_goal(ctx, q_above):
+        _note(app, notes, 'no collision-free path to the approach point')
+        return None, 'next to an approach posture with no path (skipped)'
+    asked()
+    _code, trajectory = app._plan_path(arm, [float(v) for v in q_above])
+    ctx['paths'] += 1
+    if trajectory is None:
+        ctx['failed_goals'].append(np.asarray(q_above, float))
+        _note(app, notes, 'no collision-free path to the approach point')
+        return None, 'no collision-free path to the approach point'
+    plan['trajectory'] = trajectory
+    return plan, None
+
+
+def preplan(app, arm, aim, point, origin, start):
+    """touch.py's preplan for --reach-search fast (FRONT): (plan, why), the plan
+    with _finish_plan's keys plus 'segments' (seg_in5, seg_in3, seg_press,
+    press_target, press_beyond, tool_free; hand_free, q_in5, q_near),
+    'map_version' and 'margin'. Inside touch.preplan's planning_cache its stats
+    line is logged there; called on its own it opens one and logs the same
+    line."""
+    node = app.node
+    if getattr(node, '_plan_stats', None) is not None and \
+            getattr(node, '_plan_owner', None) == threading.get_ident():
+        return _preplan(app, arm, aim, point, origin, start)
+    t0 = time.monotonic()
+    app._line_notes = {}
+    if not hasattr(node, 'planning_cache'):
+        return _preplan(app, arm, aim, point, origin, start)
+    with node.planning_cache() as stats:
+        try:
+            return _preplan(app, arm, aim, point, origin, start)
+        finally:
+            names = {'fast_ik': 'quick reach', 'ik': 'IK', 'line': 'straight lines',
+                     'path': 'path planning', 'model': 'arm model'}
+            parts = ', '.join(f'{names.get(k, k)} {v[1]}' + (f'/{v[0]}' if v[0] != v[1] else '')
+                              + f' in {v[2]:.1f} s' for k, v in stats.items())
+            text = app._notes_text() if hasattr(app, '_notes_text') else ''
+            _log(node, f'{arm} reach check: {time.monotonic() - t0:.1f} s ({parts}; asked/needed)'
+                 + (f' -- ways in not used: {text}' if text else ''))
+
+
+def _preplan(app, arm, aim, point, origin, start):
+    node, args = app.node, app.node.args
+    if getattr(app, 'top_down', False):
+        return app._preplan(arm, aim, point, origin, start)     # FRONT only
+    t0 = time.monotonic()
+    how = 'from the front'
+    # out of reach altogether (as touch.py's _preplan)
+    shoulder = node.lookup(BASE_FRAME, f'openarm_{arm}_link1')
+    if shoulder is not None:
+        far = float(np.linalg.norm(np.asarray(aim, float) - shoulder[:3, 3])) \
+            - args.tip_offsets[arm] - _arm_reach(arm)
+        if far > 0:
+            return None, f'out of reach: {100 * far:.0f} cm beyond what the {arm} arm can reach'
+    budget = float(getattr(args, 'plan_budget', 10.0))
+    deadline = t0 + budget
+    halt = getattr(node, 'halt', None)
+    cut = [False]
+
+    def late():
+        if time.monotonic() > deadline or (halt is not None and halt.is_set()):
+            cut[0] = True
+        return cut[0]
+    map_version = getattr(node, 'map_version', None)
+    entries, info = rank(app, arm, aim, point, origin, start)
+    stats = getattr(node, '_plan_stats', None)
+    if isinstance(stats, dict):
+        rec = stats.setdefault('numeric reach', [0, 0, 0.0])
+        rec[0] += 1
+        rec[1] += 1
+        rec[2] += info['seconds']
+    notes = {}
+    for k, v in info['notes'].items():               # the numbers' verdicts, as touch.py words them
+        word = {'reach': 'reach', 'line': 'wrist',
+                'press': 'the press onto the face runs a joint out of its range',
+                'room': 'room'}.get(k, k)
+        for _ in range(v):
+            _note(app, notes, word)
+    _log(node, f'{arm} fast reach: {info["candidates"]} ways in ({info.get("directions", 0)} '
+         f'directions' + (', every 15 deg of roll' if _on(args, 'free_roll', True) else '')
+         + f'), {info["ik"]} with a posture {_cm(_consts()[0])} cm short, {info["lines"]} with the '
+         f'line in and the press, {info["tier1"]} with room and joint margin, {info["edge"]} at '
+         f'the edge -- ranked in {info["seconds"]:.2f} s (squareness to the '
+         f'{info.get("oblique_from", "face normal")})')
+    if info.get('why'):
+        return None, info['why']
+    lim = np.array(node.joint_limits(arm), float)
+    ctx = {'notes': notes, 'contacts': [], 'contacts_left': CONTACTS, 'failed_goals': [],
+           'map_version': map_version, 'kin': _kin(node, arm), 'lim': lim, 'tried': 0,
+           'paths': 0, 'calls': []}
+    app._fast_reach_ctx = ctx                        # (the counts, for the tests and the logs)
+    edge_try = getattr(args, 'edge', 'try') != 'adjust' or (
+        hasattr(app, '_edge_ok') and app._edge_ok())
+    edges = []
+    i = 0
+    while i < len(entries):
+        e = entries[i]
+        if late():
+            break
+        if e['tier'] is None:                        # beyond the first ROOM_TOP: room now
+            room_check(app, arm, [x for x in entries[i:] if x['tier'] is None][:ROOM_TOP], lim)
+            if e.get('no_room'):
+                _note(app, notes, 'room')
+                i += 1
+                continue
+        if e['tier'] == 2:
+            edges.append(e)                          # only if nothing better
+            i += 1
+            continue
+        plan, why = _try(app, arm, e, ctx)
+        _log(node, f'{arm} fast reach: {e["label"]}, from {_cm(e["standoff"])} cm '
+             f'(margin {e["margin"]:.2f} rad, {e["oblique"]:.0f} deg off the face): '
+             + ('plans' if plan is not None else why))
+        if plan is not None:
+            return _done(node, arm, plan, ctx, map_version)
+        i += 1
+    if not cut[0] and edges:
+        edges = order(edges)
+        if not edge_try:
+            # --edge adjust on a narrow face: not flown (_checked_plan says so, and the
+            # robot moves instead) -- the first whose lines solve, no path
+            for e in edges:
+                if late():
+                    break
+                plan, _why = _try(app, arm, e, ctx, with_path=False)
+                if plan is not None:
+                    plan['edge'] = True
+                    return plan, None
+        else:
+            for e in edges:
+                if late():
+                    break
+                plan, why = _try(app, arm, e, ctx)
+                _log(node, f'{arm} fast reach: {e["label"]}, from {_cm(e["standoff"])} cm '
+                     f'(EDGE: margin {e["margin"]:.2f} rad, room '
+                     f'{"1 cm only" if e["room"] is False else "ok"}): '
+                     + ('plans' if plan is not None else why))
+                if plan is not None:
+                    return _done(node, arm, plan, ctx, map_version)
+    text = app._notes_text() if hasattr(app, '_notes_text') else \
+        '; '.join(f'{k} x{v}' for k, v in notes.items())
+    seen = (' -- in the way: ' + ' | '.join(ctx['contacts'])) if ctx['contacts'] else ''
+    if cut[0] and halt is not None and halt.is_set():
+        return None, 'STOP: the reach check was cut short'
+    if cut[0]:
+        return None, (f'no way to pick it {how} found in {budget:.0f} s (--plan-budget) - '
+                      f'not from here' + seen)
+    if not info['ik']:
+        return None, f'out of reach {how} (no arm posture gets there)'
+    if not entries:
+        tried = _standoffs(app, _consts()[0])
+        return None, (f'no straight line in {how} that the arm can follow, from any approach '
+                      f'point {_cm(tried[0])} to {_cm(tried[-1])} cm out'
+                      + (f' ({text})' if text else ''))
+    if ctx['paths'] and not any(k in notes for k in ('blocked', 'press')):
+        return None, 'no collision-free path to the approach point (something is in the way)'
+    return None, (f'the straight line in {how} is blocked from every way in tried'
+                  + (f' ({text})' if text else '') + seen)
+
+
+def _done(node, arm, plan, ctx, map_version):
+    now = getattr(node, 'map_version', None)
+    if now != map_version:
+        _log(node, f'{arm} fast reach: the map changed during the check ({map_version} -> {now})'
+             f' - the touch checks the plan again', warn=True)
+    seg = plan['segments']
+    _log(node, f'{arm} fast reach: {plan["label"]} - '
+         f'{ctx["tried"]} tried, {ctx["paths"]} path plans; line in '
+         + ('5 cm, ' if seg['seg_in5'] is not None else '')
+         + f'3 cm{" (the tool allowed near the box)" if seg["tool_free"] else ""}, press '
+         f'{1000 * seg["press_beyond"]:.0f} mm past'
+         + (' (hand exempt, coaxial)' if seg['hand_free'] else ' (fingers exempt)')
+         + f', joint margin {plan["margin"]:.2f} rad')
+    return plan, None

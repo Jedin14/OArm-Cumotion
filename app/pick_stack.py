@@ -56,7 +56,10 @@ The interface -- everything under /beast_arm (--ns):
   held_object/size     pick_interfaces/ObjectSize, in -- height x width x
                        depth mm of the box to pick next; at the contact it is
                        attached to the tool for the planners, released at the
-                       drop pose. Zeros: no object
+                       drop pose. Zeros: no object. Without it (2026-11-17) the
+                       box the model measured (pick_target's box_mm) is attached,
+                       a little larger, an unseen depth taken as --held-depth-mm
+                       (--held-size off: nothing attached, as before)
   held_object/state    std_msgs/String, out, latched -- "none", or
                        "<arm> <h>x<w>x<d> mm"
   held_object/release  std_msgs/Empty, in -- take the held box out of the
@@ -65,7 +68,9 @@ The interface -- everything under /beast_arm (--ns):
                        with tool and arm filled in (always matching) and box_mm:
                        the known size matched to the measured face (170 x 100 x
                        25 seen as 168 x 99 -> along 170, across 100, 25 deep),
-                       which is how the box is attached to the tool at contact
+                       which is how the box is attached to the tool at contact;
+                       with no held_object/size, the box model's own measure
+                       (box_model_node.py, 0 deep when not seen)
   status               std_msgs/String, out, latched -- all of the above as
                        one JSON object, on change and every second
   log                  std_msgs/String, out -- every message, as the window
@@ -124,6 +129,10 @@ class PickStack(ctm_app.App):
         self.next_hint = 'Waiting for ready_to_pick.'
         self.pick_result = None       # the last pick's outcome (pick_result)
         self.node.pick_box = None     # the matched box for the next contact (ctm/touch.py)
+        # ... and its size from the box model when held_object/size gives none
+        # (2026-11-17, this pick only): {'hwd': (h, w, d) m, 'source': 'box model'}
+        self.node.pick_size = None
+        self.node.pick_normal = None  # ... its face's normal (world): square on first (ctm/robot.py)
         self.node.pick_face_mm = None  # ... and its face's short side, mm
         self._status_said = None
         ns = args.ns.rstrip('/')
@@ -488,7 +497,9 @@ class PickStack(ctm_app.App):
     def prepare_target(self, target):
         """The model's target, made explicit: the tool and its arm (whatever
         the model said), and the known box matched to the measured face (for
-        the attach at contact)."""
+        the attach at contact). No held_object/size (2026-11-17): the box the
+        model measured (its box_mm) is the one attached -- node.pick_size and
+        node.pick_box, for this pick only; held_object/size, when given, wins."""
         tool = self.pick_tool if self.pick_tool in TOOL_ARM else (target.tool or 'vacuum')
         arm = TOOL_ARM[tool]
         if target.arm and target.arm != arm:
@@ -496,16 +507,28 @@ class PickStack(ctm_app.App):
                      f'arm\'s', True)
         target.tool, target.arm = tool, arm
         self.node.pick_box = None
+        self.node.pick_size = None                       # (the last target's: never this one's)
+        # the measured face's normal: the FRONT approach tries square on to it first
+        n = np.array([target.face_normal.x, target.face_normal.y, target.face_normal.z], float)
+        self.node.pick_normal = (n if target.approach != PickTarget.APPROACH_TOP
+                                 and np.linalg.norm(n) > 0.5 else None)
         # the face's short side: the cup must stay on it (ctm/touch.py)
         sides = [float(v) for v in target.face_mm if v > 0]
         self.node.pick_face_mm = min(sides) if sides else None
-        target.box_mm = [0.0, 0.0, 0.0]
+        # the box model's measured box (box_model_node.py, 2026-11-17): read before
+        # it is replaced by the known size's match below
+        model_mm = [float(v) for v in target.box_mm]
         size = self.node.object_size
+        if size is None:
+            # (box_mm is left as the model gave it: a second prepare_target of the
+            # same target -- TRY AGAIN -- reads the same box, no margin twice)
+            self._held_from_model(target, model_mm)
+            return
+        target.box_mm = [0.0, 0.0, 0.0]
         face = [float(v) for v in target.face_mm]
-        if size is None or min(face) <= 0:
-            if size is not None:
-                self.say('box size known, but the model gave no face size: attached by the '
-                         'tool\'s direction', True)
+        if min(face) <= 0:
+            self.say('box size known, but the model gave no face size: attached by the '
+                     'tool\'s direction', True)
             return
         known = [1000.0 * v for v in size['hwd']]
         box, err = box_match.match(known, face, loose=target.approach == PickTarget.APPROACH_TOP)
@@ -527,6 +550,48 @@ class PickStack(ctm_app.App):
             self.node.pick_box = {'long': np.array([target.face_long.x, target.face_long.y,
                                                     target.face_long.z]),
                                   'box_mm': tuple(float(v) for v in target.box_mm)}
+
+    def _held_from_model(self, target, model_mm):
+        """No held_object/size (2026-11-17): the box the model measured is the
+        box attached at the contact -- before, nothing was, and the way out, the
+        retrace and the drop leg were planned for the bare tool with a box on
+        the cup. model_mm: the target's box_mm from box_model_node.py (along
+        the face's long edge, across it, into the box; 0 deep when the depth
+        was not seen). Sets node.pick_box (turned as the face was seen) and
+        node.pick_size (height x width x depth m, 'box model'), each side
+        --held-margin-mm larger, an unseen depth --held-depth-mm: too big only
+        makes the planners keep more clear. Nothing moves differently before
+        the contact. --held-size off: nothing (as before)."""
+        args = self.node.args
+        if str(getattr(args, 'held_size', 'model') or 'model').lower() == 'off':
+            return
+        if len(model_mm) != 3 or min(model_mm[:2]) <= 0:
+            return                                       # the model measured no box
+        f = target.face_long
+        long_w = np.array([f.x, f.y, f.z], float)
+        if np.linalg.norm(long_w) < 0.5:
+            return                                       # (no face seen: no way to turn it)
+        long_w /= np.linalg.norm(long_w)
+        margin = max(0.0, float(getattr(args, 'held_margin_mm', 10.0)))
+        seen = model_mm[2] > 0
+        deep = model_mm[2] if seen else max(0.0, float(getattr(args, 'held_depth_mm', 150.0)))
+        box = (model_mm[0] + margin, model_mm[1] + margin, deep + margin)
+        # height x width x depth, held_object/size's order: a front face's long
+        # edge level -> it is the width and across it the height (upright: the
+        # other way round); a top face -> the depth into it is the height
+        if target.approach == PickTarget.APPROACH_TOP:
+            hwd = (box[2], box[0], box[1])
+        elif abs(long_w[2]) < np.sqrt(0.5):
+            hwd = (box[1], box[0], box[2])
+        else:
+            hwd = (box[0], box[1], box[2])
+        self.node.pick_size = {'hwd': tuple(v / 1000.0 for v in hwd), 'source': 'box model'}
+        self.node.pick_box = {'long': long_w, 'box_mm': box}
+        self.say(f'box model: {model_mm[0]:.0f} x {model_mm[1]:.0f} mm on the face, '
+                 + (f'{model_mm[2]:.0f} mm deep' if seen else
+                    f'depth not seen ({deep:.0f} mm taken)')
+                 + f' - attached at the contact as {hwd[0]:.0f} x {hwd[1]:.0f} x {hwd[2]:.0f} mm '
+                   f'(h x w x d, {margin:.0f} mm added)')
 
     def _narrow_front_to_top(self, target, face, box):
         """FRONT on a narrow face (a flat box: 169 x 30 mm for the 25 mm cup) of a box
@@ -552,6 +617,7 @@ class PickStack(ctm_app.App):
         top = p + up * (height / 2000.0) + back * (depth / 2000.0)
         target.position.x, target.position.y, target.position.z = (float(v) for v in top)
         target.approach = PickTarget.APPROACH_TOP
+        self.node.pick_normal = None
         target.face_normal.x, target.face_normal.y, target.face_normal.z = 0.0, 0.0, 1.0
         target.face_mm = [float(box[0]), float(depth)]
         target.box_mm = [float(box[0]), float(depth), float(height)]   # on the cup: top down
@@ -808,7 +874,11 @@ class PickStack(ctm_app.App):
         self.pick_result = result
         if count:
             self.node.pick_box = None                    # (used: the next target's own)
+            self.node.pick_normal = None
             self.node.pick_face_mm = None
+            # (2026-11-17) the box model's size too -- not with count=False: PICK ALL
+            # finishes a pick after the next box's prepare_target, whose size it is
+            self.node.pick_size = None
         self.result_pub.publish(String(data=json.dumps(result, default=str)))
         self.report(status)
 

@@ -17,10 +17,12 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <thread>
 #include <vector>
 
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
+#include "openarm_hardware/gains_file.hpp"
 #include "rclcpp/logging.hpp"
 #include "rclcpp/rclcpp.hpp"
 
@@ -63,6 +65,11 @@ bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
 
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
               "Raw can_fd param: %s", raw_can_fd.c_str());
+
+  // The control-law file (2026-11-17), calibration/motor_gains_<arm>.yaml by
+  // the ros2_control xacro's default. Unset or empty: none, the compiled law.
+  it = info.hardware_parameters.find("gains_file");
+  gains_file_ = (it != info.hardware_parameters.end()) ? it->second : "";
 
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
               "Configuration: CAN=%s, arm_prefix=%s, hand=%s, can_fd=%s",
@@ -150,6 +157,12 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_init(
   tau_states_.resize(total_joints, 0.0);
   // -1 until a frame has been read: "not known", not "not enabled".
   status_states_.resize(total_joints, -1.0);
+  integral_torque_states_.resize(ARM_DOF, 0.0);
+  prev_pos_commands_.resize(total_joints, 0.0);
+  status_seen_.assign(total_joints, -1);
+  status_shown_.assign(total_joints, -1);
+  status_changes_.assign(total_joints, 0);
+  status_logged_at_.assign(total_joints, std::chrono::steady_clock::now());
 
   // Initialize KDL for gravity compensation
   KDL::Tree kdl_tree;
@@ -194,12 +207,90 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_init(
   kdl_dyn_param_ = std::make_unique<KDL::ChainDynParam>(kdl_chain, gravity);
   kdl_q_.resize(ARM_DOF);
   kdl_gravity_torque_.resize(ARM_DOF);
-  integral_errors_.resize(total_joints, 0.0);
+
+  // The control law: the compiled gains, then the gains file if there is one.
+  load_control_law();
 
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
               "OpenArm V10 Simple HW initialized successfully");
 
   return CallbackReturn::SUCCESS;
+}
+
+void OpenArm_v10HW::load_control_law() {
+  const auto logger = rclcpp::get_logger("OpenArm_v10HW");
+  // Compiled: exactly the law write() ran before 2026-11-17 (gains, caps,
+  // deadband), plus the two new switches on.
+  laws_.assign(ARM_DOF, mit_law::JointLaw());
+  for (size_t i = 0; i < ARM_DOF; ++i) {
+    mit_law::JointLaw& law = laws_[i];
+    law.kp = DEFAULT_KP[i];
+    law.kd = DEFAULT_KD[i];
+    law.ki = DEFAULT_KI[i];
+    law.i_cap = std::min(MAX_I_TORQUE, MAX_I_TORQUE_JOINT[i]);
+    law.deadband = INTEGRAL_DEADBAND;
+    law.gate_in = INTEGRAL_DEADBAND;
+    law.gate_out = INTEGRAL_DEADBAND;
+    law.vff_max = VFF_MAX[i];
+  }
+  law_flags_ = mit_law::LawFlags();
+  law_memory_.assign(ARM_DOF, mit_law::JointMemory());
+
+  // Velocity feed-forward and the integral freeze are ON without a file, or
+  // with one that is missing or rejected: they are the fix for the lag and
+  // the overshoot, and the file is how to turn them off. The gains profile
+  // is only ever on from an accepted file that says so.
+  std::string arm = arm_prefix_;
+  if (!arm.empty() && arm.back() == '_') arm.pop_back();
+  gains_file::Contents contents;
+  std::string why;
+  switch (gains_file::load(gains_file_, arm, laws_, contents, why)) {
+    case gains_file::Load::kNoFile:
+      gains_source_ = "no gains file configured: compiled law";
+      RCLCPP_INFO(logger, "%s arm: %s", arm.c_str(), gains_source_.c_str());
+      break;
+    case gains_file::Load::kMissing:
+      gains_source_ =
+          "gains file " + gains_file_ + " not found: compiled law";
+      RCLCPP_WARN(logger, "%s arm: %s", arm.c_str(), gains_source_.c_str());
+      break;
+    case gains_file::Load::kRejected:
+      gains_source_ = "gains file " + gains_file_ + " REJECTED (" + why +
+                      "): compiled law, none of the file used";
+      RCLCPP_ERROR(logger, "%s arm: %s", arm.c_str(), gains_source_.c_str());
+      break;
+    case gains_file::Load::kLoaded:
+      gains_file::apply(contents, laws_, law_flags_);
+      gains_source_ = "gains file " + gains_file_ +
+                      (contents.profile_enabled ? " (profile on)"
+                                                : " (profile off)");
+      RCLCPP_INFO(logger, "%s arm: %s", arm.c_str(), gains_source_.c_str());
+      break;
+  }
+}
+
+void OpenArm_v10HW::log_control_law() const {
+  // What write() will actually run, so a log answers "which law was this?".
+  const auto logger = rclcpp::get_logger("OpenArm_v10HW");
+  RCLCPP_INFO(logger,
+              "%s control law: velocity feed-forward %s, integral freeze %s "
+              "(moving above %.3f rad/s, still for %.2f s), held-point "
+              "velocity guard %s; %s",
+              arm_prefix_.c_str(),
+              law_flags_.velocity_feedforward ? "on" : "off",
+              law_flags_.freeze_while_moving ? "on" : "off",
+              law_flags_.freeze_rate, law_flags_.freeze_hold,
+              law_flags_.zero_velocity_when_held ? "on" : "off",
+              gains_source_.c_str());
+  for (size_t i = 0; i < ARM_DOF && i < laws_.size(); ++i) {
+    const mit_law::JointLaw& law = laws_[i];
+    RCLCPP_INFO(logger,
+                "  %s: kp %.1f kd %.2f ki %.1f i_cap %.2f Nm, deadband %.2f "
+                "mrad, gate %.2f/%.2f mrad, vff_max %.1f rad/s",
+                joint_names_[i].c_str(), law.kp, law.kd, law.ki, law.i_cap,
+                1000.0 * law.deadband, 1000.0 * law.gate_in,
+                1000.0 * law.gate_out, law.vff_max);
+  }
 }
 
 hardware_interface::CallbackReturn OpenArm_v10HW::on_configure(
@@ -229,6 +320,16 @@ OpenArm_v10HW::export_state_interfaces() {
     // whether a motor is driving can read it.
     state_interfaces.emplace_back(hardware_interface::StateInterface(
         joint_names_[i], "status", &status_states_[i]));
+    // Same deal (2026-11-17): the integral's torque, N m, arm joints only
+    // (the gripper has no integral). Nothing claims it but the
+    // joint_state_broadcaster, which publishes every state interface it is
+    // given on /dynamic_joint_states (as it does "status"); the trajectory
+    // controllers claim only "position", and /joint_states carries only
+    // position, velocity and effort.
+    if (i < ARM_DOF) {
+      state_interfaces.emplace_back(hardware_interface::StateInterface(
+          joint_names_[i], "integral_torque", &integral_torque_states_[i]));
+    }
   }
 
   return state_interfaces;
@@ -287,6 +388,19 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_activate(
   // what /pick_place/engage does once this returns.
   hold_current_position();
 
+  // No velocity either (2026-11-17): the velocity command is now the motor's
+  // velocity target, and the JTC reads the command interfaces back as its
+  // starting state on activation (set_last_command_interface_value_as_state_
+  // on_activation), so it must start at "standing still". And the integral's
+  // "has the command moved?" starts from the held command, not from 0.
+  std::fill(vel_commands_.begin(), vel_commands_.end(), 0.0);
+  prev_pos_commands_ = pos_commands_;
+  for (auto& m : law_memory_) {
+    m.held_cycles = 0;
+  }
+  log_control_law();
+  start_status_watch();
+
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"), "OpenArm V10 activated");
   return CallbackReturn::SUCCESS;
 }
@@ -295,6 +409,8 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
               "Deactivating OpenArm V10...");
+  // Disabling the motors changes every status on purpose; not news.
+  watch_status_ = false;
 
   // Disable all motors (like full_arm.cpp exit)
   openarm_->disable_all();
@@ -344,7 +460,74 @@ hardware_interface::return_type OpenArm_v10HW::read(
     }
   }
 
+  watch_status();
   return hardware_interface::return_type::OK;
+}
+
+void OpenArm_v10HW::start_status_watch() {
+  // The baseline is what the motors say right after verify_enabled(), which
+  // has already reported any that did not come up.
+  const auto now = std::chrono::steady_clock::now();
+  const auto& arm_motors = openarm_->get_arm().get_motors();
+  for (size_t i = 0; i < joint_names_.size(); ++i) {
+    int s = -1;
+    if (i < ARM_DOF && i < arm_motors.size()) {
+      s = arm_motors[i].get_status();
+    } else if (i == ARM_DOF && hand_) {
+      const auto& gripper_motors = openarm_->get_gripper().get_motors();
+      if (!gripper_motors.empty()) s = gripper_motors[0].get_status();
+    }
+    status_seen_[i] = s;
+    status_shown_[i] = s;
+    status_changes_[i] = 0;
+    // Backdated, so the first change is logged at once.
+    status_logged_at_[i] =
+        now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                  std::chrono::duration<double>(STATUS_LOG_PERIOD));
+  }
+  watch_status_ = true;
+}
+
+void OpenArm_v10HW::watch_status() {
+  // Logs only. Deciding anything from these codes waits until the Damiao
+  // codes are confirmed for libopenarm_can 1.2.9; until then a change is
+  // worth seeing, and what to do about it is for whoever reads "status" on
+  // /dynamic_joint_states (the app).
+  if (!watch_status_) return;
+  const auto logger = rclcpp::get_logger("OpenArm_v10HW");
+  const auto now = std::chrono::steady_clock::now();
+  for (size_t i = 0; i < joint_names_.size() && i < status_states_.size();
+       ++i) {
+    const int s = static_cast<int>(status_states_[i]);
+    if (s != status_seen_[i]) {
+      status_seen_[i] = s;
+      ++status_changes_[i];
+    }
+    if (status_changes_[i] == 0) continue;
+    // A flapping status would otherwise log 100 times a second; this logs it
+    // at most once per period, and always the latest value within a period.
+    if (std::chrono::duration<double>(now - status_logged_at_[i]).count() <
+        STATUS_LOG_PERIOD) {
+      continue;
+    }
+    if (s == 1) {
+      RCLCPP_WARN(logger,
+                  "%s motor status %d -> %d (%d change(s)): enabled again "
+                  "(1 enabled; 0 disabled, 8-14 faults)",
+                  joint_names_[i].c_str(), status_shown_[i], s,
+                  status_changes_[i]);
+    } else {
+      RCLCPP_ERROR(logger,
+                   "%s motor status %d -> %d (%d change(s)): this motor may "
+                   "not be driving -- it can hold nothing while its encoder "
+                   "reads on (1 enabled; 0 disabled, 8-14 faults)",
+                   joint_names_[i].c_str(), status_shown_[i], s,
+                   status_changes_[i]);
+    }
+    status_shown_[i] = s;
+    status_changes_[i] = 0;
+    status_logged_at_[i] = now;
+  }
 }
 
 hardware_interface::return_type OpenArm_v10HW::write(
@@ -365,29 +548,19 @@ hardware_interface::return_type OpenArm_v10HW::write(
   double dt = period.seconds();
   if (dt <= 0.0) dt = 0.001; // fallback
 
+  // The law itself is in mit_law.hpp (2026-11-17): the same integral, caps
+  // and deadband as before, plus velocity feed-forward and the integral held
+  // while the command moves -- each switchable in the gains file.
   for (size_t i = 0; i < ARM_DOF; ++i) {
-    // Integral control to eliminate steady state error
-    double error = pos_commands_[i] - pos_states_[i];
-    // Deadband: inside the friction band the integral holds (see the header).
-    if (std::abs(error) > INTEGRAL_DEADBAND) {
-      integral_errors_[i] += error * dt;
-    }
-    const double i_cap = std::min(MAX_I_TORQUE, MAX_I_TORQUE_JOINT[i]);
-
-    double i_torque = DEFAULT_KI[i] * integral_errors_[i];
-    // Anti-windup, per joint
-    i_torque = std::clamp(i_torque, -i_cap, i_cap);
-    // Clamp the integral error itself as well, so it cannot wind up past it
-    if (DEFAULT_KI[i] > 0.0) {
-      integral_errors_[i] = std::clamp(integral_errors_[i], -i_cap / DEFAULT_KI[i], i_cap / DEFAULT_KI[i]);
-    }
-
-    double ff_torque = tau_commands_[i] + i_torque;
-    if (kdl_success) {
-      ff_torque += kdl_gravity_torque_(i);
-    }
-    arm_params.push_back({DEFAULT_KP[i], DEFAULT_KD[i], pos_commands_[i],
-                          vel_commands_[i], ff_torque});
+    const double gravity = kdl_success ? kdl_gravity_torque_(i) : 0.0;
+    const mit_law::Command c = mit_law::step(
+        laws_[i], law_flags_, pos_states_[i], pos_commands_[i],
+        prev_pos_commands_[i], vel_commands_[i], tau_commands_[i], gravity,
+        dt, law_memory_[i]);
+    // The command actually used (a NaN command keeps the last finite one).
+    prev_pos_commands_[i] = c.q;
+    integral_torque_states_[i] = c.i_torque;
+    arm_params.push_back({c.kp, c.kd, c.q, c.dq, c.tau});
   }
   openarm_->get_arm().mit_control_all(arm_params);
   // Control gripper if enabled

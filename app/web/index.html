@@ -79,6 +79,8 @@
           </div>
           <div class="sheet-actions">
             <button class="btn primary" data-action="confirm" id="calConfirm">Confirm</button>
+            <!-- AUTO CALIBRATE waiting at pre_pick for the box (also on the Calibrate tab) -->
+            <button class="btn primary" data-action="autocal_box_on" id="calBoxOn" hidden>Box is on the cup</button>
             <button class="btn danger" data-action="abort">Abort</button>
           </div>
         </div>
@@ -254,6 +256,46 @@
 
         <!-- CALIBRATE -->
         <section class="pane" data-pane="calibrate" hidden>
+          <!-- AUTO CALIBRATE (2026-11-16): everything from one button -- the tool's
+               weight, the box over the whole workspace, the model chosen and checked -->
+          <div class="card autocal" id="autocalCard">
+            <div class="card-row">
+              <span class="label">Auto calibration (one button)</span>
+              <span class="badge" id="acBadge" data-tone="idle">ready</span>
+            </div>
+            <div class="why">Needs the ArUco box (<a href="/sheets/calib_box_sheets.pdf" target="_blank">the box sheets</a>
+              at 100 % on a 170×100×25 mm box), about 30 min, and the space round the left arm clear.
+              It weighs the tool first with the arm <b>empty</b> (nothing on the cup), then asks for the box:
+              put it on the cup, cup on the cross of face B, and press <b>Box is on the cup</b>
+              (it goes on by itself once the camera sees the box). Then it moves through ~90 postures over the
+              whole workspace, chooses the arm model itself &ndash; or none, if the plain URDF is as good &ndash;
+              checks it on postures it was not fitted to, and saves it only if it is better than now.
+              The depth camera is checked on the box too.</div>
+            <label class="check"><input type="checkbox" id="acWeigh"> Weigh the tool first (better: WEIGH TOOL, then restart)</label>
+            <div class="actions">
+              <button class="btn primary big" data-action="auto_cal" id="btnAutoCal">Auto calibrate</button>
+              <button class="btn primary big" data-action="autocal_box_on" id="btnBoxOn" hidden>Box is on the cup</button>
+            </div>
+            <div class="ac-progress" id="acProgress" hidden>
+              <div class="ac-step" id="acStep"></div>
+              <div class="ac-bar" role="progressbar" aria-label="Postures measured" aria-valuemin="0" id="acBarWrap"><span id="acBar"></span></div>
+              <div class="why small" id="acCounts"></div>
+            </div>
+            <div class="ac-result" id="acResult" hidden>
+              <div class="sublabel">Tip error on postures each model was not fitted to</div>
+              <table class="models ac-cv" aria-label="Cross-validated tip error of each model">
+                <thead><tr><th>Model</th><th>Mean</th><th>90 %</th></tr></thead>
+                <tbody id="acCvBody"></tbody>
+              </table>
+              <div class="why" id="acVal"></div>
+              <div class="why" id="acBaseline"></div>
+              <div class="why" id="acSaved"></div>
+              <div class="why small" id="acNotes"></div>
+              <div class="flag" id="acRestart" hidden>Restart terminal 1 (run_launch_everything.sh) so the motors use the measured tool weight.</div>
+            </div>
+            <div class="ac-maps" id="acMaps" hidden></div>
+          </div>
+
           <div class="group">
             <div class="card-row">
               <div class="label">Live markers</div>
@@ -308,14 +350,15 @@
           </div>
 
           <div class="group">
-            <div class="label">Automatic calibration (marker box)</div>
-            <div class="hint">Print <a href="/sheets/calib_box_sheets.pdf" target="_blank">the box sheets</a> at 100 % and glue them on a 170×100×25 box. Cup on the cross of face B, vacuum on, arm at pre-pick: <b>Auto calibrate</b> (~15 min, unattended). The arm shows the box to the camera in level and top-down postures; the camera's markers give the tip and, on the same faces, the depth camera's error. Arm model and depth correction are saved only if they are better than now.</div>
+            <div class="label">Box calibration without weighing</div>
+            <div class="hint">The same run as <b>Auto calibrate</b> above, without weighing the tool first: box already on the cup (cup on the cross of face B), arm at pre-pick. It starts as soon as the camera sees the box. Arm model and depth correction are saved only if they are better than now.</div>
             <div class="actions">
-              <button class="btn primary big" data-action="box_cal">Auto calibrate (box)</button>
+              <button class="btn big" data-action="box_cal">Calibrate with the box (no weighing)</button>
             </div>
             <details class="hint">
-              <summary>Depth with the ChArUco board instead</summary>
-              Print <a href="/sheets/charuco_board.pdf" target="_blank">the board</a> at 100 %; hold it in view, Capture, move it, 3–5 times, Fit.
+              <summary>Depth with the ChArUco board (optional)</summary>
+              <b>Not needed &ndash; the auto calibration measures depth on the box.</b> Only to double-check the depth camera by hand:
+              print <a href="/sheets/charuco_board.pdf" target="_blank">the A4 board</a> at 100 % (flat, on card), hold it 35–60 cm from the camera, all of it in view; Capture; move it (another distance, side, tilt), 3–5 times; Fit.
               <div class="actions two">
                 <button class="btn" data-action="depth_capture" id="btnDepthCap">Depth: capture</button>
                 <button class="btn" data-action="depth_fit" id="btnDepthFit">Depth: fit</button>
@@ -443,11 +486,25 @@
               <span class="label">Pick all</span>
               <span class="badge" id="pickAllState" data-tone="idle">ready</span>
             </div>
-            <div class="why">Clears every box it can, one after another: detect, pick, drop, the next &ndash;
-              no Move to press. A box not taken gets one more round later. A box out of reach is
+            <div class="why">Picks boxes one after another: detect, pick, drop, the next &ndash;
+              no Move to press. <b>Pick N</b> stops once that many are picked; <b>All</b> clears
+              every box it can. A box not taken gets one more round later. A box out of reach is
               skipped, or &ndash; with No base movement off &ndash; it asks for the base to be moved
               and picks it once it is in place. <b>STOP</b> (Esc) ends it.</div>
-            <button class="btn primary big model" data-action="pick_all" id="btnPickAll"><span id="pickAllLabel">Pick all</span></button>
+            <!-- COUNT (2026-11-17): how many to pick; the stepper's buttons are not
+                 data-action (nothing is sent until Pick N or All) -->
+            <div class="pickall-count" id="pickAllCount">
+              <div class="stepper count" role="group" aria-label="How many boxes to pick">
+                <button type="button" data-count-step="-1" aria-label="One box fewer">−</button>
+                <input id="pickCount" type="number" min="1" max="200" step="1" value="1"
+                       inputmode="numeric" aria-label="Boxes to pick">
+                <button type="button" data-count-step="1" aria-label="One box more">+</button>
+              </div>
+              <button class="btn primary big model" data-action="pick_all" data-count="n" id="btnPickAll"
+                      title="Pick this many boxes, then stop"><span id="pickAllLabel">Pick 1</span></button>
+              <button class="btn big model" data-action="pick_all" data-count="all" id="btnPickAllAll"
+                      title="Clear every box it can">All</button>
+            </div>
             <div class="toggles">
               <button class="toggle" data-action="no_base_move" id="tgNoBaseMove" aria-pressed="true" title="On: a box it cannot reach from here is skipped. Off: Pick all stops at it, shows how to move the base, and picks it by itself once the box is in place">
                 <span class="knob"></span>No base movement

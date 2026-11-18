@@ -13,20 +13,22 @@
 # limitations under the License.
 
 
+# kinematics_solver_timeout is the DEFAULT, used where a request gives none --
+# above all by /compute_cartesian_path, which solves IK every 5 mm along a line
+# from the previous step (a warm start: a step that solves takes ~1 ms). A step
+# blocked by a collision cannot be solved at all and costs the whole timeout:
+# at 0.05 s the 1079 partial lines of 2026-11-16 took a median 51 ms each,
+# 55.7 s of a 12-minute run. 0.01 (2026-11-17) fails them in ~10 ms and gives
+# the same fractions. Cold IK from a far seed (click_to_move's /compute_ik)
+# keeps 0.05 -- it sets its own timeout in every request (ctm/robot.py
+# _solve_ik). Before: 0.05, because 5 ms (the generated default) failed
+# reachable cold IK goals -- "out of reach" refusals on pickable objects.
 left_arm:
   kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
   kinematics_solver_search_resolution: 0.0050000000000000001
-  # 5 ms was the generated default and it is far too short for a 7-DOF arm
-  # with a full 6-DOF pose goal: KDL is a randomly-seeded iterative solver, and
-  # a single 5 ms attempt fails on poses that are perfectly reachable -- which
-  # turned into "out of reach" refusals on objects the arm could pick.
-  kinematics_solver_timeout: 0.05
+  kinematics_solver_timeout: 0.01
 
 right_arm:
   kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
   kinematics_solver_search_resolution: 0.0050000000000000001
-  # 5 ms was the generated default and it is far too short for a 7-DOF arm
-  # with a full 6-DOF pose goal: KDL is a randomly-seeded iterative solver, and
-  # a single 5 ms attempt fails on poses that are perfectly reachable -- which
-  # turned into "out of reach" refusals on objects the arm could pick.
-  kinematics_solver_timeout: 0.05
+  kinematics_solver_timeout: 0.01

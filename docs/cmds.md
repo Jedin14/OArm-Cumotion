@@ -38,6 +38,9 @@ native/run_launch_everything.sh   # terminal 1: robot, MoveIt, cuMotion, camera;
 #   camera's check: the walls are back at the next capture (--lidar-walls always: walls whatever).
 #   Args: lidar:=serial (default) | udp | off; lidar_port:= ; lidar_x:= lidar_y:= lidar_z:= (m);
 #   lidar_roll:= lidar_pitch:= lidar_yaw:= lidar_spin:= (deg). Its state: ros2 topic echo --once /lidar/status
+#   RViz looks in the frame 'level' (gravity straight down): the robot's own frame leans ~5 deg against
+#   the room (camera accelerometer 5.3, ceiling in the L2's cloud 4.6). Args level_pitch:=5.3 level_roll:=-0.2
+#   (deg; 0 0 = as before). Planning stays in 'world'. No picture in RViz: Fixed Frame back to world.
 #   SINCE 2026-11-13 (robot/lidar_bridge.py; all three on by default, each a parameter):
 #   - self_filter: the robot is never an object. Points on the arms / hands / body (the URDF's
 #     collision shapes at the live TF, body_pad 8 cm for the LiDAR, body_pad_camera 3 cm for the
@@ -55,7 +58,27 @@ native/run_launch_everything.sh   # terminal 1: robot, MoveIt, cuMotion, camera;
 #     its window (+1.2 cm at 10% dirty, -2.7 cm at 17%). Where the camera sees the same surface it
 #     is right: once a second the median difference is taken off ALL the LiDAR's ranges (settles in
 #     ~6 s, at most 5 cm). /lidar/status: range_trim_cm (applied), range_left_cm (what is left).
-#   Tests (domain 77): scratchpad trim_test.py (4), selffilter_test.py (5), filter_test.py (8), lidar_test3.py (13).
+#   - density_filter: no specks -- a LiDAR point goes on only with >= 8 others within 3 cm over the
+#     last 2 s (replay 2026-11-16: isolated work-space voxels 134 -> 52). The gater also removes
+#     small islands of camera depth (cv2.filterSpeckles, speckle_px 200, speckle_diff_mm 25).
+#   Tests (domain 77): scratchpad speck_test.py (2), trim_test.py (4), selffilter_test.py (5), filter_test.py (8), lidar_test3.py (13).
+
+# SENSOR ALIGN (2026-11-16): move the camera's and the LiDAR's world onto the robot, live, by hand
+#   (terminal 1 running; a window on beast's desktop; nothing moves the arm):
+#     source native/setup.bash && python3 robot/sensor_align.py
+#   The yellow ball in RViz ("Sensor align tip", /sensor_align/markers) is where the robot thinks the
+#   working tip is. Hold your palm on the real tip and move the clouds until the palm sits on the ball.
+#   Move: Both (camera + LiDAR together) / Camera / LiDAR; buttons move the cloud along X/Y/Z (0.5-20 mm)
+#   and turn it about the ball (0.05-2 deg). Fit camera to the arm: its depth onto the arm's model, no
+#   motion (a shift only from one posture; it says which way it could not see). Fit LiDAR to the
+#   camera: the L2's mount onto what the camera sees (it says how firm). Readouts: camera vs arm (%
+#   within 15 mm), LiDAR vs camera. Undo / Revert / Rebuild octomap / Save (camera -> v10.urdf.xacro +
+#   cam_org.txt + rebuild; LiDAR -> the lidar_* defaults here). Unsaved: gone at the next terminal 1.
+#   After moving the camera, run the Auto calibrate again (the arm model saw the old camera).
+#   The L2's HOUSING box (MoveIt obstacle l2_lidar_housing) stays where the L2 physically is
+#   (lidar_bridge housing_xyz / housing_rpy_deg / housing_spin_deg, default the 11-13 fit), not at the
+#   aligned mount: on 11-16 a by-hand mount 6.4 cm left put the box into openarm_left_link0 (painted red).
+#   Test (domain 77, synthetic room): scratchpad align/run_test.sh.
 
 # AUTOMATIC CALIBRATION (web GUI, Calibrate tab; sheets at http://beast:8080/sheets/calib_box_sheets.pdf
 #   and /sheets/charuco_board.pdf, or: cd app && python3 -m ctm.calib_box):
@@ -151,3 +174,30 @@ native/run_calibrate.sh           # CALIBRATION only (the folded pieces on both 
 
 (cd app && python3 -m ctm.board --sheet)   # regenerate docs/sheets/gripper_boards.pdf (print at 100 %, fold on the dashed lines)
 (cd app && python3 -m ctm.board --live)    # quick camera view of the markers
+
+## STOP WHEN CTRL-C HANGS (2026-11-17)
+If terminal 1 keeps printing "user interrupted with ctrl-c (SIGINT) again, ignoring...",
+run this from another terminal on beast (asks every stack node to stop, then kills
+what is left after 10 s, including the hung `ros2 launch`):
+
+    bash /workspaces/isaac_ros-dev/robot/stop_everything.sh
+
+(It stops only the stack's own programs, this user's, on ROS domain 0 -- not an editor,
+`less` or `tail` on one of their files, nor a test on another domain.)
+
+## LIDAR: CAMERA FIRST, HOLES AND 12 CM BEHIND (2026-11-17)
+lidar_bridge drops the L2's points wherever the camera speaks for that place: in front
+of a camera surface, up to camera_first_behind (0.12 m) behind it, in camera holes up to
+camera_first_fill_px (25 px) from a depth, and up to 25 px outside the picture. Reason:
+the L2 sat 4-8 cm behind the camera's box faces and its scatter in the camera's edge
+holes made voxels 3-4 cm in front of a box, blocking every way in. In a hole and outside
+the picture (a depth the camera did not measure there) only the L2 points AT the borrowed
+surface go: at most camera_first_fill_front (0.05 m) in front of it -- anything further in
+front is something only the L2 sees (thin, dark, shiny, too near) and stays (review fix,
+2026-11-17 evening). As before (live, no restart): ros2 param set /lidar_bridge
+camera_first_behind 0.04 ; ros2 param set /lidar_bridge camera_first_fill_px 0
+The LiDAR mount itself is ~4 cm off the camera (median), range trim stuck at +5 cm:
+re-fit it with robot/sensor_align.py (Fit LiDAR to the camera, several arm postures).
+#   2026-11-17: Fit LiDAR to the camera reads /lidar/cloud_fit (the bridge's cloud NOT filtered by
+#   the camera -- /lidar/cloud lacks exactly the points on the camera's surfaces); restart terminal 1
+#   once so the bridge publishes it (an older bridge: the fit falls back to /lidar/cloud, biased).

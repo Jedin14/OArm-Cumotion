@@ -35,7 +35,7 @@ def generate_launch_description():
                               description='auto (the model decides), top, front'),
         DeclareLaunchArgument('pick_tool', default_value='vacuum',
                               description='vacuum (left arm only) or finger (right arm only)'),
-        DeclareLaunchArgument('order', default_value='v1',
+        DeclareLaunchArgument('order', default_value='grid',
                               description='which box first: v1 (stack tops, highest '
                                           'first, then nearest, then leftmost) or v2 '
                                           '(the leftmost free box)'),

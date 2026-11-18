@@ -17,6 +17,11 @@ from ctm.common import ROBOT_DIR
 POSE_FILE = os.path.join(ROBOT_DIR, 'pick_place_states_{arm}.yaml')
 MODE_POSE = {'navigation': 'navigation_state', 'pick': 'pre_pick_state'}
 AT_POSE = 0.05                  # rad: an arm this close to a pose is "at" it
+# 2026-11-17: an arm last SENT to a pose (node.last_goal, ctm/robot.py) is at it
+# while it is within GOAL_NEAR of it -- the soft wrist rests 50-70 mrad off its
+# command (j7 0.063), and every PICK ALL round moved it to pre_pick again (3.2 s)
+GOAL_SAME = 1e-3                # rad: the last goal IS the pose
+GOAL_NEAR = 0.15                # rad: ... and the arm is this near it (more: moved by hand)
 
 
 def load_poses():
@@ -40,13 +45,33 @@ class ModesMixin:
     def pose(self, arm, name):
         return self.poses.get(arm, {}).get(name)
 
+    def at_pose(self, arm, target, now):
+        """Is the arm at the pose `target`: within AT_POSE of it, or (2026-11-17)
+        last sent exactly there (node.last_goal[arm], when the node keeps it)
+        and still within GOAL_NEAR."""
+        if target is None or now is None:
+            return False
+        try:
+            target = np.asarray(target, float)
+            off = float(np.max(np.abs(np.asarray(now, float) - target)))
+        except (TypeError, ValueError):
+            return False
+        if off <= AT_POSE:
+            return True
+        try:
+            goal = (getattr(self.node, 'last_goal', None) or {}).get(arm)
+            goal = None if goal is None else np.asarray(goal, float)
+        except (AttributeError, TypeError, ValueError):
+            goal = None
+        return (goal is not None and goal.shape == target.shape and off <= GOAL_NEAR
+                and float(np.max(np.abs(goal - target))) <= GOAL_SAME)
+
     def detect_mode(self):
         for mode, name in MODE_POSE.items():
             at = True
             for arm in ('left', 'right'):
                 target, now = self.pose(arm, name), self.node.arm_positions(arm)
-                if target is None or now is None or \
-                        np.max(np.abs(np.array(now) - target)) > AT_POSE:
+                if not self.at_pose(arm, target, now):
                     at = False
             if at:
                 return mode

@@ -1,0 +1,339 @@
+# Copyright 2025 Enactic, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import xacro
+from ament_index_python.packages import (
+    get_package_share_directory,
+)
+from launch import LaunchDescription, LaunchContext
+from launch.actions import (
+    DeclareLaunchArgument,
+    TimerAction,
+    OpaqueFunction,
+    LogInfo,
+    RegisterEventHandler,
+)
+from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
+from launch.substitutions import (
+    LaunchConfiguration,
+    PathJoinSubstitution,
+)
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+from moveit_configs_utils import MoveItConfigsBuilder
+
+
+def generate_robot_description(
+    context: LaunchContext,
+    description_package,
+    description_file,
+    arm_type,
+    use_fake_hardware,
+    can_fd,
+    right_can_interface,
+    left_can_interface,
+    arm_prefix,
+):
+    """Render Xacro and return XML string."""
+    description_package_str = context.perform_substitution(description_package)
+    description_file_str = context.perform_substitution(description_file)
+    arm_type_str = context.perform_substitution(arm_type)
+    use_fake_hardware_str = context.perform_substitution(use_fake_hardware)
+    can_fd_str = context.perform_substitution(can_fd)
+    right_can_interface_str = context.perform_substitution(right_can_interface)
+    left_can_interface_str = context.perform_substitution(left_can_interface)
+    arm_prefix_str = context.perform_substitution(arm_prefix)
+
+    xacro_path = os.path.join(
+        get_package_share_directory(description_package_str),
+        "urdf",
+        "robot",
+        description_file_str,
+    )
+
+    robot_description = xacro.process_file(
+        xacro_path,
+        mappings={
+            "arm_type": arm_type_str,
+            "bimanual": "true",
+            "use_fake_hardware": use_fake_hardware_str,
+            "ros2_control": "true",
+            "can_fd": can_fd_str,
+            "left_can_interface": left_can_interface_str,
+            "right_can_interface": right_can_interface_str,
+            # arm_prefix unused inside xacro but kept for completeness
+        },
+    ).toprettyxml(indent="  ")
+
+    return robot_description
+
+
+def robot_nodes_spawner(
+    context: LaunchContext,
+    description_package,
+    description_file,
+    arm_type,
+    use_fake_hardware,
+    controllers_file,
+    can_fd,
+    right_can_interface,
+    left_can_interface,
+    arm_prefix,
+):
+    robot_description = generate_robot_description(
+        context,
+        description_package,
+        description_file,
+        arm_type,
+        use_fake_hardware,
+        can_fd,
+        right_can_interface,
+        left_can_interface,
+        arm_prefix,
+    )
+
+    controllers_file_str = context.perform_substitution(controllers_file)
+    robot_description_param = {"robot_description": robot_description}
+
+    robot_state_pub_node = Node(
+        package="robot_state_publisher",
+        executable="robot_state_publisher",
+        name="robot_state_publisher",
+        output="screen",
+        parameters=[robot_description_param],
+    )
+
+    control_node = Node(
+        package="controller_manager",
+        executable="ros2_control_node",
+        output="both",
+        parameters=[robot_description_param, controllers_file_str],
+    )
+
+    return [robot_state_pub_node, control_node]
+
+
+def controller_spawner(context: LaunchContext, robot_controller):
+    robot_controller_str = context.perform_substitution(robot_controller)
+
+    if robot_controller_str == "forward_position_controller":
+        left = "left_forward_position_controller"
+        right = "right_forward_position_controller"
+    elif robot_controller_str == "joint_trajectory_controller":
+        left = "left_joint_trajectory_controller"
+        right = "right_joint_trajectory_controller"
+    else:
+        raise ValueError(f"Unknown robot_controller: {robot_controller_str}")
+
+    # ONE spawner for every controller, one after the other: two or three
+    # spawners started at the same moment sometimes hung for good on their
+    # first service call (both launches of 2026-10-29: the arm trajectory
+    # controllers never loaded, so no arm could move). Timeouts turn a hung
+    # call into a failed spawner, which is started again (up to 2 more times).
+    names = ["joint_state_broadcaster", left, right,
+             "left_gripper_controller", "right_gripper_controller"]
+    tries = {"n": 0}
+
+    def make():
+        return Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=names + ["-c", "/controller_manager",
+                               "--controller-manager-timeout", "60",
+                               "--service-call-timeout", "15"],
+        )
+
+    def on_exit(event, _context):
+        if event.returncode == 0:
+            return []
+        if tries["n"] >= 2:
+            return [LogInfo(msg="controller spawner failed 3 times - the arms cannot move; "
+                                "check the CAN buses and restart")]
+        tries["n"] += 1
+        again = make()
+        return [LogInfo(msg=f"controller spawner failed (exit {event.returncode}) - "
+                            f"trying again ({tries['n']}/2)"),
+                TimerAction(period=2.0, actions=[
+                    again, RegisterEventHandler(OnProcessExit(target_action=again,
+                                                              on_exit=on_exit))])]
+
+    first = make()
+    return [first, RegisterEventHandler(OnProcessExit(target_action=first, on_exit=on_exit))]
+
+
+def generate_launch_description():
+    declared_arguments = [
+        DeclareLaunchArgument(
+            "description_package",
+            default_value="openarm_description",
+        ),
+        DeclareLaunchArgument(
+            "description_file",
+            default_value="v10.urdf.xacro",
+        ),
+        DeclareLaunchArgument(
+            "use_rviz",
+            default_value="true",
+            description="Start RViz. Set false on a headless or VNC session: "
+                        "without hardware GL, RViz hangs at start-up with "
+                        "its window never mapped, and nothing else needs it.",
+        ),
+        DeclareLaunchArgument("arm_type", default_value="v10"),
+        DeclareLaunchArgument("use_fake_hardware", default_value="false"),
+        DeclareLaunchArgument(
+            "robot_controller",
+            default_value="joint_trajectory_controller",
+            choices=["forward_position_controller",
+                     "joint_trajectory_controller"],
+        ),
+        DeclareLaunchArgument(
+            "runtime_config_package", default_value="openarm_bringup"
+        ),
+        DeclareLaunchArgument("arm_prefix", default_value=""),
+        DeclareLaunchArgument("right_can_interface", default_value="can0"),
+        DeclareLaunchArgument("left_can_interface", default_value="can1"),
+        DeclareLaunchArgument(
+            "controllers_file",
+            default_value="openarm_v10_bimanual_controllers.yaml",
+        ),
+        DeclareLaunchArgument(
+            "can_fd",
+            default_value="true",
+            description="Enable CAN-FD for both arms (true) or use classic CAN (false).",
+        ),
+        DeclareLaunchArgument(
+            "pipeline",
+            default_value="ompl",
+            description="Default MoveIt planning pipeline to use (ompl, cumotion, etc.)",
+        ),
+    ]
+
+    description_package = LaunchConfiguration("description_package")
+    description_file = LaunchConfiguration("description_file")
+    arm_type = LaunchConfiguration("arm_type")
+    use_fake_hardware = LaunchConfiguration("use_fake_hardware")
+    robot_controller = LaunchConfiguration("robot_controller")
+    runtime_config_package = LaunchConfiguration("runtime_config_package")
+    controllers_file = LaunchConfiguration("controllers_file")
+    right_can_interface = LaunchConfiguration("right_can_interface")
+    left_can_interface = LaunchConfiguration("left_can_interface")
+    arm_prefix = LaunchConfiguration("arm_prefix")
+    can_fd = LaunchConfiguration("can_fd")
+
+    controllers_file = PathJoinSubstitution(
+        [FindPackageShare(runtime_config_package), "config",
+         "v10_controllers", controllers_file]
+    )
+
+    robot_nodes_spawner_func = OpaqueFunction(
+        function=robot_nodes_spawner,
+        args=[
+            description_package,
+            description_file,
+            arm_type,
+            use_fake_hardware,
+            controllers_file,
+            can_fd,
+            right_can_interface,
+            left_can_interface,
+            arm_prefix,
+        ],
+    )
+
+    controller_spawner_func = OpaqueFunction(
+        function=controller_spawner, args=[robot_controller])
+
+    delayed_arm_ctrl = TimerAction(
+        period=1.0, actions=[controller_spawner_func])
+
+    moveit_config = (
+        MoveItConfigsBuilder("openarm", package_name="openarm_bimanual_moveit_config")
+        .planning_pipelines(pipelines=["ompl", "chomp", "pilz_industrial_motion_planner", "cumotion"], default_planning_pipeline="cumotion")
+        .to_moveit_configs()
+    )
+
+    moveit_params = moveit_config.to_dict()
+
+    # How far the trajectory's first point may sit from where the arm
+    # actually is when execution starts, radians. MoveIt's default is 0.01
+    # and it is too tight for this robot.
+    #
+    # These are direct-drive motors with no brakes. cuMotion plans from the
+    # joint state it read, and in the milliseconds before the trajectory is
+    # validated the shoulder sags -- so the first point no longer matches
+    # and MoveIt refuses the whole thing. Measured, 10:35:23:
+    #
+    #   Invalid Trajectory: start point deviates from current robot state
+    #   more than 0.01
+    #   joint 'openarm_right_joint1': expected: -1.02558, current: -1.03666
+    #
+    # 11.1 mrad of sag against a 10 mrad tolerance. It came back as
+    # CONTROL_FAILED, which the orchestrator reasonably treats as "the
+    # controller failed part-way", and the cycle stopped without the arm
+    # having moved at all.
+    #
+    # 0.05 leaves 4.5x headroom on the measured sag. The cost is that
+    # execution may begin up to 0.05 rad from the planned first point, so
+    # the arm takes up that much slack as the trajectory starts.
+    moveit_params['trajectory_execution.allowed_start_tolerance'] = 0.05
+
+    # Respawned, like cumotion_planner in launch_everything.launch.py. It
+    # dies with SIGSEGV (exit -11) and no message -- measured on 2026-09-30,
+    # mid-goal during click_to_move's calibration -- and without this the
+    # stack is left half alive: controllers, RViz and the camera up, nothing
+    # planning, and every client waiting out its timeouts. A respawned one
+    # comes back with the SRDF's collision matrix and an empty octomap; the
+    # clients re-apply their own scene changes (click_to_move does, before
+    # every move).
+    run_move_group_node = Node(
+        package="moveit_ros_move_group",
+        executable="move_group",
+        output="screen",
+        parameters=[moveit_params],
+        respawn=True,
+        respawn_delay=3.0,
+    )
+
+    rviz_cfg = os.path.join(
+        get_package_share_directory(
+            "openarm_bimanual_moveit_config"), "config", "moveit.rviz"
+    )
+
+    # RViz is optional, and on a headless or remote-desktop session it is
+    # worse than optional. Over TigerVNC there is no hardware GL, and RViz
+    # hangs during start-up with its window created but never mapped --
+    # measured, window 0x1a00001 at 20x20, "Map State: IsUnMapped", the
+    # process alive and idle. Nothing else needs it: move_group plans
+    # without it and the pick-and-place panel is a web page.
+    rviz_node = Node(
+        package="rviz2",
+        executable="rviz2",
+        name="rviz2",
+        output="log",
+        arguments=["-d", rviz_cfg],
+        parameters=[moveit_params],
+        condition=IfCondition(LaunchConfiguration("use_rviz")),
+    )
+
+    return LaunchDescription(
+        declared_arguments
+        + [
+            robot_nodes_spawner_func,
+            delayed_arm_ctrl,          # (every controller, the broadcaster first)
+            run_move_group_node,
+            rviz_node,
+        ]
+    )

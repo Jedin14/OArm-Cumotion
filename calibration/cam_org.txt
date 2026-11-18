@@ -4,10 +4,12 @@ The origin positions camera_bottom_screw_frame.
 The arm origin (openarm_{left,right}_link0) is at world x=0.0126, z=0.7344 m, y=-0.0448/+0.0572 m
 (moved in V7 from x=0, z=0.698, y=+/-0.051 -- see V7).
 
-current (V7):    <origin xyz="0.01233 0.000 0.53131" rpy="0.02056 -0.07726 -0.01912"/>
+current (V10):    <origin xyz="0.01598 0.02000 0.52425" rpy="0.01931 -0.01182 -0.01906"/>
 
-Position: the V4 tape measurement (12.33 mm in front of, 166.69 mm below the
-original arm origin). Orientation: roll 1.18, pitch -4.43, yaw -1.10 deg (CALIBRATE).
+3.38 mm in front of and 210.15 mm below the arm origin, +13.80 mm to the left
+X = 15.98 mm, Y = 20.00 mm, Z = 524.25 mm
+roll = 1.11 deg, pitch = -0.68 deg, yaw = -1.09 deg
+Set by hand with robot/sensor_align.py (2026-11-16T17:20): the clouds moved onto the arm and the tip as RViz draws them.
 
 history:
   X = 160.89 mm, Z = 728.46 mm    <origin xyz="0.16089 0.000 0.72846" rpy="0 1.0472 0"/>
@@ -59,3 +61,18 @@ V7  (2026-10-06)
   arm mount (+12.6, +6.2, +36.4) mm -> right 0.0126 -0.0448 0.7344,
   left 0.0126 0.0572 0.7344 (v10.urdf.xacro and openarm.urdf).
   Check: the shoulder axes should then be 734.4 mm above the stand base.
+
+V8
+  <origin xyz="0.01598 0.02800 0.56225" rpy="0.01931 -0.01182 -0.01906"/>
+  3.38 mm in front of and 172.15 mm below the arm origin, +21.80 mm to the left
+  set by hand 2026-11-16T16:55 with robot/sensor_align.py: 41.9 mm / 3.75 deg from the version before
+
+V9
+  <origin xyz="0.01598 0.02800 0.52425" rpy="0.01931 -0.01182 -0.01906"/>
+  3.38 mm in front of and 210.15 mm below the arm origin, +21.80 mm to the left
+  set by hand 2026-11-16T16:58 with robot/sensor_align.py: 38.0 mm / 0.00 deg from the version before
+
+V10
+  <origin xyz="0.01598 0.02000 0.52425" rpy="0.01931 -0.01182 -0.01906"/>
+  3.38 mm in front of and 210.15 mm below the arm origin, +13.80 mm to the left
+  set by hand 2026-11-16T17:20 with robot/sensor_align.py: 8.0 mm / 0.00 deg from the version before

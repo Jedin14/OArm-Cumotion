@@ -88,8 +88,23 @@ left_joint_trajectory_controller:
       - openarm_left_joint6
       - openarm_left_joint7
     interface_name: position
+    # 2026-11-17: position AND velocity. The velocity is the trajectory's own,
+    # and the driver (openarm_hardware, mit_law.hpp) hands it to the motor as
+    # its velocity target. With position only, nothing wrote the velocity, the
+    # motor's target speed was 0 and its damping braked every move: the arm
+    # lagged (kd/kp) x speed, ~190 mrad on joint 7 in the drop move, and the
+    # integral wound up on that lag and overshot after the stop. Off switch:
+    # back to [position] (restart), or velocity_feedforward: false in
+    # calibration/motor_gains_<arm>.yaml.
     command_interfaces:
       - position
+      - velocity
+    # Still position only (phase A). Phase B, only after the robot checks
+    # (rest check, arrivals.jsonl) have proven the driver changes: state
+    # [position, velocity], constraints.stopped_velocity_tolerance 0.05,
+    # goal_time 2.0 and a per-joint goal 0.02, so success means "arrived"
+    # rather than "time is up". With a position-only state the JTC treats the
+    # velocity error as 0 and skips 0 tolerances, so completion is unchanged.
     state_interfaces:
       - position
 
@@ -97,6 +112,11 @@ left_joint_trajectory_controller:
     action_monitor_rate: 50.0 # Defaults to 20
 
     allow_partial_joints_goal: false # Defaults to false
+    # Stated, not changed (true is the default): cuRobo's last point is not
+    # exactly at rest, and false would refuse those trajectories. The JTC then
+    # holds the last point with its velocity; the driver drops the velocity of
+    # a held point (mit_law.hpp), so it cannot keep pushing the joint.
+    allow_nonzero_velocity_at_trajectory_end: true
     constraints:
       stopped_velocity_tolerance: 0.01 # Defaults to 0.01
       goal_time: 0.0 # Defaults to 0.0 (start immediately)
@@ -154,8 +174,10 @@ right_joint_trajectory_controller:
       - openarm_right_joint6
       - openarm_right_joint7
     interface_name: position
+    # 2026-11-17: position and velocity, as the left arm (see there).
     command_interfaces:
       - position
+      - velocity
     state_interfaces:
       - position
 
@@ -163,6 +185,7 @@ right_joint_trajectory_controller:
     action_monitor_rate: 50.0 # Defaults to 20
 
     allow_partial_joints_goal: false # Defaults to false
+    allow_nonzero_velocity_at_trajectory_end: true  # the default; see the left arm
     constraints:
       stopped_velocity_tolerance: 0.01 # Defaults to 0.01
       goal_time: 0.0 # Defaults to 0.0 (start immediately)
