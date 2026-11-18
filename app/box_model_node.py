@@ -499,9 +499,49 @@ class BoxModelNode(Node):
             'boxes': ans.get('boxes') or [], 'took': ans.get('took'),
             'seconds': ans.get('seconds'), 'tilt': self.tilt,
             'target': ({k: t.get(k) for k in ('u', 'v', 'x_m', 'y_m', 'z_m', 'approach', 'size_mm',
-                                               'agreeing', 'frames', 'num_boxes')} if t else None)})))
+                                               'agreeing', 'frames', 'num_boxes')} if t else None),
+            'plan': self._plan_world(ans)})))
         self.last_answer = ans
         self._take_settings(ans)
+
+    def _plan_world(self, ans):
+        """The picker's "plan" (2026-11-18: the boxes after the target, in its order) in the
+        world frame, as the target is put there (the depth check, the camera's tf): [{xyz,
+        u, v, approach, size_mm, fallen, cell, box, normal, long, face_mm}] -- PICK ALL
+        takes them without asking again while the scene is unchanged. [] when there is none
+        or it cannot be placed."""
+        plan = ans.get('plan') or []
+        if not plan:
+            return []
+        try:
+            with self.lock:
+                info = self.info
+            world = str(self.get_parameter('world_frame').value)
+            t_wo = self.lookup(world, info.header.frame_id) if info is not None else None
+            if t_wo is None:
+                return []
+            coef = depth_cal.load()
+            out = []
+            for q in plan:
+                p = np.array([q['x_m'], q['y_m'], q['z_m']], float)
+                if coef is not None and p[2] > 0:
+                    a, b, c, e = coef
+                    xn, yn = p[0] / p[2], p[1] / p[2]
+                    z = p[2] * (1 + a) + b + c * xn + e * yn
+                    p = np.array([xn * z, yn * z, z])
+                w = t_wo[:3, :3] @ p + t_wo[:3, 3]
+                face = q.get('face') or {}
+                rot = lambda key: ([round(float(v), 4) for v in t_wo[:3, :3] @ np.asarray(face[key], float)]
+                                   if face.get(key) is not None else None)
+                out.append({'xyz': [round(float(v), 4) for v in w], 'u': q.get('u'), 'v': q.get('v'),
+                            'approach': q.get('approach'), 'size_mm': q.get('size_mm'),
+                            'fallen': q.get('fallen'), 'cell': q.get('cell'), 'box': q.get('box'),
+                            'normal': rot('normal'), 'long': rot('long'),
+                            'face_mm': face.get('size_mm')})
+            return out
+        except Exception as exc:                         # noqa: BLE001 - an extra: never the detection
+            self.get_logger().warn(f'the picker\'s plan not placed ({exc})')
+            return []
 
     def _publish_image(self, path, img, pub=None):
         """An image (or the file at path) on box_model/image, or on `pub`."""

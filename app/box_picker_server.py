@@ -415,11 +415,41 @@ class Server:
             overlay = args.overlay
         size = [int(frames[0][0].shape[1]), int(frames[0][0].shape[0])] if frames else None
         carton = detector.carton() if hasattr(detector, "carton") else None
-        return {"target": result, "boxes": boxes, "face": face, "overlay": overlay, "size": size, "carton": carton,
+        plan = self.plan_after(detector, result, boxes, cam.intr)
+        return {"target": result, "boxes": boxes, "face": face, "plan": plan, "overlay": overlay, "size": size, "carton": carton,
                 "picker_view": self.write("picker", self.picker_img), "close_up": self.write("crop", self.crop),
                 "took": {"pictures": round(t1 - t0, 2), "picker": round(t2 - t1, 2)},
                 "up": [round(float(v), 5) for v in up_now], "up_source": up_source,
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"), "seconds": round(time.time() - t0, 2)}
+
+    @staticmethod
+    def plan_after(detector, result, boxes, intr):
+        """Order grid (2026-11-18): the picks AFTER the target, in the order, each with what
+        the robot needs to go for it without asking again -- PICK ALL takes them one by one
+        while the scene stays as it was (only the picked box gone): {"x_m", "y_m", "z_m"
+        (camera), "u", "v", "approach", "size_mm", "fallen", "cell", "box" (its index in
+        "boxes", for its outline), "face" (face_axes)}. [] for other orders or no target."""
+        if result is None or not hasattr(detector, "grid_picks"):
+            return []
+        grid = detector.grid_picks()
+        if not grid:
+            return []
+        out = []
+        for i, (k, p) in sorted(grid.items(), key=lambda kv: kv[1][0]):
+            if k == 0:
+                continue                                    # the target itself
+            try:
+                face = face_axes(p["face_obj"], intr) if p.get("face_obj") is not None else None
+            except Exception:                               # noqa: BLE001 - then no face axes
+                face = None
+            out.append({"x_m": round(float(p["xyz"][0]), 4), "y_m": round(float(p["xyz"][1]), 4),
+                        "z_m": round(float(p["xyz"][2]), 4), "u": round(float(p["uv"][0]), 1),
+                        "v": round(float(p["uv"][1]), 1), "approach": p["face"],
+                        "size_mm": [round(float(v)) for v in p["size_mm"]],
+                        "fallen": bool(p["fallen"]),
+                        "cell": None if p.get("cell") is None else [int(c) + 1 for c in p["cell"]],
+                        "box": int(i) if 0 <= int(i) < len(boxes) else None, "face": face})
+        return out
 
     # -- check ----------------------------------------------------------------------
 

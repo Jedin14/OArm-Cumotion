@@ -1,0 +1,2702 @@
+"""The ROS side of click_to_move: camera/joint inputs, tf, MoveIt services
+and the motion primitives (plans, straight lines, guarded contact,
+retrace) that the touch is built from."""
+
+import collections
+import contextlib
+import json
+import math
+import os
+import re
+import threading
+import time
+import warnings
+
+import numpy as np
+import yaml
+from control_msgs.action import GripperCommand
+from control_msgs.msg import DynamicJointState
+from geometry_msgs.msg import Pose, PoseStamped
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
+from moveit_msgs.msg import (AllowedCollisionEntry, AllowedCollisionMatrix,
+                             AttachedCollisionObject, CollisionObject,
+                             Constraints,
+                             JointConstraint, MoveItErrorCodes, PlanningScene,
+                             PlanningSceneComponents, RobotState, RobotTrajectory)
+from moveit_msgs.srv import (ApplyPlanningScene, GetCartesianPath, GetPlanningScene,
+                             GetPositionFK, GetPositionIK, GetStateValidity)
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParameters
+from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
+from rclpy.time import Time
+from sensor_msgs.msg import CameraInfo, Image, JointState
+from shape_msgs.msg import SolidPrimitive
+from std_msgs.msg import String, UInt32
+from std_srvs.srv import Empty, Trigger
+from tf2_ros import Buffer, TransformListener
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from visualization_msgs.msg import Marker, MarkerArray
+
+import robot_camera_calibration as rcc
+from ctm import depth_cal
+from ctm import walls
+from ctm.common import (BASE_FRAME, COLOR_TOPIC, DEPTH_TOPIC, FINGERTIP_BEYOND_TCP,
+                        HOME_JOINTS, INFO_TOPIC,
+                        MoveGroupDown, OCTOMAP_NAME, RETRYABLE, SCREW_FRAME, WS, APP_DIR,
+                        OPENARM_URDF, OPENARM_YML, arm_joints,
+                        decode_image, gripper_links, matrix_from_quat, pixel_ray,
+                        quat_from_matrix, rot_about, tool_frame_along)
+
+
+JUMP = 0.15                     # rad: the most any joint may move between 5 mm line steps
+# The calibration pieces folded round each gripper's rail stick out past the
+# gripper the robot model knows -- ~4 cm beyond the rail's ends and 4 cm
+# towards the fingers (2026-10-15). Only calibrate.py has them on: a box per
+# hand for MoveIt, in the hand frame (y along the rail, z towards the
+# fingers), and the same as 14 spheres on cuMotion's openarm_<arm>_pieces
+# link (reserved, off, in openarm.yml).
+PIECES_BOX_CENTRE = (0.0, 0.0, 0.027)
+PIECES_BOX_SIZE = (0.06, 0.20, 0.06)        # 22 cm end to end across the rail
+PIECES_SPHERES = [(0.0, float(y), z, 0.025) for y in np.linspace(-0.085, 0.085, 6)
+                  for z in (0.012, 0.042)]  # the outermost reach +-11 cm
+PIECES_SLOTS = 14                           # spheres reserved per pieces link in openarm.yml (unused: off)
+
+# The tool past the fingertips (tools.yaml: the left arm's vacuum cup), in the
+# planners as a cylinder 3 cm across from the fingertips to its end -- before
+# 2026-10-16 the planners knew only the hand and fingers, so the last 2 cm
+# were never checked. MoveIt: a cylinder attached to the hand; cuMotion:
+# spheres on the reserved openarm_<arm>_tool link (openarm.yml), off with no tool.
+HAND_TCP_Z = 0.08                           # hand -> hand_tcp along z (openarm.urdf)
+TOOL_DIAMETER = 0.030                       # the left gripper is one 30 mm cylinder to its tip
+# The arms whose hand collision is no wider than that tool (a coaxial cylinder,
+# robot/openarm.urdf), so press_touching may exempt the hand (2026-11-17 review:
+# the right hand is the hand.stl plate, 57 x 168 mm)
+HAND_COAXIAL_ARMS = ('left',)
+TOOL_SLOTS = 4                              # spheres reserved per tool link in openarm.yml
+
+
+def tool_spheres(length):
+    """cuMotion's spheres for a tool `length` m past the fingertips, hand
+    frame: radius half the diameter, from the fingertips to the end, none
+    past the end (it must still reach the surface)."""
+    r = TOOL_DIAMETER / 2
+    start = HAND_TCP_Z + FINGERTIP_BEYOND_TCP
+    last = start + max(length - r, 0.0)
+    n = int(min(TOOL_SLOTS, max(1, np.ceil((last - start) / 0.01) + 1)))
+    return [(0.0, 0.0, float(z), r) for z in np.linspace(start, last, n)]
+
+
+def tool_id(arm):
+    return f'tool_{arm}'
+
+
+# The object in the gripper after a pick (its size from
+# /beast_arm/held_object/size): a box for MoveIt attached to the hand, and up
+# to HELD_SLOTS spheres on cuMotion's reserved openarm_<arm>_held link
+# (openarm.yml), so the way back keeps it clear of everything (2026-10-21).
+HELD_SLOTS = 32
+
+
+def held_id(arm):
+    return f'held_{arm}'
+
+
+def hand_press_ok(node, arm):
+    """May this arm's hand be exempt in a coaxial press at all: only if it is no
+    wider than the exempt tool in front of it, so the hand sweeps only where the
+    tool went first -- the left arm (its hand collision is a 30 mm cylinder,
+    robot/openarm.urdf) with its 30 mm tool on (node.args.tools, tools.yaml). The
+    right hand is the 57 x 168 mm hand.stl plate and has no tool: pressed with it
+    exempt, its wings swept up to ~5 cm of unchecked space beside the line
+    (2026-11-17 review)."""
+    if arm not in HAND_COAXIAL_ARMS:
+        return False
+    tool = (getattr(node.args, 'tools', None) or {}).get(arm) or {}
+    return bool(tool.get('on')) and float(tool.get('length', TOOL_DIAMETER) or 0.0) > 0.0
+
+
+def _gate(node):
+    """The node's _scene_gate (see ClickToMove.__init__); made on first use for a
+    node built without __init__ (the offline test harnesses)."""
+    gate = node.__dict__.get('_scene_gate')
+    return gate if gate is not None else node.__dict__.setdefault('_scene_gate',
+                                                                   threading.RLock())
+
+
+def held_geometry(size_hwd, tip_offset, rot_tcp_world):
+    """Where a held box of size (height, width, depth) m sits on the tool:
+    (rotation 3x3 and centre in hand_tcp, extents along its axes, top pick?). It hangs
+    off the tip along the tool. Tool level (front pick): height stays vertical,
+    depth along the tool, width across. Tool down (top pick): height along
+    the tool; which way width and depth lie is not known, so both take the
+    larger of the two."""
+    h, w, d = (float(v) for v in size_hwd)
+    up = rot_tcp_world.T @ np.array([0.0, 0.0, 1.0])     # world up, in hand_tcp
+    z = np.array([0.0, 0.0, 1.0])
+    top = abs(up[2]) > 0.7
+    if top:                                              # tool vertical: top pick
+        rot = np.eye(3)
+        ext = np.array([max(w, d), max(w, d), h])
+    else:
+        hv = up - (up @ z) * z
+        hv /= np.linalg.norm(hv)
+        wv = np.cross(hv, z)
+        rot = np.column_stack((wv, hv, z))
+        ext = np.array([w, h, d])
+    centre = z * (tip_offset + ext[2] / 2.0)
+    return rot, centre, ext, top
+
+
+def held_spheres(rot, centre, ext):
+    """cuMotion's spheres for the box, in the HAND frame (hand_tcp is
+    HAND_TCP_Z along it): the box cut into cells, one sphere round each whole
+    cell -- the box is covered everywhere (a grid of spheres inside it left
+    gaps up to 33 mm), bulging a little. The cut with the smallest spheres
+    that fits HELD_SLOTS."""
+    ext = np.asarray(ext, float)
+    best = None
+    for nx in range(1, HELD_SLOTS + 1):
+        for ny in range(1, HELD_SLOTS // nx + 1):
+            nz = HELD_SLOTS // (nx * ny)
+            for n in ((nx, ny, k) for k in range(1, nz + 1)):
+                r = float(np.linalg.norm(ext / n)) / 2.0
+                if best is None or r < best[0] - 1e-9:
+                    best = (r, n)
+    r, n = best
+    axes = [(np.arange(k) + 0.5) / k * e - e / 2 for e, k in zip(ext, n)]
+    out = []
+    for a in axes[0]:
+        for b in axes[1]:
+            for c in axes[2]:
+                p = rot @ np.array([a, b, c]) + centre
+                out.append((float(p[0]), float(p[1]), float(p[2] + HAND_TCP_Z), float(r)))
+    return out
+
+
+TIMED_OUT = object()      # move_group did not answer (not "no solution": never cached)
+EARLY_CONTACT_M = 0.03    # a contact this far before the measured surface is not one
+BLOCKED_LAG_M = 0.02      # the command this far ahead and the arm never got going: blocked
+START_MOVE_M = 0.003      # ... nor before the arm is rolling: moved this far, and seen
+                          # advancing (the start-up stall winds the torque up like a push)
+# Contact needs the tip STUCK: under STUCK_M of progress over the last STUCK_S
+# while the command runs on. The arm stick-slips along a slow line -- pauses
+# of 0.1-0.2 s, joint torques swinging 0.7-1.1 Nm in free air -- and a torque
+# rise alone (or an 80 ms stall) read as contact 3-7 mm into EVERY press since
+# 2026-10-28, the cup 2.5 cm above the box. Rolling free it never gained under
+# 1.8 mm in 0.3 s (2.2 mm in 0.35 s; 9 press traces, 2026-10-28..30).
+STUCK_S = 0.35
+STUCK_M = 0.001
+
+# Lead-ins (execute(lead=True)): a plan made a moment ago starts where the arm
+# WAS; the arm is a few hundredths of a radian off that by the time it runs
+# (still settling after a "successful" leg, the integral overshooting). A
+# fresh plan executed from a stale start was refused with code -4 or made the
+# controller jump (2026-11-16 run, 17:21-17:40). Under LEAD_IN_FROM the start
+# is taken as it is; up to --lead-in-max (never over LEAD_IN_CAP, whatever the
+# flag says) a short joint move onto the plan's first point is put in front --
+# only when every state of that move is collision-checked clear; further off
+# the plan is refused and planned again from where the arm is (2026-11-17).
+LEAD_IN_FROM = 0.002
+LEAD_IN_CAP = 0.10
+# A trajectory's last point should not move. cuRobo's never ends at exactly
+# 0 rad/s, and a line cut at a joint jump ended mid-motion: the controller
+# (allow_nonzero_velocity_at_trajectory_end) ends such a move with a jolt, and
+# with a velocity command to the motors it would carry on past the end
+# (2026-11-17: zeroed in execute(), warned over END_VELOCITY_WARN rad/s).
+END_VELOCITY_WARN = 0.05
+# The arrival of every executed trajectory, per joint, at +0/+0.5/+1/+2 s
+# (execute(), 2026-11-17): which joints carry the error, and whether they
+# creep in or overshoot -- the logs only ever had the worst joint.
+ARRIVAL_TIMES = (0.0, 0.5, 1.0, 2.0)
+ARRIVAL_KEEP = 500
+
+
+def joint_error_text(vec):
+    """Per-joint error (rad) as one short log string in mrad: 'j1 +12 j2 -3 ...'
+    ('n/a' without one)."""
+    if vec is None:
+        return 'n/a'
+    return ' '.join(f'j{i + 1} {1000.0 * float(v):+.0f}' if v is not None else f'j{i + 1} ?'
+                    for i, v in enumerate(vec))
+
+
+def _seconds(point):
+    return point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
+
+
+class ClickToMove(Node):
+    def __init__(self, args):
+        super().__init__('click_to_move')
+        self.args = args
+        self.pieces_on = False          # calibrate.py: the calibration pieces in the planners
+        # STOP (web GUI, pick stack): cancels the goals running now and refuses
+        # new ones until resume() -- the arms hold where they are
+        self.halt = threading.Event()
+        self.active_goals = {}          # id(handle) -> (handle, arms) (handles are not hashable)
+        self._acm_lock = threading.RLock()  # the collision matrix: read, change, write back
+        # The octomap exemptions live in move_group's ONE collision matrix: while a
+        # thread holds one (fingers_touching, press_touching, held_leaving), no other
+        # thread's validity check, IK, straight line or OMPL plan may run -- it would
+        # be answered under that exemption (2026-11-17 review: PICK ALL's look-ahead
+        # checked the next box under press_touching while the touch checked its drop
+        # legs: the hand, tool and held box unchecked against the map). Held for an
+        # exemption's whole life and for each such question; re-entrant, so a thread
+        # asks freely inside its own exemption. Taken before _acm_lock, never after.
+        self._scene_gate = threading.RLock()
+        # one MoveGroup goal at a time: PICK ALL plans the next box while the arm
+        # drops the last one, and cuMotion aborts a second plan ("Planner is
+        # busy") -- MoveIt 2.5.9 itself runs two goals side by side (2026-11-05)
+        self.move_group_lock = threading.Lock()
+        # straight to each arm's trajectory controller: the one way to stop a
+        # move at once (move_group's ExecuteTrajectory cancel did nothing -- a
+        # contact move ran 4.7 s past the felt contact, 2026-10-28)
+        self.hold_pubs = {arm: self.create_publisher(
+            JointTrajectory, f'/{arm}_joint_trajectory_controller/joint_trajectory', 10)
+            for arm in ('left', 'right')}
+        # the object size for the next pick (/beast_arm/held_object/size):
+        # (height, width, depth) m and who said so, or None; and what each
+        # arm holds now: {arm: {'size': (h, w, d), ...}}
+        self.object_size = None
+        self.held = {}
+        # the Unitree L2 LiDAR's health (robot/lidar_bridge.py, /lidar/status, latched
+        # JSON): while it works the unseen-space walls are not needed (refresh_walls)
+        self.lidar_status = None          # (dict, monotonic time received)
+        cb = ReentrantCallbackGroup()
+
+        self.lock = threading.Lock()
+        self.color = None
+        self.color_count = 0
+        self.depth = None
+        self.depths = collections.deque(maxlen=15)
+        self.info = None
+        self.joints = {}
+        self.efforts = {}
+
+        self.create_subscription(Image, COLOR_TOPIC, self._on_color, 2, callback_group=cb)
+        self.create_subscription(Image, DEPTH_TOPIC, self._on_depth, 2, callback_group=cb)
+        self.create_subscription(CameraInfo, INFO_TOPIC, self._on_info, 2, callback_group=cb)
+        self.create_subscription(JointState, '/joint_states', self._on_joints, 10,
+                                 callback_group=cb)
+        self.create_subscription(String, '/lidar/status', self._on_lidar_status,
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+                                 callback_group=cb)
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.marker_pub = self.create_publisher(MarkerArray, '/click_to_move/marker', latched)
+        self.target_pub = self.create_publisher(PoseStamped, '/click_to_move/target', 1)
+        # Which map a check was made against (2026-11-17): the 17:35 pick of
+        # 2026-11-16 flew a plan checked at 17:32, after three map rebuilds with
+        # the LiDAR mount moved. Bumped on every new /octomap_gater/version
+        # (each refresh, by whoever asked: sensor_align.py too) and by
+        # rebuild_octomap() itself (octomap:=live has no gater). A count of
+        # changes seen here, not the gater's own number -- that restarts at 0
+        # with the gater -- so only "same or not" means anything.
+        self.map_version = 0
+        self._gater_version = None
+        self.create_subscription(UInt32, '/octomap_gater/version', self._on_map_version, latched,
+                                 callback_group=cb)
+        # Each motor's own status (the driver's "status" state interface, on
+        # /dynamic_joint_states): logged when it changes. Nothing decides from
+        # the codes yet -- the Damiao meanings are not confirmed -- but a change
+        # since the start of a touch is reason enough to stop (2026-11-17; the
+        # 463 mrad hold at 17:39 of 2026-11-16 had no motor status to explain it).
+        self.motor_status = {}            # joint -> last status value
+        self.motor_status_changes = {}    # joint -> how many times it changed
+        self._status_warned = {}
+        self.create_subscription(DynamicJointState, '/dynamic_joint_states',
+                                 self._on_dynamic_joints, 10, callback_group=cb)
+        # What each arm's controller was last told to hold: execute()'s final
+        # point, hold_here()'s measured joints, the pose move_joints() reached;
+        # None while a goal runs or after one failed (2026-11-17: pick mode
+        # told from this, not from where the sagging arm settled).
+        self.last_goal = {}
+        self.last_settle = None           # settle(): {'worst', 'vec', 'status', ...}
+        self._goal_seq = {}               # arm -> goals sent (an arrival log stops at the next)
+        self._arrival_lock = threading.Lock()
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.move_client = ActionClient(self, MoveGroup, '/move_action', callback_group=cb)
+        self.ik_client = self.create_client(GetPositionIK, '/compute_ik', callback_group=cb)
+        self.fk_client = self.create_client(GetPositionFK, '/compute_fk', callback_group=cb)
+        self.cartesian_client = self.create_client(GetCartesianPath, '/compute_cartesian_path',
+                                                   callback_group=cb)
+        self.execute_client = ActionClient(self, ExecuteTrajectory, '/execute_trajectory',
+                                           callback_group=cb)
+        self.gripper_clients = {
+            arm: ActionClient(self, GripperCommand, f'/{arm}_gripper_controller/gripper_cmd',
+                              callback_group=cb) for arm in ('left', 'right')}
+        self.refresh_client = self.create_client(Trigger, '/octomap_gater/refresh',
+                                                 callback_group=cb)
+        self.clear_client = self.create_client(Empty, '/clear_octomap', callback_group=cb)
+        self.scene_query = self.create_client(GetPlanningScene, '/get_planning_scene',
+                                              callback_group=cb)
+        self.scene_apply = self.create_client(ApplyPlanningScene, '/apply_planning_scene',
+                                              callback_group=cb)
+        self.rsp_get = self.create_client(
+            GetParameters, '/robot_state_publisher/get_parameters', callback_group=cb)
+        self.rsp_set = self.create_client(
+            SetParameters, '/robot_state_publisher/set_parameters', callback_group=cb)
+        self.retract = self._retract_configs()
+
+    # -- inputs ---------------------------------------------------------------
+
+    def _on_color(self, msg):
+        with self.lock:
+            self.color = msg
+            self.color_count += 1
+
+    def _on_depth(self, msg):
+        with self.lock:
+            self.depth = msg
+            self.depths.append(msg)
+
+    def _on_info(self, msg):
+        with self.lock:
+            self.info = msg
+
+    def _on_joints(self, msg):
+        with self.lock:
+            self.joints.update(zip(msg.name, msg.position))
+            if msg.effort:
+                self.efforts.update(zip(msg.name, msg.effort))
+
+    def latest(self):
+        with self.lock:
+            return self.color, self.depth, self.info
+
+    def _on_map_version(self, msg):
+        if msg.data != self._gater_version:          # (any new value: a new map)
+            self._gater_version = msg.data
+            self.bump_map_version()
+
+    def bump_map_version(self):
+        """The octomap is (being) rebuilt: checks made before now are stale."""
+        with self.lock:
+            self.map_version += 1
+            return self.map_version
+
+    def _on_dynamic_joints(self, msg):
+        now = time.monotonic()
+        for name, iv in zip(msg.joint_names, msg.interface_values):
+            names = list(iv.interface_names)
+            if 'status' not in names:
+                continue
+            value = float(iv.values[names.index('status')])
+            old = self.motor_status.get(name)
+            if old is not None and (value == old or (math.isnan(value) and math.isnan(old))):
+                continue
+            self.motor_status[name] = value
+            if old is None:
+                continue
+            self.motor_status_changes[name] = self.motor_status_changes.get(name, 0) + 1
+            if now - self._status_warned.get(name, -10.0) > 1.0:     # (a flicker: once a second)
+                self._status_warned[name] = now
+                self.get_logger().warn(f'{name}: motor status {old:g} -> {value:g}')
+
+    def arm_status(self, arm):
+        """This arm's 7 motor status values (None where unknown), or None if no
+        motor reports one (fake hardware). Compare two of them to see a change."""
+        out = [self.motor_status.get(n) for n in arm_joints(arm)]
+        return None if all(v is None for v in out) else out
+
+    def _on(self, name, default=True):
+        """An on/off option from args (a bool, or 'on'/'off'), `default` if unset."""
+        value = getattr(self.args, name, default)
+        if isinstance(value, str):
+            return value.strip().lower() not in ('off', 'false', 'no', '0', '')
+        return bool(value)
+
+    def _on_lidar_status(self, msg):
+        try:
+            self.lidar_status = (json.loads(msg.data), time.monotonic())
+        except ValueError:
+            pass
+
+    def lidar_ok(self, max_age=3.0):
+        """The L2 LiDAR is working: its bridge said so within max_age s (it says
+        it every second: clouds arriving, points in the work area)."""
+        st = self.lidar_status
+        return bool(st and time.monotonic() - st[1] <= max_age and st[0].get('ok'))
+
+    def fresh_color(self, timeout=3.0):
+        """The next colour frame to arrive after this call, or None."""
+        with self.lock:
+            seen = self.color_count
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.lock:
+                if self.color_count > seen + 1:          # one whole frame later
+                    return self.color
+            time.sleep(0.02)
+        return None
+
+    def averaged_depth(self, count, timeout=3.0, raw=False):
+        """Per-pixel median of the next `count` aligned depth frames, metres.
+
+        One D455 frame is noisy by several mm at these ranges and has
+        speckle dropouts; the median over a few frames of a still scene is
+        both steadier and more complete. Zeros (no reading) are ignored, so a
+        pixel is valid if most frames saw it.
+        """
+        with self.lock:
+            self.depths.clear()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.lock:
+                if len(self.depths) >= count:
+                    frames = list(self.depths)[:count]
+                    break
+            time.sleep(0.03)
+        else:
+            with self.lock:
+                frames = list(self.depths)
+        if not frames:
+            return None, None
+        stack = np.stack([decode_image(m) for m in frames]).astype(np.float32)
+        valid = stack > 0
+        stack[~valid] = np.nan
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)   # all-NaN pixels
+            depth = np.nanmedian(stack, axis=0)
+        depth[valid.sum(axis=0) < (len(frames) + 1) // 2] = 0.0
+        depth = np.nan_to_num(depth, nan=0.0)
+        with self.lock:
+            info = self.info
+        if info is not None and not raw:
+            # the depth check (ctm/depth_cal.py): depth made to agree with colour
+            depth = depth_cal.apply(depth, info)
+        return depth, frames[-1]
+
+    def arm_efforts(self, arm):
+        with self.lock:
+            names = arm_joints(arm)
+            if not all(n in self.efforts for n in names):
+                return None
+            return [self.efforts[n] for n in names]
+
+    def arm_positions(self, arm):
+        with self.lock:
+            names = arm_joints(arm)
+            if not all(n in self.joints for n in names):
+                return None
+            return [self.joints[n] for n in names]
+
+    def _retract_configs(self):
+        """cuRobo's retract_config from openarm.yml, per arm: a good IK seed."""
+        try:
+            with open(OPENARM_YML) as handle:
+                cspace = yaml.safe_load(handle)['robot_cfg']['kinematics']['cspace']
+            table = dict(zip(cspace['joint_names'], cspace['retract_config']))
+            return {arm: [table[n] for n in arm_joints(arm)] for arm in ('left', 'right')}
+        except (OSError, KeyError, TypeError, yaml.YAMLError):
+            return {}
+
+    # -- geometry -------------------------------------------------------------
+
+    def lookup(self, target, source):
+        """4x4 transform taking points in `source` to `target`, or None."""
+        try:
+            tf = self.tf_buffer.lookup_transform(target, source, Time())
+        except Exception:                            # noqa: BLE001
+            return None
+        t, q = tf.transform.translation, tf.transform.rotation
+        m = np.eye(4)
+        m[:3, :3] = matrix_from_quat(q.x, q.y, q.z, q.w)
+        m[:3, 3] = (t.x, t.y, t.z)
+        return m
+
+    def robot_surface(self):
+        """The arms' visual meshes as surface samples, for CALIBRATE and
+        OVERLAY. Built once from the live robot_description (about a minute
+        the very first time, then from native/cache)."""
+        with self.lock:
+            if getattr(self, '_surface', None) is not None:
+                return self._surface
+        if not self.rsp_get.wait_for_service(timeout_sec=3.0):
+            raise RuntimeError('robot_state_publisher is not answering')
+        got = None
+        for _ in range(3):                           # a big string; it was slow once (sim)
+            got = self.wait(self.rsp_get.call_async(
+                GetParameters.Request(names=['robot_description'])), 10.0)
+            if got is not None and got.values and got.values[0].string_value:
+                break
+        if got is None or not got.values or not got.values[0].string_value:
+            raise RuntimeError('could not read robot_description')
+        surface = rcc.RobotSurface(got.values[0].string_value)
+        with self.lock:
+            self._surface = surface
+        return surface
+
+    def joint_limits(self, arm):
+        """[(lower, upper)] for the arm's 7 joints, from the URDF."""
+        if not hasattr(self, '_limits'):
+            self._limits = {}
+            try:
+                with open(OPENARM_URDF) as handle:
+                    urdf = handle.read()
+                for a in ('left', 'right'):
+                    lim = []
+                    for name in arm_joints(a):
+                        m = re.search(r'<joint name="%s".*?lower="([-\d.e]+)" upper="([-\d.e]+)"'
+                                      % name, urdf, re.S)
+                        lim.append((float(m.group(1)), float(m.group(2))))
+                    self._limits[a] = lim
+            except (OSError, AttributeError):
+                pass
+        return self._limits.get(arm)
+
+    def limit_room(self, arm, joints):
+        """Smallest distance of any joint from its limit, rad (inf if unknown)."""
+        lim = self.joint_limits(arm)
+        if lim is None:
+            return float('inf')
+        return min(min(q - lo, hi - q) for q, (lo, hi) in zip(joints, lim))
+
+    def fk(self, arm, joints, links):
+        """{link: 4x4 world<-link} for this arm at `joints`, from move_group."""
+        if not self.fk_client.wait_for_service(timeout_sec=2.0):
+            return None
+        req = GetPositionFK.Request()
+        req.header.frame_id = BASE_FRAME
+        req.fk_link_names = list(links)
+        req.robot_state.is_diff = True
+        req.robot_state.joint_state.name = arm_joints(arm)
+        req.robot_state.joint_state.position = [float(v) for v in joints]
+        res = self.wait(self.fk_client.call_async(req), 3.0)
+        if res is None or res.error_code.val != MoveItErrorCodes.SUCCESS:
+            return None
+        out = {}
+        for name, ps in zip(res.fk_link_names, res.pose_stamped):
+            q, t = ps.pose.orientation, ps.pose.position
+            m = np.eye(4)
+            m[:3, :3] = matrix_from_quat(q.x, q.y, q.z, q.w)
+            m[:3, 3] = (t.x, t.y, t.z)
+            out[name] = m
+        return out
+
+    def link_poses(self, arms=('left', 'right')):
+        """{link: 4x4 world<-link} from tf -- i.e. from the joint encoders."""
+        return {f'openarm_{arm}_{short}': self.lookup(BASE_FRAME, f'openarm_{arm}_{short}')
+                for arm in arms for short in rcc.RobotSurface.LINKS}
+
+    def fingertip(self, arm):
+        """Where the closed fingertips are now, in world -- from the encoders."""
+        m = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+        if m is None:
+            return None
+        return m[:3, 3] + m[:3, 2] * self.args.tip_offsets[arm]
+
+    def pixel_to_world(self, u, v, depth_img, info, frame_id):
+        """(point, camera origin, depth) in world, or raises ValueError."""
+        h, w = depth_img.shape
+        r = self.args.patch
+        patch = depth_img[max(0, v - r):min(h, v + r + 1), max(0, u - r):min(w, u + r + 1)]
+        valid = patch[(patch > 0.1) & (patch < 4.0) & np.isfinite(patch)]
+        if valid.size < max(3, patch.size // 5):
+            raise ValueError('no valid depth at that pixel -- pick a textured, '
+                             'nearer surface')
+        z = float(np.median(valid))
+        # The colour image is not rectified and the D455 colour lens has real
+        # distortion (k1 about -0.06): undone before deprojecting with K.
+        p_cam = pixel_ray(u, v, info) * z
+        m = self.lookup(BASE_FRAME, frame_id)
+        if m is None:
+            raise ValueError(f'no tf {BASE_FRAME} -> {frame_id}')
+        return m[:3, :3] @ p_cam + m[:3, 3], m[:3, 3], z
+
+    def candidates(self, point, cam_origin, top_down=False, arm=None):
+        """[(label, approach axis, quat, ring)] to try, in rings of preference.
+
+        The axis is the tool's +Z, the direction the tip travels in. It is
+        horizontal -- the end effector parallel to the ground (2026-10-08) --
+        unless no level approach reaches: then tilted down 10, then 20 deg
+        (rings 3 and 4; a box at the left arm's full stretch, 2026-10-14,
+        where the sag correction straightened the elbow onto its limit just
+        short of the face). And from the side the camera sees:
+        the camera's line of sight to the point, flattened, then turned 15 and
+        30 deg either way. Any roll about the axis is allowed. The far side and
+        top of an object are not in the octomap, so it is never approached
+        from there. preplan() stops at the first ring that yields a plan.
+        """
+        if top_down:
+            # TOP DOWN: the tool straight down onto the point (an object lying
+            # flat), turned about the vertical in 45 deg steps. Where straight
+            # down cannot make the 10 cm line (this arm's wrist runs out of
+            # range ~44 cm out: 2026-10-08), the tool may lean 10, then 20 deg,
+            # wrist back towards the robot -- still coming down onto the top.
+            out = []
+            shoulder = self.lookup(BASE_FRAME, f'openarm_{arm}_link1') if arm else None
+            outward = np.array(point, dtype=float) - (shoulder[:3, 3] if shoulder is not None
+                                                      else np.zeros(3))
+            outward[2] = 0.0
+            outward /= max(np.linalg.norm(outward), 1e-9)
+            # A suction cup seals only (nearly) flat on the top: with a tool on
+            # (the vacuum), at most --vacuum-lean -- a 20 deg lean touched the
+            # top 4 mm from the click and picked nothing; straight down is
+            # beyond the wrist (joint 6, +-45 deg) past ~40 cm, where the
+            # camera cannot see the table anyway (2026-10-14).
+            # (A bellows cup seals tilted: no cap by default -- the planner
+            # takes the smallest lean that reaches, 2026-10-14.)
+            tool_on = bool(getattr(self.args, 'tools', {}).get(arm, {}).get('on'))
+            limit = self.args.vacuum_lean if tool_on else 30
+            leans = tuple((k, lean) for k, lean in enumerate((0, 10, 15, 20, 25, 30))
+                          if lean <= limit)
+            for ring, lean in leans:
+                axis = np.array([0.0, 0.0, -1.0]) * math.cos(math.radians(lean)) \
+                    + outward * math.sin(math.radians(lean))
+                for deg in (0, 90, -90, 180, 45, -45, 135, -135):
+                    label = (f'top-down yaw {deg:+d}' if lean == 0 else
+                             f'top-down lean {lean} yaw {deg:+d}')
+                    out.append((label, axis,
+                                quat_from_matrix(tool_frame_along(axis, math.radians(deg))),
+                                ring))
+            return out
+        ray = np.array(point, dtype=float) - cam_origin
+        ray[2] = 0.0                                 # horizontal
+        ray /= max(np.linalg.norm(ray), 1e-9)
+        up = np.array([0.0, 0.0, 1.0])
+        out = []
+        # FIRST, when the picker measured the box's face (pick_normal, world): square on
+        # to it, level -- straight along its normal (--face-first, 2026-11-13). The cup
+        # seats flat, the tool passes the neighbours' faces at a right angle and never
+        # sweeps across them, and it is usually the one that works: with only the
+        # camera's line of sight first, the picks that went were found as "turn -15 /
+        # -30" after two rings of failures (7-30 s of checks, 2026-11-13).
+        normal = getattr(self, 'pick_normal', None)
+        if normal is not None and getattr(self.args, 'face_first', True):
+            into = np.array(normal, dtype=float)
+            into[2] = 0.0
+            if np.linalg.norm(into) > 0.5:
+                into /= np.linalg.norm(into)
+                if into @ ray < 0:
+                    into = -into                     # into the face, away from the camera
+                if into @ ray > math.cos(math.radians(50.0)):   # (else: not this face's)
+                    for deg in (0, 90, -90, 180):
+                        out.append((f'square on roll {deg:+d}', into,
+                                    quat_from_matrix(tool_frame_along(into, math.radians(deg))),
+                                    -1))
+        for tilt, base in ((0, 0), (10, 3), (20, 4)):
+            for ring, yaw in ((0, 0), (1, 15), (1, -15), (2, 30), (2, -30)):
+                axis = rot_about(up, math.radians(yaw)) @ ray
+                axis[2] = 0.0
+                axis /= np.linalg.norm(axis)
+                axis = axis * math.cos(math.radians(tilt)) - up * math.sin(math.radians(tilt))
+                for deg in (0, 90, -90, 180):
+                    head = 'level' if tilt == 0 else f'tilted {tilt}'
+                    label = (f'{head} roll {deg:+d}' if yaw == 0 else
+                             f'{head} turn {yaw:+d} roll {deg:+d}')
+                    out.append((label, axis,
+                                quat_from_matrix(tool_frame_along(axis, math.radians(deg))),
+                                ring if tilt == 0 else base))
+        return out
+
+    def tcp_for_tip(self, tip, axis, arm):
+        """hand_tcp position that puts this arm's working tip at `tip`."""
+        return np.asarray(tip) - axis * self.args.tip_offsets[arm]
+
+    # -- ROS calls from worker threads ----------------------------------------
+
+    @staticmethod
+    def wait(future, timeout):
+        done = threading.Event()
+        future.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout):
+            return None
+        return future.result()
+
+    def wait_or_dead(self, future, timeout, handle=None, arms=()):
+        """wait(), but checking every 5 s that move_group is still there, so
+        a crash mid-goal is reported in seconds rather than after `timeout`;
+        and, for a goal that moves `arms`, STOP every 50 ms (held at the
+        controllers: move_group's cancel does not stop the arm)."""
+        done = threading.Event()
+        future.add_done_callback(lambda _f: done.set())
+        deadline = time.monotonic() + timeout
+        alive_at = time.monotonic() + 5.0
+        while not done.wait(0.05):
+            if handle is not None and self.halt.is_set():
+                self._hold_until_done(handle, done, arms)
+                return None
+            if time.monotonic() > deadline:
+                if handle is not None:
+                    self._hold_until_done(handle, done, arms, seconds=0.5)
+                return None
+            if time.monotonic() > alive_at:
+                alive_at = time.monotonic() + 5.0
+                self.require_move_group()
+        return future.result()
+
+    def publish_marker(self, point):
+        x, y, z = (float(v) for v in point)
+        now = self.get_clock().now().to_msg()
+        sphere = Marker()
+        sphere.header.frame_id = BASE_FRAME
+        sphere.header.stamp = now
+        sphere.ns, sphere.id = 'click_to_move', 0
+        sphere.type, sphere.action = Marker.SPHERE, Marker.ADD
+        sphere.pose.position.x, sphere.pose.position.y, sphere.pose.position.z = x, y, z
+        sphere.pose.orientation.w = 1.0
+        sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.025
+        sphere.color.r, sphere.color.g, sphere.color.b, sphere.color.a = 1.0, 0.1, 0.1, 1.0
+        label = Marker()
+        label.header = sphere.header
+        label.ns, label.id = 'click_to_move', 1
+        label.type, label.action = Marker.TEXT_VIEW_FACING, Marker.ADD
+        label.pose.position.x, label.pose.position.y, label.pose.position.z = x, y, z + 0.05
+        label.pose.orientation.w = 1.0
+        label.scale.z = 0.03
+        label.color.r = label.color.g = label.color.b = label.color.a = 1.0
+        label.text = f'x={x:+.3f} y={y:+.3f} z={z:+.3f}'
+        self.marker_pub.publish(MarkerArray(markers=[sphere, label]))
+
+    def publish_target(self, position, quat):
+        target = PoseStamped()
+        target.header.frame_id = BASE_FRAME
+        target.header.stamp = self.get_clock().now().to_msg()
+        target.pose.position.x, target.pose.position.y, target.pose.position.z = \
+            map(float, position)
+        (target.pose.orientation.x, target.pose.orientation.y,
+         target.pose.orientation.z, target.pose.orientation.w) = map(float, quat)
+        self.target_pub.publish(target)
+
+    def rebuild_octomap(self):
+        """Clear the map and let the gater pass fresh depth frames into it."""
+        if self.clear_client.wait_for_service(timeout_sec=2.0):
+            self.wait(self.clear_client.call_async(Empty.Request()), 5.0)
+        self.bump_map_version()                      # (no gater: this is all that says so)
+        if not self.refresh_client.wait_for_service(timeout_sec=2.0):
+            return 'octomap cleared; no /octomap_gater (octomap:=live refills it by itself)'
+        result = self.wait(self.refresh_client.call_async(Trigger.Request()), 5.0)
+        # The gater passes its frames at camera rate; give move_group a moment
+        # to integrate them before anything is checked against the map.
+        time.sleep(self.args.octomap_settle)
+        self.bump_map_version()                      # and again once it is filled
+        return f'octomap rebuilt ({result.message})' if result else 'octomap refresh timed out'
+
+    def allow_grippers_in_octomap(self, touching=None, held_free=None, hand_free=None):
+        """What may touch <octomap>: the links that never move (stand, camera,
+        arm bases) always; and the two fingers of the arm `touching`, only
+        while it makes contact (fingers_touching()). Nothing else -- the
+        hand and fingers used to be exempt all the time, so the checks let
+        the gripper pass through OTHER objects on the way to the one clicked
+        (2026-10-09). The hand of the arm `hand_free` too, only inside a
+        coaxial press (press_touching(), 2026-11-17).
+
+        The matrix is read, extended and sent back whole: a diff carrying an
+        ACM replaces it wholesale, and a partial one would throw away every
+        disable_collisions entry from the SRDF (see pick_place_orchestrator's
+        current_acm).
+        """
+        with _gate(self), self._acm_lock:      # one read-modify-write at a time
+            return self._allow_grippers_in_octomap(touching, held_free, hand_free)
+
+    def _allow_grippers_in_octomap(self, touching=None, held_free=None, hand_free=None):
+        if touching is None:                         # an outer fingers_touching() holds
+            touching = next((a for a, n in self.__dict__.get('_touch_hold', {}).items()
+                             if n > 0), None)
+        if hand_free is None:                        # an outer press_touching() holds
+            hand_free = next((a for a, n in self.__dict__.get('_press_hold', {}).items()
+                              if n > 0), None)
+        if not (self.scene_query.wait_for_service(timeout_sec=5.0)
+                and self.scene_apply.wait_for_service(timeout_sec=5.0)):
+            return False, 'planning scene services unavailable; gripper not exempted'
+        request = GetPlanningScene.Request()
+        request.components.components = PlanningSceneComponents.ALLOWED_COLLISION_MATRIX
+        result = self.wait(self.scene_query.call_async(request), 5.0)
+        if result is None:
+            return False, 'move_group did not answer (busy?); gripper not exempted yet'
+        if not result.scene.allowed_collision_matrix.entry_names:
+            return False, 'empty collision matrix; gripper not exempted'
+        matrix = result.scene.allowed_collision_matrix
+        names = list(matrix.entry_names)
+        rows = [list(entry.enabled) for entry in matrix.entry_values]
+        if OCTOMAP_NAME not in names:
+            names.append(OCTOMAP_NAME)
+            for row in rows:
+                row.append(False)
+            rows.append([False] * len(names))
+        index = {name: i for i, name in enumerate(names)}
+        octomap = index[OCTOMAP_NAME]
+        # Plus the links that never move: the stand, the camera and the arm
+        # bases. Octomap voxels touching them mean nothing -- the stand's
+        # collision mesh reaches out to x = +95 mm at the base plate and the
+        # brace, so table, floor or cable voxels there turned it red in RViz
+        # and made every start state "in collision" (2026-10-06).
+        static = ['openarm_body_link0', 'camera_link', 'openarm_left_link0',
+                  'openarm_right_link0']
+        fingers = ([f'openarm_{touching}_left_finger', f'openarm_{touching}_right_finger',
+                    tool_id(touching), held_id(touching)] if touching else [])
+        # a held box leaving the spot it was picked from: the octomap still has
+        # it there until the next capture (held_leaving())
+        if held_free:
+            fingers.append(held_id(held_free))
+        # the hand itself, in a straight press along the tool (press_touching):
+        # its 30 mm cylinder ends 22.75 mm behind the tip, so at 3-20 mm past
+        # the face it met the face's own 2 cm voxels and the press "did not
+        # solve" (17:35:53, 2026-11-16) -- coaxial, it sweeps only space the
+        # exempt tool swept first
+        if hand_free:
+            fingers.append(f'openarm_{hand_free}_hand')
+        # the tools and held boxes too: checked like the gripper, free only at
+        # the contact
+        for name in (tool_id('left'), tool_id('right'), held_id('left'), held_id('right')):
+            if name not in index:
+                names.append(name)
+                for row in rows:
+                    row.append(False)
+                rows.append([False] * len(names))
+                index[name] = len(names) - 1
+        for link in gripper_links('left') + gripper_links('right') + static + \
+                [tool_id('left'), tool_id('right'), held_id('left'), held_id('right')]:
+            if link in index:
+                allowed = link in static or link in fingers
+                rows[index[link]][octomap] = rows[octomap][index[link]] = allowed
+        for arm in ('left', 'right'):                # a box on the tool touches the tool
+            a, b = index[held_id(arm)], index[tool_id(arm)]
+            rows[a][b] = rows[b][a] = True
+        updated = AllowedCollisionMatrix(entry_names=names)
+        updated.entry_values = [AllowedCollisionEntry(enabled=row) for row in rows]
+        scene = PlanningScene(is_diff=True, allowed_collision_matrix=updated)
+        applied = self.wait(self.scene_apply.call_async(
+            ApplyPlanningScene.Request(scene=scene)), 5.0)
+        if applied is None:
+            return False, 'move_group did not answer (busy?); gripper not exempted yet'
+        if not applied.success:
+            return False, 'move_group refused the gripper/octomap exemption'
+        return True, ('stand, camera and arm bases may touch the octomap'
+                      + (f'; the {touching} fingers too, for the contact' if touching else
+                         '; the arms and grippers are all checked')
+                      + (f'; the {hand_free} hand too, for the press' if hand_free else ''))
+
+    @contextlib.contextmanager
+    def fingers_touching(self, arm):
+        """While inside: this arm's two fingers may touch the octomap (the last
+        few cm onto the clicked surface). Revoked on the way out, always --
+        but not while an outer one still holds (nested: an approach point
+        closer than NEAR keeps the tool exempt for the whole touch)."""
+        with _gate(self):                       # (exemptions one thread at a time)
+            hold = self.__dict__.setdefault('_touch_hold', {})
+            with self._acm_lock:
+                hold[arm] = hold.get(arm, 0) + 1
+            try:
+                ok, message = self.allow_grippers_in_octomap(touching=arm)
+                if not ok:
+                    self.get_logger().warn(f'{arm} fingers: {message}')
+                yield ok
+            finally:
+                with self._acm_lock:
+                    hold[arm] -= 1
+                self._revoke()
+
+    def hand_press_ok(self, arm):
+        """May this arm's hand be exempt in a coaxial press at all (hand_press_ok())."""
+        return hand_press_ok(self, arm)
+
+    @contextlib.contextmanager
+    def press_touching(self, arm):
+        """fingers_touching(), and this arm's HAND may touch the octomap too:
+        for the straight press along the tool only -- the caller makes sure it
+        is one (press_is_coaxial()). Its own nesting count; revoked on the way
+        out like fingers_touching (an outer fingers_touching keeps the fingers,
+        not the hand). --no-press-hand-free, or an arm whose hand is wider than
+        its tool (hand_press_ok): just fingers_touching (2026-11-17)."""
+        with _gate(self):                       # (exemptions one thread at a time)
+            if not self._on('press_hand_free', True) or not hand_press_ok(self, arm):
+                with self.fingers_touching(arm) as ok:
+                    yield ok
+                return
+            hold = self.__dict__.setdefault('_touch_hold', {})
+            press = self.__dict__.setdefault('_press_hold', {})
+            with self._acm_lock:
+                hold[arm] = hold.get(arm, 0) + 1
+                press[arm] = press.get(arm, 0) + 1
+            try:
+                ok, message = self.allow_grippers_in_octomap(touching=arm, hand_free=arm)
+                if not ok:
+                    self.get_logger().warn(f'{arm} press: {message}')
+                yield ok
+            finally:
+                with self._acm_lock:
+                    hold[arm] -= 1
+                    press[arm] -= 1
+                self._revoke()
+
+    def press_is_coaxial(self, arm, target, quat, max_deg=None, max_mm=None, near=0.03,
+                         past=0.02):
+        """Is a straight press of hand_tcp from where it is now to `target`
+        (world, m) at `quat` along the tool's own axis -- so that the hand,
+        exempt in press_touching(), only sweeps where the exempt tool went
+        first? (ok, why). Within max_deg (--press-coax-deg) the line and the
+        commanded tool z, and the measured tool z and the commanded one; within
+        max_mm (--press-coax-mm) of the line sideways; no longer than
+        near + past + 5 mm (near, past in m: the start short of the face, the
+        distance past it). Not coaxial if the tool cannot be seen (no tf)."""
+        max_deg = float(getattr(self.args, 'press_coax_deg', 3.0) if max_deg is None else max_deg)
+        max_mm = float(getattr(self.args, 'press_coax_mm', 3.0) if max_mm is None else max_mm)
+        if not hand_press_ok(self, arm):
+            return False, f'the {arm} hand is wider than its tool: never exempt (fingers only)'
+        m = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+        if m is None:
+            return False, 'no tf for the tool'
+        z = matrix_from_quat(*quat)[:, 2]
+        z = z / max(float(np.linalg.norm(z)), 1e-9)
+        v = np.asarray(target, float) - m[:3, 3]
+        length = float(np.linalg.norm(v))
+        along = float(v @ z)
+        side = float(np.linalg.norm(v - along * z))
+        angle = (math.degrees(math.acos(max(-1.0, min(1.0, along / length))))
+                 if length > 0.0005 else 0.0)          # (already there: no direction)
+        tilt = math.degrees(math.acos(max(-1.0, min(1.0, float(m[:3, 2] @ z)))))
+        longest = float(near) + float(past) + 0.005
+        numbers = (f'{angle:.1f} deg off the tool axis, {1000 * side:.1f} mm sideways, tool '
+                   f'{tilt:.1f} deg off, {1000 * length:.0f} mm long')
+        if length > 0.0005 and along <= 0.0:
+            return False, f'not coaxial: the press goes backwards ({numbers})'
+        if angle > max_deg:
+            return False, f'not coaxial: {numbers} (max {max_deg:g} deg)'
+        if side > max_mm / 1000.0:
+            return False, f'not coaxial: {numbers} (max {max_mm:g} mm sideways)'
+        if tilt > max_deg:
+            return False, f'not coaxial: {numbers} (tool max {max_deg:g} deg)'
+        if length > longest:
+            return False, f'not coaxial: {numbers} (max {1000 * longest:.0f} mm long)'
+        return True, f'coaxial: {numbers}'
+
+    @contextlib.contextmanager
+    def held_leaving(self, arm):
+        """While inside: the box this arm holds may overlap the octomap -- the
+        straight way out of the spot it was picked from, where the map still
+        has it. Revoked on the way out, always."""
+        with _gate(self):                       # (exemptions one thread at a time)
+            ok, message = self.allow_grippers_in_octomap(held_free=arm)
+            if not ok:
+                self.get_logger().warn(f'{arm} held box: {message}')
+            try:
+                yield ok
+            finally:
+                self._revoke()
+
+    def _revoke(self):
+        """Back to the octomap checks as they were before an exemption (an
+        outer one still held stays). Retried: a revoke move_group missed left
+        the tool exempt for every later plan (2026-10-28 review)."""
+        for attempt in range(3):
+            ok, message = self.allow_grippers_in_octomap()
+            if ok:
+                return True
+            time.sleep(0.3)
+        self.get_logger().error(f'the octomap exemption could not be switched off ({message}): '
+                                f'plans may let the tool through the map - restart if it '
+                                f'persists')
+        return False
+
+    def attach_held(self, arm, size_hwd, tip_offset, exact=None):
+        """The box this arm just picked, in both planners. True if attached.
+        exact: (rotation, centre in hand_tcp, extents) when the box's pose on
+        the tool was measured (the calibration box), else from size_hwd."""
+        tcp = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+        if tcp is None:
+            self.get_logger().warn(f'{arm} held box: no tf for the tool; not attached')
+            return False
+        if exact is not None:
+            rot, centre, ext = (np.asarray(v, float) for v in exact)
+            top = False
+            if size_hwd is None:                        # (no size given: the extents)
+                size_hwd = tuple(float(v) for v in ext)
+        else:
+            rot, centre, ext, top = held_geometry(size_hwd, tip_offset, tcp[:3, :3])
+        scene = PlanningScene(is_diff=True)
+        scene.robot_state.is_diff = True
+        att = AttachedCollisionObject()
+        att.link_name = f'openarm_{arm}_hand'
+        att.touch_links = gripper_links(arm) + [f'openarm_{arm}_hand_tcp']
+        obj = att.object
+        obj.header.frame_id = f'openarm_{arm}_hand_tcp'
+        obj.id = held_id(arm)
+        obj.operation = CollisionObject.ADD
+        obj.primitives.append(SolidPrimitive(type=SolidPrimitive.BOX,
+                                             dimensions=[float(v) for v in ext]))
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = (float(v) for v in centre)
+        (pose.orientation.x, pose.orientation.y, pose.orientation.z,
+         pose.orientation.w) = quat_from_matrix(rot)
+        obj.primitive_poses.append(pose)
+        scene.robot_state.attached_collision_objects.append(att)
+        ok_moveit = False
+        if self.scene_apply.wait_for_service(timeout_sec=5.0):
+            applied = self.wait(self.scene_apply.call_async(
+                ApplyPlanningScene.Request(scene=scene)), 5.0)
+            ok_moveit = applied is not None and applied.success
+        ok_cumotion = self._held_cumotion(arm, held_spheres(rot, centre, ext))
+        self.held[arm] = {'size': tuple(float(v) for v in size_hwd), 'extents': ext.tolist(),
+                          'top': bool(top),
+                          'moveit': ok_moveit, 'cumotion': ok_cumotion}
+        self.get_logger().info(f'{arm} holds a {size_hwd[0] * 1000:.0f} x {size_hwd[1] * 1000:.0f}'
+                               f' x {size_hwd[2] * 1000:.0f} mm box (MoveIt {ok_moveit}, '
+                               f'cuMotion {ok_cumotion})')
+        return ok_moveit or ok_cumotion
+
+    def detach_held(self, arm=None):
+        """Released (at the drop pose, or asked): out of both planners."""
+        for a in ([arm] if arm else ['left', 'right']):
+            scene = PlanningScene(is_diff=True)
+            scene.robot_state.is_diff = True
+            att = AttachedCollisionObject()
+            att.link_name = f'openarm_{a}_hand'
+            att.object.id = held_id(a)
+            att.object.operation = CollisionObject.REMOVE
+            scene.robot_state.attached_collision_objects.append(att)
+            scene.world.collision_objects.append(CollisionObject(
+                id=held_id(a), operation=CollisionObject.REMOVE))
+            if self.scene_apply.wait_for_service(timeout_sec=3.0):
+                self.wait(self.scene_apply.call_async(ApplyPlanningScene.Request(scene=scene)),
+                          5.0)
+            if a in self.held or arm:
+                self._held_cumotion(a, [])
+            if self.held.pop(a, None) is not None:
+                self.get_logger().info(f'{a} released its box')
+
+    def _held_cumotion(self, arm, spheres):
+        from isaac_ros_cumotion_interfaces.action import UpdateLinkSpheres
+        if not hasattr(self, '_spheres_client'):
+            self._spheres_client = ActionClient(self, UpdateLinkSpheres, 'planner_attach_object')
+        if not self._spheres_client.wait_for_server(timeout_sec=10.0 if spheres else 3.0):
+            self.get_logger().warn(f'cuMotion planner_attach_object unavailable: {arm} held box '
+                                   f'not set')
+            return False
+        spheres = spheres[:HELD_SLOTS]
+        goal = UpdateLinkSpheres.Goal(
+            attach_object=bool(spheres), object_link_name=f'openarm_{arm}_held',
+            flattened_sphere_arr=[float(v) for sph in
+                                  (spheres + [(0.0, 0.0, 0.0, -10.0)]
+                                   * (HELD_SLOTS - len(spheres)))
+                                  for v in sph] if spheres else [])
+        handle = self.wait(self._spheres_client.send_goal_async(goal), 5.0)
+        if handle is None or not handle.accepted:
+            self.get_logger().warn(f'cuMotion refused the {arm} held box spheres')
+            return False
+        self.wait(handle.get_result_async(), 5.0)
+        return True
+
+    def path_is_clear(self, arm, trajectory, every=3):
+        """Is every `every`-th point of this trajectory clear of collisions in
+        the planning scene as it is now -- the held box included? (A way back
+        that is replayed rather than planned was checked without the box.)
+        None if move_group cannot say."""
+        jt = trajectory.joint_trajectory
+        points = list(jt.points)[::every] + list(jt.points)[-1:]
+        return self._states_valid(f'{arm}_arm', list(jt.joint_names),
+                                  [p.positions for p in points])
+
+    def _validity_client(self):
+        if not hasattr(self, '_validity'):
+            self._validity = self.create_client(GetStateValidity, '/check_state_validity')
+        return self._validity if self._validity.wait_for_service(timeout_sec=3.0) else None
+
+    def _state_validity(self, group, names, positions):
+        """move_group's GetStateValidity for these joints (the rest of the
+        robot, the tool and a held box as they are now), or None."""
+        client = self._validity_client()
+        if client is None:
+            return None
+        req = GetStateValidity.Request()
+        req.group_name = group
+        req.robot_state = RobotState(is_diff=True)
+        req.robot_state.joint_state.name = list(names)
+        req.robot_state.joint_state.position = [float(v) for v in positions]
+        with _gate(self):                       # (not under another thread's exemption)
+            return self.wait(client.call_async(req), 3.0)
+
+    def _states_valid(self, group, names, states):
+        """True if every state is valid, False at the first that is not, None
+        if move_group cannot say."""
+        for q in states:
+            res = self._state_validity(group, names, q)
+            if res is None:
+                return None
+            if not res.valid:
+                return False
+        return True
+
+    def segment_is_clear(self, arm, q_from, q_to, step=0.01):
+        """Is the straight joint-space move from q_from to q_to (this arm's 7
+        joints) clear, every `step` rad of the joint that moves most, the end
+        included? True/False, or None if move_group cannot say. The start is
+        not asked: the arm is there already (a lead-in from a state in the map
+        would otherwise never be allowed off it -- every next state is asked).
+        For lead-ins (execute(lead=True)), 2026-11-17: before, up to 0.06 rad
+        was led in unchecked."""
+        return self._segment_clear(f'{arm}_arm', arm_joints(arm), q_from, q_to, step)
+
+    def _segment_clear(self, group, names, q_from, q_to, step=0.01):
+        a, b = np.asarray(q_from, float), np.asarray(q_to, float)
+        if a.shape != b.shape or a.shape[0] != len(names):
+            return None
+        n = max(1, int(math.ceil(float(np.max(np.abs(b - a))) / max(step, 1e-4) - 1e-9)))
+        return self._states_valid(group, names, [a + (b - a) * (k / n) for k in range(1, n + 1)])
+
+    def state_contacts(self, arm, joints):
+        """What collides at these joints of this arm, for the logs: [(body 1,
+        body 2, (x, y, z) world)] -- [] if the state is valid, None if
+        move_group cannot say (2026-11-17: the refused lines in only ever said
+        "blocked by something in the map", never by what)."""
+        res = self._state_validity(f'{arm}_arm', arm_joints(arm), joints)
+        if res is None:
+            return None
+        if res.valid:
+            return []
+        return [(c.contact_body_1, c.contact_body_2,
+                 (float(c.position.x), float(c.position.y), float(c.position.z)))
+                for c in res.contacts]
+
+    def refresh_walls(self, optical, ahead=None, x_min=None, bounds=None):
+        """After a capture: walls in the planning scene where the camera cannot
+        see -- above, below and beside its picture, from `ahead` (walls.AHEAD)
+        in front of the nearest thing it saw, never nearer the robot than
+        `x_min` (walls.X_MIN) (ctm/walls.py). bounds: the part of the picture
+        with depth (walls.depth_bounds); the whole picture if None. Returns
+        how many boxes, or None."""
+        ahead = walls.AHEAD if ahead is None else float(ahead)
+        x_min = walls.X_MIN if x_min is None else float(x_min)
+        # The L2 LiDAR sees round the camera's picture: no walls while it works
+        # (2026-11-11) -- back as soon as it does not (this runs on every capture)
+        self.walls_off = (getattr(self.args, 'lidar_walls', 'auto') == 'auto'
+                          and self.lidar_ok())
+        if self.walls_off:
+            obj = CollisionObject()
+            obj.header.frame_id = BASE_FRAME
+            obj.id = walls.WALL_ID
+            obj.operation = CollisionObject.REMOVE
+            if self.scene_apply.wait_for_service(timeout_sec=5.0):
+                scene = PlanningScene(is_diff=True)
+                scene.world.collision_objects = [obj]
+                self.wait(self.scene_apply.call_async(ApplyPlanningScene.Request(scene=scene)), 5.0)
+            return 0
+        _c, _d, info = self.latest()
+        t_wo = self.lookup(BASE_FRAME, optical)
+        if info is None or t_wo is None or not self.scene_query.wait_for_service(timeout_sec=5.0):
+            return None
+        request = GetPlanningScene.Request()
+        request.components.components = PlanningSceneComponents.OCTOMAP
+        result = self.wait(self.scene_query.call_async(request), 5.0)
+        nearest = None
+        if result is not None:
+            o = result.scene.world.octomap
+            nearest = walls.nearest_seen(o.octomap, np.array(
+                [o.origin.position.x, o.origin.position.y, o.origin.position.z]))
+        start = (nearest - ahead) if nearest is not None else x_min
+        obj = CollisionObject()
+        obj.header.frame_id = BASE_FRAME
+        obj.id = walls.WALL_ID
+        obj.operation = CollisionObject.ADD
+        for centre, size in walls.boxes(t_wo, info, start, x_min, bounds):
+            box = SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[float(v) for v in size])
+            pose = Pose()
+            pose.position.x, pose.position.y, pose.position.z = map(float, centre)
+            pose.orientation.w = 1.0
+            obj.primitives.append(box)
+            obj.primitive_poses.append(pose)
+        if not obj.primitives:
+            obj.operation = CollisionObject.REMOVE
+        scene = PlanningScene(is_diff=True)
+        scene.world.collision_objects = [obj]
+        applied = self.wait(self.scene_apply.call_async(
+            ApplyPlanningScene.Request(scene=scene)), 5.0)
+        if applied is None or not applied.success:
+            self.get_logger().warn('could not put the unseen-space walls into the scene')
+            return None
+        return len(obj.primitives)
+
+    def alive(self, timeout=3.0):
+        """Does move_group answer at all? Its names linger in DDS after it
+        dies, so wait_for_service passing proves nothing; a reply does."""
+        if not self.scene_query.wait_for_service(timeout_sec=1.0):
+            return False
+        request = GetPlanningScene.Request()
+        request.components.components = PlanningSceneComponents.SCENE_SETTINGS
+        return self.wait(self.scene_query.call_async(request), timeout) is not None
+
+    def require_move_group(self):
+        if not self.alive():
+            raise MoveGroupDown('move_group is not answering')
+
+    def ensure_grippers_in_octomap(self, patience=20.0):
+        """allow_grippers_in_octomap, retried: move_group answers slowly while
+        it is executing (the boot walk), and a respawned one has forgotten it."""
+        deadline = time.monotonic() + patience
+        while True:
+            ok, message = self.allow_grippers_in_octomap()
+            if ok:
+                self.set_pieces(self.pieces_on)
+                self.set_tool()
+            if ok or time.monotonic() > deadline:
+                return ok, message
+            time.sleep(2.0)
+
+    def set_pieces(self, on):
+        """The calibration pieces on both hands in the planners, or not:
+        boxes attached to the hands for MoveIt (IK, OMPL, straight lines),
+        spheres on cuMotion's pieces links. Called with the gripper exemption,
+        before every touch -- a respawned planner has forgotten them; turning
+        them off is done once (a calibration run may have left them on)."""
+        if not on and getattr(self, '_pieces_off_done', False):
+            return True
+        # each on its own: MoveIt's box even while cuMotion is still starting
+        # (with "and" a not-yet-ready cuMotion skipped the box too, and a whole
+        # CAL ARMS ran without the pieces -- they hit the wall, 2026-10-15)
+        ok_moveit = self._pieces_moveit(on)
+        ok_cumotion = self._pieces_cumotion(on)
+        ok = ok_moveit and ok_cumotion
+        if not on and ok:
+            self._pieces_off_done = True
+        return ok
+
+    def set_tool(self):
+        """Each arm's tool (args.tools) in both planners, as it is set now:
+        after a tool change, and with the gripper exemption before every
+        touch (a respawned planner has forgotten it)."""
+        ok = True
+        for arm in ('left', 'right'):
+            t = getattr(self.args, 'tools', {}).get(arm, {})
+            length = float(t.get('length', 0.0)) if t.get('on') else 0.0
+            ok &= self._tool_moveit(arm, length)
+            ok &= self._tool_cumotion(arm, length)
+        return ok
+
+    def _tool_moveit(self, arm, length):
+        scene = PlanningScene(is_diff=True)
+        scene.robot_state.is_diff = True
+        att = AttachedCollisionObject()
+        att.link_name = f'openarm_{arm}_hand'
+        att.touch_links = gripper_links(arm) + [f'openarm_{arm}_hand_tcp']
+        obj = att.object
+        obj.header.frame_id = att.link_name
+        obj.id = tool_id(arm)
+        if length <= 0.0:
+            obj.operation = CollisionObject.REMOVE
+            scene.world.collision_objects.append(CollisionObject(
+                id=obj.id, operation=CollisionObject.REMOVE))
+        else:
+            obj.operation = CollisionObject.ADD
+            obj.primitives.append(SolidPrimitive(type=SolidPrimitive.CYLINDER,
+                                                 dimensions=[float(length),
+                                                             float(TOOL_DIAMETER / 2)]))
+            pose = Pose()
+            pose.position.z = float(HAND_TCP_Z + FINGERTIP_BEYOND_TCP + length / 2)
+            pose.orientation.w = 1.0
+            obj.primitive_poses.append(pose)
+        scene.robot_state.attached_collision_objects.append(att)
+        if not self.scene_apply.wait_for_service(timeout_sec=5.0):
+            return False
+        applied = self.wait(self.scene_apply.call_async(ApplyPlanningScene.Request(scene=scene)),
+                            5.0)
+        if applied is None or not applied.success:
+            if length <= 0.0:
+                return True          # removing a tool that was never there: nothing to do
+            self.get_logger().warn(f'could not set the {arm} tool in the planning scene')
+            return False
+        return True
+
+    def _tool_cumotion(self, arm, length):
+        from isaac_ros_cumotion_interfaces.action import UpdateLinkSpheres
+        if not hasattr(self, '_spheres_client'):
+            self._spheres_client = ActionClient(self, UpdateLinkSpheres, 'planner_attach_object')
+        if not self._spheres_client.wait_for_server(timeout_sec=60.0 if length > 0 else 3.0):
+            self.get_logger().warn(f'cuMotion planner_attach_object unavailable: {arm} tool not set')
+            return False
+        spheres = tool_spheres(length) if length > 0 else []
+        goal = UpdateLinkSpheres.Goal(
+            attach_object=bool(spheres), object_link_name=f'openarm_{arm}_tool',
+            flattened_sphere_arr=[float(v) for sph in
+                                  (spheres + [(0.0, 0.0, 0.0, -10.0)]
+                                   * (TOOL_SLOTS - len(spheres)))
+                                  for v in sph] if spheres else [])
+        handle = self.wait(self._spheres_client.send_goal_async(goal), 5.0)
+        if handle is None or not handle.accepted:
+            self.get_logger().warn(f'cuMotion refused the {arm} tool spheres')
+            return False
+        self.wait(handle.get_result_async(), 5.0)
+        return True
+
+    def _pieces_cumotion(self, on):
+        from isaac_ros_cumotion_interfaces.action import UpdateLinkSpheres
+        if not hasattr(self, '_spheres_client'):
+            self._spheres_client = ActionClient(self, UpdateLinkSpheres, 'planner_attach_object')
+        if not self._spheres_client.wait_for_server(timeout_sec=60.0 if on else 3.0):
+            self.get_logger().warn('cuMotion planner_attach_object unavailable: pieces not set')
+            return False
+        for arm in ('left', 'right'):
+            goal = UpdateLinkSpheres.Goal(
+                attach_object=bool(on), object_link_name=f'openarm_{arm}_pieces',
+                flattened_sphere_arr=[float(v) for sph in
+                                      (PIECES_SPHERES + [(0.0, 0.0, 0.0, -10.0)]
+                                       * (PIECES_SLOTS - len(PIECES_SPHERES)))
+                                      for v in sph] if on else [])
+            handle = self.wait(self._spheres_client.send_goal_async(goal), 5.0)
+            if handle is None or not handle.accepted:
+                self.get_logger().warn(f'cuMotion refused the {arm} pieces spheres')
+                return False
+            self.wait(handle.get_result_async(), 5.0)
+        return True
+
+    def _pieces_moveit(self, on):
+        scene = PlanningScene(is_diff=True)
+        scene.robot_state.is_diff = True
+        for arm in ('left', 'right'):
+            link = f'openarm_{arm}_hand'
+            att = AttachedCollisionObject()
+            att.link_name = link
+            # (the wrist too, as in openarm.yml for cuMotion: fixed to the
+            # gripper, the pieces cannot reach links 5-7 -- without these
+            # MoveIt refused the head-on wall-marker touches, 2026-10-16)
+            att.touch_links = [link, f'openarm_{arm}_left_finger', f'openarm_{arm}_right_finger',
+                               f'openarm_{arm}_link5', f'openarm_{arm}_link6',
+                               f'openarm_{arm}_link7', f'openarm_{arm}_hand_tcp']
+            obj = att.object
+            obj.header.frame_id = link
+            obj.id = f'calibration_pieces_{arm}'
+            obj.operation = CollisionObject.ADD if on else CollisionObject.REMOVE
+            if not on:
+                scene.robot_state.attached_collision_objects.append(att)
+                scene.world.collision_objects.append(CollisionObject(
+                    id=obj.id, operation=CollisionObject.REMOVE))
+                continue
+            obj.primitives.append(SolidPrimitive(type=SolidPrimitive.BOX,
+                                                 dimensions=[float(v) for v in PIECES_BOX_SIZE]))
+            pose = Pose()
+            pose.position.x, pose.position.y, pose.position.z = map(float, PIECES_BOX_CENTRE)
+            pose.orientation.w = 1.0
+            obj.primitive_poses.append(pose)
+            scene.robot_state.attached_collision_objects.append(att)
+        applied = self.wait(self.scene_apply.call_async(ApplyPlanningScene.Request(scene=scene)),
+                            5.0)
+        if applied is None or not applied.success:
+            if not on:
+                return True          # removing pieces that were never there: nothing to do
+            self.get_logger().warn('could not set the calibration pieces in the planning scene')
+            return False
+        return True
+
+    def close_gripper(self, arm):
+        """Fingers together, so the tips are one point. Result status ignored:
+        allow_stalling is false, so a stalled close reports ABORTED."""
+        client = self.gripper_clients[arm]
+        if not client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().warn(f'/{arm}_gripper_controller/gripper_cmd unavailable')
+            return False
+        goal = GripperCommand.Goal()
+        goal.command.position = 0.0
+        goal.command.max_effort = 20.0
+        handle = self.wait(client.send_goal_async(goal), 5.0)
+        if handle is None or not handle.accepted:
+            return False
+        self.wait(handle.get_result_async(), 5.0)
+        # And wait for the fingers to stop before anything is planned. Both
+        # move_group crashes on 2026-09-30 (SIGSEGV) came 0.6 and 1.5 s after
+        # a gripper command, with IK and a plan in flight while the fingers
+        # were still moving; the gripper-free runs never crashed.
+        name = f'openarm_{arm}_finger_joint1'
+        last, still = None, 0
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline and still < 10:
+            with self.lock:
+                here = self.joints.get(name)
+            still = still + 1 if (here is not None and last is not None
+                                  and abs(here - last) < 1e-4) else 0
+            last = here
+            time.sleep(0.05)
+        return True
+
+    def live_update_camera(self, xyz, rpy):
+        """Give robot_state_publisher the new camera origin, so tf -- and with
+        it every clicked point, the octomap and the VLM -- uses it at once.
+        (move_group's own robot model keeps the old camera box until the next
+        restart; it only matters for collisions with the camera itself.)"""
+        if not (self.rsp_get.wait_for_service(timeout_sec=2.0)
+                and self.rsp_set.wait_for_service(timeout_sec=2.0)):
+            return False, 'robot_state_publisher parameters unavailable'
+        got = self.wait(self.rsp_get.call_async(
+            GetParameters.Request(names=['robot_description'])), 5.0)
+        if got is None or not got.values or not got.values[0].string_value:
+            return False, 'could not read robot_description'
+        (x, y, z), (r, p, yw) = xyz, rpy
+        origin = f'<origin xyz="{x:.5f} {y:.5f} {z:.5f}" rpy="{r:.5f} {p:.5f} {yw:.5f}"/>'
+        urdf, n = re.subn(r'(<joint\s+name="camera_joint"[^>]*>\s*)<origin\b[^>]*/>',
+                          lambda m: m.group(1) + origin, got.values[0].string_value, count=1)
+        if n != 1:
+            return False, 'camera_joint not found in robot_description'
+        value = ParameterValue(type=ParameterType.PARAMETER_STRING, string_value=urdf)
+        done = self.wait(self.rsp_set.call_async(SetParameters.Request(
+            parameters=[Parameter(name='robot_description', value=value)])), 5.0)
+        if done is None or not done.results or not done.results[0].successful:
+            return False, 'robot_state_publisher refused the new robot_description'
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            m = self.lookup(BASE_FRAME, SCREW_FRAME)
+            if m is not None and np.linalg.norm(m[:3, 3] - np.asarray(xyz)) < 0.0005:
+                return True, 'live'
+            time.sleep(0.1)
+        return False, 'robot_state_publisher took the URDF but tf did not change'
+
+    def settle(self, arm, expected, timeout=None, min_wait=0.0, tol=0.002, stopped_below=None):
+        """Wait for the arm to reach `expected` joints, or to stop; return the
+        worst joint error, rad.
+
+        The controller reports SUCCESS when the trajectory ends, not when the
+        arm arrives, and the hardware integral takes seconds to pull out the
+        last of the sag. Done when every joint is within 2 mrad, or when the
+        arm has *stopped* -- no joint moving more than 0.5 mrad over 0.5 s --
+        or at the timeout. The integral term has a ~5 s time constant: with
+        a 3 s timeout the arm was often still creeping when measured, and
+        correcting on top of the creep made the corrections diverge (12.9 ->
+        7.3 -> 10.0 -> 15.7 mm, 2026-10-06).
+
+        2026-11-17: `tol` is the "arrived" band (2 mrad as before); with
+        `min_wait` s the "stopped" exit is ignored until then -- a joint held
+        by friction looks stopped, then moves again once the integral breaks
+        it free. What it found is kept in self.last_settle: {'worst' rad,
+        'vec' (measured - expected per joint, rad, or None), 'status' (how it
+        ended: 'arrived', 'stopped', 'timeout' or 'no joints'), 'seconds',
+        'motor' (arm_status() at the end)}; joint_error_text(vec) for the log.
+
+        2026-11-17 17:40: with `stopped_below` (rad), "stopped" counts only while every
+        joint is within it: j1 stops ~30 mrad short on friction, sticks, then slips on
+        as the integral grows -- a stick read as "stopped" measured it too early.
+        """
+        timeout = self.args.settle_time if timeout is None else timeout
+        t_start = time.monotonic()
+        deadline = t_start + timeout
+        worst, vec, status = None, None, 'no joints'
+        history = collections.deque()
+        while True:
+            now = time.monotonic()
+            here = self.arm_positions(arm)
+            if here is not None and expected is not None:
+                vec = [float(a - b) for a, b in zip(here, expected)]
+                worst = max(abs(v) for v in vec)
+                if worst < tol:
+                    status = 'arrived'
+                    break
+            if here is not None:
+                history.append((now, here))
+                while len(history) > 1 and now - history[1][0] >= 0.5:
+                    history.popleft()
+                if now - history[0][0] >= 0.5 and now - t_start >= min_wait and max(
+                        abs(a - b) for a, b in zip(here, history[0][1])) < 0.0005 and (
+                        stopped_below is None or worst is None or worst < stopped_below):
+                    status = 'stopped'
+                    break
+            if now > deadline:
+                status = 'timeout' if here is not None else 'no joints'
+                break
+            time.sleep(0.05)
+        self.last_settle = {'arm': arm, 'worst': worst, 'vec': vec, 'status': status,
+                            'seconds': round(time.monotonic() - t_start, 2),
+                            'motor': self.arm_status(arm)}
+        time.sleep(0.15)                 # robot_state_publisher's tf catches up
+        return worst
+
+    joint_error_text = staticmethod(joint_error_text)   # (node.joint_error_text(vec) too)
+
+    @contextlib.contextmanager
+    def planning_cache(self):
+        """While inside (a reach check, nothing moving, the scene fixed): the
+        same IK or straight-line question is asked of move_group once -- the
+        line in, the contact and the correction room repeat for every
+        approach point. Yields the stats: {kind: [calls, asked, seconds]}."""
+        self._plan_cache, self._plan_stats = {}, {}
+        self._plan_owner = threading.get_ident()     # only this thread's questions
+        try:
+            yield self._plan_stats
+        finally:
+            self._plan_cache = self._plan_stats = self._plan_owner = None
+
+    def _cached(self, kind, key, ask):
+        """ask() once per key inside planning_cache(); timed either way."""
+        cache, stats = getattr(self, '_plan_cache', None), getattr(self, '_plan_stats', None)
+        if cache is None or stats is None or \
+                getattr(self, '_plan_owner', None) != threading.get_ident():
+            got = ask()
+            return None if got is TIMED_OUT else got
+        held = tuple(sorted(a for a, n in self.__dict__.get('_touch_hold', {}).items()
+                            if n > 0))                   # what may touch the octomap
+        # (the hand too, in press_touching: a fingers-only answer is not one for a press)
+        pressed = tuple(sorted(a for a, n in self.__dict__.get('_press_hold', {}).items()
+                               if n > 0))
+        key = (kind, held, pressed) + key
+        rec = stats.setdefault(kind, [0, 0, 0.0])
+        rec[0] += 1
+        if key in cache:
+            return cache[key]
+        t0 = time.monotonic()
+        got = ask()
+        rec[1] += 1
+        rec[2] += time.monotonic() - t0
+        if got is TIMED_OUT:                         # move_group busy: ask again next time
+            return None
+        cache[key] = got
+        return got
+
+    def solve_ik(self, arm, position, quat, seed):
+        r = lambda v, d: tuple(np.round(np.asarray(v, float).ravel(), d))
+        got = self._cached('ik', (arm, r(position, 4), r(quat, 4), r(seed, 3)),
+                           lambda: self._solve_ik(arm, position, quat, seed))
+        return list(got) if got is not None else None
+
+    def _solve_ik(self, arm, position, quat, seed):
+        req = GetPositionIK.Request()
+        ik = req.ik_request
+        ik.group_name = f'{arm}_arm'
+        ik.ik_link_name = f'openarm_{arm}_hand_tcp'
+        ik.avoid_collisions = True
+        ik.timeout.nanosec = int(0.05 * 1e9)       # solvable poses solve in a few ms; failures cost the whole timeout
+        # A diff on the current state: without it MoveIt clears the attached
+        # bodies (conversions.cpp, robotStateMsgToRobotState), so every IK was
+        # solved without the tool and the held box (2026-11-17)
+        ik.robot_state.is_diff = True
+        ik.robot_state.joint_state.name = arm_joints(arm)
+        ik.robot_state.joint_state.position = [float(v) for v in seed]
+        pose = PoseStamped()
+        pose.header.frame_id = BASE_FRAME
+        pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = map(float, position)
+        (pose.pose.orientation.x, pose.pose.orientation.y,
+         pose.pose.orientation.z, pose.pose.orientation.w) = map(float, quat)
+        ik.pose_stamped = pose
+        with _gate(self):                       # (not under another thread's exemption)
+            result = self.wait(self.ik_client.call_async(req), 3.0)
+        if result is None:
+            self.require_move_group()
+            return TIMED_OUT
+        if result.error_code.val != MoveItErrorCodes.SUCCESS:
+            return None
+        found = dict(zip(result.solution.joint_state.name,
+                         result.solution.joint_state.position))
+        if not all(n in found for n in arm_joints(arm)):
+            return None
+        return [found[n] for n in arm_joints(arm)]
+
+    def seeds(self, arm, start, tcp=None, quat=None):
+        """Starting postures for IK. For a tool pointing straight down, the
+        three stored top-down postures (ctm/topdown_seeds.npz) nearest `tcp`
+        at the same turn come first: from the usual seeds KDL never finds one."""
+        out = [start, HOME_JOINTS] + ([self.retract[arm]] if arm in self.retract else [])
+        if tcp is None or quat is None:
+            return out
+        r = matrix_from_quat(*quat)
+        if r[2, 2] > -0.85:                          # not (near) top-down
+            return out
+        table = self._topdown_seeds()
+        if table is None or f'{arm}_q' not in table:
+            return out
+        turn = math.atan2(r[1, 0], r[0, 0])
+        same = np.abs(np.angle(np.exp(1j * (table[f'{arm}_turn'] - turn)))) < math.radians(25)
+        if not same.any():
+            return out
+        idx = np.flatnonzero(same)
+        near = idx[np.argsort(np.linalg.norm(table[f'{arm}_tcp'][idx] - tcp, axis=1))[:3]]
+        seeds = [table[f'{arm}_q'][i] for i in near]
+        lim = self.joint_limits(arm)
+        if lim is not None:
+            # cuRobo often parks a joint right on its limit; start KDL inside
+            # them so it settles on a posture with room to move if there is one.
+            lo, hi = np.array(lim).T
+            seeds = [np.clip(q, lo + 0.15, hi - 0.15) for q in seeds]
+        return [q.tolist() for q in seeds] + out
+
+    def fast_ik(self, arm, tcp, quat, start=None, want=3):
+        """Joint solutions (plain URDF, within limits, no collision check) for
+        hand_tcp at (tcp, quat), from 48 spread-out starting postures at once
+        (kinematics.ik_batch, ~20 ms) -- [] if the arm cannot get there at
+        all. A failed collision-aware IK costs its whole timeout; asking this
+        first took TOP DOWN planning from ~100 s to seconds (2026-10-14)."""
+        from ctm.kinematics import Arm, ik_batch
+        if not hasattr(self, '_kin'):
+            self._kin = {}
+        if arm not in self._kin:
+            self._kin[arm] = Arm(arm)
+        lim = self.joint_limits(arm)
+        if lim is None:
+            return []
+        lo, hi = np.array(lim).T
+        if not hasattr(self, '_ik_starts'):
+            self._ik_starts = {}
+        if arm not in self._ik_starts:
+            rng = np.random.default_rng(7)           # the same starts every time
+            self._ik_starts[arm] = rng.uniform(lo + 0.05, hi - 0.05, (48, 7))
+        seeds = self._ik_starts[arm]
+        if start is not None:
+            seeds = np.vstack([np.clip(start, lo, hi), seeds])
+        target = np.eye(4)
+        target[:3, :3] = matrix_from_quat(*quat)
+        target[:3, 3] = tcp
+        sols = ik_batch(self._kin[arm], target, seeds, list(zip(lo, hi)))
+        return [np.clip(q, lo + 0.01, hi - 0.01).tolist() for q in sols[:want]]
+
+    def _topdown_seeds(self):
+        if not hasattr(self, '_td'):
+            self._td = None
+            try:
+                raw = dict(np.load(os.path.join(APP_DIR, 'ctm', 'topdown_seeds.npz')))
+                for arm in ('left', 'right'):
+                    if f'{arm}_yaw' in raw:          # the tool x axis's heading per entry
+                        raw[f'{arm}_turn'] = np.array([
+                            math.atan2(*tool_frame_along(np.array([0.0, 0.0, -1.0]),
+                                                         math.radians(y))[[1, 0], 0])
+                            for y in raw[f'{arm}_yaw']])
+                self._td = raw
+            except (OSError, ValueError) as exc:
+                self.get_logger().warn(f'no top-down seeds ({exc}); run ctm/make_topdown_seeds.py')
+        return self._td
+
+    def cartesian_plan(self, arm, position, quat, start_joints=None, check=True, via=None):
+        r = lambda v, d: None if v is None else tuple(np.round(np.asarray(v, float).ravel(), d))
+        key = (arm, r(position, 4), r(quat, 4), r(start_joints, 3), check,
+               tuple((r(p, 4), r(q, 4)) for p, q in (via or [])))
+        if start_joints is None:                     # from where the arm is: not cacheable
+            got = self._cartesian_plan(arm, position, quat, start_joints, check, via)
+            return (0.0, None, None) if got is TIMED_OUT else got
+        got = self._cached('line', key, lambda: self._cartesian_plan(
+            arm, position, quat, start_joints, check, via))
+        return (0.0, None, None) if got is None else got
+
+    def _cartesian_plan(self, arm, position, quat, start_joints=None, check=True, via=None):
+        """Straight line of hand_tcp to `position`, planned, not moved.
+
+        From where the arm is, or from `start_joints` (so a whole touch can
+        be checked before anything moves). Returns (fraction, trajectory,
+        final joints) -- trajectory None if it did not solve. via: [(position,
+        quat)] waypoints before the end (a turn of the wrist in steps).
+        """
+        if not self.cartesian_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn('/compute_cartesian_path unavailable')
+            return 0.0, None, None
+        req = GetCartesianPath.Request()
+        req.header.frame_id = BASE_FRAME
+        req.group_name = f'{arm}_arm'
+        req.link_name = f'openarm_{arm}_hand_tcp'
+        req.max_step = 0.005
+        # No joint may move more than JUMP between two 5 mm steps (a real step
+        # needs < 0.05 rad). With jump detection off, a top-down line once
+        # flipped IK branch mid-path: the arm would have swung 0.5 m off the
+        # line and back (simulated, 2026-10-08).
+        req.jump_threshold = 0.0
+        req.revolute_jump_threshold = JUMP
+        req.avoid_collisions = check
+        if start_joints is None:
+            req.start_state.is_diff = True
+        else:
+            req.start_state.is_diff = True
+            req.start_state.joint_state.name = arm_joints(arm)
+            req.start_state.joint_state.position = [float(v) for v in start_joints]
+        req.waypoints = []
+        for pos, q in list(via or []) + [(position, quat)]:
+            target = PoseStamped().pose
+            target.position.x, target.position.y, target.position.z = map(float, pos)
+            (target.orientation.x, target.orientation.y,
+             target.orientation.z, target.orientation.w) = map(float, q)
+            req.waypoints.append(target)
+        with _gate(self):                       # (not under another thread's exemption)
+            result = self.wait(self.cartesian_client.call_async(req), 10.0)
+        if result is None:
+            self.require_move_group()
+            return TIMED_OUT
+        if result.error_code.val != MoveItErrorCodes.SUCCESS:
+            return 0.0, None, None
+        trajectory = result.solution
+        points = trajectory.joint_trajectory.points
+        names = list(trajectory.joint_trajectory.joint_names)
+        fraction = float(result.fraction)
+        # And check it here too: cut the path at any jump.
+        n = len(points)
+        for k in range(1, n):
+            if np.max(np.abs(np.subtract(points[k].positions, points[k - 1].positions))) > JUMP:
+                self.get_logger().warn(f'straight line to {np.round(position, 3)}: joint jump '
+                                       f'at step {k}/{n}; cut there')
+                del points[k:]
+                fraction *= (k - 1) / max(1, n - 1)      # the share of the line before it
+                # the new end was a point mid-line: it must not move on (2026-11-17)
+                last = points[-1] if points else None
+                if last is not None:
+                    last.velocities = [0.0] * len(last.velocities)
+                    last.accelerations = [0.0] * len(last.accelerations)
+                break
+        final = None
+        if points:
+            end = dict(zip(names, points[-1].positions))
+            final = [end.get(n) for n in arm_joints(arm)]
+            final = None if None in final else final
+        return fraction, trajectory, final
+
+    @staticmethod
+    def retime(trajectory, length, speed):
+        """Scale a trajectory in time so the tool moves `length` m at `speed` m/s."""
+        points = trajectory.joint_trajectory.points
+        seconds = lambda p: p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
+        duration = max(seconds(points[-1]), 1e-3) if points else 1e-3
+        wanted = max(0.3, length / max(1e-3, speed))
+        scale = duration / wanted
+        for point in points:
+            t = seconds(point) / scale
+            point.time_from_start.sec = int(t)
+            point.time_from_start.nanosec = int((t % 1.0) * 1e9)
+            point.velocities = [v * scale for v in point.velocities]
+            point.accelerations = [a * scale * scale for a in point.accelerations]
+        return wanted
+
+    def retrace(self, arm, trajectory, label, scale=1.0):
+        """Fly a planned trajectory backwards from where the arm is now: a
+        short lead-in onto its last point, then the same path in reverse --
+        `scale` times as fast (velocities x scale, accelerations x scale^2).
+        The way back is then the way in -- already checked, and nothing to
+        plan (cuMotion's optimiser can fail the reverse of a move it just
+        planned, near the edge of reach: 3/3 in simulation, 2026-10-07).
+        False if the arm is not near the path's end, or it did not run.
+
+        2026-11-17 review: the lead-in onto the path's end obeys the rule every
+        other lead-in does (execute(lead=True)): at most --lead-in-max (never over
+        LEAD_IN_CAP), and only if segment_is_clear() says True -- else False, and
+        the caller plans the way back from where the arm is. It used to lead in
+        up to 0.4 rad unchecked; after a refused approach or a bad arrival that
+        drove the arm onto the approach pose (toward the box) before coming back."""
+        jt = trajectory.joint_trajectory
+        if not jt.points:
+            return False
+        names = list(jt.joint_names)
+        with self.lock:
+            now = [self.joints.get(n) for n in names]
+        if any(v is None for v in now):
+            return False
+        seconds = lambda p: p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
+        end = np.array(jt.points[-1].positions)
+        gap = float(np.max(np.abs(np.array(now) - end)))
+        limit = getattr(self.args, 'lead_in_max', LEAD_IN_CAP)
+        limit = min(float(LEAD_IN_CAP if limit is None else limit), LEAD_IN_CAP)
+        if gap > limit:
+            self.get_logger().warn(f'{label}: the arm is {gap:.3f} rad off the path it came '
+                                   f'(lead-in max {limit:.2f}) - not retraced, planned instead')
+            return False
+        if gap > 0.002:
+            arms = [a for a in ('left', 'right') if any(f'_{a}_' in n for n in names)]
+            clear = self._segment_clear(f'{arms[0]}_arm' if arms else '', names, now, end)
+            if clear is not True:
+                self.get_logger().warn(f'{label}: the way onto the path it came ({gap:.3f} rad) '
+                                       + ('is not clear' if clear is False
+                                          else 'cannot be checked')
+                                       + ' - not retraced, planned instead')
+                return False
+        lead = max(0.3, gap / 0.3) if gap > 0.002 else 0.0     # <= 0.3 rad/s onto the path
+        scale = min(1.0, max(0.05, float(scale)))
+        total = seconds(jt.points[-1]) / scale
+        out = JointTrajectory()
+        out.joint_names = names
+        if lead:
+            out.points.append(JointTrajectoryPoint(positions=[float(v) for v in now],
+                                                   velocities=[0.0] * len(names)))
+        for k, p in enumerate(reversed(jt.points)):
+            t = lead + total - seconds(p) / scale
+            q = JointTrajectoryPoint()
+            q.positions = [float(v) for v in (now if (k == 0 and not lead) else p.positions)]
+            q.velocities = [-float(v) * scale for v in p.velocities] if p.velocities else []
+            q.accelerations = ([float(v) * scale * scale for v in p.accelerations]
+                               if p.accelerations else [])
+            q.time_from_start.sec = int(t)
+            q.time_from_start.nanosec = int((t % 1.0) * 1e9)
+            out.points.append(q)
+        robot = RobotTrajectory()
+        robot.joint_trajectory = out
+        ok, _ = self.execute(robot, label, timeout=total + lead + 20.0)
+        return ok
+
+    def lead_in(self, trajectory, rate=0.3):
+        """The planned trajectory from where the arm is now: a short joint move
+        onto its first point (at most `rate` rad/s, 0.3 s at least), then the
+        path as planned. For a plan made from where the arm was to come back to
+        (PICK ALL plans the next box during the drop): the arm settles a few
+        hundredths of a radian off that, and MoveIt would refuse the start or the
+        controller jump to it. (a copy, how far off the arm was in rad), or
+        (None, None) without /joint_states."""
+        import copy
+        out = copy.deepcopy(trajectory)
+        jt = out.joint_trajectory
+        with self.lock:
+            now = [self.joints.get(n) for n in jt.joint_names]
+        if not jt.points or any(v is None for v in now):
+            return None, None
+        gap = float(np.max(np.abs(np.subtract(now, jt.points[0].positions))))
+        lead = max(0.3, gap / rate)
+        seconds = lambda p: p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
+        for p in jt.points:
+            t = seconds(p) + lead
+            p.time_from_start.sec = int(t)
+            p.time_from_start.nanosec = int((t % 1.0) * 1e9)
+        first = JointTrajectoryPoint(positions=[float(v) for v in now],
+                                     velocities=[0.0] * len(now))
+        if jt.points[0].accelerations:
+            first.accelerations = [0.0] * len(now)
+        jt.points.insert(0, first)
+        return out, gap
+
+    def still_torque(self, arm, settle=0.5, window=0.4):
+        """The arm held still: let it settle `settle` s, then its joints and the
+        mean (and noise of the mean) of its torques over `window` s. None if no
+        /joint_states."""
+        self.settle(arm, None, timeout=settle)
+        qs, es = [], []
+        t_end = time.monotonic() + window
+        while time.monotonic() < t_end:
+            q, e = self.arm_positions(arm), self.arm_efforts(arm)
+            if q is not None and e is not None:
+                qs.append(q)
+                es.append(e)
+            time.sleep(0.01)
+        if len(es) < 5:
+            return None
+        es = np.array(es)
+        return {'q': np.mean(qs, axis=0), 'tau': es.mean(0),
+                'noise': es.std(0) / np.sqrt(len(es)) + 0.01}
+
+    def held_grams(self, arm, before, after, centre):
+        """What the tool holds, from the torques held still at the same spot
+        before and after the press: (grams, +- grams). The box's weight at
+        `centre` (world) loads the shoulder and elbow (joints 1-4, the long
+        levers) by (unit-mass torque x m); the arm's own gravity at the two
+        slightly different postures is taken out with the URDF. The torques
+        oppose gravity (sign measured by WEIGH TOOL, 2026-10-27)."""
+        from ctm.kinematics import Arm, G
+        kin = self._kin.get(arm) if hasattr(self, '_kin') else None
+        if kin is None:
+            self._kin = getattr(self, '_kin', {})
+            kin = self._kin[arm] = Arm(arm)
+        q = np.asarray(after['q'], float)
+        _frames, joints = kin.frames(q)
+        unit = np.array([axis @ np.cross(np.asarray(centre) - origin, G)
+                         for origin, axis in joints])            # N m per kg
+        own = kin.gravity_torque(q) - kin.gravity_torque(np.asarray(before['q'], float))
+        d = (after['tau'] - before['tau']) + own                 # the box's share
+        j = slice(0, 4)
+        nn = float(unit[j] @ unit[j])
+        if nn < 1e-6:
+            return None, None
+        m = -float(d[j] @ unit[j]) / nn
+        noise = float(np.sqrt(np.sum(unit[j] ** 2 * (after['noise'][j] ** 2 +
+                                                     before['noise'][j] ** 2))) / nn)
+        return 1000.0 * m, 1000.0 * noise
+
+    def hold_here(self, arm):
+        """Stop `arm` now: its controller is sent one point, where the joints
+        are, which replaces whatever trajectory it runs. True if sent."""
+        here = self.arm_positions(arm)
+        if here is None:
+            return False
+        jt = JointTrajectory()
+        jt.joint_names = arm_joints(arm)
+        p = JointTrajectoryPoint()
+        p.positions = [float(v) for v in here]
+        p.velocities = [0.0] * len(here)
+        p.time_from_start.nanosec = 50_000_000       # 50 ms: from where it is, so no jump
+        jt.points.append(p)
+        self.hold_pubs[arm].publish(jt)
+        self.last_goal[arm] = list(p.positions)      # what it holds now (2026-11-17)
+        return True
+
+    def stop_motion(self):
+        """STOP: both arms held where they are (at their controllers), every
+        running goal cancelled; nothing moves until resume()."""
+        self.halt.set()
+        goals = list(self.active_goals.values())
+        # only the arms that are moving: holding an idle arm where it sags to
+        # would lower it (2026-10-28 review)
+        for arm in sorted({a for _h, arms in goals for a in arms}):
+            self.hold_here(arm)
+        for handle, _arms in goals:
+            try:
+                handle.cancel_goal_async()
+            except Exception:                        # noqa: BLE001 - finished meanwhile
+                pass
+        self.get_logger().error('STOP: motion cancelled; the arms hold where they are')
+
+    def resume(self):
+        if self.halt.is_set():
+            self.halt.clear()
+            self.get_logger().info('STOP cleared: moves allowed again')
+
+    def execute(self, trajectory, label, timeout=60.0, watch=None, lead=False, max_lead=None):
+        """Execute a planned trajectory through move_group. (ok, stopped)
+
+        `watch()` is polled every 10 ms while it runs; when it returns True
+        the goal is cancelled -- the controller then holds where the arm is --
+        and (True, True) is returned. That is how a guarded move stops on
+        contact.
+
+        2026-11-17: the last point's velocities and accelerations are always
+        made 0 (in the trajectory given). lead=True: for a plan that starts
+        where the arm WAS -- if the arm is more than LEAD_IN_FROM off its first
+        point, a lead-in (lead_in()) onto it, only up to max_lead rad
+        (--lead-in-max, never over LEAD_IN_CAP) and only if segment_is_clear()
+        says True; otherwise refused. guarded_line() never leads in (its
+        timing starts with the line). Once it has run: self.last_goal[arm] is
+        its last point, and the arrival is logged (arrivals.jsonl).
+        """
+        ok, stopped, _code, _why = self._execute(trajectory, label, timeout, watch, lead,
+                                                 max_lead)
+        return ok, stopped
+
+    def _execute(self, trajectory, label, timeout=60.0, watch=None, lead=False, max_lead=None):
+        """execute(), and the MoveIt code and why it ended: (ok, stopped, code,
+        why) -- why one of 'done', 'contact', 'stop', 'lead', 'rejected',
+        'timeout', 'failed'."""
+        failure = MoveItErrorCodes.FAILURE
+        if self.halt.is_set():
+            self.get_logger().error(f'{label}: STOP is on - not moving')
+            return False, False, failure, 'stop'
+        jt = trajectory.joint_trajectory
+        names = list(jt.joint_names)
+        arms = [a for a in ('left', 'right') if any(f'_{a}_' in n for n in names)]
+        if jt.points:
+            self._zero_end(jt, label)
+        if lead and jt.points:
+            led, why = self._with_lead(trajectory, label, names, arms, max_lead)
+            if led is None:
+                self.get_logger().error(f'{label}: {why} - not moving')
+                return False, False, MoveItErrorCodes.CONTROL_FAILED, 'lead'
+            if led is not trajectory:
+                timeout += _seconds(led.joint_trajectory.points[1])
+                self.get_logger().info(f'{label}: {why}')
+                trajectory = led
+        if not self.execute_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('/execute_trajectory unavailable')
+            return False, False, failure, 'rejected'
+        handle = self.wait(self.execute_client.send_goal_async(
+            ExecuteTrajectory.Goal(trajectory=trajectory)), 10.0)
+        if handle is None or not handle.accepted:
+            self.get_logger().error(f'{label}: trajectory rejected')
+            return False, False, failure, 'rejected'
+        for arm in arms:                             # moving: the old goal no longer holds
+            self.last_goal[arm] = None
+            self._goal_seq[arm] = self._goal_seq.get(arm, 0) + 1
+        self.active_goals[id(handle)] = (handle, arms)
+        try:
+            ok, stopped, code, why = self._execute_wait(handle, label, timeout, watch, arms)
+        finally:
+            self.active_goals.pop(id(handle), None)
+        if ok and not stopped and trajectory.joint_trajectory.points:
+            final = [float(v) for v in trajectory.joint_trajectory.points[-1].positions]
+            goals = {}
+            for arm in arms:
+                if all(n in names for n in arm_joints(arm)):
+                    goals[arm] = [final[names.index(n)] for n in arm_joints(arm)]
+                    self.last_goal[arm] = goals[arm]
+            self._log_arrival(label, goals)
+        return ok, stopped, code, why
+
+    def _zero_end(self, jt, label):
+        """The last point stands still (see END_VELOCITY_WARN)."""
+        last = jt.points[-1]
+        moving = max((abs(float(v)) for v in last.velocities), default=0.0)
+        if moving > END_VELOCITY_WARN:
+            self.get_logger().warn(f'{label}: the trajectory ends moving ({moving:.2f} rad/s); '
+                                   f'stopped at its end instead')
+        last.velocities = [0.0] * len(last.velocities)
+        last.accelerations = [0.0] * len(last.accelerations)
+
+    def _with_lead(self, trajectory, label, names, arms, max_lead=None):
+        """(the trajectory to run, what was done) for execute(lead=True): the
+        same one when the arm is on its start, a led-in copy when it is a
+        little off and the way onto it is clear -- (None, why not) otherwise."""
+        limit = getattr(self.args, 'lead_in_max', LEAD_IN_CAP) if max_lead is None else max_lead
+        limit = min(float(LEAD_IN_CAP if limit is None else limit), LEAD_IN_CAP)
+        led, gap = self.lead_in(trajectory)
+        if led is None:
+            return None, 'no joint states for a lead-in'
+        if gap <= LEAD_IN_FROM:
+            return trajectory, 'on its start'
+        if gap > limit:
+            return None, (f'the arm is {gap:.3f} rad off the start of the plan (lead-in max '
+                          f'{limit:.2f})')
+        pts = led.joint_trajectory.points
+        group = f'{arms[0]}_arm' if arms else ''
+        clear = self._segment_clear(group, names, pts[0].positions, pts[1].positions)
+        if clear is not True:
+            return None, ('the lead-in onto the plan ' + ('is not clear' if clear is False
+                                                           else 'cannot be checked')
+                          + f' ({gap:.3f} rad)')
+        return led, f'led in {gap:.3f} rad onto the plan (checked)'
+
+    def _log_arrival(self, label, goals):
+        """How each arm arrives at its goal: measured - commanded per joint,
+        mrad, at ARRIVAL_TIMES after the trajectory ended, and its motor status
+        -- one line per arm in native/logs/arrivals.jsonl (the last ARRIVAL_KEEP
+        kept). Stops early, marked, when the next goal for the arm is sent.
+        Diagnostics only: in its own thread, never decides anything."""
+        if not goals:
+            return
+        t0 = time.monotonic()
+        seq = {arm: self._goal_seq.get(arm, 0) for arm in goals}
+        stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+
+        def run():
+            recs = {arm: {'time': stamp, 'label': label, 'arm': arm,
+                          'goal': [round(v, 4) for v in goal], 'err_mrad': {},
+                          'worst_mrad': {}, 'motor': self.arm_status(arm)}
+                    for arm, goal in goals.items()}
+            for at in ARRIVAL_TIMES:
+                delay = t0 + at - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                for arm, goal in goals.items():
+                    rec = recs[arm]
+                    if 'cut_at' in rec:
+                        continue
+                    if self._goal_seq.get(arm, 0) != seq[arm]:
+                        rec['cut_at'] = at            # the next goal started: not an arrival
+                        continue
+                    here = self.arm_positions(arm)
+                    if here is None:
+                        continue
+                    err = [round(1000.0 * (h - g), 1) for h, g in zip(here, goal)]
+                    rec['err_mrad'][f'{at:g}'] = err
+                    rec['worst_mrad'][f'{at:g}'] = max(abs(e) for e in err)
+            for arm in goals:
+                end = self.arm_status(arm)
+                if end != recs[arm]['motor']:
+                    recs[arm]['motor_end'] = end
+            self._append_arrivals([json.dumps(r) for r in recs.values()])
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _append_arrivals(self, lines):
+        path = os.path.join(WS, 'native', 'logs', 'arrivals.jsonl')
+        with self._arrival_lock:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                old = open(path).read().splitlines() if os.path.exists(path) else []
+                keep = (old + lines)[-ARRIVAL_KEEP:]
+                tmp = path + '.tmp'
+                with open(tmp, 'w') as f:
+                    f.write('\n'.join(keep) + '\n')
+                os.replace(tmp, path)
+            except (OSError, ValueError):
+                pass
+
+    def _execute_wait(self, handle, label, timeout, watch, arms=()):
+        """(ok, stopped, code, why), see _execute()."""
+        future = handle.get_result_async()
+        done = threading.Event()
+        future.add_done_callback(lambda _f: done.set())
+        deadline = time.monotonic() + timeout
+        while not done.wait(0.01):
+            if self.halt.is_set():
+                self._hold_until_done(handle, done, arms)
+                self.get_logger().error(f'{label}: STOP')
+                return False, False, MoveItErrorCodes.FAILURE, 'stop'
+            try:
+                hit = watch is not None and watch()
+            except Exception:                        # noqa: BLE001 - never leave it moving
+                self._hold_until_done(handle, done, arms, seconds=0.5)
+                raise
+            if hit:
+                # held at the controller at once; move_group's goal then ends
+                # (its cancel alone never stopped the arm)
+                self._hold_until_done(handle, done, arms, seconds=0.5)
+                return True, True, MoveItErrorCodes.SUCCESS, 'contact'
+            if time.monotonic() > deadline:
+                self._hold_until_done(handle, done, arms, seconds=0.5)
+                self.get_logger().error(f'{label}: timed out; held and cancelled')
+                self.require_move_group()
+                return False, False, MoveItErrorCodes.TIMED_OUT, 'timeout'
+        code = future.result().result.error_code.val
+        if code != MoveItErrorCodes.SUCCESS:
+            self.get_logger().error(f'{label}: execution failed, code {code}')
+            return False, False, code, 'failed'
+        return True, False, code, 'done'
+
+    def _hold_until_done(self, handle, done, arms, seconds=2.0):
+        """Hold `arms` at their controllers and cancel the goal -- re-sending the
+        hold every 50 ms until move_group's goal ends (or `seconds`): a hold
+        sent before move_group has passed the trajectory on would be replaced
+        by it (2026-10-28 review)."""
+        handle.cancel_goal_async()
+        t_end = time.monotonic() + seconds
+        while True:
+            for arm in arms:
+                self.hold_here(arm)
+            if done.wait(0.05) or time.monotonic() > t_end:
+                return
+
+    def line_move(self, arm, position, quat, label, speed=None, check=True, via=None,
+                  length=None):
+        """Straight line of hand_tcp from where it is to `position`.
+
+        Returns the joints the line ends on (what the arm should settle to),
+        or None. /compute_cartesian_path interpolates the line and solves IK
+        every 5 mm, so the path is straight by construction; two joint goals
+        would only fix the ends. It is collision-checked like the rest, with
+        the grippers exempt from the octomap. Its timing is not speed scaled,
+        so it is re-timed here to a constant speed (`--line-speed` unless
+        given).
+        """
+        fraction, trajectory, final = self.cartesian_plan(arm, position, quat, check=check,
+                                                          via=via)
+        if trajectory is None or fraction < 0.98:
+            self.get_logger().warn(f'{label}: only {100 * fraction:.0f}% of the straight line '
+                                   f'solves')
+            return None
+        if len(trajectory.joint_trajectory.points) < 2:
+            return self.arm_positions(arm)           # already there
+        if length is None:
+            m = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+            length = (float(np.linalg.norm(np.asarray(position) - m[:3, 3]))
+                      if m is not None else self.args.standoff)
+        wanted = self.retime(trajectory, length, speed or self.args.line_speed)
+        ok, _ = self.execute(trajectory, label, timeout=wanted + 20.0)
+        if not ok:
+            return None
+        return final if final is not None else self.arm_positions(arm)
+
+    def line_or_step(self, arm, position, quat, label, speed=None, max_step=0.25):
+        """line_move(); if the straight line does not fully solve (a wrist
+        limit part-way, at the edge of reach: "only 80 % of the straight line
+        solves", 2026-10-27), the same pose as one short joint step instead --
+        only if no joint moves more than `max_step` rad (then it stays close to
+        straight) and its path is clear. The joints it ends on, or None."""
+        done = self.line_move(arm, position, quat, label, speed=speed)
+        if done is not None:
+            return done
+        here = self.arm_positions(arm)
+        q = self.solve_ik(arm, position, quat, here) if here is not None else None
+        if q is None:
+            return None
+        self.get_logger().info(f'{label}: as a short joint step instead')
+        return self.joint_step(arm, q, f'{label} (step)', max_step=max_step)
+
+    def joint_step(self, arm, target, label, max_step=0.25, speed=0.2):
+        """Straight in joint space from where the arm is to `target`, smooth
+        (s-curve), if no joint moves more than `max_step` rad and every point
+        of it is clear of collisions. The target, or None."""
+        here = self.arm_positions(arm)
+        if here is None:
+            return None
+        here, target = np.asarray(here, float), np.asarray(target, float)
+        dq = target - here
+        big = float(np.max(np.abs(dq)))
+        if big > max_step:
+            self.get_logger().warn(f'{label}: {big:.2f} rad - too far for a joint step')
+            return None
+        total = max(0.6, 1.5 * big / speed)
+        n = max(3, int(math.ceil(big / 0.01)) + 1)
+        jt = JointTrajectory()
+        jt.joint_names = arm_joints(arm)
+        for k in range(n):
+            f = k / (n - 1)
+            s, ds = 3 * f * f - 2 * f ** 3, (6 * f - 6 * f * f) / total
+            p = JointTrajectoryPoint()
+            p.positions = [float(v) for v in here + dq * s]
+            p.velocities = [float(v) for v in dq * ds]
+            t = f * total
+            p.time_from_start.sec = int(t)
+            p.time_from_start.nanosec = int((t % 1.0) * 1e9)
+            jt.points.append(p)
+        robot = RobotTrajectory()
+        robot.joint_trajectory = jt
+        if self.path_is_clear(arm, robot, every=2) is not True:
+            self.get_logger().warn(f'{label}: the joint step is not clear (or cannot be '
+                                   f'checked)')
+            return None
+        ok, _ = self.execute(robot, label, timeout=total + 10.0)
+        return target if ok else None
+
+    @staticmethod
+    def turn_steps(tcp_a, quat_a, tcp_b, quat_b, step_deg=10.0):
+        """[(tcp, quat)] from pose a to pose b, the tool turned in steps of at
+        most step_deg (the end, b, not included): a turn as a straight-line
+        path that never asks a joint to jump."""
+        from scipy.spatial.transform import Rotation, Slerp
+        rots = Rotation.from_quat([quat_a, quat_b])
+        angle = math.degrees((rots[0].inv() * rots[1]).magnitude())
+        n = max(1, int(math.ceil(angle / step_deg)))
+        slerp = Slerp([0.0, 1.0], rots)
+        out = []
+        for k in range(1, n):
+            f = k / n
+            out.append((np.asarray(tcp_a) + (np.asarray(tcp_b) - np.asarray(tcp_a)) * f,
+                        tuple(slerp([f]).as_quat()[0])))
+        return out
+
+    def guarded_line(self, arm, position, quat, label, needed=None, trajectory=None):
+        """Straight line towards `position`, slow, stopping on contact.
+
+        trajectory: that line as planned before (a stored, checked press
+        segment, 2026-11-17) -- flown as it is (a copy, re-timed) instead of
+        planning it from here; only if the arm is within 0.05 rad (MoveIt's
+        start tolerance) of its first point, else (None, False).
+
+        Contact is a joint torque rising by more than --contact-torque (and
+        6x its resting noise) against 0.3 s before, for 20 ms, AND the tool
+        stuck: under STUCK_M of progress in STUCK_S while the command still
+        moves on -- with the vacuum tool too (a torque rise alone stopped
+        every press 3-7 mm in, 2026-10-28..30). Whatever happens, a joint torque rising by
+        --max-touch-torque against half a second before (after the first
+        0.8 s) stops it. Torque alone
+        was not enough: in a TOP DOWN posture the left
+        arm lags its command by ~60 mrad, its controller pushes harder to
+        catch up, and that read as contact 1-2 cm above the object
+        (2026-10-09) -- a lagging arm still moves, a blocked one does not.
+        The move is then cancelled and the arm holds there. Returns (joints,
+        contact) -- contact False if it reached `position` without touching
+        anything, or if the torques were too noisy to watch.
+        """
+        args = self.args
+        names = arm_joints(arm)
+        # let the arm come to rest first: a lagging arm still settling made the
+        # baseline "too noisy" and contact went unwatched (simulated, 2026-10-12)
+        t_end, prev = time.monotonic() + 0.8, self.arm_positions(arm)
+        while time.monotonic() < t_end:
+            time.sleep(0.05)
+            now = self.arm_positions(arm)
+            if prev is not None and now is not None and \
+                    np.max(np.abs(np.subtract(now, prev))) < 0.0005:
+                break
+            prev = now
+        samples = []
+        t_end = time.monotonic() + 0.25        # torque baseline (100 Hz: 25 samples)
+        while time.monotonic() < t_end:
+            e = self.arm_efforts(arm)
+            if e is not None:
+                samples.append(e)
+            time.sleep(0.01)
+        if trajectory is not None:
+            import copy
+            trajectory = copy.deepcopy(trajectory)       # (retime() below changes it)
+            jt = trajectory.joint_trajectory
+            with self.lock:
+                here = [self.joints.get(n) for n in jt.joint_names]
+            off = (float(np.max(np.abs(np.subtract(here, jt.points[0].positions))))
+                   if jt.points and None not in here else None)
+            if off is None or off > 0.05:
+                self.get_logger().warn(f'{label}: the arm is not on the stored line\'s start ('
+                                       + (f'{off:.3f} rad off' if off is not None else
+                                          'no joint states') + ') - not moving in')
+                return None, False
+            fraction = 1.0
+            end = dict(zip(jt.joint_names, jt.points[-1].positions))
+            final = [end.get(n) for n in names]
+            final = None if None in final else [float(v) for v in final]
+        else:
+            fraction, trajectory, final = self.cartesian_plan(arm, position, quat)
+        m = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+        length = (float(np.linalg.norm(np.asarray(position) - m[:3, 3]))
+                  if m is not None else 0.02)
+        if trajectory is None or fraction < 0.98:
+            # At the edge of reach the line past the surface may not solve to
+            # its end; as far as it does is enough if that reaches `needed`
+            # (the surface): it stops on contact anyway. (A box at 55 cm: the
+            # last 12% of the line past it did not solve and the touch was
+            # skipped, 2026-10-13.)
+            if trajectory is None or needed is None or fraction * length < needed:
+                self.get_logger().warn(f'{label}: only {100 * fraction:.0f}% of the line solves')
+                return None, False
+            self.get_logger().info(f'{label}: {100 * fraction:.0f}% of the line solves - '
+                                   f'{1000 * fraction * length:.0f} mm, past the surface')
+            length = fraction * length
+        # A tool on (the rubber vacuum extension) squashes: the tip keeps
+        # creeping on contact, so "stopped advancing" shows late and the push
+        # builds. With a tool: slower and a lower torque limit near the
+        # surface, which ends the press. (Contact on the torque rise alone,
+        # as it was, fired on the arm's stick-slip 3-7 mm in, 2026-10-30.)
+        soft = bool(getattr(args, 'tools', {}).get(arm, {}).get('on'))
+        max_torque = min(args.max_touch_torque, args.soft_tool_torque) if soft \
+            else args.max_touch_torque
+        wanted = self.retime(trajectory, length,
+                             min(args.contact_speed, 0.01) if soft else args.contact_speed)
+        watch = None
+        if args.contact_torque > 0 and len(samples) < 10:
+            # no torques to watch: no contact, and no torque limit either -- do
+            # not push blind into a box
+            self.get_logger().error(f'{label}: no joint torques to watch - not moving in')
+            return None, False
+        if args.contact_torque > 0 and len(samples) >= 10:
+            base = np.array(samples)
+            noise = base.std(0)
+            # Torques are compared with their own recent past, not with the
+            # level before the move: reaching out changes gravity's pull on the
+            # shoulder and the lag the controller fights by over 2 Nm in free
+            # air -- against the start level that stopped touches short of the
+            # wall at "2 Nm" (2026-10-13). A contact is fast, those are slow.
+            limit = np.minimum(np.maximum(args.contact_torque, 6.0 * min(noise.max(), 0.15)),
+                               0.8 * max_torque)
+            history = collections.deque([(time.monotonic(), e) for e in samples])
+            p0 = m[:3, 3] if m is not None else None
+            # the unit direction of the line (length may have been cut to the
+            # part that solves: dividing by it made progress read 1/fraction high)
+            way = None
+            if p0 is not None:
+                d = np.asarray(position, float) - p0
+                way = d / max(float(np.linalg.norm(d)), 1e-6)
+            track = collections.deque()                 # (time, progress along the line)
+            slow = collections.deque()                  # the same over STUCK_S
+            t0 = time.monotonic()
+            # where the surface is along the line (needed: up to it, +3 mm). A
+            # contact counts only within EARLY_CONTACT_M of it: as the slow line
+            # starts, the arm lags its command (no progress) and its controller
+            # pushes to catch up -- that read as contact 0.4 s in, 3 cm out,
+            # every pick (2026-10-28; hidden while move_group's cancel did not
+            # stop the arm and it went on to the box anyway)
+            surface = (needed - 0.003) if needed is not None else max(
+                0.0, length - args.past_contact)
+            trace = []                                  # (s, mm in, torque rise per joint)
+            rolling = {'on': False}                     # the arm has got going
+            count = {'contact': 0, 'cap': 0}
+
+            def stuck():
+                """True when the tip is blocked: rolling, under STUCK_M of
+                progress over the last STUCK_S, the command running on. (An
+                80 ms stall was the test before: the arm stick-slips, pausing
+                0.1-0.2 s in free air -- 2026-10-30.)"""
+                if p0 is None:
+                    return True                         # cannot tell: torque decides
+                now = time.monotonic()
+                tcp = self.lookup(BASE_FRAME, f'openarm_{arm}_hand_tcp')
+                if tcp is None:
+                    return True
+                progress = float((tcp[:3, 3] - p0) @ way)
+                track.append((now, progress))
+                slow.append((now, progress))
+                # rolling is told over 80 ms; stuck over STUCK_S (slow[0]: the
+                # newest sample at least STUCK_S old)
+                while track and now - track[0][0] > 0.08:
+                    track.popleft()
+                while len(slow) > 1 and now - slow[1][0] >= STUCK_S:
+                    slow.popleft()
+                # rolling: past the start-up stall -- moved START_MOVE_M and, over
+                # the last 80 ms, advancing at a third of the contact speed or more
+                if not rolling['on'] and len(track) >= 3 and track[-1][1] >= START_MOVE_M and \
+                        (track[-1][1] - track[0][1]) >= 0.33 * (length / wanted) * \
+                        (track[-1][0] - track[0][0]):
+                    rolling['on'] = True
+                if not rolling['on'] or now - slow[0][0] < STUCK_S - 0.02:
+                    return False                        # still getting going
+                commanded = min(1.0, (now - t0) / wanted) * length
+                return progress - slow[0][1] < STUCK_M and commanded - progress > 0.002
+
+            def past(seconds):
+                """The torques `seconds` ago (the oldest kept if not that old)."""
+                now = time.monotonic()
+                for t, e in history:
+                    if now - t <= seconds:
+                        return np.array(e)
+                return np.array(history[-1][1])
+
+            def watch():
+                e = self.arm_efforts(arm)
+                is_stuck = stuck()
+                if e is None:
+                    return False
+                now = time.monotonic()
+                history.append((now, e))
+                while history and now - history[0][0] > 1.2:
+                    history.popleft()
+                e = np.array(e)
+                if now - t0 < 0.4:
+                    return False            # starting: the arm takes up its lag (3 cm out)
+                # the hard limit: --max-touch-torque on any joint, against 0.5 s ago --
+                # not in the first 0.8 s: the arm taking up its lag as it starts
+                # read as 1.1 Nm on the shoulder and stopped a TOP DOWN pick 2.4 cm
+                # above the box (2026-10-14); at contact speed it is still >2 cm
+                # out then
+                big = np.abs(e - past(0.5)) if now - t0 >= 0.8 else np.zeros_like(e)
+                # the tool's soft limit only where it can be pressed: near the
+                # surface. Further out the arm, at rest, needs more than 1 Nm to
+                # get going at contact speed -- that stopped every pick 3 cm short
+                # with the tip not yet moving (2026-10-28); the arm's own limit
+                # still holds there
+                progress = track[-1][1] if track else 0.0
+                # armed: rolling, and within EARLY_CONTACT_M of the measured surface
+                # (or past it) -- a torque rise then is the press of a contact
+                near = p0 is None or (rolling['on'] and progress >= surface - EARLY_CONTACT_M)
+                # never got going while the command ran BLOCKED_LAG_M ahead: blocked
+                # (a box nearer than measured; the start-up stall lags ~1 cm at most)
+                commanded = min(1.0, (now - t0) / wanted) * length
+                if p0 is not None and not rolling['on'] and commanded - progress > BLOCKED_LAG_M:
+                    self.get_logger().info(
+                        f'{label}: contact (blocked: {1000 * commanded:.0f} mm commanded, '
+                        f'{1000 * progress:.0f} mm moved)')
+                    return True
+                cap = max_torque if near else args.max_touch_torque
+                trace.append((round(now - t0, 3), round(1000 * progress, 1),
+                              [round(float(v), 2) for v in e - past(0.5)]))
+                count['cap'] = count['cap'] + 1 if np.any(big > cap) else 0
+                if count['cap'] >= 2:
+                    j = int(np.argmax(big))
+                    self.get_logger().warn(
+                        f'{label}: stopped at the torque limit ({names[j]} '
+                        f'{big[j]:.2f} Nm, max {cap:.1f}, {1000 * progress:.0f} of '
+                        f'{1000 * surface:.0f} mm in)')
+                    return True
+                # contact: stuck (no progress over STUCK_S) and a torque rising
+                # against 0.3 s ago, near the surface only (the hard limit above
+                # holds everywhere). Stuck for the vacuum tool too: its rubber
+                # creeps on as it squashes, and the soft limit above ends that
+                # press; a torque rise alone fired on the arm's stick-slip
+                rise = np.abs(e - past(0.3))
+                if p0 is not None and not near:
+                    count['contact'] = 0
+                    return False
+                count['contact'] = count['contact'] + 1 if np.any(rise > limit) else 0
+                if (count['contact'] >= 2 or noise.max() > 1.0) and is_stuck:
+                    j = int(np.argmax(rise / limit))
+                    self.get_logger().info(
+                        f'{label}: contact ({names[j]} {rise[j]:+.2f} Nm in 0.3 s, stuck '
+                        f'{1000 * progress:.0f} of {1000 * surface:.0f} mm in)')
+                    return True
+                return False
+        ok, stopped = self.execute(trajectory, label, timeout=wanted + 20.0, watch=watch)
+        if watch is not None:
+            self._save_trace(label, stopped, surface, trace)
+        if not ok:
+            return None, False
+        return (self.arm_positions(arm) if stopped else final), stopped
+
+    def _save_trace(self, label, stopped, surface, trace):
+        """Each guarded line's progress and torques, every 10 ms, to
+        native/logs/guarded_lines.jsonl (the last 50 lines kept)."""
+        import json
+        path = os.path.join(WS, 'native', 'logs', 'guarded_lines.jsonl')
+        try:
+            old = open(path).read().splitlines()[-49:] if os.path.exists(path) else []
+            rec = {'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'label': label,
+                   'stopped': bool(stopped), 'surface_mm': round(1000 * surface, 1),
+                   'trace': trace}
+            with open(path, 'w') as f:
+                f.write('\n'.join(old + [json.dumps(rec)]) + '\n')
+        except (OSError, ValueError):
+            pass
+
+    def plan_joints(self, arm, positions, velocity=None, tries=2, start=None):
+        stats = getattr(self, '_plan_stats', None)
+        t0 = time.monotonic()
+        try:
+            return self._plan_joints(arm, positions, velocity, tries, start)
+        finally:
+            if stats is not None:
+                rec = stats.setdefault('path', [0, 0, 0.0])
+                rec[0] += 1
+                rec[1] += 1
+                rec[2] += time.monotonic() - t0
+
+    def _plan_joints(self, arm, positions, velocity=None, tries=2, start=None):
+        """A plan to `positions`, not executed: (code, trajectory).
+
+        cuMotion, retried once (its optimiser starts from random seeds). A
+        big turn of the tool -- level at pre_pick to straight down for TOP
+        DOWN -- still defeats it now and then; then MoveIt's sampling planner
+        (OMPL, checked against the same octomap) finds the way.
+
+        start: this arm's joints to plan from, instead of where it is (PICK
+        ALL plans the next box from pre_pick while the arm is at the drop)."""
+        for _ in range(tries):
+            code, trajectory = self._plan_joints_once(arm, positions, velocity, start=start)
+            if code != MoveItErrorCodes.PLANNING_FAILED:
+                return code, trajectory
+        code_o, trajectory_o = self._plan_joints_once(arm, positions, velocity, 'ompl',
+                                                      start=start)
+        if code_o == MoveItErrorCodes.SUCCESS:
+            self.get_logger().info(f'{arm}: cuMotion found no path; OMPL did')
+            return code_o, trajectory_o
+        return code, trajectory
+
+    def _plan_joints_once(self, arm, positions, velocity=None, pipeline='cumotion', start=None):
+        # OMPL checks against move_group's collision matrix: not under another
+        # thread's exemption (_scene_gate). cuMotion checks in its own world (spheres,
+        # not the matrix) -- its 1.3-2.2 s plans would only stall the other thread
+        if pipeline != 'cumotion':
+            with _gate(self):
+                return self._plan_joints_ask(arm, positions, velocity, pipeline, start)
+        return self._plan_joints_ask(arm, positions, velocity, pipeline, start)
+
+    def _plan_joints_ask(self, arm, positions, velocity=None, pipeline='cumotion', start=None):
+        goal = self._joint_goal(arm, positions, velocity, pipeline, start=start)
+        goal.planning_options.plan_only = True
+        with self.move_group_lock:
+            handle = self.wait(self.move_client.send_goal_async(goal), 15.0)
+            if handle is None:
+                self.require_move_group()
+            if handle is None or not handle.accepted:
+                return MoveItErrorCodes.FAILURE, None
+            result = self.wait_or_dead(handle.get_result_async(), self.args.motion_timeout)
+        if result is None:
+            handle.cancel_goal_async()
+            return MoveItErrorCodes.TIMED_OUT, None
+        code = result.result.error_code.val
+        return code, (result.result.planned_trajectory if code == MoveItErrorCodes.SUCCESS
+                      else None)
+
+    def move_joints(self, arm, positions, label, velocity=None, via_home=True, attempts=None):
+        """cuMotion joint goal, going via HOME_JOINTS if there is no direct path.
+
+        cuRobo's optimiser only finds detours so long; from an arm hanging by
+        the torso the direct path to pre_pick needs a longer one and fails
+        every time, while via home both legs plan (measured 2026-09-30).
+        """
+        code = self._move_joints_once(arm, positions, label, velocity, attempts)
+        if code == MoveItErrorCodes.SUCCESS:
+            self._reached(arm, positions)
+            return True
+        if not via_home:
+            return False
+        if code not in (MoveItErrorCodes.PLANNING_FAILED, MoveItErrorCodes.FAILURE) or \
+                max(abs(a - b) for a, b in zip(positions, HOME_JOINTS)) < 0.02:
+            return False
+        self.get_logger().info(f'{label}: no direct path; going via home')
+        if self._move_joints_once(arm, HOME_JOINTS, f'{label} via home',
+                                  velocity) != MoveItErrorCodes.SUCCESS:
+            return False
+        if self._move_joints_once(arm, positions, label, velocity) == MoveItErrorCodes.SUCCESS:
+            self._reached(arm, positions)
+            return True
+        return False
+
+    def _reached(self, arm, positions):
+        """move_joints() got there: the pose itself is what the controller
+        holds (the plan ends within the 0.01 rad goal tolerance of it) --
+        so pick mode is told from the pose sent, not from the sagging arm."""
+        self.last_goal[arm] = [float(v) for v in positions]
+
+    def _move_joints_once(self, arm, positions, label, velocity=None, attempts=None):
+        """Joint goal through move_group: cuMotion, and if it finds no path,
+        MoveIt's sampling planner (OMPL) -- cuMotion's optimiser misses some
+        longer repositioning moves (simulated CALIBRATE ARMS, 2026-10-12: a
+        third of them). Returns the MoveIt code.
+
+        2026-11-17: planned, then executed from where the arm is by then
+        (execute(lead=True)) -- no longer one plan-and-execute goal. A plan
+        takes 1.3-2.2 s and the arm was still moving after the last "finished"
+        leg, so the plan's start was stale by the time it ran: code -4."""
+        code = self._plan_then_execute(arm, positions, label, velocity, attempts)
+        # CONTROL_FAILED too: a cuMotion plan from a stale start state is
+        # refused by the controller, every retry alike; OMPL starts from
+        # move_group's own, current state (2026-10-13)
+        if code in (MoveItErrorCodes.PLANNING_FAILED, MoveItErrorCodes.FAILURE,
+                    MoveItErrorCodes.CONTROL_FAILED) and not self.halt.is_set():
+            ompl = self._plan_then_execute(arm, positions, f'{label} (OMPL)', velocity,
+                                           pipeline='ompl')
+            if ompl == MoveItErrorCodes.SUCCESS:
+                self.get_logger().info(f'{label}: cuMotion found no path; OMPL did')
+                return ompl
+        return code
+
+    def _plan_then_execute(self, arm, positions, label, velocity=None, attempts=None,
+                           pipeline='cumotion'):
+        """_send_until_planned()'s retries, as a plan (_plan_joints_once) and
+        then execute(lead=True): a retryable failure is planned again, from
+        where the arm is then (0.6 s after a CONTROL_FAILED -- a lead-in
+        refused counts as one). The MoveIt code."""
+        code = MoveItErrorCodes.FAILURE
+        for attempt in range(1, (attempts or self.args.attempts) + 1):
+            if self.halt.is_set():
+                self.get_logger().error(f'{label}: STOP is on - not moving')
+                return MoveItErrorCodes.FAILURE
+            t0 = time.monotonic()
+            code, trajectory = self._plan_joints_once(arm, positions, velocity, pipeline)
+            if self.halt.is_set():
+                return MoveItErrorCodes.FAILURE
+            if code == MoveItErrorCodes.TIMED_OUT and trajectory is None and \
+                    time.monotonic() - t0 >= self.args.motion_timeout - 0.5:
+                self.get_logger().error(f'{label}: timed out; goal cancelled')
+                return code                          # (move_group never answered: as before)
+            if code == MoveItErrorCodes.SUCCESS:
+                if trajectory is None:
+                    code = MoveItErrorCodes.FAILURE
+                elif not trajectory.joint_trajectory.points:
+                    return code                      # (already there: nothing to run)
+                else:
+                    total = _seconds(trajectory.joint_trajectory.points[-1])
+                    ok, _stopped, code, why = self._execute(trajectory, label,
+                                                            timeout=total + 20.0, lead=True)
+                    if ok:
+                        return MoveItErrorCodes.SUCCESS
+                    if why in ('stop', 'rejected', 'timeout'):
+                        return code                  # (not retried, as before)
+            self.get_logger().warn(f'{label}: MoveIt error {code} (attempt {attempt})')
+            if code not in RETRYABLE:
+                return code
+            if code == MoveItErrorCodes.CONTROL_FAILED:
+                time.sleep(0.6)              # let the arm finish moving; replan from there
+        return code
+
+    def _joint_goal(self, arm, positions, velocity=None, pipeline='cumotion', start=None):
+        if not self.move_client.wait_for_server(timeout_sec=5.0):
+            raise MoveGroupDown('/move_action is not served')
+        velocity = self.args.velocity if velocity is None else velocity
+        goal = MoveGroup.Goal()
+        req = goal.request
+        req.group_name = f'{arm}_arm'
+        req.pipeline_id = pipeline
+        req.num_planning_attempts = 1 if pipeline == 'cumotion' else 4
+        req.allowed_planning_time = self.args.planning_time if pipeline == 'cumotion' else 3.0
+        req.max_velocity_scaling_factor = velocity
+        req.max_acceleration_scaling_factor = velocity
+        req.start_state.is_diff = True
+        if start is not None:
+            # From these joints, not from where the arm is. For cuMotion NOT a diff:
+            # it adds a diff's positions to the current ones (cumotion_planner.py,
+            # execute_callback). For OMPL a diff: MoveIt sets the joints given
+            # absolutely either way, but a NON-diff start state has its attached
+            # bodies cleared (conversions.cpp, robotStateMsgToRobotState) -- OMPL
+            # then planned without the tool and the held box (2026-11-17 review)
+            req.start_state.is_diff = pipeline != 'cumotion'
+            req.start_state.joint_state.name = arm_joints(arm)
+            req.start_state.joint_state.position = [float(v) for v in start]
+        req.workspace_parameters.header.frame_id = BASE_FRAME
+        for corner, sign in ((req.workspace_parameters.min_corner, -1.0),
+                             (req.workspace_parameters.max_corner, 1.0)):
+            corner.x = corner.y = corner.z = sign * 1.5
+        constraints = Constraints()
+        for name, value in zip(arm_joints(arm), positions):
+            jc = JointConstraint()
+            jc.joint_name = name
+            jc.position = float(value)
+            jc.tolerance_above = jc.tolerance_below = 0.01
+            jc.weight = 1.0
+            constraints.joint_constraints.append(jc)
+        req.goal_constraints = [constraints]
+        goal.planning_options.planning_scene_diff.is_diff = True
+        goal.planning_options.planning_scene_diff.robot_state.is_diff = True
+        return goal
+
+    def _send_until_planned(self, goal, label, attempts=None):
+        for attempt in range(1, (attempts or self.args.attempts) + 1):
+            if self.halt.is_set():
+                self.get_logger().error(f'{label}: STOP is on - not moving')
+                return MoveItErrorCodes.FAILURE
+            with self.move_group_lock:               # (a plan for the next box waits)
+                handle = self.wait(self.move_client.send_goal_async(goal), 15.0)
+                if handle is None:
+                    self.require_move_group()
+                if handle is None or not handle.accepted:
+                    self.get_logger().error(f'{label}: goal rejected by move_group')
+                    return MoveItErrorCodes.FAILURE
+                arms = [a for a in ('left', 'right') if goal.request.group_name.startswith(a)]
+                self.active_goals[id(handle)] = (handle, arms)
+                try:
+                    result = self.wait_or_dead(handle.get_result_async(),
+                                               self.args.motion_timeout, handle=handle, arms=arms)
+                finally:
+                    self.active_goals.pop(id(handle), None)
+            if self.halt.is_set():
+                return MoveItErrorCodes.FAILURE
+            if result is None:
+                handle.cancel_goal_async()
+                self.get_logger().error(f'{label}: timed out; goal cancelled')
+                return MoveItErrorCodes.TIMED_OUT
+            code = result.result.error_code.val
+            if code == MoveItErrorCodes.SUCCESS:
+                return code
+            self.get_logger().warn(f'{label}: MoveIt error {code} (attempt {attempt})')
+            if code not in RETRYABLE:
+                return code
+            if code == MoveItErrorCodes.CONTROL_FAILED:
+                time.sleep(0.6)              # let the arm finish moving; replan from there
+        return code

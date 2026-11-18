@@ -31,6 +31,7 @@
 #include "hardware_interface/system_interface.hpp"
 #include "hardware_interface/types/hardware_interface_return_values.hpp"
 #include "openarm_hardware/mit_law.hpp"
+#include "openarm_hardware/recovery.hpp"
 #include "openarm_hardware/visibility_control.h"
 #include "rclcpp/macros.hpp"
 #include "rclcpp_lifecycle/state.hpp"
@@ -199,6 +200,8 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   std::vector<mit_law::JointLaw> laws_;
   mit_law::LawFlags law_flags_;
   std::vector<mit_law::JointMemory> law_memory_;
+  std::vector<recovery::State> recover_;   // recovery.hpp, per arm joint
+  std::chrono::steady_clock::time_point t0_ = std::chrono::steady_clock::now();
 
   // Motor status watch (2026-11-17), while active only: a motor that stops
   // driving mid-run (the 463 mrad hold of 17:39:39 was never explained, and
@@ -226,6 +229,7 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   // Read back what the motors say after an enable, retry the ones that did
   // not come up, and clear a latched fault first where there is one.
   void verify_enabled();
+  void report_recovery(size_t i, const recovery::Out& ro);
   bool parse_config(const hardware_interface::HardwareInfo& info);
   void generate_joint_names();
 

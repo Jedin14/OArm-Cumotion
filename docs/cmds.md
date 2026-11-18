@@ -201,3 +201,26 @@ re-fit it with robot/sensor_align.py (Fit LiDAR to the camera, several arm postu
 #   2026-11-17: Fit LiDAR to the camera reads /lidar/cloud_fit (the bridge's cloud NOT filtered by
 #   the camera -- /lidar/cloud lacks exactly the points on the camera's surfaces); restart terminal 1
 #   once so the bridge publishes it (an older bridge: the fit falls back to /lidar/cloud, biased).
+
+## PICK ALL: LOOK ONCE, THEN THE ORDER (2026-11-18)
+The picker's first look gives the whole grid order (box_model/scene "plan", world coords).
+After each pick, with the arm out of the picture, ONE depth frame is compared with the last
+look (inside the stack, outside the picked box): unchanged -> the next box of the order is
+reach-checked and picked at once (no DETECT BOX); a change elsewhere (>15 mm over a 600 px
+patch or 2 % of the stack) -> a full look again. A box the cup weighed is "picked", one it
+weighed empty is not -- no camera pick check (it waited ~30 s, "arm still in view", per box).
+Off switches (web_gui args): --pick-all-plan off   --pick-all-verify camera
+Tune: --plan-change-mm 15 --plan-change-px 600. --approach-settle now 1.5 s (was 2.5).
+
+## MOTOR DROP-OUT, PICK ALL IN VIEW, LIDAR KEEP-OUT (2026-11-18)
+- A motor that stops driving (status 1 -> 0, or 9 / 13): the driver holds it at its measured
+  position, re-enables it every 0.2 s (max 25), then eases it back to the command at 0.25 rad/s
+  (recovery.hpp; motor_gains_*.yaml auto_reenable / reenable_rate). Real faults (8, 10-12, 14)
+  are not retried. The app STOPs everything at once (--stop-on-motor-drop on); PICK ALL ends
+  saying which motor. Cause seen 11-18 10:48: left joint2, no fault code, during USB "EMI?"
+  drop-outs -- a brownout/noise restart. Check its power and CAN cable.
+- PICK ALL never asks the picker's camera check (it waited ~30 s with the hand in view): the
+  cup's weight, else one depth frame of the box's spot. Full looks only with the arm back at
+  pre_pick; a check spoiled by the arm is redone at once when it is back.
+- l2_lidar_keepout: the LiDAR housing box grown 12 cm up, 8 cm back, 5 cm right, 1 cm left /
+  front (lidar_bridge keepout_pad; all zero: none). >= 16 mm clear of the arm bases / body.

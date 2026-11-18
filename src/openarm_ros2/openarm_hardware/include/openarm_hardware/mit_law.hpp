@@ -79,6 +79,10 @@ struct LawFlags {
   double freeze_rate = 0.01;   // the command moves above this, rad/s
   double freeze_hold = 0.15;   // still this long before integrating again, s
   bool zero_velocity_when_held = true;
+  // recovery.hpp (2026-11-18): a motor that stops driving is re-enabled where
+  // it is and eased back to the command at reenable_rate rad/s
+  bool auto_reenable = true;
+  double reenable_rate = 0.25;
 };
 
 // A position command that repeats exactly this many cycles is a held point.

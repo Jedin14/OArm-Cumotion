@@ -801,9 +801,14 @@ def make_parser():
                              '2026-11-16); hybrid: settle, then at most one correction 5 cm short '
                              '(60 %%, capped to --correction-room); cartesian: the corrections as '
                              'before. TOP DOWN always cartesian')
-    parser.add_argument('--approach-settle', type=float, default=2.5,
+    parser.add_argument('--approach-settle', type=float, default=1.5,
                         help='settle/hybrid: the longest wait for the arm to settle at the '
-                             'approach point, s')
+                             'approach point, s (2026-11-18: 1.5 -- it always ran out at 2.5 with '
+                             'the tip 3-7 mm off, and the 5 cm stop is the one that decides)')
+    parser.add_argument('--stop-on-motor-drop', choices=('on', 'off'), default='on',
+                        help='STOP at once when an arm motor stops driving (status 1 -> 0 or a '
+                             'fault; 2026-11-18: left joint2 dropped and PICK ALL went on for a '
+                             'minute with the shoulder limp)')
     parser.add_argument('--short-settle', type=float, default=3.0,
                         help='settle/hybrid: the same 5 cm short of the box, s')
     parser.add_argument('--abort-joint-err', type=float, default=0.10,

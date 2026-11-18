@@ -235,6 +235,7 @@ void OpenArm_v10HW::load_control_law() {
   }
   law_flags_ = mit_law::LawFlags();
   law_memory_.assign(ARM_DOF, mit_law::JointMemory());
+  recover_.assign(ARM_DOF, recovery::State());
 
   // Velocity feed-forward and the integral freeze are ON without a file, or
   // with one that is missing or rejected: they are the fix for the lag and
@@ -275,12 +276,13 @@ void OpenArm_v10HW::log_control_law() const {
   RCLCPP_INFO(logger,
               "%s control law: velocity feed-forward %s, integral freeze %s "
               "(moving above %.3f rad/s, still for %.2f s), held-point "
-              "velocity guard %s; %s",
+              "velocity guard %s, motor re-enable %s (ease back %.2f rad/s); %s",
               arm_prefix_.c_str(),
               law_flags_.velocity_feedforward ? "on" : "off",
               law_flags_.freeze_while_moving ? "on" : "off",
               law_flags_.freeze_rate, law_flags_.freeze_hold,
               law_flags_.zero_velocity_when_held ? "on" : "off",
+              law_flags_.auto_reenable ? "on" : "off", law_flags_.reenable_rate,
               gains_source_.c_str());
   for (size_t i = 0; i < ARM_DOF && i < laws_.size(); ++i) {
     const mit_law::JointLaw& law = laws_[i];
@@ -551,8 +553,32 @@ hardware_interface::return_type OpenArm_v10HW::write(
   // The law itself is in mit_law.hpp (2026-11-17): the same integral, caps
   // and deadband as before, plus velocity feed-forward and the integral held
   // while the command moves -- each switchable in the gains file.
+  const double now_s = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - t0_).count();
   for (size_t i = 0; i < ARM_DOF; ++i) {
     const double gravity = kdl_success ? kdl_gravity_torque_(i) : 0.0;
+    // A motor that stopped driving (recovery.hpp, 2026-11-18): held at where it
+    // is, re-enabled, eased back -- never a jump to a command it fell away from.
+    if (i < recover_.size()) {
+      const recovery::Out ro = recovery::step(
+          recover_[i], watch_status_ && law_flags_.auto_reenable,
+          static_cast<int>(status_states_[i]), pos_states_[i], pos_commands_[i],
+          now_s, dt, law_flags_.reenable_rate);
+      report_recovery(i, ro);
+      if (ro.action == recovery::Action::kEnable) {
+        openarm_->get_arm().enable_one(static_cast<int>(i));
+      } else if (ro.action == recovery::Action::kClear) {
+        openarm_->get_arm().clear_error_one(static_cast<int>(i));
+      }
+      if (ro.overriding) {
+        law_memory_[i].integral = 0.0;       // nothing stored while it hung
+        law_memory_[i].still_time = 0.0;
+        prev_pos_commands_[i] = ro.q;
+        integral_torque_states_[i] = 0.0;
+        arm_params.push_back({laws_[i].kp, laws_[i].kd, ro.q, 0.0, gravity});
+        continue;
+      }
+    }
     const mit_law::Command c = mit_law::step(
         laws_[i], law_flags_, pos_states_[i], pos_commands_[i],
         prev_pos_commands_[i], vel_commands_[i], tau_commands_[i], gravity,
@@ -572,6 +598,35 @@ hardware_interface::return_type OpenArm_v10HW::write(
   }
   openarm_->recv_all(1000);
   return hardware_interface::return_type::OK;
+}
+
+void OpenArm_v10HW::report_recovery(size_t i, const recovery::Out& ro) {
+  // Events only (a handful per drop-out), so logging here costs nothing per cycle.
+  if (!(ro.went_down || ro.came_back || ro.done || ro.gave_up)) return;
+  const auto logger = rclcpp::get_logger("OpenArm_v10HW");
+  const char* name = joint_names_[i].c_str();
+  const int s = static_cast<int>(status_states_[i]);
+  if (ro.went_down) {
+    RCLCPP_ERROR(logger,
+                 "%s stopped driving (status %d): held at its measured %.3f rad, "
+                 "re-enabling%s -- check its power and CAN cable",
+                 name, s, pos_states_[i],
+                 law_flags_.auto_reenable ? "" : " is OFF (auto_reenable false)");
+  }
+  if (ro.gave_up) {
+    RCLCPP_ERROR(logger,
+                 "%s: status %d is not re-enabled automatically (%s): it holds "
+                 "nothing until the cause is fixed and terminal 1 restarted",
+                 name, s, recovery::retried(s) ? "25 enables did not take"
+                                               : "a fault: over-current / heat / voltage / load");
+  }
+  if (ro.came_back) {
+    RCLCPP_WARN(logger, "%s is enabled again at %.3f rad; easing back to the command "
+                "at %.2f rad/s", name, pos_states_[i], law_flags_.reenable_rate);
+  }
+  if (ro.done) {
+    RCLCPP_WARN(logger, "%s is back on its command", name);
+  }
 }
 
 void OpenArm_v10HW::verify_enabled() {

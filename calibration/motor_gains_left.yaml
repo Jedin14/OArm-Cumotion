@@ -40,6 +40,14 @@ freeze_hold: 0.15     # s
 # held non-zero velocity pushes the joint kd x v / kp off target for good.
 zero_velocity_when_held: true
 
+# A motor that stops driving mid-run (2026-11-18: left joint2 went status 1 -> 0, a
+# brownout-style restart, and hung limp): held at its measured position, re-enabled
+# every 0.2 s (at most 25 times; only status 0, 9 under-voltage, 13 CAN lost -- a
+# real fault is left alone), then eased back to the command at reenable_rate rad/s.
+# Off: the motor stays limp until terminal 1 is restarted (the app STOPs either way).
+auto_reenable: true
+reenable_rate: 0.25   # rad/s, 0.05 .. 1.0
+
 # --- the gains profile: used ONLY when profile_enabled is true -----------------
 # A faster integral (KI 20 -> 60 on joints 1-4: time constant 5 s -> 1.7 s) with
 # a hysteresis gate against hunting: it stops at |error| <= gate_in and starts

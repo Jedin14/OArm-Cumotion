@@ -485,3 +485,113 @@ TEST(GainsFile, ShippedFilesAreValid) {
   GTEST_SKIP() << "OPENARM_CALIBRATION_DIR not set";
 #endif
 }
+
+// ---- recovery.hpp (2026-11-18): a motor that stops driving ------------------
+#include "openarm_hardware/recovery.hpp"
+namespace rc = openarm_hardware::recovery;
+
+TEST(Recovery, DropHoldsMeasuredEnablesThenEasesBack) {
+  rc::State s;
+  // enabled and following: nothing
+  rc::Out o = rc::step(s, true, 1, 0.50, 0.50, 0.0, 0.001, 0.25);
+  EXPECT_FALSE(o.overriding);
+  // drops out (status 0) and sags to 0.30 while the command stays 0.50
+  o = rc::step(s, true, 0, 0.45, 0.50, 1.0, 0.001, 0.25);
+  EXPECT_TRUE(o.went_down);
+  EXPECT_TRUE(o.overriding);
+  EXPECT_DOUBLE_EQ(o.q, 0.45);                      // the measured, never the command
+  EXPECT_EQ(o.action, rc::Action::kEnable);
+  o = rc::step(s, true, 0, 0.40, 0.50, 1.1, 0.001, 0.25);
+  EXPECT_EQ(o.action, rc::Action::kNone);           // paced: kRetryS
+  o = rc::step(s, true, 0, 0.30, 0.50, 1.21, 0.001, 0.25);
+  EXPECT_EQ(o.action, rc::Action::kEnable);
+  EXPECT_DOUBLE_EQ(o.q, 0.30);
+  // enabled again at 0.30: starts there, eases up at <= 0.25 rad/s
+  o = rc::step(s, true, 1, 0.30, 0.50, 1.3, 0.001, 0.25);
+  EXPECT_TRUE(o.came_back);
+  EXPECT_TRUE(o.overriding);
+  EXPECT_NEAR(o.q, 0.30025, 1e-9);
+  double t = 1.3, q = o.q, worst_step = 0.0;
+  int cycles = 0;
+  while (o.overriding && cycles < 100000) {
+    t += 0.001;
+    o = rc::step(s, true, 1, q, 0.50, t, 0.001, 0.25);
+    if (o.overriding) {
+      worst_step = std::max(worst_step, std::abs(o.q - q));
+      q = o.q;
+    }
+    ++cycles;
+  }
+  EXPECT_TRUE(o.done);
+  EXPECT_LE(worst_step, 0.25 * 0.001 + 1e-12);
+  EXPECT_NEAR(cycles * 0.001, 0.2 / 0.25, 0.02);    // 0.2 rad at 0.25 rad/s: ~0.8 s
+  o = rc::step(s, true, 1, 0.50, 0.50, t + 0.001, 0.001, 0.25);
+  EXPECT_FALSE(o.overriding);
+}
+
+TEST(Recovery, FaultsNotRetriedUnderVoltageCleared) {
+  rc::State s;
+  rc::Out o = rc::step(s, true, 10, 0.1, 0.2, 0.0, 0.001, 0.25);   // over-current
+  EXPECT_TRUE(o.overriding);
+  EXPECT_EQ(o.action, rc::Action::kNone);
+  EXPECT_TRUE(o.gave_up);
+  o = rc::step(s, true, 10, 0.1, 0.2, 0.5, 0.001, 0.25);
+  EXPECT_FALSE(o.gave_up);                                          // said once
+  rc::State u;
+  o = rc::step(u, true, 9, 0.1, 0.2, 0.0, 0.001, 0.25);            // under-voltage
+  EXPECT_EQ(o.action, rc::Action::kClear);
+  rc::State n;
+  o = rc::step(n, true, 13, 0.1, 0.2, 0.0, 0.001, 0.25);           // CAN lost
+  EXPECT_EQ(o.action, rc::Action::kClear);
+}
+
+TEST(Recovery, GivesUpAfterMaxTriesAndOffDoesNothing) {
+  rc::State s;
+  int enables = 0;
+  bool gave = false;
+  for (int k = 0; k < 400; ++k) {
+    rc::Out o = rc::step(s, true, 0, 0.1, 0.2, k * 0.05, 0.05, 0.25);
+    enables += o.action == rc::Action::kEnable;
+    gave = gave || o.gave_up;
+  }
+  EXPECT_EQ(enables, rc::kMaxTries);
+  EXPECT_TRUE(gave);
+  rc::State off;
+  rc::Out o = rc::step(off, false, 0, 0.1, 0.2, 0.0, 0.001, 0.25);
+  EXPECT_FALSE(o.overriding);
+  EXPECT_EQ(o.action, rc::Action::kNone);
+  rc::State unknown;
+  o = rc::step(unknown, true, -1, 0.1, 0.2, 0.0, 0.001, 0.25);
+  EXPECT_FALSE(o.overriding);
+  rc::State nan_cmd;
+  rc::step(nan_cmd, true, 0, 0.1, 0.2, 0.0, 0.001, 0.25);
+  o = rc::step(nan_cmd, true, 1, 0.1, std::nan(""), 0.1, 0.001, 0.25);
+  EXPECT_TRUE(std::isfinite(o.q) || o.done);
+}
+
+TEST(GainsFile, ReenableKeys) {
+  const char* name = "/tmp/claude-1000/test_gains_reenable.yaml";
+  {
+    std::FILE* f = std::fopen(name, "w");
+    ASSERT_NE(f, nullptr);
+    std::fputs("arm: left\nauto_reenable: false\nreenable_rate: 0.5\n", f);
+    std::fclose(f);
+  }
+  gf::Contents c;
+  std::string why;
+  ASSERT_EQ(gf::load(name, "left", compiled(), c, why), gf::Load::kLoaded) << why;
+  std::vector<openarm_hardware::mit_law::JointLaw> laws = compiled();
+  openarm_hardware::mit_law::LawFlags flags;
+  EXPECT_TRUE(flags.auto_reenable);
+  gf::apply(c, laws, flags);
+  EXPECT_FALSE(flags.auto_reenable);
+  EXPECT_DOUBLE_EQ(flags.reenable_rate, 0.5);
+  {
+    std::FILE* f = std::fopen(name, "w");
+    std::fputs("arm: left\nreenable_rate: 3.0\n", f);   // above the 1.0 bound
+    std::fclose(f);
+  }
+  gf::Contents c2;
+  EXPECT_EQ(gf::load(name, "left", compiled(), c2, why), gf::Load::kRejected);
+  std::remove(name);
+}

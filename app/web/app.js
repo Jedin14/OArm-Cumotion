@@ -362,6 +362,7 @@ function render(s) {
     + (s.object_source && !heldArms.length ? ` · ${s.object_source}` : '')
     : `No size on ${s.ns}/held_object/size`);
   setPressed($('tgDummy'), s.dummy);
+  renderSizes(s);
   // the size fields follow the server, except the one being typed in
   if (s.dummy_mm) {
     [['dimH', 0], ['dimW', 1], ['dimD', 2]].forEach(([id, i]) => {
@@ -1000,6 +1001,46 @@ function autocalMaps(pts) {
   act('dummy_dims', { h: $('dimH').value, w: $('dimW').value, d: $('dimD').value })
     .then((j) => { if (j && j.ok) toast(j.message); });
 }));
+
+// named held-object sizes (2026-11-18): pick one to use it, Save the fields under a name
+let sizeKeys = null;
+function renderSizes(s) {
+  const presets = s.size_presets || {};
+  const keys = JSON.stringify(Object.entries(presets).sort());
+  const pick = $('sizePick');
+  if (keys !== sizeKeys && document.activeElement !== pick) {
+    sizeKeys = keys;
+    pick.textContent = '';
+    const first = document.createElement('option');
+    first.value = '';
+    first.textContent = Object.keys(presets).length ? 'Saved sizes…' : 'No saved sizes yet';
+    pick.appendChild(first);
+    Object.keys(presets).sort((a, b) => a.localeCompare(b)).forEach((name) => {
+      const o = document.createElement('option');
+      const [h, w, d] = presets[name];
+      o.value = name;
+      o.textContent = `${name} · ${Math.round(h)} × ${Math.round(w)} × ${Math.round(d)}`;
+      pick.appendChild(o);
+    });
+  }
+  if (document.activeElement !== pick) pick.value = s.size_name && presets[s.size_name] ? s.size_name : '';
+  $('btnSizeDel').disabled = !pick.value;
+}
+$('sizePick').addEventListener('change', () => {
+  const name = $('sizePick').value;
+  $('btnSizeDel').disabled = !name;
+  if (name) act('size_use', { name }).then((j) => { if (j) toast(j.message); });
+});
+$('btnSizeSave').addEventListener('click', () => {
+  const name = $('sizeName').value.trim() || $('sizePick').value;
+  if (!name) { toast('Type a name for this size first'); $('sizeName').focus(); return; }
+  act('size_save', { name }).then((j) => { if (j) { toast(j.message); if (j.ok) $('sizeName').value = ''; } });
+});
+$('sizeName').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('btnSizeSave').click(); });
+$('btnSizeDel').addEventListener('click', () => {
+  const name = $('sizePick').value;
+  if (name) act('size_delete', { name }).then((j) => { if (j) toast(j.message); });
+});
 
 connect();
 

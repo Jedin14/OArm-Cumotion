@@ -258,6 +258,11 @@ kbd {
 .held .xyz { font: 500 0.88rem/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .held .why { font-size: 0.78rem; color: var(--text-2); }
 .dims { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.sizes { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) auto auto; gap: 6px; align-items: center; margin-top: 6px; }
+.sizes select, .sizes input { min-width: 0; width: 100%; height: 32px; padding: 0 8px; border-radius: 8px;
+  border: 1px solid var(--line-strong); background: var(--raised-2); color: var(--text); font-family: inherit; font-size: 0.8rem; font-weight: 600; }
+.sizes select:focus-visible, .sizes input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+@media (max-width: 480px) { .sizes { grid-template-columns: 1fr 1fr; } }
 .dims label { display: inline-flex; align-items: center; gap: 4px; font-size: 0.78rem; color: var(--text-2); font-weight: 600; }
 .dims input {
   width: 64px; height: 32px; padding: 0 8px; border-radius: 8px;

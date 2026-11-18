@@ -149,6 +149,8 @@ class WebStack(pick_stack.PickStack):
         self.next_hint = 'Click a point, then MOVE.' if self.click_only else \
             'Detect a box, then MOVE.'
         self.dummy = False            # publish a test size on held_object/size
+        self.size_presets, self.size_name = {}, None
+        self._load_sizes()            # (2026-11-18) on, with the last size, unless switched off
         node.create_timer(1.0, self._publish_dummy)
         self.box = None               # the last DETECT BOX result (PickTarget)
         self.model_pick = None        # self.pick when it came from that result
@@ -310,12 +312,41 @@ class WebStack(pick_stack.PickStack):
             if not all(5.0 <= v <= 600.0 for v in dims):
                 return False, 'each size between 5 and 600 mm'
             self.DUMMY_MM = dims
+            self.size_name = next((n for n, v in self.size_presets.items()
+                                   if tuple(v) == tuple(dims)), None)
+            self._save_sizes()
             if self.dummy:
                 self._publish_dummy()
             return True, 'dummy size {:.0f} x {:.0f} x {:.0f} mm'.format(*dims)
         if name == 'dummy_size':
             self.set_dummy(not self.dummy)
+            self._save_sizes()
             return True, 'dummy size ' + ('on' if self.dummy else 'off')
+        if name in ('size_save', 'size_use', 'size_delete'):
+            label = ' '.join(str(data.get('name') or '').split())[:40]
+            if not label:
+                return False, 'a name for the size, please'
+            if name == 'size_save':
+                self.size_presets[label] = [round(float(v), 1) for v in self.DUMMY_MM]
+                self.size_name = label
+                msg = 'saved "{}": {:.0f} x {:.0f} x {:.0f} mm'.format(label, *self.DUMMY_MM)
+            elif label not in self.size_presets:
+                return False, f'no saved size "{label}"'
+            elif name == 'size_use':
+                self.DUMMY_MM = tuple(float(v) for v in self.size_presets[label])
+                self.size_name = label
+                if not self.dummy:
+                    self.set_dummy(True)
+                else:
+                    self._publish_dummy()
+                msg = 'using "{}": {:.0f} x {:.0f} x {:.0f} mm'.format(label, *self.DUMMY_MM)
+            else:
+                del self.size_presets[label]
+                if self.size_name == label:
+                    self.size_name = None
+                msg = f'deleted "{label}"'
+            self._save_sizes()
+            return True, msg
         if name == 'release':
             if not self.node.held:
                 return False, 'no arm holds a box'
@@ -621,6 +652,41 @@ class WebStack(pick_stack.PickStack):
 
     DUMMY_MM = (170.0, 100.0, 25.0)   # height x width x depth
 
+    SIZES_FILE = os.path.join(APP_DIR, '..', 'calibration', 'held_sizes.json')
+
+    def _load_sizes(self):
+        """(2026-11-18, the user: "dummy size should be always on, with the last stored
+        size, also allow me to save it as object names to sizes") the dummy size's state
+        and the named sizes, from calibration/held_sizes.json; no file: on, the default."""
+        self.dummy = True
+        try:
+            with open(self.SIZES_FILE) as f:
+                data = json.load(f)
+            dims = [float(v) for v in data.get('size_mm') or self.DUMMY_MM]
+            if len(dims) == 3 and all(5.0 <= v <= 600.0 for v in dims):
+                self.DUMMY_MM = tuple(dims)
+            self.dummy = bool(data.get('on', True))
+            self.size_presets = {str(k): [float(v) for v in vals]
+                                 for k, vals in (data.get('presets') or {}).items()
+                                 if isinstance(vals, (list, tuple)) and len(vals) == 3}
+            self.size_name = data.get('name') if data.get('name') in self.size_presets else None
+        except FileNotFoundError:
+            pass
+        except Exception as exc:                         # noqa: BLE001 - defaults then
+            self.node.get_logger().warn(f'{self.SIZES_FILE}: not read ({exc}); dummy size on, '
+                                        f'{self.DUMMY_MM}')
+
+    def _save_sizes(self):
+        try:
+            tmp = self.SIZES_FILE + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump({'on': self.dummy, 'size_mm': [round(float(v), 1) for v in self.DUMMY_MM],
+                           'name': self.size_name, 'presets': self.size_presets,
+                           'saved': time.strftime('%Y-%m-%d %H:%M:%S')}, f, indent=1)
+            os.replace(tmp, self.SIZES_FILE)
+        except Exception as exc:                         # noqa: BLE001 - kept in memory
+            self.say(f'held sizes not saved ({exc})', True)
+
     def _publish_dummy(self):
         if self.dummy:
             from pick_interfaces.msg import ObjectSize
@@ -848,8 +914,11 @@ class WebStack(pick_stack.PickStack):
                      True)
             return
         self.box = self.target = answer.target
+        self._box_from_plan = False
         self.prepare_target(answer.target)              # the tool's arm, the box matched
         self.target_pub.publish(answer.target)
+        if self.picking_all is not None:
+            self._remember_plan(self.picking_all)       # the boxes after this one (2026-11-18)
         if self.frame is None:
             return
         self.view = 'captured'
@@ -1071,6 +1140,7 @@ class WebStack(pick_stack.PickStack):
                 run['out_of_reach'] = []                 # (this round's: what is left at the end)
                 given_up = []                            # where this round's skipped boxes are
                 tried = []                               # tried: the camera could not tell / dropped
+                run['plan'], run['ref'] = [], None       # (a round starts with a full look)
                 go, why, bad = self._next_pickable(run, given_up, tried)
                 while go and not self._enough(run):
                     go, why, bad = self._pick_all_one(run, given_up, tried)
@@ -1106,6 +1176,12 @@ class WebStack(pick_stack.PickStack):
         left = run.get('out_of_reach') or []
         if left:                                         # the boxes left that it could not reach
             self.base_correction = dict(left[0], more=len(left) - 1)
+        fault = getattr(self.node, 'motor_fault', None)
+        if bad and str(why).startswith('STOP') and fault:
+            # (2026-11-18) the STOP was a motor that stopped driving: say which
+            why = (f'STOP - the {fault["joint"]} motor stopped driving at {fault["time"]} '
+                   f'(status {fault["status"]:g}); the driver re-enables it where it is - check '
+                   f'its power and CAN cable, then clear STOP')
         rep = self._pick_all_report(run, why, bad)
         took = f'; {self._duration(rep["total_s"])} in all' + (
             f', {self._duration(rep["per_box_s"])} per box picked (each pick '
@@ -1141,7 +1217,7 @@ class WebStack(pick_stack.PickStack):
         for the base to be moved (_wait_for_base) and picks it then. can_wait
         False (the look-ahead, the arm still away): ('wait', ...) instead --
         pick_all waits once the arm is back."""
-        detect = detect or (lambda before_check: self.detect_box(before_check=before_check))
+        detect = detect or (lambda before_check: self._detect_from_plan(None, before_check))
         while True:
             if self.halted():
                 return False, 'STOP', True
@@ -1339,9 +1415,12 @@ class WebStack(pick_stack.PickStack):
         box looked for meanwhile (_look_ahead). (go on, why not, fault)"""
         if not self.ensure_pick_mode():
             return False, 'STOP' if self.halted() else 'could not get to pre_pick', True
+        if run.get('ref') is not None:
+            run['ref']['checked'] = False                # this pick changes the scene: look once
         _u, _v, point, arm, origin = self.pick
         mine = {'pick': self.pick, 'target': self.target, 'close_up': self.close_up,
-                'where': self._target_xyz(self.box if self.box is not None else self.target)}
+                'where': self._target_xyz(self.box if self.box is not None else self.target),
+                'from_plan': bool(getattr(self, '_box_from_plan', False))}
         ahead = {'arm': arm, 'box_m': self._box_size_m(self.target), 'box': 0.0, 'start': None,
                  'returning': threading.Event(), 'done': threading.Event(),
                  'cancel': threading.Event(), 'verified': None, 'fate': None, 'found': None}
@@ -1363,8 +1442,18 @@ class WebStack(pick_stack.PickStack):
             worker.join()
             self._ahead = None
             self.activity = None
+        verified = ahead['verified']
+        if verified is None and self.last_touch is None and not self.halted():
+            # (no look-ahead) the cup's weight, else one depth frame of the box's spot
+            # (the arm back at pre_pick, out of the picture); the camera check only in
+            # camera mode, or with nothing to compare with
+            verified = self._verified_by_weight(self.last_contact, mine)
+            if verified is None and self.last_contact is not None and \
+                    not self._camera_check_mode() and run.get('ref') is not None:
+                self._wait_arm_clear(arm)
+                verified = self._verified_by_depth(run['ref'])
         pick_stack.PickStack.finish_pick(self, arm, pick=mine['pick'], target=mine['target'],
-                                         verified=ahead['verified'], count=False)
+                                         verified=verified, count=False)
         r = self.pick_result or {}
         self.record_pick(r, close_up=mine['close_up'])
         out = 'an arm is still out: RETURN it' if self.last_touch is not None else None
@@ -1541,6 +1630,228 @@ class WebStack(pick_stack.PickStack):
             ahead['box'] = max([ahead['box_m']] + [float(v) for v in held.get('extents') or []])
         ahead['returning'].set()
 
+    # -- PICK ALL's plan (2026-11-18): look once, then take the boxes in order ----------
+    #
+    # The user: "the detection side already detects everything initially, just check if it
+    # is same, if it is same and unchanged then pick up next, only in case of change detect
+    # once again and go pick". The 09:27 run took 65-114 s a box: a full DETECT BOX (4 s)
+    # and the picker's camera check (~30 s, "CAN'T TELL YET: arm still in view") before
+    # every box. Now: the picker's first look gives the whole order (box_model/scene "plan");
+    # after each pick one depth frame (arm out of the picture) is compared with the last
+    # look's -- only the picked box may have changed -- and the next box in the order is
+    # planned at once. Any other change (a box knocked, fallen, moved): a full look again.
+
+    def _remember_plan(self, run):
+        """After a full DETECT BOX in PICK ALL: the picker's order after its target and
+        what to compare the scene with (the averaged depth of that capture, the boxes'
+        outlines, the target's)."""
+        run['plan'], run['ref'] = [], None
+        if str(getattr(self.node.args, 'pick_all_plan', 'on')) != 'on' or self.frame is None:
+            return
+        scene = self.scene_shown or {}
+        plan = [q for q in (scene.get('plan') or []) if q.get('xyz') and q.get('u') is not None]
+        boxes = scene.get('boxes') or []
+        target = next((b.get('poly') for b in boxes if b.get('target')), None)
+        if not plan or not boxes or target is None:
+            return
+        run['plan'] = plan
+        run['ref'] = {'frame': self.frame, 'depth': self.frame[1].copy(), 'size': scene.get('size'),
+                      'polys': [b.get('poly') for b in boxes], 'picked_poly': target,
+                      'box_mm': [float(v) for v in (getattr(self.target, 'box_mm', None)
+                                                    if getattr(self.target, 'box_mm', None) is not None
+                                                    else [])],
+                      'checked': False}
+
+    def _polys_mask(self, polys, shape, size, grow=0):
+        """A bool mask (shape) of the picker's outlines (in its picture of `size`),
+        grown by `grow` px."""
+        h, w = shape
+        sx = w / float(size[0]) if size else 1.0
+        sy = h / float(size[1]) if size else 1.0
+        m = np.zeros((h, w), np.uint8)
+        for poly in polys:
+            if poly:
+                pts = np.round(np.asarray(poly, float) * [sx, sy]).astype(np.int32)
+                cv2.fillPoly(m, [pts], 1)
+        if grow > 0:
+            m = cv2.dilate(m, np.ones((2 * grow + 1, 2 * grow + 1), np.uint8))
+        return m.astype(bool)
+
+    def _scene_changed(self, ref):
+        """Has anything but the picked box changed since ref's depth? One median of 3
+        depth frames against it, inside the stack (the boxes' outlines, grown 15 px) and
+        outside the picked box (grown 25 px: it and what was behind it). (changed True /
+        False / None = cannot tell, text, the new depth)."""
+        args = self.node.args
+        d1, _last = self.node.averaged_depth(3)
+        d0 = ref['depth']
+        if d1 is None or d1.shape != d0.shape:
+            return None, 'no depth frames to compare', None
+        stack = self._polys_mask(ref['polys'], d0.shape, ref['size'], 15)
+        picked = self._polys_mask([ref['picked_poly']], d0.shape, ref['size'], 25)
+        region = stack & ~picked & (d0 > 0.15) & (d1 > 0.15)
+        n = int(region.sum())
+        if n < 500:
+            return None, f'too little of the stack to compare ({n} px)', d1
+        moved = region & (np.abs(d1 - d0) > float(getattr(args, 'plan_change_mm', 15.0)) / 1000.0)
+        share = moved.sum() / float(n)
+        biggest = 0
+        if moved.any():
+            k, _lab, stats, _c = cv2.connectedComponentsWithStats(moved.astype(np.uint8), connectivity=8)
+            biggest = int(stats[1:, cv2.CC_STAT_AREA].max()) if k > 1 else 0
+        text = f'{100 * share:.1f} % of the stack moved, the largest patch {biggest} px'
+        changed = share > 0.02 or biggest > int(getattr(args, 'plan_change_px', 600))
+        return changed, text, d1
+
+    def _detect_from_plan(self, ahead, before_check):
+        """PICK ALL's next box: the plan's next one if the scene is unchanged (checked
+        once per pick, the arm out of the picture), else a full DETECT BOX (the
+        look-ahead's during the drop when `ahead`)."""
+        run = self.picking_all
+
+        def full():
+            if ahead is not None and run is not None and \
+                    str(getattr(self.node.args, 'pick_all_plan', 'on')) == 'on':
+                # (2026-11-18) a full look takes the picker 4-10 s and the arm comes back
+                # through the picture in less ("the arm came into the picture while the
+                # picker looked" every time): it looks once the arm is back at pre_pick,
+                # out of the picture, straight after the touch
+                raise _LookAgain()
+            if ahead is None:
+                self._wait_arm_clear(TOOL_ARM.get(self.pick_tool, 'left'))
+                return self.detect_box(before_check=before_check)
+            return self._detect_ahead(ahead, before_check)
+        ref = (run or {}).get('ref')
+        if not run or not run.get('plan') or ref is None:
+            return full()
+        if not ref['checked']:
+            if ahead is not None:
+                # one try: if the arm comes into the picture meanwhile, the check is made
+                # at once when it is back at pre_pick, not waited for again (2026-11-18)
+                changed, text, d1 = self._out_of_view(ahead, lambda: self._scene_changed(ref),
+                                                      tries=1)
+            else:
+                self._wait_arm_clear(TOOL_ARM.get(self.pick_tool, 'left'))
+                changed, text, d1 = self._scene_changed(ref)
+            if changed is not False:
+                self.say(f'PICK ALL: the scene changed ({text}) - looking again')
+                run['plan'], run['ref'] = [], None
+                return full()
+            ref['depth'], ref['checked'] = d1, True
+            self.say(f'PICK ALL: the scene is as it was ({text}) - the next box in the order')
+        q = run['plan'].pop(0)
+        check = before_check
+        if ahead is not None:
+            def check():
+                # (as _detect_ahead: the reach check only once the box the arm held is
+                # out of the planners -- they would carry it on the tool)
+                if before_check is not None and not before_check():
+                    return False
+                while ahead['arm'] in self.node.held:
+                    if ahead['cancel'].is_set() or self.halted() or ahead['done'].is_set():
+                        raise _LookAgain()
+                    time.sleep(0.05)
+                return True
+        try:
+            self._use_plan_box(q, ref, ahead['start'] if ahead is not None else None, check)
+        except _LookAgain:
+            run['plan'].insert(0, q)                      # (not used: the next look has it)
+            raise
+        if q.get('box') is not None and q['box'] < len(ref['polys']):
+            ref['picked_poly'] = ref['polys'][q['box']]   # what may change at the next look
+
+    def _use_plan_box(self, q, ref, start_from, before_check):
+        """The plan's box q as DETECT BOX would leave it: the target (world, from the
+        picker's first look), the pick on the frame of that look, the reach check."""
+        t = PickTarget()
+        t.header.frame_id = BASE_FRAME
+        t.header.stamp = self.node.get_clock().now().to_msg()
+        t.position.x, t.position.y, t.position.z = (float(v) for v in q['xyz'])
+        t.approach = str(q.get('approach') or 'front')
+        for vec, key in ((t.face_normal, 'normal'), (t.face_long, 'long')):
+            if q.get(key):
+                vec.x, vec.y, vec.z = (float(v) for v in q[key])
+        if q.get('face_mm'):
+            t.face_mm = [float(v) for v in q['face_mm']]
+        t.confidence = 1.0
+        t.u, t.v = float(q['u']), float(q['v'])
+        t.bbox = [0.0, 0.0, 0.0, 0.0]
+        size = ref.get('size') or [0, 0]
+        t.image_width, t.image_height = int(size[0]), int(size[1])
+        if ref.get('box_mm'):
+            t.box_mm = [float(v) for v in ref['box_mm']]     # one size in a grid
+        self.frame = ref['frame']                          # the look it came from (unchanged)
+        self.retry = None
+        self.box = self.target = t
+        self._box_from_plan = True
+        self.prepare_target(t)
+        self.target_pub.publish(t)
+        self.view = 'captured'
+        self.top_down = t.approach == PickTarget.APPROACH_TOP
+        h, w = self.frame[0].shape[:2]
+        check = self.select_point(t.u * w / float(t.image_width or w),
+                                  t.v * h / float(t.image_height or h),
+                                  world=np.array([t.position.x, t.position.y, t.position.z]))
+        cell = f' (cell {q["cell"]})' if q.get('cell') else ''
+        self.say(f'box: {t.approach}, from the first look{cell}, at x={t.position.x:+.3f} '
+                 f'y={t.position.y:+.3f} z={t.position.z:+.3f}')
+        self.model_pick = self.pick
+        if check is None:
+            return
+        if before_check is not None and not before_check():
+            return
+        if start_from is not None:
+            check['start_from'] = [float(v) for v in start_from]
+        self.check_pick(check, in_job=True)
+        ok = check.get('ok')
+        self.say(f'{t.approach.upper()} pick of the next box - ' +
+                 ('picking it' if ok else f'cannot pick it: {check.get("why") or "not reachable"}'),
+                 not ok)
+
+    def _verified_by_weight(self, contact, mine):
+        """PICK ALL --pick-all-verify weight: (picked, outcome, message, None) from the
+        cup's weighing, or None (ask the camera). A box from the plan is not the
+        picker's target: never its camera check (no_check, decided by the contact)."""
+        if contact is None:
+            return None
+        held = contact.get('held')
+        if not self._camera_check_mode():
+            if held is True:
+                return True, 'success', 'the cup weighed the box (no camera check)', None
+            if held is False:
+                return False, 'missed', 'the cup holds nothing (weighed; no camera check)', None
+        if mine.get('from_plan') and self._camera_check_mode():
+            # (the picker's check is of its own target, another box)
+            return None, 'no_check', 'no camera check for a box from the plan', None
+        return None
+
+    def _camera_check_mode(self):
+        return str(getattr(self.node.args, 'pick_all_verify', 'weight')) == 'camera'
+
+    def _verified_by_depth(self, ref):
+        """Is the picked box gone from its spot? One median of 3 depth frames against
+        the last look's, inside its outline (shrunk 6 px): mostly farther by 3 cm or
+        more / no reading -> gone (picked); mostly the same -> still there (missed);
+        between -> cannot tell. (picked, outcome, message, None) as verify_pick."""
+        d1, _last = self.node.averaged_depth(3)
+        d0 = ref['depth'] if ref else None
+        if d1 is None or d0 is None or d1.shape != d0.shape:
+            return None, 'no_check', 'no depth frames for the pick check', None
+        spot = self._polys_mask([ref['picked_poly']], d0.shape, ref['size'])
+        spot = cv2.erode(spot.astype(np.uint8), np.ones((13, 13), np.uint8)).astype(bool) & (d0 > 0.15)
+        n = int(spot.sum())
+        if n < 200:
+            return None, 'no_check', f'too little of the box\'s spot to see ({n} px)', None
+        gone = spot & ((d1 <= 0.15) | (d1 - d0 > 0.03))
+        same = spot & (d1 > 0.15) & (np.abs(d1 - d0) <= 0.015)
+        g, k = gone.sum() / float(n), same.sum() / float(n)
+        text = f'{100 * g:.0f} % of its spot emptied, {100 * k:.0f} % unchanged (depth)'
+        if g >= 0.6:
+            return True, 'success', f'the box left its spot: {text}', None
+        if k >= 0.6:
+            return False, 'missed', f'the box is still in its spot: {text}', None
+        return None, 'blocked', f'cannot tell: {text}', None
+
     def _look_ahead(self, ahead, mine, run, given_up, tried):
         """PICK ALL, while the arm takes its box away (a thread beside the touch):
         once the arm is on its way back and out of the camera's picture, the
@@ -1557,12 +1868,20 @@ class WebStack(pick_stack.PickStack):
                          'finding the next box while it drops')
             contact = self.last_contact                  # this pick's (set at the press)
             holding = {True: 'held', False: 'empty'}.get((contact or {}).get('held'), '')
+            by_weight = self._verified_by_weight(contact, mine)
             if contact is None:
                 # never touched: not taken -- no camera check for it (2026-11-17: 49 s
                 # of "waiting for the arm" on a box never touched, 2026-11-16 17:39:55)
                 verified = (False, 'no_contact', 'the arm never touched the box', None)
-            else:
+            elif by_weight is not None:
+                verified = by_weight
+            elif self._camera_check_mode() or (run.get('ref') is None and not mine.get('from_plan')):
                 verified = self._out_of_view(ahead, lambda: self.verify_pick(holding, wait=0.0))
+            else:
+                # (2026-11-18) the cup could not weigh: one depth frame of the box's spot,
+                # the arm out of the picture -- never the picker's ~30 s camera check
+                verified = self._out_of_view(ahead, lambda: self._verified_by_depth(run['ref']),
+                                             tries=1)
             ahead['verified'] = verified
             # as finish_pick will read it: never touched = not taken; no camera check:
             # the contact and the weight
@@ -1587,7 +1906,7 @@ class WebStack(pick_stack.PickStack):
                 ahead['found'] = (False, f'{run["picked"]} picked, as asked', False)
                 return
             ahead['found'] = self._next_pickable(run, given_up, tried,
-                                                 detect=lambda bc: self._detect_ahead(ahead, bc),
+                                                 detect=lambda bc: self._detect_from_plan(ahead, bc),
                                                  can_wait=False)
         except _LookAgain:
             pass                                         # after the touch, as before
@@ -1647,8 +1966,21 @@ class WebStack(pick_stack.PickStack):
                 watch['stop'].set()
             if not watch['spoiled'].is_set():
                 return out
-            self.say('PICK ALL: the arm came into the picture meanwhile - again', True)
+            self.say('PICK ALL: the arm came into the picture meanwhile - ' +
+                     ('again' if tries > 1 else 'looking as soon as it is back at pre_pick'))
         raise _LookAgain()
+
+    def _wait_arm_clear(self, arm, longest=3.0):
+        """Until the arm is out of the camera's picture (it should be, at pre_pick), at
+        most `longest` s -- then on anyway, said."""
+        t0 = time.monotonic()
+        while self.arm_in_view(arm) is True:
+            if self.halted() or time.monotonic() - t0 > longest:
+                if not self.halted():
+                    self.say(f'PICK ALL: the {arm} arm is still in the picture at pre_pick - '
+                             f'looking anyway', True)
+                return
+            time.sleep(0.05)
 
     def _detect_ahead(self, ahead, also=None, tries=3):
         """DETECT BOX during the drop: the picker's look and the capture with the arm
@@ -1800,6 +2132,11 @@ class WebStack(pick_stack.PickStack):
         """The picker's "skip" for its last box (it says when it has it): the
         next detection takes another. False if it did not answer."""
         self.say(f'PICK ALL: skipping this box ({reason}) - the next one', True)
+        if getattr(self, '_box_from_plan', False):
+            # a box from the plan (2026-11-18) is not the picker's last target: its
+            # "skip" would skip another -- remembered here (given_up) only
+            given_up.append(where)
+            return True
         last = self.model_cmd('skip')
         if last is None or not last.get('ok'):
             self._say_cmd(last)
@@ -1988,6 +2325,7 @@ class WebStack(pick_stack.PickStack):
             'camera': color is not None, 'click_only': self.click_only,
             'phase': self.step, 'dummy': self.dummy, 'ns': self.ns,
             'dummy_mm': [round(v, 1) for v in self.DUMMY_MM],
+            'size_presets': self.size_presets, 'size_name': self.size_name,
             'held': {a: [round(1000 * v) for v in h['size']] for a, h in self.node.held.items()},
             'object_size': ([round(1000 * v) for v in self.node.object_size['hwd']]
                             if self.node.object_size else None),
@@ -2298,6 +2636,21 @@ def make_parser():
                         metavar=('NEAR', 'FAR', 'RIGHT', 'LEFT'),
                         help='the same for a FRONT pick (the band where front picks were reachable '
                              'and not at the edge of reach)')
+    parser.add_argument('--pick-all-plan', choices=('on', 'off'), default='on',
+                        help='PICK ALL (2026-11-18): the boxes after the first, in the picker\'s order, '
+                             'are taken from its first look while the scene stays as it was (one depth '
+                             'frame compared, only the picked box changed); any other change: it '
+                             'looks again. off: a full DETECT BOX before every box, as before')
+    parser.add_argument('--pick-all-verify', choices=('weight', 'camera'), default='weight',
+                        help='PICK ALL: weight -- a box the cup weighed is picked, one it weighed '
+                             'empty is not, with no camera check (the picker\'s check could not decide '
+                             'while the hand was in its view: ~30 s a box); camera: its check, as before '
+                             '(also used when the cup could not weigh)')
+    parser.add_argument('--plan-change-mm', type=float, default=15.0,
+                        help='PICK ALL plan: a pixel has changed when its depth moved this much')
+    parser.add_argument('--plan-change-px', type=int, default=600,
+                        help='PICK ALL plan: the scene has changed when a patch of changed pixels '
+                             '(outside the picked box) is this big, or 2 %% of the stack')
     parser.add_argument('--click', action='store_true',
                         help='click-only, like click_to_move: no box model, no DETECT BOX '
                              'or AUTO PICK (ready_to_pick on arm_action is refused)')

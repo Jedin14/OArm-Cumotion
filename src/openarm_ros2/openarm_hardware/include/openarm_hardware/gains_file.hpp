@@ -58,6 +58,8 @@ constexpr double kGateMax = 0.005;
 constexpr double kFreezeRateMin = 0.002;
 constexpr double kFreezeRateMax = 0.5;
 constexpr double kFreezeHoldMax = 2.0;
+constexpr double kReenableRateMin = 0.05;  // rad/s
+constexpr double kReenableRateMax = 1.0;
 constexpr size_t kMaxFileBytes = 64 * 1024;
 
 // One joint's profile values; a missing key keeps the compiled value.
@@ -72,6 +74,8 @@ struct Contents {
   std::optional<double> freeze_rate;
   std::optional<double> freeze_hold;
   std::optional<bool> zero_velocity_when_held;
+  std::optional<bool> auto_reenable;
+  std::optional<double> reenable_rate;
   bool profile_enabled = false;
   std::array<JointProfile, kJoints> joints;
 };
@@ -177,6 +181,16 @@ inline bool parse(const std::string& text, const std::string& arm,
       bool b;
       if (!detail::as_bool(v, key, b, why)) return false;
       out.zero_velocity_when_held = b;
+    } else if (key == "auto_reenable") {
+      bool b;
+      if (!detail::as_bool(v, key, b, why)) return false;
+      out.auto_reenable = b;
+    } else if (key == "reenable_rate") {
+      double d;
+      if (!detail::as_number(v, key, d, why)) return false;
+      if (!detail::within(d, kReenableRateMin, kReenableRateMax, key, why))
+        return false;
+      out.reenable_rate = d;
     } else if (key == "profile_enabled") {
       bool b;
       if (!detail::as_bool(v, key, b, why)) return false;
@@ -340,6 +354,8 @@ inline void apply(const Contents& c, std::vector<mit_law::JointLaw>& laws,
   if (c.freeze_hold) flags.freeze_hold = *c.freeze_hold;
   if (c.zero_velocity_when_held)
     flags.zero_velocity_when_held = *c.zero_velocity_when_held;
+  if (c.auto_reenable) flags.auto_reenable = *c.auto_reenable;
+  if (c.reenable_rate) flags.reenable_rate = *c.reenable_rate;
   if (!c.profile_enabled) return;
   for (size_t i = 0; i < kJoints && i < laws.size(); ++i) {
     const JointProfile& p = c.joints[i];

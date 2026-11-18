@@ -221,6 +221,12 @@
               <label>D <input type="number" min="5" max="600" step="1" id="dimD" value="25"></label>
               <span class="muted small">mm</span>
             </div>
+            <div class="sizes" id="sizePresets">
+              <select id="sizePick" aria-label="Saved sizes"><option value="">Saved sizes…</option></select>
+              <input type="text" id="sizeName" maxlength="40" placeholder="Name" aria-label="Name for this size">
+              <button class="btn" id="btnSizeSave" type="button">Save</button>
+              <button class="btn" id="btnSizeDel" type="button" disabled>Delete</button>
+            </div>
             <div class="actions two">
               <button class="toggle" data-action="dummy_size" id="tgDummy" aria-pressed="false">
                 <span class="knob"></span>Dummy size

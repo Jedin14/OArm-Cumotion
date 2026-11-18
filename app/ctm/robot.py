@@ -303,6 +303,7 @@ class ClickToMove(Node):
         # since the start of a touch is reason enough to stop (2026-11-17; the
         # 463 mrad hold at 17:39 of 2026-11-16 had no motor status to explain it).
         self.motor_status = {}            # joint -> last status value
+        self.motor_fault = None           # (2026-11-18) the last arm motor that stopped driving
         self.motor_status_changes = {}    # joint -> how many times it changed
         self._status_warned = {}
         self.create_subscription(DynamicJointState, '/dynamic_joint_states',
@@ -395,6 +396,18 @@ class ClickToMove(Node):
             if now - self._status_warned.get(name, -10.0) > 1.0:     # (a flicker: once a second)
                 self._status_warned[name] = now
                 self.get_logger().warn(f'{name}: motor status {old:g} -> {value:g}')
+            # 2026-11-18: an ARM motor that stops driving (status 1 -> anything else: 0
+            # disabled -- a brownout restarts a Damiao motor disabled -- or 8-14 a fault)
+            # holds nothing: STOP at once. On 11-18 10:48:37 left joint2 went 1 -> 0 and
+            # PICK ALL went on for a minute with the shoulder limp (206-391 mrad off).
+            if old == 1 and value != 1 and re.match(r'openarm_(left|right)_joint[1-7]$', name) \
+                    and self._on('stop_on_motor_drop', True):
+                self.motor_fault = {'joint': name, 'status': value, 'time': time.strftime('%H:%M:%S')}
+                self.get_logger().error(
+                    f'{name}: the motor stopped driving (status {old:g} -> {value:g}; 0 disabled, '
+                    f'8-14 a fault) - STOP. The driver re-enables it where it is; check its power '
+                    f'and CAN cable, then clear STOP')
+                threading.Thread(target=self.stop_motion, daemon=True).start()
 
     def arm_status(self, arm):
         """This arm's 7 motor status values (None where unknown), or None if no

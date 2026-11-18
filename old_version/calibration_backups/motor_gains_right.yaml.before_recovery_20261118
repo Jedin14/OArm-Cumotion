@@ -1,0 +1,29 @@
+# RIGHT arm motor control law, read by openarm_hardware (v10_simple_hardware.cpp)
+# once, when the hardware starts: edit, then restart terminal 1 (the stack).
+# Created 2026-11-17, with the left arm's (see calibration/motor_gains_left.yaml
+# for what each key does, the bounds and the all-or-nothing rule).
+#
+# The right arm gets the two switches the controller yaml change brings to both
+# arms (velocity feed-forward, the integral held while the command moves), so
+# they can be turned off here per arm. No gains profile: the precision work was
+# on the left arm, and nothing here has been tried on the right one.
+
+arm: right
+
+velocity_feedforward: true
+integral_freeze_while_moving: true
+freeze_rate: 0.01     # rad/s
+freeze_hold: 0.15     # s
+zero_velocity_when_held: true
+
+profile_enabled: true    # 2026-11-17 17:40: on -- j1 stopped 25-50 mrad short of every target with ki 20
+# (2026-11-17 17:40: the same profile as the left arm -- the right j1 also stopped
+# 13-47 mrad short of pre_pick)
+joints:
+  joint1: {ki: 60.0, gate_in: 0.001, gate_out: 0.002}
+  joint2: {ki: 60.0, gate_in: 0.001, gate_out: 0.002}
+  joint3: {ki: 60.0, gate_in: 0.001, gate_out: 0.002}
+  joint4: {ki: 60.0, gate_in: 0.001, gate_out: 0.002}
+  joint5: {kp: 10.0, ki: 20.0, gate_in: 0.001, gate_out: 0.003}
+  joint6: {kp: 10.0, ki: 20.0, gate_in: 0.001, gate_out: 0.003}
+  joint7: {kp: 10.0, ki: 20.0, gate_in: 0.001, gate_out: 0.003}

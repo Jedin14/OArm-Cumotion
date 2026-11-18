@@ -101,6 +101,7 @@ from std_msgs.msg import String
 from tf2_ros import Buffer, StaticTransformBroadcaster, TransformListener
 
 HOUSING_ID = 'l2_lidar_housing'
+KEEPOUT_ID = 'l2_lidar_keepout'
 
 
 def rpy_matrix(roll, pitch, yaw):
@@ -603,6 +604,14 @@ class LidarBridge(Node):
         p('housing_xyz', [-0.028, 0.003, 0.8829])
         p('housing_rpy_deg', [2.2, 113.4, 0.8])
         p('housing_spin_deg', 161.3)
+        # a keep-out round the housing (2026-11-18, the user: "above the arm where the lidar
+        # is there should be a safety limit"): the housing box grown by [x-, x+, y-, y+, z-,
+        # z+] m in its own frame -- x up-forward, y to the robot's right, z forward-down.
+        # Sized against the URDF: >= 16 mm clear of both arm bases and the body (only 1 cm
+        # toward the left base and the front), 6.5 mm clear of the closest of 175 poses the
+        # arms really went to (named + native/logs/arrivals.jsonl); a pick at 10:45:39 had
+        # passed 24 mm from the L2 itself. All zero: no keep-out.
+        p('keepout_pad', [0.0, 0.12, 0.01, 0.05, 0.08, 0.01])
         # its ranges follow the camera's where both see the same surface (see the top)
         p('range_trim', True)
         p('range_trim_max', 0.05)           # m
@@ -1177,6 +1186,34 @@ class LidarBridge(Node):
             return self.t, self.R
         return (np.array(xyz), rpy_matrix(*[math.radians(v) for v in rpy]) @ rot_z(spin))
 
+    def keepout_object(self, t, R, size):
+        """The keep-out round the housing (keepout_pad), or a REMOVE when it is all zero."""
+        try:
+            pad = [float(v) for v in self.get_parameter('keepout_pad').value]
+        except (TypeError, ValueError):
+            pad = []
+        obj = CollisionObject()
+        obj.header.frame_id = self.parent
+        obj.id = KEEPOUT_ID
+        if len(pad) != 6 or not any(v > 0 for v in pad):
+            if not getattr(self, '_keepout_added', False):
+                return None                      # (never added: nothing to remove)
+            self._keepout_added = False
+            obj.operation = CollisionObject.REMOVE
+            return obj
+        self._keepout_added = True
+        offset, dims = _keepout_box(size, [max(0.0, v) for v in pad])
+        obj.operation = CollisionObject.ADD
+        obj.primitives.append(SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[float(v) for v in dims]))
+        pose = Pose()
+        c = t + R @ (np.array([0.0, 0.0, size[2] / 2.0]) + offset)
+        pose.position.x, pose.position.y, pose.position.z = (float(v) for v in c)
+        q = quat_from_matrix(R)
+        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = \
+            (float(v) for v in q)
+        obj.primitive_poses.append(pose)
+        return obj
+
     def add_housing(self):
         """A box around the LiDAR in the planning scene (MoveIt; cuMotion takes the
         scene's objects with every plan), so no move swings an arm into it. Again
@@ -1200,9 +1237,21 @@ class LidarBridge(Node):
         obj.primitive_poses.append(pose)
         scene = PlanningScene(is_diff=True)
         scene.world.collision_objects = [obj]
+        keep = self.keepout_object(t, R, size)
+        if keep is not None:
+            scene.world.collision_objects.append(keep)
         future = self.scene.call_async(ApplyPlanningScene.Request(scene=scene))
         future.add_done_callback(lambda f: setattr(self, '_housing_done', bool(
             f.result() is not None and f.result().success)))
+
+
+def _keepout_box(size, pad):
+    """(centre offset in the housing frame from the housing box's centre, dimensions) of
+    the housing box grown by pad = [x-, x+, y-, y+, z-, z+]."""
+    h = np.asarray(size, float) / 2.0
+    lo = -h - np.asarray(pad[0::2], float)
+    hi = h + np.asarray(pad[1::2], float)
+    return (lo + hi) / 2.0, hi - lo
 
 
 def main(args=None):
