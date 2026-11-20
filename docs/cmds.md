@@ -356,3 +356,24 @@ Tune: --plan-change-mm 15 --plan-change-px 600. --approach-settle now 1.5 s (was
       PYTHONNOUSERSITE=1 python3 app/tests/test_drop_decisions.py    # 26: drop / let go / spot / retries
       PYTHONNOUSERSITE=1 python3 app/tests/test_press_cap.py          # the guarded press, stick-slip
       python3 app/tests/replay_presses.py                             # the 50 recorded presses
+
+## VACUUM ON THE TOP ROW: SQUARE TO THE FACE OR A BASE MOVE (2026-11-20)
+- Why the cup missed the centre on the top row: at shoulder height (box z 0.71, shoulders 0.73) and
+  49 cm ahead, the left arm only reached the face with the tool 22-36 deg off square ("tilted 20
+  turn -15/-30"). The square ways in there sit at the very edge of reach (no room for the camera's
+  last correction) and were dropped. A cup that comes in that oblique touches rim-first, slides off
+  the centre as it squashes, and does not hold: the top row 2 of 11 picked today (it weighed 75 g and
+  67 g on the cup, then the box stayed in its spot); the one that came in square (12:55) worked.
+  Lower rows: square ways in (median 5-7 deg). The face centre itself is not off (the outline is
+  6-9 mm big on every row alike).
+- Now: --vacuum-face-max 20 (deg; FRONT, tool on): no way in more than 20 deg off square to the face
+  (top-down picks keep --vacuum-lean). A top-row box with none -> the base correction, which for a
+  box at --high-row-z 0.65 or higher aims at --front-zone-high 0.55 0.60 0.05 0.30 (box 55-60 cm
+  ahead, 5-30 cm left) instead of --front-zone 0.44 0.50 0.06 0.20.
+- Reach maps (the real reach check on the URDF, deg off the face with room; app/tests/reach_map.py Z):
+      z 0.44 (bottom): square 40-50 cm ahead, oblique or none at 55-60
+      z 0.58 (middle): square 40-60 cm ahead
+      z 0.71 (top):    square only 55-60 cm ahead (45-50: 20-23 deg)
+  So one stand-off rarely suits the bottom and the top rows: the base moves back for the top row.
+- Test: PYTHONNOUSERSITE=1 python3 app/tests/test_vacuum_face.py   (10, incl. the real reach check)
+  To go back: --vacuum-face-max 90 (and --front-zone-high = --front-zone).

@@ -2121,7 +2121,10 @@ class WebStack(pick_stack.PickStack):
         MOVE_MIN_M or more. Shown -- the base is never driven from here."""
         args = self.node.args
         top = str(approach) == PickTarget.APPROACH_TOP
-        near, far, right, left = (args.top_zone if top else args.front_zone)
+        zone = args.top_zone if top else args.front_zone
+        if not top and len(xyz) > 2 and float(xyz[2]) >= float(getattr(args, 'high_row_z', 9.0)):
+            zone = getattr(args, 'front_zone_high', zone)      # the top row (2026-11-20)
+        near, far, right, left = zone
         x, y = float(xyz[0]), float(xyz[1])
         m = self.ZONE_MARGIN_M
         inside = near <= x <= far and right <= y <= left
@@ -2701,6 +2704,14 @@ def make_parser():
                         metavar=('NEAR', 'FAR', 'RIGHT', 'LEFT'),
                         help='the same for a FRONT pick (the band where front picks were reachable '
                              'and not at the edge of reach)')
+    parser.add_argument('--front-zone-high', type=float, nargs=4, default=[0.55, 0.60, 0.05, 0.30],
+                        metavar=('NEAR', 'FAR', 'RIGHT', 'LEFT'),
+                        help='--front-zone for a box at --high-row-z or higher (the top row): '
+                             'there the left arm comes in square to the face (with room for its '
+                             'correction) only with the box 55-60 cm ahead -- 44-50 cm gave '
+                             '20-23 deg, the cup slid off the centre (URDF reach map, 2026-11-20)')
+    parser.add_argument('--high-row-z', type=float, default=0.65,
+                        help='a FRONT box this high (world z, m) or higher uses --front-zone-high')
     parser.add_argument('--pick-all-plan', choices=('on', 'off'), default='on',
                         help='PICK ALL (2026-11-18): the boxes after the first, in the picker\'s order, '
                              'are taken from its first look while the scene stays as it was (one depth '

@@ -715,12 +715,25 @@ class ClickToMove(Node):
                         out.append((f'square on roll {deg:+d}', into,
                                     quat_from_matrix(tool_frame_along(into, math.radians(deg))),
                                     -1))
+        # the vacuum (a tool on): no way in more than --vacuum-face-max off square to the
+        # face (against its normal, else the line of sight -- as the reach check measures
+        # it). 2026-11-20: on the top row only 22-36 deg ones reached; the cup touched
+        # rim-first, slid off the centre and lost the box (2 of 11 picked)
+        tool_on = bool(getattr(self.args, 'tools', {}).get(arm, {}).get('on')) if arm else False
+        cap = float(getattr(self.args, 'vacuum_face_max', 90.0)) if tool_on else 90.0
+        ref = out[0][1] if out else ray              # (square on: the face's normal)
+
+        def square_enough(axis):
+            return math.degrees(math.acos(float(np.clip(np.dot(axis, ref), -1.0, 1.0)))) \
+                <= cap + 1e-6
         for tilt, base in ((0, 0), (10, 3), (20, 4)):
             for ring, yaw in ((0, 0), (1, 15), (1, -15), (2, 30), (2, -30)):
                 axis = rot_about(up, math.radians(yaw)) @ ray
                 axis[2] = 0.0
                 axis /= np.linalg.norm(axis)
                 axis = axis * math.cos(math.radians(tilt)) - up * math.sin(math.radians(tilt))
+                if not square_enough(axis):
+                    continue
                 for deg in (0, 90, -90, 180):
                     head = 'level' if tilt == 0 else f'tilted {tilt}'
                     label = (f'{head} roll {deg:+d}' if yaw == 0 else

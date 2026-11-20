@@ -696,6 +696,12 @@ def make_parser():
                         help='TOP DOWN: the point the tool goes down onto, moved this far along the '
                              'world x (straight ahead, towards the boxes), m; negative = nearer the '
                              'robot. -0.015: it went in 1.5 cm too deep (2026-11-06); 0 = as measured')
+    parser.add_argument('--vacuum-face-max', type=float, default=20,
+                        help='FRONT with a tool on (the vacuum): the most the tool may be off '
+                             'square to the box face (deg). 2026-11-20: on the top row only '
+                             'ways in 22-36 deg off were found -- the cup touched rim-first, '
+                             'slid off the centre and did not hold (2 of 11 picked); those '
+                             'boxes go to a base move instead. 0 = square only, 90 = no cap')
     parser.add_argument('--vacuum-lean', type=float, default=30,
                         help='TOP DOWN with a tool on: the most the tool may lean off '
                              'straight down (deg). Straight down first, then the smallest '
