@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""A stand-in for the device behind /c60000004/vertical_distance (2026-11-19): publishes
+x as sensor_msgs/Range (a range sensor's reading: `range` in metres, 2026-11-19) so robot/height_box.py (the box under the arms: 152 - (x + 10) cm below their
+centre) can be tried without it. Do not run it while the real device publishes -- two
+sources on one topic.
+
+    python3 robot/vertical_distance_pub.py                          a slider window; 45 cm, 10 Hz
+    python3 robot/vertical_distance_pub.py --ros-args -p value_cm:=30.0
+    python3 robot/vertical_distance_pub.py --ros-args -p mode:=sweep -p min_cm:=20.0 -p max_cm:=60.0
+    ros2 launch robot/vertical_distance.launch.py value_cm:=30 mode:=sweep
+
+    while running:  ros2 param set /vertical_distance_pub value_cm 50.0
+                    ros2 param set /vertical_distance_pub mode sweep     (fixed / sweep / off)
+
+The window (2026-11-19, the user: "a slider from right above the box to 152 cm or max"):
+a slider for x from slider_min_cm (0: the sensor right above the box) up to slider_max_cm
+(152, the total), what it means for the box (gap 152 - (x + 10) cm, from the arms' centre;
+from 67.6 cm up height_box holds the box just under the robot's foot) and what height_box
+says. Fixed (the slider) / Sweep / Off. gui: auto (with a DISPLAY) | on | off.
+
+Parameters:
+    topic      /c60000004/vertical_distance
+    type       range (sensor_msgs/Range, default: range = x / 100 m) | string ("45.0 cm") |
+               float32 | float64 (the number, in cm)
+    frame_id   c60000004_range            (Range: its header.frame_id)
+    radiation_type  infrared | ultrasound (Range)
+    field_of_view   0.05 rad               (Range)
+    min_range_m / max_range_m   0.0 / 1.52 (Range: what the sensor can read; x outside ->
+               sent as -inf / +inf, REP 117 -- height_box takes that as no reading)
+    value_cm   45.0     what `fixed` sends
+    mode       fixed | sweep (min_cm -> max_cm -> min_cm over period_s, a triangle) |
+               off (sends nothing: height_box falls back to its 100 cm default after 3 s)
+    min_cm / max_cm / period_s   20.0 / 60.0 / 20.0
+    rate_hz    10.0
+    decimals   1
+    gui        auto
+    slider_min_cm / slider_max_cm   0.0 / 152.0
+    total_cm / offset_cm            152.0 / 10.0   (only for the window's readout)
+"""
+import json
+import os
+import signal
+import threading
+
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
+from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Range
+from std_msgs.msg import Float32, Float64, String
+
+STOP = threading.Event()
+TYPES = {'range': Range, 'string': String, 'float32': Float32, 'float64': Float64}
+MODES = ('fixed', 'sweep', 'off')
+
+
+def sweep_cm(t, lo, hi, period):
+    """A triangle from lo up to hi and back down, `period` s round."""
+    if period <= 0 or hi <= lo:
+        return lo
+    phase = (t % period) / period
+    return lo + (hi - lo) * (2 * phase if phase < 0.5 else 2 * (1 - phase))
+
+
+def make_range(cm, stamp, frame_id, radiation, fov, min_m, max_m):
+    """sensor_msgs/Range for x = cm (metres; outside min..max: -inf / +inf, REP 117)."""
+    m = Range()
+    m.header.stamp = stamp
+    m.header.frame_id = frame_id
+    m.radiation_type = Range.ULTRASOUND if str(radiation).lower().startswith('ultra') else Range.INFRARED
+    m.field_of_view = float(fov)
+    m.min_range, m.max_range = float(min_m), float(max_m)
+    r = cm / 100.0
+    m.range = float('-inf') if r < m.min_range else float('inf') if r > m.max_range else float(r)
+    return m
+
+
+def make_msg(kind, cm, decimals):
+    if kind == 'string':
+        return String(data=f'{cm:.{decimals}f} cm')
+    return TYPES[kind](data=float(round(cm, decimals)))
+
+
+class VerticalDistancePub(Node):
+    def __init__(self):
+        super().__init__('vertical_distance_pub')
+        p = self.declare_parameter
+        num = ParameterDescriptor(dynamic_typing=True)   # 30 and 30.0 both welcome
+        p('topic', '/c60000004/vertical_distance')
+        p('type', 'range')
+        p('frame_id', 'c60000004_range')
+        p('radiation_type', 'infrared')
+        p('field_of_view', 0.05, num)
+        p('min_range_m', 0.0, num)
+        p('max_range_m', 1.52, num)
+        p('value_cm', 45.0, num)
+        p('mode', 'fixed')
+        p('min_cm', 20.0, num)
+        p('max_cm', 60.0, num)
+        p('period_s', 20.0, num)
+        p('rate_hz', 10.0, num)
+        p('decimals', 1, num)
+        p('gui', 'auto', num)                            # (gui:=on arrives as a bool)
+        p('slider_min_cm', 0.0, num)
+        p('slider_max_cm', 152.0, num)
+        p('total_cm', 152.0, num)
+        p('offset_cm', 10.0, num)
+        self.box_status = {}
+        self.sent_cm = None
+        self.create_subscription(
+            String, '/height_box/status', self.on_box_status,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=ReliabilityPolicy.RELIABLE))
+        kind = str(self.get_parameter('type').value).lower()
+        if kind not in TYPES:
+            raise SystemExit(f'type must be one of {sorted(TYPES)}, not {kind!r}')
+        self.kind = kind
+        self.pub = self.create_publisher(TYPES[kind], self.get_parameter('topic').value, 10)
+        self.t0 = self.get_clock().now()
+        self.add_on_set_parameters_callback(self.on_params)
+        self.timer = self.create_timer(1.0 / max(0.1, float(self.get_parameter('rate_hz').value)),
+                                       self.tick)
+        self.last_said = None
+        self.last_mode = None
+        self.get_logger().info(
+            f"{self.get_parameter('topic').value} ({kind}): mode {self.get_parameter('mode').value}, "
+            f"{self.get_parameter('value_cm').value:g} cm (height_box: gap 152 - (x + 10) cm)")
+
+    def on_params(self, params):
+        for q in params:
+            if q.name in ('value_cm', 'min_cm', 'max_cm', 'period_s', 'rate_hz', 'decimals'):
+                try:
+                    float(q.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(successful=False, reason=f'{q.name}: a number')
+            if q.name == 'mode' and str(q.value) not in MODES:
+                return SetParametersResult(successful=False, reason=f'mode: one of {MODES}')
+            if q.name in ('type', 'topic'):
+                return SetParametersResult(successful=False, reason=f'{q.name}: restart to change')
+            if q.name == 'rate_hz':
+                try:
+                    rate = float(q.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(successful=False, reason='rate_hz: a number')
+                self.timer.cancel()
+                self.timer = self.create_timer(1.0 / max(0.1, rate), self.tick)
+        return SetParametersResult(successful=True)
+
+    def value(self):
+        g = lambda k: self.get_parameter(k).value
+        mode = str(g('mode'))
+        if mode == 'off':
+            return None
+        if mode == 'sweep':
+            t = (self.get_clock().now() - self.t0).nanoseconds * 1e-9
+            return sweep_cm(t, float(g('min_cm')), float(g('max_cm')), float(g('period_s')))
+        return float(g('value_cm'))
+
+    def on_box_status(self, msg):
+        try:
+            self.box_status = json.loads(msg.data)
+        except ValueError:
+            pass
+
+    def tick(self):
+        cm = self.value()
+        mode = str(self.get_parameter('mode').value)
+        said = None if cm is None else round(cm)
+        if mode != self.last_mode or (said != self.last_said and mode == 'fixed'
+                                      and not getattr(self, 'gui_on', False)):
+            self.get_logger().info({'off': 'sending nothing (mode off)',
+                                    'sweep': 'sweeping'}.get(mode, f'sending {cm:g} cm'))
+        self.last_said, self.last_mode = said, mode
+        self.sent_cm = cm
+        if cm is not None:
+            g = lambda k: self.get_parameter(k).value
+            if self.kind == 'range':
+                self.pub.publish(make_range(round(cm, int(g('decimals'))), self.get_clock().now().to_msg(),
+                                            g('frame_id'), g('radiation_type'), g('field_of_view'),
+                                            g('min_range_m'), g('max_range_m')))
+            else:
+                self.pub.publish(make_msg(self.kind, cm, int(g('decimals'))))
+
+
+def run_gui(node):
+    """The slider window (Tk, in the main thread; ROS spins in another)."""
+    import tkinter as tk
+    g = lambda k: node.get_parameter(k).value
+    lo, hi = float(g('slider_min_cm')), float(g('slider_max_cm'))
+    root = tk.Tk()
+    root.title('vertical_distance')
+    big, mid = ('Helvetica', 15, 'bold'), ('Helvetica', 11)
+    tk.Label(root, text=g('topic'), font=mid).pack(padx=10, pady=(8, 0))
+    row = tk.Frame(root)
+    row.pack(padx=10, pady=6, fill='both', expand=True)
+    var = tk.DoubleVar(value=min(hi, max(lo, float(g('value_cm')))))
+    mode = tk.StringVar(value=str(g('mode')))
+
+    def push(*_):
+        node.set_parameters([Parameter('value_cm', value=float(var.get())),
+                             Parameter('mode', value=mode.get())])
+
+    tk.Scale(row, from_=hi, to=lo, resolution=0.5, orient='vertical', length=440, width=28,
+             tickinterval=20,
+             variable=var, command=lambda _v: (mode.set('fixed'), push()), font=mid,
+             label='x  cm').pack(side='left', fill='y')
+    info = tk.Frame(row)
+    info.pack(side='left', padx=12, fill='both', expand=True)
+    x_lbl = tk.Label(info, font=big, anchor='w', justify='left')
+    x_lbl.pack(anchor='w', pady=(4, 2))
+    gap_lbl = tk.Label(info, font=mid, anchor='w', justify='left')
+    gap_lbl.pack(anchor='w', pady=2)
+    box_lbl = tk.Label(info, font=mid, anchor='w', justify='left', wraplength=260)
+    box_lbl.pack(anchor='w', pady=2)
+    for text, value in (('Fixed (slider)', 'fixed'), ('Sweep', 'sweep'), ('Off: send nothing', 'off')):
+        tk.Radiobutton(info, text=text, value=value, variable=mode, command=push,
+                       font=mid).pack(anchor='w')
+    hint = tk.Label(info, font=('Helvetica', 9), fg='#666', justify='left', wraplength=260)
+    hint.pack(anchor='w', pady=(10, 0))
+    base = (f'gap = {float(g("total_cm")):g} - (x + {float(g("offset_cm")):g}) cm, arms\' centre '
+            'to the box top. It goes up round the stand; the camera, LiDAR and arm bases hold '
+            'it 1.5 cm under them')
+
+    def refresh():
+        if STOP.is_set() or not rclpy.ok():
+            root.destroy()
+            return
+        cm = node.sent_cm
+        if mode.get() == 'sweep' and cm is not None:
+            var.set(round(cm * 2) / 2)
+        x_lbl.config(text='x  -' if cm is None else f'x  {cm:.1f} cm')
+        if cm is None:
+            gap_lbl.config(text='sending nothing: height_box\nuses its 100 cm default (3 s)')
+        else:
+            gap = float(g('total_cm')) - (cm + float(g('offset_cm')))
+            gap_lbl.config(text=f'gap  {gap:.1f} cm below the arms')
+        b = node.box_status
+        if not b:
+            box_lbl.config(text='height_box: no word (not running?)', fg='#a60')
+        else:
+            held = f" -- HELD under the {b.get('held_by') or 'robot'}" if b.get('clamped') else ''
+            arms = b.get('arm_in_box') or []
+            in_box = f"\nARM IN THE BOX: {', '.join(a.replace('openarm_', '') for a in arms)}" if arms else ''
+            box_lbl.config(text=f"height_box: {b.get('source')}, gap {b.get('gap_cm')} cm, "
+                                f"top z {b.get('top_z')} m{held}{in_box}",
+                           fg='#b00' if (b.get('clamped') or arms) else '#060')
+        b = node.box_status
+        lim = b.get('limit_top_z') if b else None
+        if lim is not None:
+            arm_z = 0.7344                  # height_box's arm_centre z
+            x_max = float(g('total_cm')) - float(g('offset_cm')) - 100 * (arm_z - lim)
+            hint.config(text=f'{base} (now: from x {x_max:.1f}).')
+        else:
+            hint.config(text=f'{base}.')
+        root.after(150, refresh)
+
+    root.protocol('WM_DELETE_WINDOW', lambda: (rclpy.shutdown(), root.destroy()))
+    push()
+    refresh()
+    root.mainloop()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VerticalDistancePub()
+    want = node.get_parameter('gui').value
+    want = {True: 'on', False: 'off'}.get(want, str(want).lower()) if isinstance(want, bool) \
+        else str(want).lower()
+    gui = want == 'on' or (want == 'auto' and bool(os.environ.get('DISPLAY')))
+    node.gui_on = gui
+    if not gui:
+        if want == 'on':
+            node.get_logger().warning('gui on but no DISPLAY')
+        try:
+            rclpy.spin(node)
+        except (KeyboardInterrupt, ExternalShutdownException):
+            pass
+    else:
+        # Ctrl-C / launch's SIGINT / SIGTERM: Tk swallows a KeyboardInterrupt raised in its
+        # callbacks, so the window is closed by refresh() on this flag instead
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda *_: STOP.set())
+        spin = threading.Thread(target=lambda: _spin(node), daemon=True)
+        spin.start()
+        try:
+            run_gui(node)
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:              # noqa: BLE001 - no Tk / display: carry on without
+            node.get_logger().warning(f'no slider window ({e}); publishing on')
+            while spin.is_alive() and not STOP.is_set():
+                spin.join(0.2)
+        # the spin thread first (destroying the node under a running executor aborts)
+        if rclpy.ok():
+            rclpy.shutdown()
+        spin.join(3.0)
+    try:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+    except BaseException:                   # noqa: BLE001 - a second Ctrl-C mid-cleanup
+        pass
+
+
+def _spin(node):
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    except Exception:                       # noqa: BLE001 - (shutting down)
+        if rclpy.ok():
+            raise
+
+
+if __name__ == '__main__':
+    main()

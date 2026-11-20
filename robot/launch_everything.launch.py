@@ -6,10 +6,10 @@ from launch.actions import (IncludeLaunchDescription, DeclareLaunchArgument, Exe
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node, SetRemap
 from launch.substitutions import LaunchConfiguration, PythonExpression
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 
 
-def realsense_imu_readable():
+def realsense_imu_readable(sensor='accel_3d'):
     """True when the D455's motion sensor (its accelerometer: /dev/iio:device*
     named accel_3d, on the camera's USB) can be read without root. It needs
     the RealSense udev rules (librealsense's 99-realsense-libusb.rules); without
@@ -21,7 +21,7 @@ def realsense_imu_readable():
             name = open(os.path.join(d, 'name')).read().strip()
         except OSError:
             continue
-        if name != 'accel_3d':
+        if name != sensor:
             continue
         found = True
         dev = os.path.join('/dev', os.path.basename(d))
@@ -75,8 +75,8 @@ def lidar_nodes(context):
     nodes.append(ExecuteProcess(
         cmd=['python3', '/workspaces/isaac_ros-dev/robot/lidar_bridge.py', '--ros-args',
              '-p', 'in_topic:=/l2/cloud', '-p', 'imu_topic:=/l2/imu',
-             '-p', f"mount_xyz:=[{f('lidar_x', -0.0625)}, {f('lidar_y', 0.0592)}, {f('lidar_z', 0.8666)}]",
-             '-p', f"mount_rpy_deg:=[{f('lidar_roll', 3.19)}, {f('lidar_pitch', 114.16)}, {f('lidar_yaw', -0.13)}]",
+             '-p', f"mount_xyz:=[{f('lidar_x', -0.0416)}, {f('lidar_y', -0.0388)}, {f('lidar_z', 0.9121)}]",
+             '-p', f"mount_rpy_deg:=[{f('lidar_roll', 3.21)}, {f('lidar_pitch', 117.66)}, {f('lidar_yaw', -0.11)}]",
              '-p', f"mount_spin_deg:={f('lidar_spin', 161.30)}",
              '-p', f"tilt_from_imu:={'false' if cfg.get('lidar_tilt', 'measured') != 'imu' else 'true'}",
              '-p', f"octomap_live:={'false' if cfg.get('octomap', 'live') == 'static' else 'true'}"],
@@ -157,14 +157,16 @@ def generate_launch_description():
         # 2026-11-16T16:55: set by hand with robot/sensor_align.py (live; 76.0 mm / 2.03 deg from the values before).
         # 2026-11-16T16:58: set by hand with robot/sensor_align.py (live; 38.0 mm / 0.00 deg from the values before).
         # 2026-11-16T17:20: set by hand with robot/sensor_align.py (live; 8.0 mm / 0.00 deg from the values before).
-        DeclareLaunchArgument('lidar_x', default_value='-0.0625'),
-        DeclareLaunchArgument('lidar_y', default_value='0.0592'),
-        DeclareLaunchArgument('lidar_z', default_value='0.8666'),
-        DeclareLaunchArgument('lidar_roll', default_value='3.19'),
-        DeclareLaunchArgument('lidar_pitch', default_value='114.16',
+        # 2026-11-18T16:20: set by hand with robot/sensor_align.py (live; 50.1 mm / 3.50 deg from the values before).
+        # 2026-11-18T17:29: set by hand with robot/sensor_align.py (live; 98.0 mm / 0.00 deg from the values before).
+        DeclareLaunchArgument('lidar_x', default_value='-0.0416'),
+        DeclareLaunchArgument('lidar_y', default_value='-0.0388'),
+        DeclareLaunchArgument('lidar_z', default_value='0.9121'),
+        DeclareLaunchArgument('lidar_roll', default_value='3.21'),
+        DeclareLaunchArgument('lidar_pitch', default_value='117.66',
                               description='deg, + = its top (the dome, blue) tipped forward from upright: '
                                           '120 = the dome 30 deg below level, toward the box'),
-        DeclareLaunchArgument('lidar_yaw', default_value='-0.13',
+        DeclareLaunchArgument('lidar_yaw', default_value='-0.11',
                               description='deg, its X turned left of straight ahead (about the '
                                           "robot's vertical; which side of it faces where: lidar_spin)"),
         DeclareLaunchArgument('lidar_spin', default_value='161.30',
@@ -215,6 +217,14 @@ def generate_launch_description():
         'accel', default_value='true' if imu_ok else 'false',
         description='the D455 accelerometer (the box picker\'s up direction). Default: on when '
                     'its motion sensor is readable (the RealSense udev rules), else off')
+    # (2026-11-18) the gyro too, and both as one sensor_msgs/Imu on /camera/camera/imu
+    # (unite_imu_method 2: the accelerometer interpolated to each gyro sample). The
+    # separate /camera/camera/accel/sample (the box picker's) and /gyro/sample stay.
+    gyro_ok = realsense_imu_readable('gyro_3d')
+    declare_gyro = DeclareLaunchArgument(
+        'gyro', default_value='true' if (imu_ok and gyro_ok) else 'false',
+        description='the D455 gyro, and with the accelerometer the united /camera/camera/imu. '
+                    'Default: on when both motion sensors are readable')
     declare_depth_profile = DeclareLaunchArgument(
         'depth_profile',
         default_value='640x480x15',
@@ -316,6 +326,7 @@ def generate_launch_description():
         declare_boot_pre_pick,
         declare_depth_profile,
         declare_accel,
+        declare_gyro,
         declare_vacuum,
         declare_vacuum_port,
         *declare_lidar,
@@ -360,6 +371,29 @@ def generate_launch_description():
     # (the old 4d:=true TF bridge, robot_tf_bringup, is not started any more: it hung
     # unilidar_lidar 25 cm in front of base_link, which Unitree's stock L2 driver also parents)
     launch_nodes.append(OpaqueFunction(function=lidar_nodes))
+    # the see-through guard round the D455 (robot/camera_guard.py; camera_guard:=off: none)
+    launch_nodes.append(DeclareLaunchArgument(
+        'camera_guard', default_value='on',
+        description='on: a see-through guard of plates round the D455 in the planning scene, '
+                    'so no arm scratches it; off: none'))
+    launch_nodes.append(ExecuteProcess(
+        cmd=['python3', '/workspaces/isaac_ros-dev/robot/camera_guard.py'],
+        output='screen', additional_env={'PYTHONUNBUFFERED': '1'}, name='camera_guard',
+        respawn=True, respawn_delay=2.0,
+        condition=UnlessCondition(PythonExpression(
+            ["'", LaunchConfiguration('camera_guard'), "'.strip().lower() in ('off', 'false', '0', 'none')"]))))
+    # the box under the arms that follows /c60000004/vertical_distance (robot/height_box.py;
+    # height_box:=off: none)
+    launch_nodes.append(DeclareLaunchArgument(
+        'height_box', default_value='on',
+        description='on: an obstacle box under the arms, 152 - (x + 10) cm below their centre, '
+                    'x from /c60000004/vertical_distance (100 cm while none comes); off: none'))
+    launch_nodes.append(ExecuteProcess(
+        cmd=['python3', '/workspaces/isaac_ros-dev/robot/height_box.py'],
+        output='screen', additional_env={'PYTHONUNBUFFERED': '1'}, name='height_box',
+        respawn=True, respawn_delay=2.0,
+        condition=UnlessCondition(PythonExpression(
+            ["'", LaunchConfiguration('height_box'), "'.strip().lower() in ('off', 'false', '0', 'none')"]))))
 
     # 'level': a frame for LOOKING (RViz's Fixed Frame), with gravity straight down. The robot's own
     # frame ('world') leans against the room: the D455's accelerometer through its calibrated TF has
@@ -408,6 +442,8 @@ def generate_launch_description():
             # From the TF the picker was told the camera looked 4.5 deg up; the scene
             # showed ~4.7 deg down, the boxes' tops lost to their fronts (2026-10-29)
             'enable_accel': LaunchConfiguration('accel'),
+            'enable_gyro': LaunchConfiguration('gyro'),
+            'unite_imu_method': '2',                 # /camera/camera/imu (needs both)
         }
 
         realsense_node_live = IncludeLaunchDescription(

@@ -25,6 +25,12 @@ plus v1's:
 
 avoid: outlines of boxes passed over (T in the window): they are left out of the order.
 With no target (None), self.res["carton"] says why: the carton in front may be empty.
+
+box_size: (height, width, depth) mm of the boxes, given (the robot's /beast_arm/held_object/fixed_size,
+or --box-size): its depth sets the layers (grid_order.py, 5). The loop doesn't pick without it.
+The front measured in the picture is compared with it: more than SIZE_WARN off (height or width)
+-> self.res["size_warning"] (the size entered may be another product's; partly hidden fronts
+can also measure short, so it only warns).
 """
 import time
 
@@ -37,6 +43,7 @@ from pick_v1 import draw
 
 SAME_TARGET_M = 0.02     # two answers this close (same face kind) are the same box
 SKIP_OVERLAP = 0.5       # an outline overlapping a passed-over one this much (of the smaller) is that box
+SIZE_WARN = 0.25         # the front measured this much off the given box size (height or width): warn
 
 
 def overlap(a, b):
@@ -51,6 +58,18 @@ def overlap(a, b):
 
 def passed_over(mask, avoid):
     return any((mask & m).sum() > SKIP_OVERLAP * min(mask.sum(), m.sum()) for m in avoid)
+
+
+def size_warning(measured, given):
+    """None, or why the front measured in the picture doesn't fit the given box size."""
+    if not measured or not given or measured[0] is None or measured[1] is None:
+        return None
+    w, h = measured[0], measured[1]
+    gh, gw = given[0], given[1]
+    if abs(w - gw) > SIZE_WARN * gw or abs(h - gh) > SIZE_WARN * gh:
+        return (f"the boxes look {w:.0f} wide x {h:.0f} high, the box size given is {gw:.0f} x {gh:.0f}: "
+                "check the box size entered")
+    return None
 
 
 def _keep_image(finder):
@@ -78,17 +97,19 @@ class GridDetector:
         self.res = None         # grid_order's answer for that frame (picks without passed-over boxes)
         self.best_frame = None
 
-    def detect(self, color, depth_m, intr, up=(0.0, -1.0, 0.0), avoid=()):
-        """The target dict, or None if there is no box to pick."""
+    def detect(self, color, depth_m, intr, up=(0.0, -1.0, 0.0), avoid=(), box_size=None):
+        """The target dict, or None if there is no box to pick. box_size: (height, width, depth) mm."""
         up = np.asarray(up, float)
         t0 = time.time()
         points, masks, scores, boxes, sam_s = find_boxes(self.finder, color, depth_m, intr, up)
         tc = time.time()
         cartons = carton.find_cartons(self.finder) if self.carton_check else None
         t1 = time.time()
-        res = grid_order.order({"boxes": boxes, "intr": intr, "up": up, "depth": depth_m, "cartons": cartons})
+        res = grid_order.order({"boxes": boxes, "intr": intr, "up": up, "depth": depth_m, "cartons": cartons,
+                                "box_depth": None if not box_size else box_size[2] / 1000.0})
         picks = [p for p in res["picks"] if not passed_over(boxes[p["box"]].mask, avoid)]
-        self.res = dict(res, picks=picks)
+        self.res = dict(res, picks=picks, size_warning=size_warning(res.get("box_size_mm"), box_size),
+                        box_given_mm=None if not box_size else list(box_size))
         if not picks:
             self.last = (points, boxes, None)
             return None
@@ -104,11 +125,11 @@ class GridDetector:
                 "box_size_mm": None if size is None else [None if v is None else round(v) for v in size],
                 "next": [{"face": q["face"], "fallen": q["fallen"], "u": round(q["uv"][0], 1),
                           "v": round(q["uv"][1], 1), "cell": cell(q)} for q in picks[1:4]],
-                "carton": carton.summary(res["carton"]),
+                "carton": carton.summary(res["carton"]), "box_given_mm": None if not box_size else list(box_size),
                 "timings": {"sam_s": round(sam_s, 3), "carton_s": round(t1 - tc, 3), "order_s": round(time.time() - t1, 3),
                             "total_s": round(time.time() - t0, 3)}}
 
-    def detect_frames(self, frames, intr, up=(0.0, -1.0, 0.0), avoid=()):
+    def detect_frames(self, frames, intr, up=(0.0, -1.0, 0.0), avoid=(), box_size=None):
         """[(colour, depth_m), ...] of one still scene -> one target dict, or None.
 
         Each frame is run on its own; the answers that agree (same face kind, and centre within
@@ -117,7 +138,7 @@ class GridDetector:
         self.last / self.res / self.best_frame then refer to the frame used."""
         found = []                             # (frame index, result, last, res)
         for i, (color, depth_m) in enumerate(frames):
-            r = self.detect(color, depth_m, intr, up, avoid)
+            r = self.detect(color, depth_m, intr, up, avoid, box_size)
             if r is not None:
                 found.append((i, r, self.last, self.res))
         if not found:

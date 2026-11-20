@@ -13,7 +13,7 @@ import numpy as np
 import robot_camera_calibration as rcc
 from ctm.kinematics import directions
 from ctm.common import (ARM_REACH, BASE_FRAME, TOOL_ARM, NUDGE, arm_joints, decode_image,
-                        matrix_from_quat,
+                        matrix_from_quat, project,
                         quat_from_matrix,
                         tool_frame_along)
 from ctm import armcal
@@ -1660,27 +1660,91 @@ class TouchMixin:
                                     scale=slow) or \
                     node.move_joints(arm, home, f'{arm} return', velocity=velocity,
                                      via_home=False)
+        # Still no way home: again by itself -- via the home posture, then with a held
+        # box let through the map -- not left waiting for RETURN (2026-11-20, the user:
+        # "i dont want it to be stuck or remain paused unable to return back home")
+        for again in range(1, self.HOME_RETRIES + 1):
+            if back or node.halt.is_set():
+                break
+            self.say(f'{arm} arm: no way home yet - trying again by itself ({again}/'
+                     f'{self.HOME_RETRIES})', True)
+            time.sleep(1.0)
+            back = node.move_joints(arm, home, f'{arm} return (again)', velocity=velocity,
+                                    via_home=True)
+            if not back and (holding or arm in node.held) and not node.halt.is_set():
+                with node.held_leaving(arm):
+                    back = node.move_joints(arm, home, f'{arm} return (again, box let through)',
+                                            velocity=velocity, via_home=True)
         # ... then straight on to the drop pose, hold, and back to pre_pick.
         drop = self.pose(arm, 'drop_state') if args.drop_hold >= 0 else None
-        # nothing to take there: no box held, the cup never pressed -- straight back to
-        # pre_pick instead (2026-11-17: the empty round trip to the drop cost ~6 s)
-        empty = not (arm in node.held or lt.get('held') or lt.get('pressed')) \
+        # Did the box go with the cup? The camera on its spot, the arm back out of the
+        # picture (2026-11-20: the cup's weighing said "nothing" three times with the
+        # box on it -- a FRONT-picked box still rests on the one below while weighed)
+        seen = None
+        if back and drop is not None and not lt.get('dropped') and lt.get('spot') is not None \
+                and (lt.get('pressed') or lt.get('held') or arm in node.held):
+            seen, text = self._spot_check(lt['spot'])
+            self.say(f'{arm} arm: the camera - {text}')
+            if self.last_contact is not None:
+                self.last_contact['spot_left'] = seen
+        weighed = (self.last_contact or {}).get('held')
+        if seen is True and weighed is False:
+            self.say(f'{arm} arm: the box left its spot though the cup weighed nothing - it is '
+                     f'taken to the drop')
+        # nothing to take there: no box held and the cup never pressed, or the camera sees
+        # the box still in its spot (and the cup did not weigh it) -- straight back to
+        # pre_pick (2026-11-17: the empty round trip to the drop cost ~6 s). The weighing
+        # alone never skips the drop: it misses boxes on the cup
+        still_there = seen is False and weighed is not True
+        empty = (not (arm in node.held or lt.get('held') or lt.get('pressed')) or still_there) \
             and _on(args, 'skip_empty_drop', True)
+        # the drop pose would collide (x 87-152 cm, or it is in something now): let go
+        # at pre_pick -- asked once, before the moves (2026-11-19: the hand was in the
+        # height box at x 84.5 and cuMotion tried 3 x 11 s, OMPL once, then gave up)
+        blocked = None
+        if back and drop is not None and not lt.get('dropped') and not empty:
+            blocked = self._drop_blocked(arm, drop)
         if back and drop is not None and not lt.get('dropped') and empty:
             lt['dropped'] = True
+            if still_there:
+                self.say(f'{arm} arm: the box is still in its spot - nothing to take to the drop')
+                if arm in node.held:
+                    node.detach_held(arm)            # (the vacuum goes off once home)
             if not self._at_goal(arm, home):
                 self.phase(f'{arm} to_pre_pick')
                 self.say(f'{arm} arm: nothing on the cup - back to pre_pick (no drop)')
                 back = self._leg(arm, 'to_rest', home, f'{arm} return',
                                  start=self._commanded(arm), start_name='measured')
+        elif back and drop is not None and not lt.get('dropped') and blocked is not None:
+            # the drop pose would collide: let go at pre_pick instead
+            lt['dropped'] = True
+            self.say(f'{arm} arm: {blocked} - the drop pose would collide; letting go at '
+                     f'pre_pick instead')
+            if not self._at_goal(arm, home):
+                self.phase(f'{arm} to_pre_pick')
+                back = self._leg(arm, 'to_rest', home, f'{arm} return',
+                                 start=self._commanded(arm), start_name='measured')
+            if back:
+                self.phase(f'{arm} drop')
+                self.say(f'{arm} arm: at pre_pick; letting go, holding {max(args.drop_hold, 0):g} s')
+                self.vacuum(arm, False)                  # let go of the box
+                time.sleep(max(args.drop_hold, 0.0))
+                if arm in node.held:
+                    node.detach_held(arm)
+                    self.say(f'{arm} arm: box let go at pre_pick - out of the planners')
+                self.on_dropped(arm)
+            else:
+                self.say(f'{arm} arm: could not get to pre_pick to let go - the box is still on '
+                         f'the cup', True)
         elif back and drop is not None and not lt.get('dropped'):
             lt['dropped'] = True                     # once per touch, also after a RETURN
             self.phase(f'{arm} to_drop')
             self.say(f'{arm} arm: to the drop pose')
             # planned from the pose it is sent back to (nominal pre_pick when near
             # it): the same start every pick, so the stored leg is used again
+            let_go_home = False
             if self._leg(arm, 'to_drop', drop, f'{arm} to drop', self._drop_velocity(velocity),
-                         start=home, start_name=self._pose_name(arm, home)):
+                         start=home, start_name=self._pose_name(arm, home), fallback=False):
                 self.phase(f'{arm} drop')
                 self.say(f'{arm} arm: at the drop pose; holding {args.drop_hold:g} s')
                 self.vacuum(arm, False)                  # let go of the box
@@ -1690,12 +1754,22 @@ class TouchMixin:
                     self.say(f'{arm} arm: box dropped - out of the planners')
                 self.on_dropped(arm)
             else:
-                self.say(f'{arm} arm: could not reach the drop pose; back to pre_pick with the box',
+                # (2026-11-20: not left hanging on the cup at pre_pick -- it let go there)
+                self.say(f'{arm} arm: could not reach the drop pose - letting go at pre_pick',
                          True)
+                let_go_home = True
             self.phase(f'{arm} to_pre_pick')
             self.say(f'{arm} arm: back to pre_pick')
             back = self._leg(arm, 'from_drop', home, f'{arm} return',
                              start=drop, start_name='drop_state')
+            if back and let_go_home:
+                self.phase(f'{arm} drop')
+                self.vacuum(arm, False)
+                time.sleep(max(args.drop_hold, 0.0))
+                if arm in node.held:
+                    node.detach_held(arm)
+                    self.say(f'{arm} arm: box let go at pre_pick - out of the planners')
+                self.on_dropped(arm)
         elif back and lt.get('top_carry'):
             # at pre_pick_top with no drop pose (or past it already): on to pre_pick
             self.phase(f'{arm} to_pre_pick')
@@ -1713,6 +1787,91 @@ class TouchMixin:
         self.say(f'{arm} arm: could not get back to the start posture -- press RETURN (b) to '
                  f'try again', True)
 
+    HOME_RETRIES = 2            # more tries home by itself before it waits for RETURN
+    SPOT_GONE_M = 0.03          # the spot this much farther (or no reading): the box left it
+    SPOT_SAME_M = 0.015         # ... within this: still there
+    SPOT_SHARE = 0.6            # of the spot's pixels, to say either
+    SPOT_MIN_PX = 150
+
+    def _spot_ref(self, point):
+        """The box's spot as the camera sees it now, the arm away: its pixels within
+        ~a third of the face of `point` and on the face (depth within 3 cm of the
+        point's), and a median of 3 depth frames. None if it cannot be had."""
+        node = self.node
+        try:
+            _c, _d, info = node.latest()
+            optical = info.header.frame_id if info is not None else None
+            t_wo = node.lookup(BASE_FRAME, optical) if optical else None
+            if t_wo is None or not info.width:
+                return None
+            depth, _last = node.averaged_depth(3)
+            if depth is None:
+                return None
+            p = np.asarray(point, float).reshape(3)
+            z = float((np.linalg.inv(t_wo) @ np.r_[p, 1.0])[2])
+            if z <= 0.15:
+                return None
+            u, v = project([p], t_wo, info)[0]
+            face = getattr(node, 'pick_face_mm', None)
+            radius = min(max(0.35 * (face or 85.0) / 1000.0, 0.02), 0.05)
+            r_px = float(info.k[0]) * radius / z
+            h, w = depth.shape
+            yy, xx = np.ogrid[:h, :w]
+            mask = ((xx - u) ** 2 + (yy - v) ** 2 <= r_px ** 2) & (depth > 0.15) & \
+                (np.abs(depth - z) <= 0.03)
+            if int(mask.sum()) < self.SPOT_MIN_PX:
+                return None
+            return {'mask': mask, 'depth': depth, 'n': int(mask.sum())}
+        except Exception:                            # noqa: BLE001 - no camera check, as before
+            return None
+
+    def _spot_check(self, ref):
+        """The box's spot again, the arm back out of the picture: (False, text) it is
+        still there -- not taken; (True, text) it left -- on the cup (or fell); (None,
+        text) cannot tell (no frames; something in front of it -- the arm, a box on
+        the cup)."""
+        try:
+            depth, _last = self.node.averaged_depth(3)
+        except Exception:                            # noqa: BLE001
+            depth = None
+        if depth is None or ref is None or depth.shape != ref['depth'].shape:
+            return None, 'no depth frames to check the box\'s spot'
+        m = ref['mask']
+        d0, d1 = ref['depth'][m], depth[m]
+        gone = float(np.mean((d1 <= 0.15) | (d1 - d0 > self.SPOT_GONE_M)))
+        same = float(np.mean((d1 > 0.15) & (np.abs(d1 - d0) <= self.SPOT_SAME_M)))
+        front = float(np.mean((d1 > 0.15) & (d0 - d1 > self.SPOT_GONE_M)))
+        text = (f'{100 * gone:.0f} % of the box\'s spot emptied, {100 * same:.0f} % unchanged'
+                + (f', {100 * front:.0f} % hidden by something in front' if front >= 0.1 else ''))
+        if same >= self.SPOT_SHARE:
+            return False, f'the box is still in its spot ({text})'
+        if gone >= self.SPOT_SHARE:
+            return True, f'the box left its spot ({text})'
+        return None, f'cannot tell ({text})'
+
+    def _drop_blocked(self, arm=None, drop=None):
+        """Why the drop pose would collide, or None: x (cm) within --no-drop-x (the box
+        under the arms that high), or the drop pose in something in the planning scene
+        now (the robot, its tool and the held box as they are) -- MoveIt's own check.
+        No fresh x, or MoveIt cannot say: None (the drop pose as usual)."""
+        node, args = self.node, self.node.args
+        rng = getattr(args, 'no_drop_x', None)
+        get = getattr(node, 'vertical_x', None)
+        if rng and len(rng) == 2 and get is not None:
+            lo, hi = float(rng[0]), float(rng[1])
+            x = get()
+            if x is not None and hi > lo and lo <= x <= hi:
+                return f'x {x:.1f} cm'
+        if arm is not None and drop is not None and hasattr(node, 'state_contacts'):
+            try:
+                hits = node.state_contacts(arm, drop)
+            except Exception:                        # noqa: BLE001 - cannot say: as usual
+                hits = None
+            if hits:
+                what = sorted({f'{a} / {b}' for a, b, *_ in hits})
+                return 'the drop pose is in collision (' + ', '.join(what[:3]) + ')'
+        return None
+
     def on_returning(self, arm, lt, holding):
         """Called once the arm is out of the box and on its way back (pre_pick,
         the drop, pre_pick): PICK ALL looks ahead from here (web_gui.py)."""
@@ -1723,7 +1882,8 @@ class TouchMixin:
 
     LEG_END_TOL = 0.03                               # rad: a stored leg ends near enough its goal
 
-    def _leg(self, arm, key, goal, label, velocity=None, start=None, start_name=None):
+    def _leg(self, arm, key, goal, label, velocity=None, start=None, start_name=None,
+             fallback=True):
         """A joint move made every pick between the same poses (pre_pick -> the drop
         -> pre_pick): planned once and stored, then flown again. Planning it every
         time cost 1.2-1.6 s per leg (2026-11-05). True once there.
@@ -1786,6 +1946,11 @@ class TouchMixin:
                 return True
             if node.halt.is_set():
                 return False
+        if not fallback:
+            # (the drop leg, 2026-11-20: move_joints' retries took ~58 s on a goal it
+            # could not reach, the box hanging on the cup the while)
+            node.get_logger().warn(f'{label}: no plan - not retried')
+            return False
         return node.move_joints(arm, goal, label, velocity=velocity, via_home=False)
 
     def _arrived_at(self, arm, end, goal):
@@ -1977,12 +2142,15 @@ class TouchMixin:
             self.say(f'{arm} arm: no approach from further out works - flying to '
                      f'{cm(standoff)} cm in front of the box (that way checked with the tool '
                      f'counted up to its last {100 * CLOSE_FREE:.0f} %), then in')
+        # the box's spot as the camera sees it, the arm still away (2026-11-20): asked
+        # again once the arm is back -- whether the box went with the cup
+        spot = self._spot_ref(point) if _on(args, 'spot_check', True) else None
         # From here on the arm is out: touch() brings it back whatever happens.
         self.touch_moved = True
         self.last_touch = {'arm': arm, 'trajectory': plan['trajectory'], 'start': start,
                            'above': plan['above'], 'quat': quat, 'out_to': approach,
                            'out': True, 'level': plan.get('level'),
-                           'standoff': standoff, 'way': np.array(way, float)}
+                           'standoff': standoff, 'way': np.array(way, float), 'spot': spot}
         self.phase(f'{arm} approach')
         mode = self._correct_mode()
         motor0 = self._motor_now(arm)                # a change from this by the way in: abort

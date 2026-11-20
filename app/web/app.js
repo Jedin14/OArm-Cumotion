@@ -1013,7 +1013,7 @@ function renderSizes(s) {
     pick.textContent = '';
     const first = document.createElement('option');
     first.value = '';
-    first.textContent = Object.keys(presets).length ? 'Saved sizes…' : 'No saved sizes yet';
+    first.textContent = Object.keys(presets).length ? 'Saved…' : 'None saved';
     pick.appendChild(first);
     Object.keys(presets).sort((a, b) => a.localeCompare(b)).forEach((name) => {
       const o = document.createElement('option');
@@ -1029,17 +1029,17 @@ function renderSizes(s) {
 $('sizePick').addEventListener('change', () => {
   const name = $('sizePick').value;
   $('btnSizeDel').disabled = !name;
-  if (name) act('size_use', { name }).then((j) => { if (j) toast(j.message); });
+  if (name) act('size_use', { label: name }).then((j) => { if (j) toast(j.message); });
 });
 $('btnSizeSave').addEventListener('click', () => {
   const name = $('sizeName').value.trim() || $('sizePick').value;
   if (!name) { toast('Type a name for this size first'); $('sizeName').focus(); return; }
-  act('size_save', { name }).then((j) => { if (j) { toast(j.message); if (j.ok) $('sizeName').value = ''; } });
+  act('size_save', { label: name }).then((j) => { if (j) { toast(j.message); if (j.ok) $('sizeName').value = ''; } });
 });
 $('sizeName').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('btnSizeSave').click(); });
 $('btnSizeDel').addEventListener('click', () => {
   const name = $('sizePick').value;
-  if (name) act('size_delete', { name }).then((j) => { if (j) toast(j.message); });
+  if (name) act('size_delete', { label: name }).then((j) => { if (j) toast(j.message); });
 });
 
 connect();

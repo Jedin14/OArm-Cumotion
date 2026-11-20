@@ -28,7 +28,9 @@ worked (the box is gone from its place). When the pick happens is the robot's: i
     No target (empty, or only boxes passed over with T): the picker tries again every few seconds.
     "reset" forgets the boxes passed over.
 
-Check v2 (--check v2, or W in the window): steps 2 and 3 are done by the camera, as in the Pick
+These steps are check v1 (--check v1, or W in the window; the default with --replay).
+
+Check v2 (the default since 17 Nov 2026): steps 2 and 3 are done by the camera, as in the Pick
 Check team's box_picking_integration (pick_watch.py, their pick_check.py renamed). No "done" is
 needed: from the frame the target came from, every camera frame is compared with the target's
 face (arm in view, box still there, box gone), and once the box has left its spot, the whole
@@ -41,7 +43,7 @@ at the camera's rate (30 fps). "picked" comes later than in v1: once the arm has
 
 Check v1's code (pick_check.py, pick_and_check.py) belongs to the Pick Check team and is used
 unchanged: from this folder, else from ../../Pick Check/. Without it (the v2 robot package) only
-check v2 is there, and it is the default.
+check v2 is there.
 
 stdin, one line at a time (the robot, or you):
     done | done held | done empty   the pick is over, the arm out of view: check it (held / empty: what
@@ -66,6 +68,9 @@ stdout carries only JSON events, one a line; everything else goes to stderr:
                                      target is that top (pick_rules.py, a last resort). The robot
                                      still picks it; this tells a person. Once per box.
     {"event": "no_target", "pick": n}
+    {"event": "no_target", "pick": n, "reason": "box size not set"}
+                                     no box size (the robot's /beast_arm/held_object/fixed_size through
+                                     the bridge, or --box-size H W D): no pick; asked again every 3 s
 
 Keys in the window (for testing without the robot), also buttons on the panel's two tabs:
     PICK       C = "done" (check now), T next target (pass over this box until the next successful
@@ -75,16 +80,19 @@ Keys in the window (for testing without the robot), also buttons on the panel's 
     ADVANCED   D depth picture, V the picker's view (v1's order numbered on all boxes), S save colour +
                depth (snapshots/), N new target now (new frames), R forget the boxes passed over,
                W check v1 (robot says done) / v2 (camera watches; looks again), − / + frames per target,
-               SAM confidence (--score) and frames per pick success (from the next one on)
+               SAM confidence (--score) and frames per pick success (from the next one on);
+               BOX SIZE: B type this PC's box size (height width depth mm, then Enter; Esc cancels),
+               G use the robot's (/beast_arm/held_object/fixed_size) or this PC's. From the next look on.
+               No box size: no pick
 
 Usage (from box_picking/v1/; the Python is the old folder's, which has SAM 3.1):
     PY=../../vlm/molmo2-box-picking/.venv/bin/python
     $PY pick_loop.py --ros                      # camera over ROS 2 (ros_bridge.py; tilt from its accel topic), window
     $PY pick_loop.py --ros --no-window          # for the robot: stdin / stdout only
-    $PY pick_loop.py --ros --check v2           # the camera watches each pick, no "done" (pick_watch.py)
+    $PY pick_loop.py --ros --check v1           # the robot says "done", then the check (Pick Check's pick_check)
     $PY pick_loop.py                            # D455 by USB
     $PY pick_loop.py --replay ../../vlm/molmo2-box-picking/recordings/grid_part2 --replay-fps 1
-                                                # no camera: a recording, one frame a second (C = done)
+                                                # no camera: a recording, one frame a second (check v1: C = done)
     -> outputs/pick_loop/<session>/pick_NN/{before_*, after_*, picker.jpg, check.jpg}, events.jsonl,
        flags/flag_NN_{target,crop,check}.jpg, flags/toponly_NN_{target,crop}.jpg
 """
@@ -127,7 +135,9 @@ CANT_TELL = 3            # this many "can't tell" in a row for one pick: choose 
 V2_RESULT = {"picked": ("PICK SUCCESS", "the box left its spot and the camera's view", (0, 200, 0)),
              "missed": ("PICK FAILED: MISSED", "the arm came and went, the box is still there", (0, 0, 255)),
              "moved": ("PICK FAILED: BOX MOVED", "the box was knocked or dragged, not picked", (0, 0, 255)),
-             "dropped": ("PICK FAILED: DROPPED", "the box was lifted but fell back into the carton", (0, 0, 255))}
+             "dropped": ("PICK FAILED: DROPPED", "the box was lifted but fell back into the carton", (0, 0, 255)),
+             "camera_moved": ("CAN'T TELL: CAMERA MOVED", "most of the view changed since before the pick",
+                              (0, 165, 255))}
 WINDOW = "pick loop"
 
 
@@ -253,14 +263,21 @@ def main():
     ap.add_argument("--replay", metavar="RECORDING", help="no camera: play a recording's frames instead (for testing)")
     ap.add_argument("--replay-fps", type=float, default=1.0, help="--replay: recorded frames per second (default 1)")
     ap.add_argument("--replay-from", type=int, default=0, help="--replay: the frame number to start at")
-    ap.add_argument("--check", choices=["v1", "v2"], default="v1" if pc else "v2",
-                    help="v1: the robot says done, then new frames are compared with before (Pick Check's pick_check); "
-                         "v2: the camera watches the pick on every frame and decides picked / missed / moved / "
-                         "dropped itself, no done needed (pick_watch.py)")
+    ap.add_argument("--check", choices=["v1", "v2"],
+                    help="v2 (default): the camera watches the pick on every frame and decides picked / missed / "
+                         "moved / dropped itself, no done needed (pick_watch.py); v1: the robot says done, then new "
+                         "frames are compared with before (Pick Check's pick_check; the default with --replay, whose "
+                         "frames come too slowly to watch a pick)")
     ap.add_argument("--out", default="outputs/pick_loop", help="where each session is saved")
     ap.add_argument("--no-carton", action="store_true",
                     help="use every box in view, not only those in the carton in front (v2's carton check off)")
+    ap.add_argument("--box-size", type=float, nargs=3, metavar=("H", "W", "D"),
+                    help="the boxes' height, width and depth in mm, instead of the robot's "
+                         "(/beast_arm/held_object/fixed_size, through the bridge): for the USB camera or --replay. "
+                         "No box size: no pick")
     args = ap.parse_args()
+    if args.check is None:
+        args.check = "v1" if args.replay and pc else "v2"
     if args.check == "v1" and pc is None:
         ap.error("check v1 needs Pick Check's pick_check.py and pick_and_check.py (not in this package): use --check v2")
 
@@ -296,6 +313,8 @@ def main():
     stamps = collections.deque(maxlen=20)     # when the last frames came: the live pill's rate
     latest = [None]                           # the newest (colour, depth)
     tab, depth_on, picker_on, snap = "pick", False, False, ""
+    # The box size set on this PC (ADVANCED tab: B types it, G switches robot / this PC), else the robot's.
+    boxsize = {"pc": list(args.box_size) if args.box_size else None, "use_pc": bool(args.box_size), "typing": None}
 
     def order_tab():
         """The ORDER tab's panel: v1's order from the last look."""
@@ -305,12 +324,16 @@ def main():
         res = detector.res
         if res is None:
             return rows + [None, ("text", "No look yet.")]
-        size = res["box_size_mm"]
+        size, given = res["box_size_mm"], res.get("box_given_mm")
         fallen = sum(p["fallen"] for p in res["picks"])
+        layers = len({p["cell"][0] for p in res["picks"] if p["cell"] is not None})
         rows += [None, ("label", "LAST LOOK"), ("text", *carton_line(res)),
-                 ("text", "Box " + ("?" if size is None else
-                                    f"{size[0]:.0f} × {size[1]:.0f} × {'?' if size[2] is None else f'{size[2]:.0f}'} mm")),
-                 ("text", f"{len(res['picks']) - fallen} in the grid, {fallen} fallen")]
+                 ("text", "Box " + ("not set" if not given else
+                                    f"{given[1]:.0f} × {given[0]:.0f} × {given[2]:.0f} mm (w × h × d, given)")),
+                 ("small", "seen: " + ("?" if size is None or size[0] is None else f"{size[0]:.0f} × {size[1]:.0f} mm front")),
+                 *([("text", "Check the box size: " + res["size_warning"], ui.ORANGE)] if res.get("size_warning") else []),
+                 ("text", f"{len(res['picks']) - fallen} in the grid ({layers} layer{'s' if layers != 1 else ''}), "
+                          f"{fallen} fallen")]
         for k, p in enumerate(res["picks"][:4]):
             where = "fallen box" if p["fallen"] else "layer {} · row {} · column {}".format(
                 *(c + 1 for c in p["cell"]))
@@ -333,7 +356,21 @@ def main():
                 *([("button", "W", "Check", "v2: camera watches" if args.check == "v2" else "v1: robot says done",
                     args.check == "v2"),
                    ("setting", "check_frames", FRAMES["check_frames"][0], str(args.check_frames), False)]
-                  if pc else [("text", "Check v2: the camera watches the pick")])]
+                  if pc else [("text", "Check v2: the camera watches the pick")]),
+                None, ("label", "BOX SIZE, H × W × D MM (NONE: NO PICK)"),
+                ("button", "B", "Type it · G: robot/PC", box_value())]
+
+    def box_value():
+        """The box size row's value: what is being typed, or the size used and where from."""
+        if boxsize["typing"] is not None:
+            return boxsize["typing"] + "_"
+        s, where = (boxsize["pc"], "PC") if boxsize["use_pc"] else (robot_size(), "robot")
+        return f"{where} " + ("none" if not s else "{:.0f}×{:.0f}×{:.0f}".format(*s))
+
+    def robot_size():
+        """The robot's box size (height, width, depth mm) through the bridge, or None (none, or a side 0)."""
+        s = getattr(cam, "box_size", None)
+        return tuple(float(v) for v in s) if s and len(s) == 3 and all(v and v > 0 for v in s) else None
 
     def show(img, status, colour, panel, step, live=False, target=False):
         """Draw the window (loop_screen) and return the key pressed or clicked (lower case), or ''.
@@ -358,6 +395,25 @@ def main():
             sized = True
         cv2.imshow(WINDOW, canvas)
         k = cv2.waitKey(1) & 0xFF
+        if boxsize["typing"] is not None and k != 255:    # typing the box size: digits, space, Backspace, Enter, Esc
+            if k in (13, 10):
+                try:
+                    v = [float(x) for x in boxsize["typing"].replace(",", " ").split()]
+                except ValueError:
+                    v = []
+                if len(v) == 3 and all(x > 0 for x in v):
+                    boxsize["pc"], boxsize["use_pc"] = v, True
+                    log(f"box size set on this PC: {v[0]:.0f} high x {v[1]:.0f} wide x {v[2]:.0f} deep mm")
+                else:
+                    log(f"box size not understood ({box['typing']!r}): type height width depth in mm, e.g. 125 125 54")
+                boxsize["typing"] = None
+            elif k == 27:
+                boxsize["typing"] = None
+            elif k in (8, 127):
+                boxsize["typing"] = boxsize["typing"][:-1]
+            elif chr(k) in "0123456789 .,":
+                boxsize["typing"] += chr(k)
+            return ""
         key = "q" if k == 27 else chr(k).lower() if 0 < k < 128 else clicks.popleft() if clicks else ""
         if key == "a":                                # the next tab
             names = [n for n, _ in ui.TABS]
@@ -371,6 +427,16 @@ def main():
         elif key == "w" and pc is not None:
             args.check = "v2" if args.check == "v1" else "v1"
             log(f"pick check: {args.check} ({'the camera watches the pick' if args.check == 'v2' else 'the robot says done'})")
+        elif key == "b":                              # type this PC's box size
+            boxsize["typing"] = ""
+            tab = "advanced"
+        elif key == "g":                              # the box size from: the robot / this PC
+            boxsize["use_pc"] = not boxsize["use_pc"]
+            if boxsize["use_pc"] and not boxsize["pc"]:
+                boxsize["pc"] = list(robot_size()) if robot_size() else None
+                if boxsize["pc"] is None:
+                    boxsize["typing"] = ""             # nothing to start from: type it
+            log("box size from " + ("this PC" if boxsize["use_pc"] else "the robot"))
         elif key[2:] in FRAMES:                       # frames, SAM's confidence: from the next target / check on
             name = key[2:]
             _, lo, hi, step = FRAMES[name]
@@ -422,6 +488,18 @@ def main():
     before = d = ev = result = None
     passed = []                  # outlines of the boxes passed over with T, until the next pick succeeds
     failed, attempt = None, 0    # the last target that wasn't picked, and how many tries it has had
+    size_missing, no_size = None, ""    # no box size given: no pick (see given_size); None: not looked yet
+    size_missing_last = None             # the size (and where from) last used: logged when it changes
+
+    def given_size():
+        """((height, width, depth) mm, where from) or (None, None): this PC's (ADVANCED tab, or
+        --box-size) when chosen there, else the robot's (cam.box_size, through the bridge); any side
+        0 or missing counts as not set."""
+        if boxsize["use_pc"]:
+            s = boxsize["pc"]
+            return (tuple(float(v) for v in s), "this PC") if s and all(v > 0 for v in s) else (None, None)
+        s = robot_size()
+        return (s, "robot") if s else (None, None)
     watcher, fell = None, None   # check v2: the pick being watched; where the last dropped box fell
     outcomes = []                # the check's outcome for each try on the current box
     cant_tell_run = 0            # "can't tell" results in a row for the current pick
@@ -445,6 +523,21 @@ def main():
 
             # ---- 1. PICK ------------------------------------------------------------------------
             if stage == "pick":
+                size, size_from = given_size()
+                if size is None:                  # no box size: no pick (the layers need its depth)
+                    no_size = (("Box size not set: enter it in the robot's GUI" if args.ros and not boxsize["use_pc"]
+                                else "Box size not set") +
+                               (", or set it on this PC (ADVANCED: B)" if window else ": give --box-size H W D (mm)"))
+                    if not size_missing:
+                        event({"event": "no_target", "pick": n + 1, "reason": "box size not set"}, events)
+                        log(f"no box size ({no_size}): not picking")
+                    size_missing = True
+                    stage, shown_until = "no_target", time.time() + RESULT_S
+                    continue
+                elif size_missing is None or (size, size_from) != size_missing_last:
+                    log(f"box size {size[0]:.0f} high x {size[1]:.0f} wide x {size[2]:.0f} deep mm ({size_from})")
+                size_missing_last = (size, size_from)
+                size_missing, no_size = False, ""
                 show(colour, f"PICK {n + 1}: TAKING PICTURES", ui.BLUE,
                      [("label", "PICKER"), ("text", f"Taking {args.frames} new frames...")], 0, live=True)
                 flag_tries = 0
@@ -454,10 +547,10 @@ def main():
                 up = tilt()                                   # the tilt while these frames were taken
 
                 def find():
-                    r = detector.detect_frames(frames, cam.intr, up, avoid=passed)
+                    r = detector.detect_frames(frames, cam.intr, up, avoid=passed, box_size=size)
                     if r is None and passed:      # no box after the passed ones: back to the first
                         passed.clear()
-                        r = detector.detect_frames(frames, cam.intr, up)
+                        r = detector.detect_frames(frames, cam.intr, up, box_size=size)
                     return r, remember(detector, frames, r)
                 found = in_background(find, f"PICK {n + 1}: FINDING THE TARGET",
                                       [("label", "PICKER"), ("text", f"SAM 3.1 on {args.frames} frames...")])
@@ -497,15 +590,20 @@ def main():
                     event({"event": "flag", "pick": n, "reason": "top face only", "target": result, **flag}, events)
                     log(f"pick {n}: FLAG: top face only (a grid box with no front found); picking it by its top; "
                         f"photos in {Path(flag['photo']).parent}")
-                # Check v2: from now on every frame is compared with the depth of the frame the target came from.
-                watcher = pw.PickWatcher(box.pick, frames[detector.best_frame][1], box.mask) \
-                    if args.check == "v2" else None
-                watch_t0 = time.time()
+                # Check v2: from now on every frame is compared with the depth before the pick: all the frames
+                # the target was found in (depth that flickers between them is not compared), with the box's
+                # size (how far back its face must read to be gone).
+                watcher = pw.PickWatcher(box.pick, frames[detector.best_frame][1], box.mask,
+                                         refs=[f[1] for i, f in enumerate(frames) if i != detector.best_frame],
+                                         box_mm=size) if args.check == "v2" else None
+                watch_t0, arm_out, holding = time.time(), False, None
                 stage, cant_tell_run = "wait", 0
                 continue
             if stage == "no_target":
                 panel = [("title", "No target"), ("text", "No box the robot can pick right now.")]
-                if detector.res is not None and detector.res.get("carton") is not None:
+                if size_missing:
+                    panel += [("text", no_size, ui.RED)]
+                elif detector.res is not None and detector.res.get("carton") is not None:
                     panel += [("text", *carton_line(detector.res))]
                 panel += [None, ("label", "NEXT"), ("text", f"Looking again in {max(shown_until - time.time(), 0):.0f} s")]
                 key = show(colour, "NO TARGET", ui.GREY, panel, 0, live=True)
@@ -534,6 +632,8 @@ def main():
                            if attempt > tries else []), None,
                          *([("text", "FLAG: top face only. A grid box with no front found: "
                                      "picking it by its top.", ui.ORANGE), None] if r.get("top_only") else []),
+                         *([("text", "Check the box size: " + detector.res["size_warning"], ui.ORANGE), None]
+                           if detector.res is not None and detector.res.get("size_warning") else []),
                          ("small", f"{r['agreeing']} of {r['frames']} frames agree  \u00b7  {r['num_boxes']} boxes  "
                                    f"\u00b7  face {r['size_mm'][0]}\u00d7{r['size_mm'][1]} mm"),
                          ("small", f"found in {sum(took):.1f} s  \u00b7  pictures {took[0]:.1f} s  \u00b7  "
@@ -558,14 +658,25 @@ def main():
                     continue
                 if watcher is not None:
                     # ---- 3. CHECK v2: every frame, until the camera has decided (no "done" needed) ----
-                    outcome = watcher.update(depth, cam.intr)
+                    # A "done" (robot_done.py: the arm is back) says the arm is out of the view: the camera
+                    # then decides on what it sees (19 Nov 2026), and "held" / "empty" win over it.
+                    if words[:1] == ["done"] or key == "c":
+                        arm_out = True
+                        holding = {"held": True, "empty": False}.get(words[1]) if len(words) > 1 else holding
+                    outcome = watcher.update(depth, cam.intr, time.time(), arm_out=arm_out)
                     if outcome is None:
                         continue
+                    if holding is True and outcome == "dropped":
+                        outcome = "picked"
+                    elif holding is False and outcome == "picked":
+                        outcome = "dropped"
                     verdict = {"check": "v2", "outcome": outcome, "success": outcome == "picked",
                                "seconds": round(time.time() - watch_t0, 1),
-                               "shift_mm": None if watcher.shift is None else round(watcher.shift * 1000)}
+                               "shift_mm": None if watcher.shift is None else round(watcher.shift * 1000),
+                               "holding": holding, "arm_out": arm_out, "status": watcher.status,
+                               "timeline": [list(x) for x in list(watcher.timeline)[-30:]]}
                     after = [(colour, depth)]
-                    picked = outcome == "picked"
+                    picked = {"picked": True, "camera_moved": None}.get(outcome, False)
                     result_img = check_img = watch_image(colour, watcher, outcome)
                     fell, watcher = (watcher.drop if outcome == "dropped" else None), None
                 else:
@@ -613,7 +724,8 @@ def main():
 
             # ---- 4. NEXT ------------------------------------------------------------------------
             if stage == "result":
-                cant_tell = ev["picked"] is None and cant_tell_run < CANT_TELL
+                # (check v2's can't tell -- camera moved -- chooses again: its watcher has decided)
+                cant_tell = ev["picked"] is None and cant_tell_run < CANT_TELL and ev["verdict"].get("check") != "v2"
                 nxt = "waiting for 'done' again" if cant_tell else "new pictures, choosing again" \
                     if ev["picked"] is None else "retry" if ev["picked"] is False else "next box"
                 v = ev["verdict"]

@@ -89,6 +89,7 @@ class Camera:
 
 
 ROS_SETUP = "/opt/ros/humble/setup.bash"
+MSG_SETUP = Path(__file__).parent / "ros" / "install" / "setup.bash"   # the robot's box size message (README)
 BRIDGE_LOG = Path(__file__).parent / "outputs" / "ros_bridge.log"
 
 
@@ -100,7 +101,8 @@ def start_bridge(port):
     env["PATH"] = ":".join(p for p in env.get("PATH", "").split(":") if ".venv" not in p)
     BRIDGE_LOG.parent.mkdir(parents=True, exist_ok=True)
     bridge = Path(__file__).with_name("ros_bridge.py")
-    return subprocess.Popen(["bash", "-c", f'source {ROS_SETUP} && exec /usr/bin/python3 "{bridge}" --port {port}'],
+    setup = f'source {ROS_SETUP}' + (f' && source "{MSG_SETUP}"' if MSG_SETUP.exists() else '')
+    return subprocess.Popen(["bash", "-c", f'{setup} && exec /usr/bin/python3 "{bridge}" --port {port}'],
                             env=env, stdout=open(BRIDGE_LOG, "w"), stderr=subprocess.STDOUT)
 
 
@@ -128,6 +130,7 @@ class RosCamera:
                         raise SystemExit(f"ros_bridge.py didn't start; see {BRIDGE_LOG}")
                     time.sleep(0.5)
         self.accel = None                        # from each frame's header, when the driver sends it
+        self.box_size = None                     # [height, width, depth] mm: the robot's, from the bridge
         self.depth_scale = 0.001
         end = time.time() + wait_s               # a new bridge needs a few seconds to find the camera
         while True:
@@ -160,12 +163,13 @@ class RosCamera:
         depth = np.frombuffer(self._recv(w * ht * 2), np.uint16).reshape(ht, w).astype(np.float32) / 1000
         self.intr = Intrinsics(h["fx"], h["fy"], h["cx"], h["cy"])
         self.accel = h.get("accel")              # mean of the last 0.5 s, None while moving
+        self.box_size = h.get("box_size")
         return color, depth
 
     def meta(self):
         i = self.intr
         return {"fx": i.fx, "fy": i.fy, "cx": i.cx, "cy": i.cy, "depth_scale": self.depth_scale, "accel": self.accel,
-                "source": "ros"}
+                "box_size": self.box_size, "source": "ros"}
 
     def close(self):
         if getattr(self, "sock", None):
@@ -188,6 +192,7 @@ class ReplayCamera:
             raise SystemExit(f"no frames (*_color.png) in {folder}")
         self.fps, self.t0, self.k, self.frame = fps, time.time(), None, None
         _, _, self.intr, self.accel = load(self.prefixes[0])
+        self.box_size = json.loads(Path(f"{self.prefixes[0]}_meta.json").read_text()).get("box_size")
         print(f"replaying {len(self.prefixes)} frames of {folder}, {fps:g} a second", flush=True)
 
     def read(self):
@@ -202,7 +207,7 @@ class ReplayCamera:
     def meta(self):
         i = self.intr
         return {"fx": i.fx, "fy": i.fy, "cx": i.cx, "cy": i.cy, "depth_scale": 0.001, "accel": self.accel,
-                "replay": self.prefixes[self.k or 0]}
+                "box_size": self.box_size, "replay": self.prefixes[self.k or 0]}
 
     def close(self):
         pass

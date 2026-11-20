@@ -27,6 +27,8 @@ All names below are relative to `/beast_arm` (change it with `--ns`). "Latched" 
 | `held_object/size` | topic | `pick_interfaces/ObjectSize` | in | depth 10 | Size of the box to pick next |
 | `held_object/state` | topic | `std_msgs/String` | out | latched | What each arm holds now |
 | `held_object/release` | topic | `std_msgs/Empty` | in | depth 10 | Take the held box out of the planners now |
+| `held_object/fixed_size` | topic | `pick_interfaces/ObjectSize` | out | latched | The user's fixed box size from the GUI (Held object card), mm, at every change -- whether or not Dummy size is on. `header.frame_id` = the saved size's name, or `dummy` when unnamed (2026-11-18) |
+| `held_object/get_size` | service | `std_srvs/Trigger` | request | - | Pushes `held_object/fixed_size` again (and `held_object/size` while Dummy size is on) and answers JSON in `message`: `{"fixed": {name, height_mm, width_mm, depth_mm, dummy_on}, "measured": {height_mm, width_mm, depth_mm, stamp} or null}` -- `measured` is the camera's last box from `box_model/box_size` |
 | `pick_target` | topic | `pick_interfaces/PickTarget` | out | depth 10 | The target of the current pick: coordinates, approach, tool, arm, the matched box |
 | `pick_result` | topic | `std_msgs/String` (JSON) | out | latched | Each pick's outcome: picked true / false / null, from the camera's check |
 | `base_adjust` | topic | `pick_interfaces/BaseAdjust` | out | depth 10, not latched | When the box cannot be picked from here (out of reach, only at the edge of reach, too near the camera), or after 2 failed picks in a row on it: how the wheels should move the robot |
@@ -43,14 +45,34 @@ All names below are relative to `/beast_arm` (change it with `--ns`). "Latched" 
 | `box_model/picker_view` | topic | `sensor_msgs/Image` | out | latched | The picker's own drawing: of each answer (every box, its faces, grip points) and of each check (red gone, green unchanged, blue nearer, purple another box) |
 | `box_model/close_up` | topic | `sensor_msgs/Image` | out | latched | The target box cut out, its pick face boxed in red |
 | `box_model/settings` | topic | `std_msgs/String` (JSON) | out | latched | The picker's settings (`frames`, `check_frames`, `score`, `order`), `skipped` / `passed` counts, the `tilt` it uses (`source`: accelerometer / saved / tf, `deg` down) and the `last` command's answer |
+| `box_model/box_size` | topic | `pick_interfaces/ObjectSize` | out | latched | Each detection's target box as measured, mm, no margin (`height_mm`, `width_mm`, `depth_mm`; depth 0 = not seen). Not `held_object/size` (that is the size attached to the tool) |
+| `box_model/boxes` | topic | `std_msgs/String` (JSON) | out | latched | Each detection: the target and every box after it in the picker's order -- `{time, frame, box_mm {w, h, d}, num_boxes, boxes: [{order, target, xyz (world, m), approach, cell [layer, row, column], face_mm, box_mm {w, h, d}}]}` |
+| `camera/up` | topic | `geometry_msgs/Vector3Stamped` | out | latched, 1 Hz | The D455's "up" (unit, the colour camera's optical frame: x right, y down, z forward): from the live accelerometer, else its saved reading (`calibration/camera_tilt.yaml`) |
+| `camera/tilt` | topic | `std_msgs/String` (JSON) | out | latched, 1 Hz | `{deg, source, live, saved, time}`: the camera's tilt in degrees (negative = looking down), what it came from, whether the accelerometer is live, and the date of the saved reading |
 | `box_model/cmd` | topic | `std_msgs/String` | in | - | The picker window's keys: `set frames N` (1-15), `set score X` (0.20-0.90), `set check_frames N` (1-10), `set order v1\|v2`, `pass` (next target), `skip`, `reset` (forget skipped), `save` (colour + depth snapshot), `flag` (photos of the target), `settings`. See 1.12 |
+
+The D455's motion sensor (2026-11-18; the realsense node, started by terminal 1; not under `/beast_arm`). All best effort: echo them with `--qos-reliability best_effort`.
+
+| Name | Kind | Type | Rate | What it is |
+|---|---|---|---|---|
+| `/camera/camera/imu` | topic | `sensor_msgs/Imu` | ~200 Hz | Gyro and accelerometer in one message (`unite_imu_method` 2: the accelerometer interpolated to each gyro sample). `launch_everything ... gyro:=false` turns it off |
+| `/camera/camera/accel/sample` | topic | `sensor_msgs/Imu` | ~100 Hz | Accelerometer only (`linear_acceleration`, m/s^2). The box picker's tilt comes from it (`box_model_node`, `box_picker_bridge`) |
+| `/camera/camera/gyro/sample` | topic | `sensor_msgs/Imu` | ~200 Hz | Gyro only (`angular_velocity`, rad/s) |
+| `/camera/camera/accel/imu_info`, `/gyro/imu_info` | topic | `realsense2_camera_msgs/IMUInfo` | latched | The motion sensor's noise and bias figures |
+
+**Checked live 2026-11-18 13:00: these three topics exist but carry NO data.** The camera's accelerometer has sent nothing since about 2026-11-12: the D455 is on USB 2 (480M) through two hubs (the same hub as the keyboard that drops out for "EMI?"), and the kernel's motion-sensor driver fails at every start (`hid-sensor-hub 0003:8086:0B5C: No report with id 0xffffffff found`). The box picker has been using the saved tilt of 2026-11-12 10:50 (see `camera/tilt`, `source`). Fix: the camera straight into a USB 3 (blue) port on beast with a USB 3 cable, no hub; then `camera/tilt` says `"live": true`.
+
+```bash
+ros2 topic hz /camera/camera/imu --qos-reliability best_effort        # ~200 Hz when it works
+ros2 topic echo --once /beast_arm/camera/tilt --qos-durability transient_local
+```
 
 The Unitree L2 4D LiDAR (2026-11-11; started by terminal 1 with `lidar:=serial|udp`: the user's own driver, `4D_lidar`'s `l2_driver`, and `robot/lidar_bridge.py`; not under `/beast_arm`):
 
 | Name | Kind | Type | Direction | QoS | What it is |
 |---|---|---|---|---|---|
 | `/l2/cloud` | topic | `sensor_msgs/PointCloud2` | in | best effort | The driver's cloud, 10 Hz, ~4000 points (frame `l2_lidar`) |
-| `/l2/imu` | topic | `sensor_msgs/Imu` | in | best effort | The L2's IMU, ~250 Hz (frame `l2_imu`, which the driver hangs on `l2_lidar`). Its accelerometer's say is reported in `/lidar/status`; used for the tilt only with `lidar_tilt:=imu` (on 2026-11-12 it read 1.9 g at rest) |
+| `/l2/imu` | topic | `sensor_msgs/Imu` | in | depth 400 | The L2's IMU, ~250 Hz (checked live 2026-11-18: 250.6 Hz; frame `l2_imu`, which the driver hangs on `l2_lidar`). Its accelerometer's say is reported in `/lidar/status`; used for the tilt only with `lidar_tilt:=imu`. Its accelerometer reads ~1.9 g at rest (15.6 m/s^2 on x on 2026-11-18) -- the L2's own scale, not corrected |
 | `/lidar/cloud` | topic | `sensor_msgs/PointCloud2` | out | default | The same points in `l2_lidar`, which hangs on `openarm_body_link0` by the mount (static TF): RViz |
 | `/lidar/cloud_work` | topic | `sensor_msgs/PointCloud2` | out | default | Only the work area in front (x 0.15–1.5 m from the body): what goes to the octomap |
 | `/lidar/cloud_octomap` | topic | `sensor_msgs/PointCloud2` | out | default | What MoveIt's `l2_lidar` updater reads: the work clouds of 0.8 s after each `/octomap_gater/refresh` (octomap:=static), or every one (live) |
@@ -222,7 +244,7 @@ Rules:
 - All zeros on `held_object/size` = no object: nothing is attached.
 - The latest size is used for every pick until it changes.
 - While an arm holds a box, a new pick with that arm is refused. Send `held_object/release` (or press Release in the GUI) once the box is gone some other way.
-- The GUI's Dummy size toggle publishes 170 x 100 x 25 mm (`frame_id: dummy`) on this topic every second; turning it off publishes zeros.
+- The GUI's Dummy size publishes its H x W x D (`frame_id: dummy`) on this topic every second; turning it off publishes zeros. Since 2026-11-18 it is ON by default, keeps the last size across restarts, and sizes can be saved by name (Held object card: Save / the saved-sizes list / Delete) -- all in `calibration/held_sizes.json`. While it is on, it wins over the box model's measured size for what is attached.
 
 ### 1.8 `status` (out, JSON)
 
@@ -371,6 +393,10 @@ ros2 topic pub --once /beast_arm/held_object/size pick_interfaces/msg/ObjectSize
   "{header: {frame_id: wms}, height_mm: 170, width_mm: 100, depth_mm: 25}"
 ros2 topic echo /beast_arm/held_object/state
 ros2 topic pub --once /beast_arm/held_object/release std_msgs/msg/Empty
+# the GUI's fixed size, and the camera's measured one (source native/setup.bash first)
+ros2 topic echo /beast_arm/held_object/fixed_size --qos-durability transient_local
+ros2 service call /beast_arm/held_object/get_size std_srvs/srv/Trigger
+ros2 topic echo /beast_arm/box_model/box_size --qos-durability transient_local
 
 # poses
 ros2 topic pub --once /beast_arm/arm_state/cmd std_msgs/msg/String "{data: pre_pick}"
@@ -401,6 +427,29 @@ A typical sequence from another system:
 
 ---
 
+The obstacle box under the arms (2026-11-19; `robot/height_box.py`, started by terminal 1, `height_box:=off`: none; not under `/beast_arm`):
+
+| Name | Kind | Type | Direction | QoS | What it is |
+|---|---|---|---|---|---|
+| `/c60000004/vertical_distance` | topic | **`sensor_msgs/Range`** (a range sensor: `range` in m, x = range × 100 cm; ±inf or outside `min_range`..`max_range` = no reading, REP 117). Also taken: a number (cm), a string like `"45 cm"` | in | best effort (takes reliable too) | x. The type is the publisher's, looked up when it appears and again when it changes |
+| `/c60000004/vertical_distance` (pick stack) | topic | `sensor_msgs/Range` | in | best effort | Also read by the pick stack (`app/ctm/robot.py`): while x is 87–152 cm (`--no-drop-x`) a held box is let go at pre_pick instead of the drop pose, which would collide |
+| `/height_box/status` | topic | `std_msgs/String` (JSON) | out | latched, 1 Hz | `source` (`live` / `default`), `x_cm`, `gap_cm`, `top_z` (m, `openarm_body_link0`), `clamped`, `held_by` (`camera_link` / `l2_lidar_body` / an arm base), `limit_top_z`, `pieces`, `stand_holes` ([z lo, z hi, x lo, y lo, x hi, y hi]), `arm_in_box` (links), `subscribed`, `age_s` |
+| `height_box` | planning-scene object | box 0.20 x 0.60 x 0.28 m | out | | MoveIt and cuMotion plan round it. Its top is **152 - (x + 10) cm** below the arms' centre (0.0126, 0.0062, 0.7344), or **100 cm** when no value has come in for 3 s. It is centred under that point: 10 cm to the front and back, 30 cm to the left and right, 28 cm deep downward. It goes up round the stand (the aluminium column): it is sent in pieces round a hole that follows the stand's URDF shape layer by layer (~91% of the box kept at the foot), so the stand never counts as touching it. Only the camera, the LiDAR and the arm bases hold it down: its top stays 1.5 cm under the lowest of them over its footprint (the camera: top <= ~0.549 m, so x up to ~123.5 cm; above that `clamped`, `held_by`). Arm links inside it are named in `arm_in_box`: MoveIt and cuMotion will not plan from a start in collision. Until TF is up it stays under the stand's foot (z -0.01). See-through blue in RViz |
+
+```
+ros2 topic echo /height_box/status --qos-durability transient_local
+ros2 topic pub /c60000004/vertical_distance sensor_msgs/msg/Range "{header: {frame_id: c60000004_range}, radiation_type: 1, min_range: 0.0, max_range: 1.52, range: 0.45}" -r 5   # test: gap 97 cm
+ros2 launch robot/vertical_distance.launch.py value_cm:=45 mode:=fixed   # the stand-in publisher with a slider (robot/vertical_distance_pub.py): sensor_msgs/Range; fixed / sweep / off
+ros2 param set /height_box default_gap_cm 100.0      # also total_cm, offset_cm, size, arm_centre, timeout_s, max_top_z, rgba
+```
+
+The guard round the D455 (2026-11-19; `robot/camera_guard.py`, started by terminal 1, `camera_guard:=off`: none; not under `/beast_arm`):
+
+| Name | Kind | Type | Direction | QoS | What it is |
+|---|---|---|---|---|---|
+| `camera_guard` | planning-scene object | 6 boxes | out | | A see-through orange shell round the camera: 20 mm in front (7 mm off its face), 15 mm at each end, over its front lip and under its two ends. There are plates rather than one box because the camera sits half inside the body column (in the URDF), and a box over it would put the robot in collision with itself. It follows the camera's TF (sensor_align) and is checked against the body and the arm bases before every send: a plate within 3 mm of them is left out and logged. MoveIt and cuMotion plan round it (cuMotion did not know the camera at all before) |
+| `/camera_guard/status` | topic | `std_msgs/String` (JSON) | out | latched | `plates_sent`, `left_out` ([name, mm]), `nearest_robot_mm`, `camera_xyz` |
+
 ## 4. Launch options
 
 | Launch argument | Values | Default | Effect |
@@ -419,6 +468,9 @@ A typical sequence from another system:
 | `--held-min-g` (script) | g | `30` | Weight on the cup that counts as holding the box |
 | `--sweet-spot X Y` (script) | m | `0.45 0.10` | Where the picking arm works best; `base_adjust` brings the box there |
 | `model` | `true`, `false` | `true` | Start `box_model_node.py` |
+| `camera_guard` (terminal 1) | `on`, `off` | `on` | The see-through guard round the D455 |
+| `--no-drop-x MIN MAX` (script) | cm | `87 152` | x in this range: the box is let go at pre_pick, not at the drop pose (`0 0`: off) |
+| `height_box` (terminal 1) | `on`, `off` | `on` | The obstacle box under the arms from `/c60000004/vertical_distance` |
 | `click` (web GUI; `--click` on the script) | `true`, `false` | `false` | Click-only: no box model |
 | `host`, `port` (web GUI) | address, number | `0.0.0.0`, `8080` | Where the page listens |
 

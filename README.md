@@ -57,3 +57,5 @@ ros2 topic echo /beast_arm/arm_action/status
 | `log/` | colcon's build logs (`native/build_ws.sh`) |
 
 The modules under `ctm/` run from `app/`: `cd app && python3 -m ctm.board --live`.
+
+ros2 launch robot/vertical_distance.launch.py

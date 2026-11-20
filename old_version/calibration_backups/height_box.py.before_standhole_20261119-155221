@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""A box under the arms that rides up and down with /c60000004/vertical_distance
+(2026-11-19, the user): "a variable obstacle box that goes up and down based on the data
+from topic /c60000004/vertical_distance where it returns a value like x cm, the box is
+actual 152-(x+10) cm to the bottom of the arm ... 60 cm x 20 cm x 28 cm where 28 cm is
+the depth and 20 cm is 10 cm to the front and 10 cm to the back, similarly 60 cm is 30 to
+left and 30 to right ... if no value is being read then use default value of 100 cm from
+arm centre to the box".
+
+    gap (arm centre -> the box's top)  = total_cm - (x + offset_cm)       (152 - (x + 10))
+                                       = default_gap_cm (100) while no value comes in
+    the box: size [x 0.20, y 0.60, z 0.28] m, its top `gap` below arm_centre, centred under
+    it (10 cm in front / behind, 30 cm left / right), 28 cm deep downward.
+
+arm_centre = the middle of the two arms' bases (v10.urdf.xacro: x 0.0126, y +0.0572 /
+-0.0448, z 0.7344 in openarm_body_link0) -> (0.0126, 0.0062, 0.7344).
+
+Never into the robot: the body (URDF openarm_body_link0) stands from z 0 (its foot,
+25 x 19 cm, right under the arms) up to the shoulders, so a box centred under the arms
+whose top is above z 0 would be IN the robot -- MoveIt then calls every start state a
+collision and nothing moves. Its top stays at most max_top_z (-0.01: 1 cm under the foot,
+a gap of >= 74.4 cm); a value asking for more is held there and reported (clamped).
+
+The topic's type is whatever is published there (looked up when it appears): a number
+(std_msgs Float32/Float64/Int*; taken as cm), a string like "37.5 cm" / "375 mm" /
+"0.375 m" (no unit: cm), or sensor_msgs/Range (m). No value for timeout_s: the default.
+
+    -> the planning scene (MoveIt; cuMotion takes its objects with every plan): object
+       `height_box`, see-through (rgba), moved when its top changes by >= move_tol, again
+       every 30 s (a respawned move_group has forgotten it)
+    -> /height_box/status  JSON, latched, 1 Hz: source live/default, x_cm, gap_cm, top_z,
+       clamped, age_s
+"""
+import json
+import math
+import re
+import time
+
+import rclpy
+from geometry_msgs.msg import Pose
+from moveit_msgs.msg import CollisionObject, ObjectColor, PlanningScene
+from moveit_msgs.srv import ApplyPlanningScene
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from shape_msgs.msg import SolidPrimitive
+from std_msgs.msg import ColorRGBA, String
+
+OBJECT_ID = 'height_box'
+_UNIT = {'mm': 0.1, 'cm': 1.0, 'm': 100.0}
+
+
+def value_cm(msg):
+    """The distance a message carries, in cm, or None."""
+    if hasattr(msg, 'range') and isinstance(getattr(msg, 'range'), float):   # sensor_msgs/Range
+        return float(msg.range) * 100.0
+    v = getattr(msg, 'data', None)
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        return parse_cm(v)
+    return None
+
+
+def parse_cm(text):
+    """'37.5 cm' / '375mm' / '0.375 m' / '37.5' (cm) -> 37.5, else None."""
+    m = re.search(r'([-+]?\d+(?:\.\d+)?)\s*(mm|cm|m)?\b', text.strip().lower())
+    if not m:
+        return None
+    return float(m.group(1)) * _UNIT[m.group(2) or 'cm']
+
+
+def box_pose(gap_m, centre, size, max_top_z):
+    """(centre xyz of the box, its top z, clamped?) for a top `gap_m` below `centre`."""
+    top = centre[2] - gap_m
+    clamped = top > max_top_z
+    if clamped:
+        top = max_top_z
+    return (centre[0], centre[1], top - size[2] / 2.0), top, clamped
+
+
+class HeightBox(Node):
+    def __init__(self):
+        super().__init__('height_box')
+        p = self.declare_parameter
+        p('topic', '/c60000004/vertical_distance')
+        p('total_cm', 152.0)
+        p('offset_cm', 10.0)
+        p('default_gap_cm', 100.0)       # arm centre -> the box's top, while no value comes in
+        p('timeout_s', 3.0)              # no value this long: the default
+        p('size', [0.20, 0.60, 0.28])    # m: x front-back, y left-right, z its depth
+        p('arm_centre', [0.0126, 0.0062, 0.7344])
+        p('frame', 'openarm_body_link0')
+        p('max_top_z', -0.01)            # m: never higher (the body's foot is at z 0)
+        p('move_tol', 0.005)             # m: re-send when its top moves this much
+        p('rgba', [0.2, 0.55, 1.0, 0.35])
+        self.x_cm = None
+        self.t_value = 0.0
+        self.sub = None
+        self.sent_top = None
+        self.sent_t = 0.0
+        self.warned = None
+        self.warned_type = None
+        self.scene = self.create_client(ApplyPlanningScene, '/apply_planning_scene')
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             reliability=ReliabilityPolicy.RELIABLE)
+        self.pub_status = self.create_publisher(String, '/height_box/status', latched)
+        self.create_timer(2.0, self.find_topic)
+        self.create_timer(0.2, self.update)
+        self.create_timer(1.0, self.publish_status)
+        self.find_topic()
+        self.get_logger().info(
+            f"box {self.get_parameter('size').value} m under the arms, gap = "
+            f"{self.get_parameter('total_cm').value:g} - (x + {self.get_parameter('offset_cm').value:g}) cm "
+            f"from {self.get_parameter('topic').value} (default {self.get_parameter('default_gap_cm').value:g} cm)")
+
+    # -- the value -------------------------------------------------------------------
+
+    def find_topic(self):
+        """Subscribe once the topic exists, with the type it is published as."""
+        if self.sub is not None:
+            return
+        name = self.get_parameter('topic').value
+        types = dict(self.get_topic_names_and_types()).get(name)
+        if not types:
+            return
+        from rosidl_runtime_py.utilities import get_message
+        try:
+            cls = get_message(types[0])
+        except (AttributeError, ModuleNotFoundError, ValueError) as e:
+            if self.warned_type != types[0]:
+                self.warned_type = types[0]
+                self.get_logger().error(f'{name}: type {types[0]} not available here ({e}); default used')
+            return
+        qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)  # takes either kind
+        self.sub = self.create_subscription(cls, name, self.on_value, qos)
+        self.get_logger().info(f'{name}: {types[0]}')
+
+    def on_value(self, msg):
+        v = value_cm(msg)
+        if v is None or not math.isfinite(v):
+            return
+        self.x_cm = v
+        self.t_value = time.monotonic()
+
+    def gap(self):
+        """(gap m, source, x cm or None)."""
+        g = self.get_parameter
+        fresh = self.x_cm is not None and time.monotonic() - self.t_value <= float(g('timeout_s').value)
+        if not fresh:
+            return float(g('default_gap_cm').value) / 100.0, 'default', None
+        return (float(g('total_cm').value) - (self.x_cm + float(g('offset_cm').value))) / 100.0, \
+            'live', self.x_cm
+
+    # -- the box -----------------------------------------------------------------------
+
+    def current(self):
+        g = self.get_parameter
+        gap, source, x = self.gap()
+        size = [float(v) for v in g('size').value]
+        centre = [float(v) for v in g('arm_centre').value]
+        xyz, top, clamped = box_pose(gap, centre, size, float(g('max_top_z').value))
+        return dict(gap=gap, source=source, x=x, size=size, xyz=xyz, top=top, clamped=clamped)
+
+    def update(self):
+        if not self.scene.service_is_ready():
+            return
+        c = self.current()
+        now = time.monotonic()
+        if self.sent_top is not None and abs(c['top'] - self.sent_top) < float(
+                self.get_parameter('move_tol').value) and now - self.sent_t < 30.0:
+            return
+        if c['clamped'] and self.warned != 'clamped':
+            self.warned = 'clamped'
+            self.get_logger().warning(
+                f"gap {100 * c['gap']:.1f} cm would put the box into the robot's body: held "
+                f"with its top at z {c['top']:.3f}")
+        elif not c['clamped'] and self.warned == 'clamped':
+            self.warned = None
+        obj = CollisionObject()
+        obj.header.frame_id = self.get_parameter('frame').value
+        obj.id = OBJECT_ID
+        obj.operation = CollisionObject.ADD
+        obj.primitives.append(SolidPrimitive(type=SolidPrimitive.BOX, dimensions=c['size']))
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = (float(v) for v in c['xyz'])
+        pose.orientation.w = 1.0
+        obj.primitive_poses.append(pose)
+        scene = PlanningScene(is_diff=True)
+        scene.world.collision_objects = [obj]
+        rgba = [float(v) for v in self.get_parameter('rgba').value]
+        if len(rgba) == 4:
+            scene.object_colors = [ObjectColor(id=OBJECT_ID, color=ColorRGBA(
+                r=rgba[0], g=rgba[1], b=rgba[2], a=rgba[3]))]
+        self.sent_top, self.sent_t = c['top'], now
+        self.scene.call_async(ApplyPlanningScene.Request(scene=scene))
+
+    def publish_status(self):
+        c = self.current()
+        self.pub_status.publish(String(data=json.dumps({
+            'source': c['source'], 'x_cm': None if c['x'] is None else round(c['x'], 2),
+            'gap_cm': round(100 * c['gap'], 2), 'top_z': round(c['top'], 4),
+            'clamped': c['clamped'], 'subscribed': self.sub is not None,
+            'age_s': None if self.x_cm is None else round(time.monotonic() - self.t_value, 2)})))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = HeightBox()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

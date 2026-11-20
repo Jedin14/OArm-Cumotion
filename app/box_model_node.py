@@ -90,49 +90,14 @@ from std_msgs.msg import String
 from rclpy.qos import DurabilityPolicy, QoSProfile
 import tf2_ros
 
-from pick_interfaces.msg import PickTarget
+from pick_interfaces.msg import ObjectSize, PickTarget
 from pick_interfaces.srv import CheckPick, DetectTarget
 
-from ctm import box_match, depth_cal
+from ctm import depth_cal
 from ctm.common import BASE_FRAME, CALIB_DIR, INFO_TOPIC, TOOL_ARM, WS, matrix_from_quat
 
 TILT_FILE = os.path.join(CALIB_DIR, 'camera_tilt.yaml')   # the accelerometer's last tilt
 COMMANDS = ('set', 'pass', 'skip', 'reset', 'save', 'flag', 'settings')
-DEPTH_SAME_MM = 10.0     # a depth seen before is this box's when its W and H are this close
-
-
-def model_box_mm(size_mm, face_mm, long_world, approach, fallen=False):
-    """The grid picker's box (target.box_size_mm: W across, H up, D deep or None,
-    as its front faces stand) as PickTarget.box_mm defines it (2026-11-17):
-    mm along the gripped face's long edge, across it, into the box (0: the
-    depth not seen). Only for a FRONT pick of a box standing in the grid, whose
-    measured face is the W x H front within box_match's tolerance -- anything
-    else (a top, a fallen box, another size) is not known well enough to hang
-    on the tool. (box_mm or None, why not)."""
-    if not size_mm or len(size_mm) < 2 or size_mm[0] is None or size_mm[1] is None:
-        return None, 'no box size measured'
-    w, h = float(size_mm[0]), float(size_mm[1])
-    d = size_mm[2] if len(size_mm) > 2 else None
-    d = float(d) if d is not None and float(d) > 0 else 0.0
-    if w <= 0 or h <= 0:
-        return None, 'no box size measured'
-    if str(approach) != PickTarget.APPROACH_FRONT or fallen:
-        return None, 'not a front pick of a box in the grid'
-    # (a real PickTarget's face_mm is a numpy array: never `face_mm or ()`)
-    face = sorted((float(v) for v in (face_mm if face_mm is not None else ())), reverse=True)
-    if len(face) != 2 or face[1] <= 0:
-        return None, 'no face measured'
-    lw = np.asarray(long_world, float)
-    if lw.shape != (3,) or np.linalg.norm(lw) < 0.5:
-        return None, 'no face direction'
-    big, small = max(w, h), min(w, h)
-    ok = all(abs(f - v) <= max(box_match.TOL_MM, box_match.TOL_SHARE * v)
-             for f, v in ((face[0], big), (face[1], small)))
-    if not ok:
-        return None, (f'the face {face[0]:.0f} x {face[1]:.0f} mm is not the box\'s '
-                      f'{w:.0f} x {h:.0f} front')
-    level = abs(lw[2]) / np.linalg.norm(lw) < np.sqrt(0.5)   # its long edge mostly level
-    return ([w, h, d] if level else [h, w, d]), ''
 
 
 class BoxModelNode(Node):
@@ -159,9 +124,19 @@ class BoxModelNode(Node):
         # 2026-10-29). Needs enable_accel in the camera launch.
         import collections
         self.accel = collections.deque(maxlen=200)       # (monotonic time, vector, frame)
-        self.declare_parameter('accel_topic', '/camera/camera/accel/sample')
-        self.create_subscription(Imu, str(self.get_parameter('accel_topic').value),
-                                 self._on_accel, qos_profile_sensor_data, callback_group=cb)
+        # (comma-separated; the driver may send it on accel/sample or, accel and gyro united, on imu)
+        self.declare_parameter('accel_topic', '/camera/camera/accel/sample,/camera/camera/imu')
+        for topic in str(self.get_parameter('accel_topic').value).split(','):
+            if topic.strip():
+                self.create_subscription(Imu, topic.strip(), self._on_accel, qos_profile_sensor_data,
+                                         callback_group=cb)
+        # the box size entered in the robot's GUI (the pick stack's, latched): order grid's layers
+        # need its depth, and it doesn't pick without it (18 Nov 2026). Read only.
+        self.box_size = None
+        self.declare_parameter('box_size_topic', '/beast_arm/held_object/fixed_size')
+        self.create_subscription(ObjectSize, str(self.get_parameter('box_size_topic').value), self._on_box_size,
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+                                 callback_group=cb)
         self._up_said = None
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -182,10 +157,6 @@ class BoxModelNode(Node):
         self.settings_pub = self.create_publisher(String, f'{ns}/box_model/settings', latched)
         self.settings = {}                               # the picker's, from its last answer
         self.last_cmd = None                             # the last box_model/cmd and its answer
-        # (W, H, D) mm: the last depth the grid picker measured, for a later look
-        # that could not (one layer, no side face) at a box of the same front
-        # (2026-11-17; this session only)
-        self.depth_seen = None
         self.saved_up = self._load_tilt()                # (up, deg, when) or None
         self.tilt = {'source': 'tf', 'deg': None}        # what the last request used
         import queue
@@ -214,6 +185,14 @@ class BoxModelNode(Node):
             self.restart_lock = threading.Lock()
             self._stop_orphans()
             threading.Thread(target=self._load_picker, daemon=True).start()
+
+    def _on_box_size(self, msg):
+        size = (float(msg.height_mm), float(msg.width_mm), float(msg.depth_mm))
+        size = size if all(v > 0 for v in size) else None
+        if size != self.box_size:
+            self.get_logger().info('box size: ' + ('not set (a side is 0)' if size is None else
+                                   '%.0f high x %.0f wide x %.0f deep mm' % size) + f' ({msg.header.frame_id})')
+        self.box_size = size
 
     def _on_accel(self, msg):
         a = msg.linear_acceleration
@@ -499,49 +478,9 @@ class BoxModelNode(Node):
             'boxes': ans.get('boxes') or [], 'took': ans.get('took'),
             'seconds': ans.get('seconds'), 'tilt': self.tilt,
             'target': ({k: t.get(k) for k in ('u', 'v', 'x_m', 'y_m', 'z_m', 'approach', 'size_mm',
-                                               'agreeing', 'frames', 'num_boxes')} if t else None),
-            'plan': self._plan_world(ans)})))
+                                               'agreeing', 'frames', 'num_boxes')} if t else None)})))
         self.last_answer = ans
         self._take_settings(ans)
-
-    def _plan_world(self, ans):
-        """The picker's "plan" (2026-11-18: the boxes after the target, in its order) in the
-        world frame, as the target is put there (the depth check, the camera's tf): [{xyz,
-        u, v, approach, size_mm, fallen, cell, box, normal, long, face_mm}] -- PICK ALL
-        takes them without asking again while the scene is unchanged. [] when there is none
-        or it cannot be placed."""
-        plan = ans.get('plan') or []
-        if not plan:
-            return []
-        try:
-            with self.lock:
-                info = self.info
-            world = str(self.get_parameter('world_frame').value)
-            t_wo = self.lookup(world, info.header.frame_id) if info is not None else None
-            if t_wo is None:
-                return []
-            coef = depth_cal.load()
-            out = []
-            for q in plan:
-                p = np.array([q['x_m'], q['y_m'], q['z_m']], float)
-                if coef is not None and p[2] > 0:
-                    a, b, c, e = coef
-                    xn, yn = p[0] / p[2], p[1] / p[2]
-                    z = p[2] * (1 + a) + b + c * xn + e * yn
-                    p = np.array([xn * z, yn * z, z])
-                w = t_wo[:3, :3] @ p + t_wo[:3, 3]
-                face = q.get('face') or {}
-                rot = lambda key: ([round(float(v), 4) for v in t_wo[:3, :3] @ np.asarray(face[key], float)]
-                                   if face.get(key) is not None else None)
-                out.append({'xyz': [round(float(v), 4) for v in w], 'u': q.get('u'), 'v': q.get('v'),
-                            'approach': q.get('approach'), 'size_mm': q.get('size_mm'),
-                            'fallen': q.get('fallen'), 'cell': q.get('cell'), 'box': q.get('box'),
-                            'normal': rot('normal'), 'long': rot('long'),
-                            'face_mm': face.get('size_mm')})
-            return out
-        except Exception as exc:                         # noqa: BLE001 - an extra: never the detection
-            self.get_logger().warn(f'the picker\'s plan not placed ({exc})')
-            return []
 
     def _publish_image(self, path, img, pub=None):
         """An image (or the file at path) on box_model/image, or on `pub`."""
@@ -605,56 +544,12 @@ class BoxModelNode(Node):
                     self.picker is None or self.picker.poll() is not None:
                 return False, 'the box picker is not running', {}
             self._drain()
-            try:
-                self.picker.stdin.write(text + '\n')
-                self.picker.stdin.flush()
-            except BrokenPipeError:
-                # its pipe is gone (2026-11-16 17:40:44: "skip failed: Broken pipe"
-                # twice, then PICK ALL stopped): started again, as detect_picker
-                # does -- not the command: the new picker has no last box to skip,
-                # and its skipped / passed lists start empty
-                restarted = self._restart_picker(f'"{cmd}": Broken pipe', text)
-                return False, ('the box picker had stopped (Broken pipe) - ' + (
-                    'picker restarted - skip lists lost (skipped boxes may be offered again)'
-                    if restarted else f'it did not start again: {self.load_error}')), \
-                    {'restarted': restarted}
+            self.picker.stdin.write(text + '\n')
+            self.picker.stdin.flush()
             ans = self._picker_line(30.0 if cmd == 'save' else 10.0, key='cmd')
         if ans is None:
             return False, 'the box picker did not answer', {}
         return bool(ans.get('ok')), str(ans.get('message', '')), ans
-
-    def _restart_picker(self, why, text=''):
-        """The picker started again after its pipe broke (2026-11-17) -- the old
-        process killed first (each holds ~4 GB of GPU memory) and its reader's
-        end read, so it cannot end the new one's queue. True if it runs again.
-        Says so on box_model/settings first: a restart takes up to ~2 min and
-        the GUI waits 5 s for a command's answer."""
-        import queue
-        self.last_cmd = {'text': text, 'ok': False, 'time': time.time(),
-                         'message': 'the box picker had stopped (Broken pipe) - restarting it; '
-                                    'skip lists lost', 'path': None, 'photos': None}
-        self._publish_settings()
-        with self.restart_lock:
-            old = self.picker
-            if old is not None and old.poll() is None:
-                try:
-                    old.kill()
-                    old.wait(timeout=5.0)
-                except Exception:                        # noqa: BLE001 - gone either way
-                    pass
-            deadline = time.monotonic() + 3.0            # the old reader's last word: None
-            while time.monotonic() < deadline:
-                try:
-                    if self.lines.get(timeout=0.2) is None:
-                        break
-                except queue.Empty:
-                    continue
-                except AttributeError:                   # (no reader yet)
-                    break
-            self.get_logger().warn(f'the box picker had stopped ({why}) - starting it again; '
-                                   f'its skip lists are lost')
-            self._load_picker()
-        return self.picker is not None and self.picker.poll() is None and not self.load_error
 
     def detect_picker(self):
         """pick_server.py's answer, into the world frame: (found, message, target)."""
@@ -684,7 +579,8 @@ class BoxModelNode(Node):
                      'may lose to fronts')
         # (a saved tilt is marked: a live reading sent with the frames goes before it)
         self.picker.stdin.write('pick' + ('' if up is None else ' %.5f %.5f %.5f' % tuple(up)) +
-                                (' saved' if up is not None and source != 'accelerometer' else '') + '\n')
+                                (' saved' if up is not None and source != 'accelerometer' else '') +
+                                ('' if self.box_size is None else ' box %.0f %.0f %.0f' % self.box_size) + '\n')
         self.picker.stdin.flush()
         ans = self._picker_line(60.0)
         if ans is None:
@@ -701,6 +597,8 @@ class BoxModelNode(Node):
                          'deg': round(float(np.degrees(np.arcsin(np.clip(-u[2], -1, 1)))), 1)}
         self._publish_overlay(ans)
         t = ans.get('target')
+        if not t and ans.get('why'):                     # e.g. no box size (order grid doesn't pick without it)
+            return False, f'no box to pick - {ans["why"]} ({ans.get("seconds", "?")} s)', PickTarget()
         if not t:
             # say what is in view: "no box" with a box in the picture read as a fault
             # (2026-11-06: the one left was skipped, out of reach)
@@ -755,11 +653,6 @@ class BoxModelNode(Node):
         target.image_width = int(info.width) if info is not None else 0
         target.image_height = int(info.height) if info is not None else 0
         target.num_boxes = int(t.get('num_boxes', 0))
-        try:                                             # target.box_mm (2026-11-17)
-            boxed = self._box_of(t, ans, target)
-        except Exception as exc:                         # noqa: BLE001 - an extra: never the detection
-            target.box_mm = [0.0, 0.0, 0.0]
-            boxed = f'; box size not used ({exc})'
         self.target_pub.publish(target)
         size = t.get('size_mm') or ['?', '?']
         # pick_rules.py: a box on a box with only its top found is picked by it as a last
@@ -771,38 +664,7 @@ class BoxModelNode(Node):
         return True, (f'{target.approach}, {agreeing} of {frames} frames agree, face '
                       f'{size[0]} x {size[1]} mm, {target.num_boxes} boxes seen, at '
                       f'x={position[0]:+.3f} y={position[1]:+.3f} z={position[2]:+.3f} '
-                      f'({ans.get("seconds", "?")} s){top_only}{boxed}'), target
-
-    def _box_of(self, t, ans, target):
-        """target.box_mm from the grid picker's measured box (2026-11-17: it was
-        dropped here, and a box on the cup was never in the planners): its
-        target's box_size_mm [W, H, D or null] (else the answer's), turned onto
-        the gripped face (model_box_mm). An unseen depth is taken from an
-        earlier look at a box of the same front (within DEPTH_SAME_MM), else
-        left 0 -- the pick stack then assumes a deep box. A note for the
-        message ('' when the picker gave no size)."""
-        size = t.get('box_size_mm') or ans.get('box_size_mm')
-        if not isinstance(size, (list, tuple)) or len(size) < 2:
-            return ''
-        try:
-            w, h = float(size[0]), float(size[1])
-            d = float(size[2]) if len(size) > 2 and size[2] is not None else 0.0
-        except (TypeError, ValueError):
-            return ''
-        how = ''
-        if d > 0:
-            self.depth_seen = (w, h, d)
-        elif self.depth_seen is not None and abs(w - self.depth_seen[0]) <= DEPTH_SAME_MM \
-                and abs(h - self.depth_seen[1]) <= DEPTH_SAME_MM:
-            d, how = self.depth_seen[2], ', depth from an earlier look'
-        long_w = [target.face_long.x, target.face_long.y, target.face_long.z]
-        box, why = model_box_mm([w, h, d], target.face_mm, long_w, target.approach,
-                                bool(t.get('fallen')))
-        text = f'; box {w:.0f} x {h:.0f} x {f"{d:.0f}" if d > 0 else "?"} mm{how}'
-        if box is None:
-            return f'{text} (not for the tool: {why})'
-        target.box_mm = [float(v) for v in box]
-        return text
+                      f'({ans.get("seconds", "?")} s){top_only}'), target
 
     # -- the pick check -----------------------------------------------------------
 

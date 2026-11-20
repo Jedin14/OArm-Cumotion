@@ -26,33 +26,60 @@ Requests, one line each; every answer carries "settings":
     pick ux uy uz [saved]  the same, with the up direction (colour camera frame) of now;
               "saved": the accelerometer's saved reading, so one sent with the frames
               (ros_bridge.py's) goes first; without any, the --pitch one (the TF)
+    pick ... box H W D   with the box size (height, width, depth mm: the node reads
+              /beast_arm/held_object/fixed_size, the size entered in the robot's GUI).
+              Order grid uses its depth for the layers (box_picker/v1/grid_order.py, 18 Nov
+              2026) and doesn't pick without it: no target, "why": "box size not set ..."
     check [held|empty]   after the pick, with the arm out of the view: the
               result of the pick check (2026-11-11: the Pick Check team's new one,
-              box_picker/src/pick_watch.py). From the "pick" on, a thread feeds it
-              every camera frame: the target's pick face (arm in front of it, still
-              there, gone), then once the box has left its spot the whole view, until
-              it settles. "check" waits for its decision, up to CHECK_WAIT_S ->
+              pick_watch.py: box_picker/v1's when there, else box_picker/src's). From the
+              "pick" on, a thread feeds it every camera frame: the target's pick face (arm
+              in front of it, still there, gone), then once the box has left its spot the
+              whole view, until it settles. Its reference is all the pick's frames (pixels
+              whose depth flickers between them are not compared), and with the robot's box
+              size the face must read most of the box's thinnest side further back to be gone.
+              "check" also tells it the robot's arm is out of the view (19 Nov 2026): it then
+              decides on what it sees within a second -- still there: missed (also if the arm
+              was never seen); pushed back or tipped: moved; gone: picked unless a new surface
+              stands in the carton -- instead of waiting for the arm to be seen leaving. A
+              missed / moved decided before the "check" is not final (the robot can press
+              again): it keeps watching. "check" waits for the decision, up to CHECK_WAIT_S ->
               {"check": verdict, "picked": true / false / null, "message", "title",
               "why", "outline" (the target's polygon), "overlay" (the newest frame,
               clean), "picker_view" (the check's picture: the pick face in the
               result's colour, where a dropped box fell outlined), "frames"}.
               verdict["outcome"]: "success" (left its spot, then nothing new stayed
-              in view), "missed" (the arm came and went, the box is still there),
-              "moved" (knocked or dragged), "dropped" (left its spot, then a new
-              surface stood still in the carton: it fell back in), "blocked" (no
-              decision yet: null). held / empty, the gripper's word, wins over the
-              camera: held -> "success", empty -> "dropped". A success forgets the
-              passed boxes. check_frames is no longer used (kept for the GUI)
-    set NAME VALUE       frames (1-15), check_frames (1-10), score (0.20-0.90),
+              in view), "missed" (the box is still there), "moved" (pushed, knocked or
+              dragged), "dropped" (left its spot, then a new surface stood still in the
+              carton: it fell back in), "camera_moved" (most of the view changed: null),
+              "blocked" (no decision yet: null; "why" says what it waits for, e.g. something
+              reaching in from the picture's edge). held / empty, the gripper's word, wins
+              over the camera: held -> "success", empty -> "dropped"; and when the box left
+              its spot but the view did not settle, it decides. verdict also has what the
+              camera saw: "status", "detail" (the face's shares, where it reads, the change at
+              the picture's edge), "timeline" (each change of status, s from the "pick"),
+              "provisional", "fps", "gone_mm", "log" (the folder with it all: below). A
+              success forgets the passed boxes. check_frames is no longer used (kept for the GUI)
+
+              Every check is saved in <out>/<run>/checks/NNN_HHMMSS_<outcome>/ (the last
+              KEEP_CHECKS): verdict.json, timeline.txt, trace.jsonl (every frame: the face's
+              shares, the state, the change at the edge), a picture at each change of status
+              (key_*.jpg, with its depth *_depth.png, mm), the pick's frames (ref_*_depth.png,
+              ref_color.jpg) and face.npz; with --record-checks (or "set record on") also every
+              frame watched (frames/), to replay it (replay_check.py in box_picker/v1, the repository's box_picking/v1)
+    set NAME VALUE       record (on / off: every frame of each pick check saved, as
+              --record-checks), frames (1-15), check_frames (1-10), score (0.20-0.90),
               order (grid / v1 / v2: see below), top_faces (on / off: pick_rules.py -- off, a box
               on a box by its front, a top only as a last resort, "top_only";
               on, the larger of front and top anywhere, as before 5 Nov 2026):
               from the next pick / check on
-    pass      the last target, and every box under it, is passed over until the
-              next successful pick (pick_loop's T); with no other box left, the
-              first again
-    skip      the last target is never chosen again (until reset), but still
-              blocks the boxes behind and under it
+    pass      the last target is passed over until the next successful pick
+              (pick_loop's T); with no other box left, the first again
+    skip      the last target is never chosen again (until reset)
+              Order grid (the default): only that box is left out, so the next
+              target is the one that would be picked if it wasn't there (the box
+              under it can be next). Orders v1 / v2 (the old picker): the boxes
+              under and behind it are left out too
     reset     forget the skipped and passed boxes
     save [ux uy uz]  the newest colour + depth, as rgbd.save (pick_pipeline
               --capture reads it), in <out>/snapshots/ -> {"path"}
@@ -77,8 +104,11 @@ the carton in front is picked from). "set order v1" goes back to the old picker.
     .venv/bin/python ../../box_picker_server.py --pitch -4.5 --ros --overlay /tmp/x.jpg
 """
 import argparse
+import importlib.util
 import json
 import os
+import queue
+import shutil
 import sys
 import threading
 import time
@@ -89,15 +119,19 @@ import numpy as np
 LIMITS = {"frames": (1, 15, int), "check_frames": (1, 10, int), "score": (0.2, 0.9, float)}
 RED = (0, 0, 255)                                       # BGR, the target, as the picker draws it
 CHECK_WAIT_S = 15.0      # "check" waits this long for the pick check's decision (the node waits 20 s)
+KEEP_CHECKS = 30         # the last this many checks are kept in <out>/<run>/checks/
+KEY_FRAMES = 12          # pictures kept per pick check: at each change of status (and the decision)
 # The new pick check's results, in the old check's words (box_model_node / the GUI read "outcome"):
 # outcome -> (picked, title, why, colour BGR)
 RESULT = {"success": (True, "PICK SUCCESS", "the box left its spot and the camera's view", (0, 200, 0)),
-          "missed": (False, "PICK FAILED: MISSED", "the arm came and went, the box is still there", (0, 0, 255)),
-          "moved": (False, "PICK FAILED: BOX MOVED", "the box was knocked or dragged, not picked", (0, 0, 255)),
+          "missed": (False, "PICK FAILED: MISSED", "the box is still there", (0, 0, 255)),
+          "moved": (False, "PICK FAILED: BOX MOVED", "the box was pushed, knocked or dragged, not picked", (0, 0, 255)),
           "dropped": (False, "PICK FAILED: DROPPED", "the box was lifted but fell back into the carton", (0, 0, 255)),
-          "blocked": (None, "CAN'T TELL YET", "the pick check has not decided: arm still in view, "
-                                                "or the box has not left its spot", (0, 165, 255))}
-OUTCOME = {"picked": "success", "missed": "missed", "moved": "moved", "dropped": "dropped"}
+          "camera_moved": (None, "CAN'T TELL: CAMERA MOVED", "most of the view changed since before the pick: "
+                                                               "the camera or the robot moved", (0, 165, 255)),
+          "blocked": (None, "CAN'T TELL YET", "the pick check has not decided", (0, 165, 255))}
+OUTCOME = {"picked": "success", "missed": "missed", "moved": "moved", "dropped": "dropped",
+           "camera_moved": "camera_moved"}
 
 
 def reply(obj):
@@ -171,26 +205,84 @@ class LockedCamera:
         return getattr(self._cam, name)
 
 
-class Watch(threading.Thread):
-    """The pick check on every camera frame, from the "pick" until it has decided."""
-    def __init__(self, cam, watcher):
+class Recorder(threading.Thread):
+    """Every frame a pick check watches, written to <folder>/frames/ by its own thread (colour
+    .jpg, depth .png in mm; NNNNN_<s from the pick>), to replay it (replay_check.py). Frames that
+    come while the disk is behind are left out (counted)."""
+    def __init__(self, folder):
         super().__init__(daemon=True)
-        self.cam, self.watcher = cam, watcher
+        self.folder = os.path.join(folder, "frames")
+        os.makedirs(self.folder, exist_ok=True)
+        self.q, self.k, self.left_out = queue.Queue(maxsize=90), 0, 0
+        self.start()
+
+    def put(self, t, colour, depth):
+        self.k += 1
+        try:
+            self.q.put_nowait((self.k, t, colour, depth))
+        except queue.Full:
+            self.left_out += 1
+
+    def close(self):
+        self.q.put(None)
+
+    def run(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                break
+            k, t, colour, depth = item
+            p = os.path.join(self.folder, f"{k:05d}_{t:08.3f}")
+            cv2.imwrite(p + "_color.jpg", colour, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            cv2.imwrite(p + "_depth.png", np.clip(depth * 1000, 0, 65535).astype(np.uint16))
+
+
+class Watch(threading.Thread):
+    """The pick check on every camera frame, from the "pick" until it has decided.
+    arm_out (set by "check"): the robot's arm is out of the view -- the watcher then decides on
+    what it sees. Before it, a missed / moved is not final (the robot can press again): the
+    watcher is reopened and keeps watching. keyframes: (s, status, colour, depth) at each change
+    of status. ctx: what the target was found with (for the check's log)."""
+    def __init__(self, cam, watcher, ctx=None, record=None):
+        super().__init__(daemon=True)
+        self.cam, self.watcher, self.ctx, self.record = cam, watcher, ctx or {}, record
         self.result = self.error = self.last = None
         self.frames, self.stopped, self.done = 0, False, threading.Event()
         self.started = time.time()
+        self.arm_out, self.arm_out_at, self.decided_at = False, None, None
+        self.keyframes = []
+        self.new = hasattr(watcher, "reopen")            # pick_watch.py of 19 Nov 2026 or newer
 
     def run(self):
+        said = None
         try:
             while not self.stopped:
                 colour, depth = self.cam.read()
+                now = time.time()
                 self.last, self.frames = (colour, depth), self.frames + 1
-                self.result = self.watcher.update(depth, self.cam.intr)
-                if self.result is not None:
-                    break
+                if self.new:
+                    result = self.watcher.update(depth, self.cam.intr, now, arm_out=self.arm_out)
+                else:
+                    result = self.watcher.update(depth, self.cam.intr)
+                if self.record is not None:
+                    self.record.put(now - self.started, colour, depth)
+                status = self.watcher.status
+                if status != said and len(self.keyframes) < KEY_FRAMES:
+                    self.keyframes.append((round(now - self.started, 2), status, colour, depth))
+                said = status
+                if result is None:
+                    continue
+                if self.new and result in ("missed", "moved") and not self.arm_out:
+                    self.watcher.reopen(result)          # not final: the robot's "check" decides
+                    continue
+                self.keyframes.append((round(now - self.started, 2), f"decided: {result}", colour, depth))
+                self.result, self.decided_at = result, now
+                break
         except Exception as exc:                         # noqa: BLE001 - told at the next "check"
             self.error = exc
         finally:
+            if self.record is not None:
+                self.record.close()
             self.done.set()
 
     def stop(self):
@@ -240,11 +332,11 @@ class Orders:
     def best_frame(self):
         return self.used.best_frame
 
-    def detect_frames(self, frames, intr, up, avoid=()):
+    def detect_frames(self, frames, intr, up, avoid=(), box_size=None):
         if self.order == "grid":
             self.used = self.grid
-        else:
-            self.old.order, self.used = self.order, self.old
+            return self.grid.detect_frames(frames, intr, up, avoid=avoid, box_size=box_size)
+        self.old.order, self.used = self.order, self.old
         return self.used.detect_frames(frames, intr, up, avoid=avoid)
 
     def annotate(self, color):
@@ -295,18 +387,44 @@ class Server:
         self.watch = None                                # the pick check's thread for the last pick
         self.before, self.before_up = None, up          # the last pick, for "check"
         self.skipped, self.passed = [], []              # outlines never / not now chosen (avoid)
+        self.box_size = None                             # the robot's box size (height, width, depth mm), per pick
         self.picker_img = self.crop = self.check_img = None
         self.flags = 0
         self.up_from_accel = lambda a: np.asarray(a, float) / np.linalg.norm(a)   # (faces.up_from_accel)
         base = os.path.splitext(args.overlay)[0]
         self.paths = {k: f"{base}_{k}.jpg" for k in ("picker", "crop", "check")}
         self.out = os.path.join(os.path.abspath(args.out), time.strftime("%Y-%m-%d_%H%M%S"))
+        self.checks = 0                                  # picks watched: their logs in <out>/checks/
+        self.record = bool(getattr(args, "record_checks", False))
+
+    def new_watcher(self, face, depth, mask, refs, box_mm):
+        """The pick check for a target: with all the pick's frames and the box's size (pick_watch.py
+        of 19 Nov 2026), or as before with an older pick_watch.py."""
+        try:
+            return self.pw.PickWatcher(face, depth, mask, refs=refs, box_mm=box_mm)
+        except TypeError:
+            print("pick_watch.py is older than 19 Nov 2026: the check uses one frame and no box size",
+                  file=sys.stderr)
+            return self.pw.PickWatcher(face, depth, mask)
+
+    def pick_folder(self):
+        """The folder for this pick's check log, <out>/<run>/checks/NNN_HHMMSS (made when first
+        written); the oldest are removed so that only the last KEEP_CHECKS stay."""
+        root = os.path.join(self.out, "checks")
+        try:
+            old = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))
+            for d in old[:max(0, len(old) - KEEP_CHECKS + 1)]:
+                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+        except OSError:
+            pass
+        return os.path.join(root, f"{self.checks:03d}_{time.strftime('%H%M%S')}")
 
     def settings(self):
         a = self.args
         return {"frames": a.frames, "check_frames": a.check_frames, "score": round(a.score, 2),
                 "order": self.detector.order, "top_faces": bool(getattr(self.detector, "top_faces", False)),
-                "skipped": len(self.skipped), "passed": len(self.passed)}
+                "skipped": len(self.skipped), "passed": len(self.passed),
+                "box_size": getattr(self, "box_size", None), "record": getattr(self, "record", False)}
 
     def write(self, key, img):
         if img is None:
@@ -328,6 +446,15 @@ class Server:
         frames, else the one from --pitch (the TF)."""
         args, detector, cam = self.args, self.detector, self.cam
         self.stop_watch()
+        self.box_size = None                             # "box H W D" at the end: the robot's box size
+        if "box" in words:
+            k = words.index("box")
+            try:
+                size = [float(v) for v in words[k + 1:k + 4]]
+                self.box_size = size if len(size) == 3 and all(v > 0 for v in size) else None
+            except ValueError:
+                pass
+            words = words[:k]
         saved = words[3:4] == ["saved"]                  # the node's saved reading, not a live one
         given = up_of(words[:3]) if words else None
         t0 = time.time()
@@ -340,17 +467,44 @@ class Server:
             given = None                                 # live, with the frames: before a saved one
         up_now, up_source = ((given, "given") if given is not None else
                              (camera, "camera") if camera is not None else (self.up, "pitch"))
-        result = detector.detect_frames(frames, cam.intr, up_now, avoid=self.skipped + self.passed)
+        if detector.order == "grid" and self.box_size is None:   # no box size: no pick (18 Nov 2026)
+            self.before = None
+            if frames:
+                cv2.imwrite(args.overlay, frames[-1][0])
+            return {"target": None, "boxes": [], "face": None, "overlay": args.overlay if frames else None,
+                    "size": [int(frames[0][0].shape[1]), int(frames[0][0].shape[0])] if frames else None,
+                    "carton": None, "picker_view": None, "close_up": None,
+                    "why": "box size not set: enter it in the robot's GUI (/beast_arm/held_object/fixed_size)",
+                    "took": {"pictures": round(t1 - t0, 2), "picker": 0.0},
+                    "up": [round(float(v), 5) for v in up_now], "up_source": up_source,
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"), "seconds": round(time.time() - t0, 2)}
+        size = self.box_size if detector.order == "grid" else None
+        result = detector.detect_frames(frames, cam.intr, up_now, avoid=self.skipped + self.passed, box_size=size)
         if result is None and self.passed:                # no box after the passed ones: the first again
             self.passed.clear()
-            result = detector.detect_frames(frames, cam.intr, up_now, avoid=self.skipped)
+            result = detector.detect_frames(frames, cam.intr, up_now, avoid=self.skipped, box_size=size)
         t2 = time.time()
         self.before, self.before_up = None, up_now
         if result is not None and detector.last is not None and detector.last[2] is not None:
             box = detector.last[1][detector.last[2]]
             self.before = Target(box.mask.copy(), result)
-            # The pick check, from the depth of the frame the target came from, on every frame from now on.
-            self.watch = Watch(cam, self.pw.PickWatcher(box.pick, frames[detector.best_frame or 0][1], box.mask))
+            # The pick check, on every frame from now on: against the frame the target came from and the
+            # pick's other frames (a pixel whose depth flickers between them is not compared), with the
+            # robot's box size (how far back the face must read to be gone).
+            best = detector.best_frame or 0
+            refs = [f[1] for i, f in enumerate(frames) if i != best]
+            self.checks += 1
+            ctx = {"n": self.checks, "face": box.pick, "mask": box.mask, "frames": frames, "best": best,
+                   "box_size": self.box_size, "intr": cam.intr, "target": result, "folder": self.pick_folder(),
+                   "checks": 0}
+            record = None
+            if self.record:
+                try:
+                    record = Recorder(ctx["folder"])
+                except OSError as exc:
+                    print(f"record: {exc}", file=sys.stderr)
+            self.watch = Watch(cam, self.new_watcher(box.pick, frames[best][1], box.mask, refs, self.box_size),
+                               ctx, record)
             self.watch.start()
         self.picker_img = self.crop = None
         boxes, overlay, face = [], None, None
@@ -415,41 +569,11 @@ class Server:
             overlay = args.overlay
         size = [int(frames[0][0].shape[1]), int(frames[0][0].shape[0])] if frames else None
         carton = detector.carton() if hasattr(detector, "carton") else None
-        plan = self.plan_after(detector, result, boxes, cam.intr)
-        return {"target": result, "boxes": boxes, "face": face, "plan": plan, "overlay": overlay, "size": size, "carton": carton,
+        return {"target": result, "boxes": boxes, "face": face, "overlay": overlay, "size": size, "carton": carton,
                 "picker_view": self.write("picker", self.picker_img), "close_up": self.write("crop", self.crop),
                 "took": {"pictures": round(t1 - t0, 2), "picker": round(t2 - t1, 2)},
                 "up": [round(float(v), 5) for v in up_now], "up_source": up_source,
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"), "seconds": round(time.time() - t0, 2)}
-
-    @staticmethod
-    def plan_after(detector, result, boxes, intr):
-        """Order grid (2026-11-18): the picks AFTER the target, in the order, each with what
-        the robot needs to go for it without asking again -- PICK ALL takes them one by one
-        while the scene stays as it was (only the picked box gone): {"x_m", "y_m", "z_m"
-        (camera), "u", "v", "approach", "size_mm", "fallen", "cell", "box" (its index in
-        "boxes", for its outline), "face" (face_axes)}. [] for other orders or no target."""
-        if result is None or not hasattr(detector, "grid_picks"):
-            return []
-        grid = detector.grid_picks()
-        if not grid:
-            return []
-        out = []
-        for i, (k, p) in sorted(grid.items(), key=lambda kv: kv[1][0]):
-            if k == 0:
-                continue                                    # the target itself
-            try:
-                face = face_axes(p["face_obj"], intr) if p.get("face_obj") is not None else None
-            except Exception:                               # noqa: BLE001 - then no face axes
-                face = None
-            out.append({"x_m": round(float(p["xyz"][0]), 4), "y_m": round(float(p["xyz"][1]), 4),
-                        "z_m": round(float(p["xyz"][2]), 4), "u": round(float(p["uv"][0]), 1),
-                        "v": round(float(p["uv"][1]), 1), "approach": p["face"],
-                        "size_mm": [round(float(v)) for v in p["size_mm"]],
-                        "fallen": bool(p["fallen"]),
-                        "cell": None if p.get("cell") is None else [int(c) + 1 for c in p["cell"]],
-                        "box": int(i) if 0 <= int(i) < len(boxes) else None, "face": face})
-        return out
 
     # -- check ----------------------------------------------------------------------
 
@@ -467,21 +591,46 @@ class Server:
             return {"check": None, "picked": None,
                     "message": "nothing to check: no box was chosen by the last pick"}
         holding = {"held": True, "empty": False}.get(words[0]) if words else None
+        asked = time.time()
+        before_check = watch.result is not None          # decided while the robot was still at it
+        # The robot asks once its arm is back out of the view (pre_pick): the watcher now decides on
+        # what it sees, instead of waiting for the arm to be seen leaving.
+        watch.arm_out = True
+        if watch.arm_out_at is None:
+            watch.arm_out_at = asked
         watch.done.wait(CHECK_WAIT_S)
         if watch.error is not None:
             raise watch.error                            # the camera failed: the node restarts the picker
         w = watch.watcher
-        outcome = OUTCOME[watch.result] if watch.result is not None else "blocked"
+        outcome = OUTCOME.get(watch.result, "blocked") if watch.result is not None else "blocked"
+        by_gripper = False
+        if outcome == "blocked" and holding is not None and getattr(w, "left", False) and w.drop is None:
+            # the box left its spot, the view did not settle (something stays at the picture's edge):
+            # the gripper's word decides
+            outcome, by_gripper = ("success" if holding else "dropped"), True
         if holding is True and outcome == "dropped":     # the gripper holds it: trust the gripper
             outcome = "success"
         elif holding is False and outcome == "success":  # gone from the view, but not in the gripper
             outcome = "dropped"
         picked, title, why, _ = RESULT[outcome]
-        if watch.result is None:
-            why += f" ({w.status})"
-        verdict = {"outcome": outcome, "check": "pick_watch", "status": w.status, "holding": holding,
-                   "seconds": None if watch.result is None else round(time.time() - watch.started, 1),
-                   "shift_mm": None if w.shift is None else round(w.shift * 1000)}
+        detail = getattr(w, "detail", w.status)
+        if watch.result is None and not by_gripper:
+            why += f" in {CHECK_WAIT_S:.0f} s: {detail}"
+        elif by_gripper:
+            why += f" (the gripper says {'held' if holding else 'empty'}; the camera: {w.status})"
+        ctx = watch.ctx
+        verdict = {"outcome": outcome, "check": "pick_watch", "status": w.status, "detail": detail,
+                   "holding": holding, "by_gripper": by_gripper,
+                   "seconds": None if watch.result is None else round(watch.decided_at - watch.started, 1),
+                   "decided_before_check": before_check,
+                   "after_check_s": None if watch.decided_at is None or before_check
+                   else round(watch.decided_at - asked, 2),
+                   "shift_mm": None if w.shift is None else round(w.shift * 1000),
+                   "provisional": [list(p) for p in getattr(w, "provisional", [])],
+                   "fps": getattr(w, "fps", None), "frames": watch.frames,
+                   "gone_mm": round(getattr(w, "gone_m", 0.01) * 1000), "box_size": ctx.get("box_size"),
+                   "face_px": int(len(w.pixels)), "off_plane_px": getattr(w, "off_plane", None),
+                   "timeline": [[t, s] for t, s in list(getattr(w, "timeline", []))[-30:]]}
         colour = watch.last[0] if watch.last is not None else self.cam.read()[0]
         cv2.imwrite(self.args.overlay, colour)           # clean: the GUI draws
         try:
@@ -493,12 +642,63 @@ class Server:
             self.passed.clear()                          # pick_loop: until the next successful pick
         if watch.result is not None:
             self.watch = None                            # decided: a second "check" has nothing to check
+        elif picked is not None:                         # the gripper's word decided: stop watching
+            self.stop_watch()
+        if watch.ctx.get("folder"):
+            watch.ctx["checks"] = watch.ctx.get("checks", 0) + 1
+            verdict["log"] = watch.ctx["folder"]
+            threading.Thread(target=self.save_check, args=(watch, dict(verdict), self.check_img,
+                                                           watch.ctx["checks"]), daemon=True).start()
         return {"check": verdict, "picked": picked,
                 "message": f"{title}: {why}", "title": title, "why": why,
                 "outline": outline(before.target), "overlay": self.args.overlay,
                 "picker_view": self.write("check", self.check_img), "frames": watch.frames,
                 "size": [int(colour.shape[1]), int(colour.shape[0])],
                 "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+    def save_check(self, watch, verdict, check_img, k):
+        """The k-th check of a pick, written to its folder (see the module's notes); never fails
+        the check. The first also writes what the target was found with, to replay it."""
+        ctx, w = watch.ctx, watch.watcher
+        folder = ctx["folder"]
+        depth_png = lambda d: np.clip(d * 1000, 0, 65535).astype(np.uint16)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            tag = f"check{k}_{verdict['outcome']}"
+            timeline = [[t, s] for t, s in getattr(w, "timeline", [])]
+            with open(os.path.join(folder, f"{tag}_verdict.json"), "w") as f:
+                json.dump({**verdict, "timeline": timeline, "target": ctx.get("target")}, f, indent=1, default=str)
+            with open(os.path.join(folder, f"{tag}_timeline.txt"), "w") as f:
+                f.write(f"pick {ctx['n']}, check {k}: {verdict['outcome']}  (s from the pick; "
+                        f"{verdict['frames']} frames, {verdict['fps']} a second)\n\n")
+                f.writelines(f"{t:8.2f} s  {s}\n" for t, s in timeline)
+                f.write(f"\n{verdict['detail']}\n")
+            with open(os.path.join(folder, f"{tag}_trace.jsonl"), "w") as f:
+                f.writelines(json.dumps(e) + "\n" for e in list(getattr(w, "trace", [])))
+            if check_img is not None:
+                cv2.imwrite(os.path.join(folder, f"{tag}.jpg"), check_img)
+            for i, (t, status, colour, depth) in enumerate(list(watch.keyframes)):
+                img = colour.copy()
+                cv2.polylines(img, [np.round(w.corners_px).astype(np.int32)], True, (255, 0, 255), 2)
+                cv2.rectangle(img, (0, 0), (img.shape[1], 24), (0, 0, 0), -1)
+                cv2.putText(img, f"{t:.2f} s  {status}"[:100], (6, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.imwrite(os.path.join(folder, f"key_{i:02d}_{t:07.2f}s.jpg"), img)
+                cv2.imwrite(os.path.join(folder, f"key_{i:02d}_{t:07.2f}s_depth.png"), depth_png(depth))
+            if k == 1:
+                frames, face, intr = ctx["frames"], ctx["face"], ctx["intr"]
+                cv2.imwrite(os.path.join(folder, "ref_color.jpg"), frames[ctx["best"]][0])
+                for i, (_, d) in enumerate(frames):
+                    cv2.imwrite(os.path.join(folder, f"ref_{i}_depth.png"), depth_png(d))
+                np.savez_compressed(
+                    os.path.join(folder, "face.npz"), pixels=face.pixels, normal=face.normal,
+                    centroid=face.centroid, corners_px=np.asarray(face.corners_px, float),
+                    centroid_px=np.asarray(getattr(face, "centroid_px", (0, 0)), float),
+                    size_mm=np.asarray(face.size_mm, float), kind=str(face.kind), mask=ctx["mask"],
+                    best=ctx["best"], box_size=np.asarray(ctx["box_size"] or [], float),
+                    intr=np.array([intr.fx, intr.fy, intr.cx, intr.cy]))
+        except Exception as exc:                         # noqa: BLE001 - only a record
+            print(f"check log: {exc}", file=sys.stderr)
 
     # -- the window's other keys ------------------------------------------------------
 
@@ -511,6 +711,12 @@ class Server:
             if len(words) != 2:
                 return False, "set NAME VALUE", {}
             name, value = words
+            if name == "record":                         # every frame of each pick check, to replay it
+                if value not in ("on", "off"):
+                    return False, "record is on or off", {}
+                self.record = value == "on"
+                return True, (f"recording every frame of each pick check (from the next pick) in "
+                              f"{os.path.join(self.out, 'checks')}" if self.record else "not recording"), {}
             if name == "order":
                 if value not in ("grid", "v1", "v2"):
                     return False, "order is grid, v1 or v2", {}
@@ -545,7 +751,7 @@ class Server:
                 return False, f"no target to {cmd}", {}
             (self.passed if cmd == "pass" else self.skipped).append(self.before.target.copy())
             self.stop_watch()                            # this box isn't being picked now
-            return True, ("passed over this box and the boxes under it, until the next successful pick"
+            return True, ("passed over this box until the next successful pick"
                           if cmd == "pass" else "this box is skipped until reset"), {}
         if cmd == "reset":
             n = len(self.skipped) + len(self.passed)
@@ -583,6 +789,24 @@ class Server:
         return False, f"unknown request {cmd!r}", {}
 
 
+def load_pick_watch(grid_dir):
+    """pick_watch.py: box_picker/v1's when it has the 19 Nov 2026 check (the box size add-on replaces
+    v1/), else box_picker/src's."""
+    path = os.path.join(os.path.abspath(grid_dir), "pick_watch.py")
+    if os.path.exists(path):
+        spec = importlib.util.spec_from_file_location("pick_watch", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if hasattr(mod.PickWatcher, "reopen"):
+            sys.modules["pick_watch"] = mod
+            print(f"pick check: {path}", file=sys.stderr)
+            return mod
+    import pick_watch                                  # box_picker/src
+    print(f"pick check: {pick_watch.__file__}" + ("" if hasattr(pick_watch.PickWatcher, "reopen") else
+          " (older than 19 Nov 2026: one reference frame, no box size, no arm-out decision)"), file=sys.stderr)
+    return pick_watch
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--frames", type=int, default=5)
@@ -601,14 +825,17 @@ def main():
                          "a box), as before 5 Nov 2026; default: a box on a box by its front")
     ap.add_argument("--ros", action="store_true")
     ap.add_argument("--overlay", required=True, help="where to write the drawing of each answer")
-    ap.add_argument("--out", default="outputs/gui", help="snapshots and flags, one folder per run")
+    ap.add_argument("--out", default="outputs/gui", help="snapshots, flags and pick check logs, one folder per run")
+    ap.add_argument("--record-checks", action="store_true",
+                    help="save every frame each pick check watches (<out>/<run>/checks/NNN_*/frames/), to replay "
+                         "it with replay_check.py (box_picker/v1); ~4 MB a second")
     args = ap.parse_args()
 
     sys.path.insert(0, os.getcwd())                    # box_picker/src
     # order grid's own files, after src: it uses src's faces.py and box_masks.py (the same box finding)
     sys.path.append(os.path.abspath(args.grid_dir))
     real_stdout, sys.stdout = sys.stdout, sys.stderr   # libraries' output -> stderr
-    import pick_watch as pw                            # the pick check (2026-11-11)
+    pw = load_pick_watch(args.grid_dir)                # the pick check (2026-11-11; 19 Nov 2026)
     from faces import up_from_accel, up_from_pitch
     from pick_frame import PickDetector
     from rgbd import open_camera, save

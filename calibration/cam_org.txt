@@ -4,12 +4,12 @@ The origin positions camera_bottom_screw_frame.
 The arm origin (openarm_{left,right}_link0) is at world x=0.0126, z=0.7344 m, y=-0.0448/+0.0572 m
 (moved in V7 from x=0, z=0.698, y=+/-0.051 -- see V7).
 
-current (V10):    <origin xyz="0.01598 0.02000 0.52425" rpy="0.01931 -0.01182 -0.01906"/>
+current (V11):    <origin xyz="0.01587 0.02000 0.56557" rpy="0.01815 0.04926 -0.01908"/>
 
-3.38 mm in front of and 210.15 mm below the arm origin, +13.80 mm to the left
-X = 15.98 mm, Y = 20.00 mm, Z = 524.25 mm
-roll = 1.11 deg, pitch = -0.68 deg, yaw = -1.09 deg
-Set by hand with robot/sensor_align.py (2026-11-16T17:20): the clouds moved onto the arm and the tip as RViz draws them.
+3.27 mm in front of and 168.83 mm below the arm origin, +13.80 mm to the left
+X = 15.87 mm, Y = 20.00 mm, Z = 565.57 mm
+roll = 1.04 deg, pitch = 2.82 deg, yaw = -1.09 deg
+Set by hand with robot/sensor_align.py (2026-11-18T16:20): the clouds moved onto the arm and the tip as RViz draws them.
 
 history:
   X = 160.89 mm, Z = 728.46 mm    <origin xyz="0.16089 0.000 0.72846" rpy="0 1.0472 0"/>
@@ -76,3 +76,8 @@ V10
   <origin xyz="0.01598 0.02000 0.52425" rpy="0.01931 -0.01182 -0.01906"/>
   3.38 mm in front of and 210.15 mm below the arm origin, +13.80 mm to the left
   set by hand 2026-11-16T17:20 with robot/sensor_align.py: 8.0 mm / 0.00 deg from the version before
+
+V11
+  <origin xyz="0.01587 0.02000 0.56557" rpy="0.01815 0.04926 -0.01908"/>
+  3.27 mm in front of and 168.83 mm below the arm origin, +13.80 mm to the left
+  set by hand 2026-11-18T16:20 with robot/sensor_align.py: 41.3 mm / 3.50 deg from the version before

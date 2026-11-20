@@ -224,3 +224,135 @@ Tune: --plan-change-mm 15 --plan-change-px 600. --approach-settle now 1.5 s (was
   pre_pick; a check spoiled by the arm is redone at once when it is back.
 - l2_lidar_keepout: the LiDAR housing box grown 12 cm up, 8 cm back, 5 cm right, 1 cm left /
   front (lidar_bridge keepout_pad; all zero: none). >= 16 mm clear of the arm bases / body.
+  REPLACED 2026-11-19 by the square box below (keepout_pad is only the fallback now).
+
+## L2 LIDAR MODEL AND KEEP-OUT BOX (2026-11-19)
+- RViz draws the real L2 on the robot: link l2_lidar_body in v10.urdf.xacro (fixed on
+  openarm_body_link0 at housing_xyz, dome tilted forward 113.4 deg), mesh
+  src/openarm_description/meshes/sensors/unitree_l2.stl, made from Unitree's L2 user manual
+  drawing (75 x 75 x 65 mm). Drawn only: no collision in the URDF (cuMotion uses
+  robot/openarm.urdf). Moved L2? Change the joint origin there, then
+      native/build_ws.sh --packages-select openarm_description      (and restart terminal 1)
+- l2_lidar_keepout is now a see-through ORANGE box square to the robot (MoveIt + cuMotion both
+  plan round it): x -55..100, y -55..65, z 815..1000 mm in openarm_body_link0 -- 6 cm in front
+  of the L2, 8 cm above it, 1-2 cm behind / to the sides; 20 mm above both arm bases, 42 mm
+  above the body. Of 453 poses the arms really went to, it blocks only the 11-18 10:45 approach
+  that passed 24 mm from the L2 (next nearest: 6.9 mm clear).
+  While it holds the L2, the green l2_lidar_housing box is taken out of the scene (it only hid
+  the model); it comes back if the keep-out is turned off.
+      ros2 param set /lidar_bridge keepout_box "[-0.055, 0.12, -0.055, 0.065, 0.815, 1.0]"  # resize
+      ros2 param set /lidar_bridge keepout_box "[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]"   # off (-> keepout_pad)
+      ros2 param set /lidar_bridge keepout_rgba "[1.0, 0.55, 0.0, 0.3]"           # colour / see-through
+  (applied within 3 s). RViz: MotionPlanning -> Scene Geometry -> Show Scene Geometry on.
+
+## IMU AND BOX SIZE TOPICS, PICK ALL CAMERA CHECK (2026-11-18)
+- /camera/camera/imu        sensor_msgs/Imu: D455 gyro + accelerometer (unite_imu_method 2); the
+                            separate /camera/camera/accel/sample and /gyro/sample stay.
+                            launch_everything gyro:=false turns the gyro (and /imu) off.
+- /l2/imu                   sensor_msgs/Imu from l2_driver (frame l2_imu); its accelerometer reads
+                            ~1.9 g at rest (the L2's own scale) -- not corrected here.
+- /beast_arm/box_model/box_size   pick_interfaces/ObjectSize (latched): the target box as measured,
+                            mm, no margin (depth 0 = not seen). Every detection.
+- /beast_arm/box_model/boxes      std_msgs/String JSON (latched): the target and every box in the
+                            order -- xyz (world), approach, cell, face_mm, box_mm {w, h, d}.
+  ros2 topic echo /beast_arm/box_model/box_size
+- PICK ALL pick check: the cup's weight AND the camera (the box's spot in one depth frame, arm out
+  of the picture) after every pick; the weight wins, a disagreement is said; weighed empty but the
+  spot emptied = "dropped". --pick-all-verify camera: the picker's own check as before.
+
+## OBSTACLE BOX UNDER THE ARMS (2026-11-19)
+- robot/height_box.py (terminal 1 starts it; height_box:=off to leave it out): planning-scene box
+  `height_box`, 20 (front-back) x 60 (left-right) x 28 (deep) cm, centred under the arms' centre,
+  its top 152 - (x + 10) cm below it, x from /c60000004/vertical_distance; 100 cm while nothing
+  has come in for 3 s.
+  2026-11-19 later: it goes UP ROUND THE STAND (sent in pieces round the stand's URDF shape, layer
+  by layer); only the camera / LiDAR / arm bases hold it down, 1.5 cm under the lowest over it
+  (the camera: top <= 0.549 m, x <= ~123.5 cm). Arm links inside it: status arm_in_box (and the
+  slider window says ARM IN THE BOX) -- the planners will not start from there.
+      ros2 topic echo /height_box/status --qos-durability transient_local
+- Test (domain 77): scratchpad test_height_box.py (7 checks, no TF) + test_height_box2.py (6: round
+  the stand, held by the camera, arm in the box).
+
+## GUARD ROUND THE CAMERA (2026-11-19)
+- robot/camera_guard.py (terminal 1; camera_guard:=off to leave it out): planning-scene object
+  `camera_guard`, see-through orange plates round the D455: 20 mm in front (7 mm off the face),
+  15 mm at the ends, over the front lip, under both ends. Not one box: the camera sits half in the
+  URDF body column, and a box would put the robot in collision with itself. It follows the camera TF,
+  and a plate within 3 mm of the body or the arm bases is left out (and logged).
+- Before it, cuMotion did not know the camera at all (robot/openarm.urdf has none), and MoveIt
+  knew it with no margin. 11 recorded left-arm moves passed 8-15 mm from it (forearm past its left
+  end). The guard blocks 12 of 455 recorded poses, all within ~27 mm of the camera.
+      ros2 topic echo /camera_guard/status --qos-durability transient_local
+      ros2 param set /camera_guard rgba "[1.0, 0.55, 0.0, 0.3]"
+- Test (domain 77): scratchpad test_camera_guard.py (5 checks); geometry: cam_guard_eval.py.
+
+## STAND-IN /c60000004/vertical_distance PUBLISHER (2026-11-19)
+- For trying the height box without the device (not while the device publishes: two sources):
+      ros2 launch robot/vertical_distance.launch.py                     # SLIDER window: x 0..152 cm
+                       (0 = sensor right above the box; shows the gap and what height_box says;
+                       Fixed / Sweep / Off; gui:=off for no window; slider_min_cm / slider_max_cm)
+      ros2 launch robot/vertical_distance.launch.py value_cm:=30        # gap 152-(30+10) = 112 cm
+      ros2 launch robot/vertical_distance.launch.py mode:=sweep min_cm:=20 max_cm:=60 period_s:=20
+      ros2 launch robot/vertical_distance.launch.py type:=string        # "x cm" text instead of the
+                       default sensor_msgs/Range (range = x/100 m, frame c60000004_range; x outside
+                       min_range_m..max_range_m 0..1.52 -> +-inf = no reading)
+      python3 robot/vertical_distance_pub.py --ros-args -p value_cm:=30 # the same without launch
+  While running:
+      ros2 param set /vertical_distance_pub value_cm 50
+      ros2 param set /vertical_distance_pub mode sweep        # fixed / sweep / off (off: height_box -> 100 cm)
+
+## NO DROP POSE WHILE THE BOX BELOW IS HIGH (2026-11-19)
+- While x (/c60000004/vertical_distance, sensor_msgs/Range) reads 87-152 cm, a picked box is let go
+  at PRE_PICK: the arm goes straight back to pre_pick, the vacuum goes off there (--drop-hold s),
+  the box is taken out of the planners -- never the drop pose (it would collide). Outside that range,
+  or no reading for 3 s: the drop pose as before. Said in the log: "x .. cm - the drop pose would
+  collide; letting go at pre_pick instead".
+      --no-drop-x 87 152      (web GUI / pick stack / click_to_move; "--no-drop-x 0 0": off)
+      --vertical-topic /c60000004/vertical_distance
+- Test: scratchpad test_no_drop.py (12 checks: 86.9/152.1 drop, 87/100/152 pre_pick, stale, none,
+  off, top pick).
+
+## PRESS STOPPED SHORT / DROP POSE BLOCKED (2026-11-19 17:36 fix)
+- The first try at 17:36 never reached the box: each press stopped "at the torque limit" (1.0 Nm, the
+  vacuum tool's soft limit) 26, 23 and 6 mm into a 31 mm press -- in free air. The shoulder's stick-slip
+  swings 0.6-1.2 Nm in 0.5 s, and the soft limit was armed over the whole press (EARLY_CONTACT_M 3 cm;
+  the press starts ~3 cm out). 17 of the last 50 recorded presses stopped short like that (11-18, 11-19
+  10:13, 10:23, 17:20, 17:36); the next try then "worked" unchanged, by luck.
+  Now (app/ctm/robot.py guarded_line): the tool's 1.0 Nm limit at / past the measured surface as before,
+  before it only while the tip is not keeping up (< half the commanded speed over 0.35 s: blocked or
+  squashing); the arm's 2.0 Nm limit everywhere; contact (stuck + torque rise) armed from 1.5 cm before
+  the surface (was 3 cm). Replayed on the 50 recorded presses: the 17 false stops go, the 7 real ones
+  at / past the surface unchanged. A box nearer than measured still stops at 1.0 Nm (the tip blocks).
+- The drop pose is checked before going (MoveIt's collision check, held box included): in collision
+  -> the box is let go at pre_pick, said why. 17:36 / 17:38: at x 84.5 (under --no-drop-x 87) the hand
+  was IN the height box; cuMotion tried 3 x 11 s + OMPL (~58 s) and you switched the vacuum off by hand.
+- (Replaced 11-20: "weighed nothing -> no drop trip" -- the weighing misses boxes on the cup.)
+- Tests: app/tests/ (see below).
+
+## IS THE BOX ON THE CUP? THE CAMERA DECIDES, NOT THE WEIGHING (2026-11-20)
+- 11-19 17:36 the cup weighed "nothing" (-36, +4, +5 g) with the box on it: a FRONT-picked box still
+  rests on the one below while it is weighed (3 cm out), so the shoulder torques barely see it.
+- Now: before the arm moves, one depth frame of the box's spot (the face round the pick point); once
+  the arm is back at pre_pick (out of the picture -- checked: the cup and a hanging box are off the
+  left edge), the spot again:
+    still there (60 % unchanged)  -> nothing taken: no drop trip, the box released from the planners
+                                     (unless the cup weighed a box: then the drop, to be safe)
+    gone (60 % farther/no reading)-> on the cup: to the drop, even if the weighing said nothing
+    cannot tell (hidden, no frames)-> the drop, as always
+  The weighing alone never skips the drop any more. --spot-check off: as before (~0.3 s per pick).
+- Never left hanging / waiting:
+    the drop pose in collision, or x 87-152 cm   -> let go at pre_pick (11-19)
+    the drop leg does not plan                   -> one try only (was 3 x 11 s + OMPL), back at
+                                                    pre_pick and LET GO there (it used to keep the
+                                                    box on the cup)
+    no way home                                  -> 2 more tries by itself (via the home posture,
+                                                    then with a held box let through the map)
+                                                    before "press RETURN"
+- The 4D LiDAR is not used for this: it can see the cup at pre_pick, but lidar_bridge drops every point
+  within 8 cm of the arm, it is +-3 cm, and it scatters false points near surfaces -- a 54 mm box on
+  the cup is not reliably told from air. The sure way: a vacuum pressure sensor on the ESP32.
+- Tests (kept in the repo now; the scratchpad is wiped on reboot):
+      source native/setup.bash
+      PYTHONNOUSERSITE=1 python3 app/tests/test_drop_decisions.py    # 26: drop / let go / spot / retries
+      PYTHONNOUSERSITE=1 python3 app/tests/test_press_cap.py          # the guarded press, stick-slip
+      python3 app/tests/replay_presses.py                             # the 50 recorded presses

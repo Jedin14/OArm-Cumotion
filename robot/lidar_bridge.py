@@ -87,7 +87,7 @@ import numpy as np
 import rclpy
 from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import Pose, TransformStamped
-from moveit_msgs.msg import CollisionObject, PlanningScene
+from moveit_msgs.msg import CollisionObject, ObjectColor, PlanningScene, PlanningSceneWorld
 from moveit_msgs.srv import ApplyPlanningScene
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
@@ -97,7 +97,7 @@ from rcl_interfaces.msg import SetParametersResult
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image, Imu, PointCloud2, PointField
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import String
+from std_msgs.msg import ColorRGBA, String
 from tf2_ros import Buffer, StaticTransformBroadcaster, TransformListener
 
 HOUSING_ID = 'l2_lidar_housing'
@@ -612,6 +612,17 @@ class LidarBridge(Node):
         # arms really went to (named + native/logs/arrivals.jsonl); a pick at 10:45:39 had
         # passed 24 mm from the L2 itself. All zero: no keep-out.
         p('keepout_pad', [0.0, 0.12, 0.01, 0.05, 0.08, 0.01])
+        # 2026-11-19 (the user: "a semi transparent box covering a rectangular area slightly in
+        # front and on top of the robot where the lidar is mounted"): the keep-out as a box
+        # square to the robot instead -- [x min, x max, y min, y max, z min, z max] m in
+        # mount_parent's frame (x forward, y left, z up). Round the L2 as the URDF draws it
+        # (link l2_lidar_body: x -43..43, y -35..41, z 827..917 mm): 12 mm behind, 57 mm in
+        # front, 20 / 24 mm to the sides, 83 mm above; its bottom 20 mm above both arm bases'
+        # tops (795 mm), 42 mm above the body. Against the 453 poses the arms really went to
+        # (named + arrivals.jsonl) it blocks only the 11-18 10:45:21/39 approach that passed
+        # 24 mm from the L2 -- the next nearest is 6.9 mm clear. All zero: keepout_pad above.
+        p('keepout_box', [-0.055, 0.100, -0.055, 0.065, 0.815, 1.000])
+        p('keepout_rgba', [1.0, 0.55, 0.0, 0.3])   # its colour in RViz (MoveIt scene): see-through
         # its ranges follow the camera's where both see the same surface (see the top)
         p('range_trim', True)
         p('range_trim_max', 0.05)           # m
@@ -748,6 +759,9 @@ class LidarBridge(Node):
         """mount_xyz / mount_rpy_deg / mount_spin_deg changed while running: the new mount
         at once (the TF, the housing; the clouds kept so far were in the old one)."""
         new = {q.name: q.value for q in params}
+        if {'keepout_box', 'keepout_pad', 'keepout_rgba', 'housing_size', 'housing_xyz',
+                'housing_rpy_deg', 'housing_spin_deg'} & set(new):
+            self._housing_done = False      # (set after this returns: the 3 s timer re-sends)
         if not {'mount_xyz', 'mount_rpy_deg', 'mount_spin_deg'} & set(new):
             return SetParametersResult(successful=True)
         try:
@@ -1186,15 +1200,39 @@ class LidarBridge(Node):
             return self.t, self.R
         return (np.array(xyz), rpy_matrix(*[math.radians(v) for v in rpy]) @ rot_z(spin))
 
+    def keepout_aabb(self):
+        """keepout_box as (lo, hi) in mount_parent's frame, or None (unset / all zero / bad)."""
+        try:
+            b = [float(v) for v in self.get_parameter('keepout_box').value]
+        except (TypeError, ValueError):
+            return None
+        if len(b) != 6 or not all(math.isfinite(v) for v in b):
+            return None
+        lo, hi = np.array(b[0::2]), np.array(b[1::2])
+        return (lo, hi) if (hi > lo).all() else None
+
     def keepout_object(self, t, R, size):
-        """The keep-out round the housing (keepout_pad), or a REMOVE when it is all zero."""
+        """The keep-out: keepout_box (square to the robot) when set, else round the housing
+        (keepout_pad); a REMOVE when both are off."""
+        aabb = self.keepout_aabb()
+        obj = CollisionObject()
+        obj.header.frame_id = self.parent
+        obj.id = KEEPOUT_ID
+        if aabb is not None:
+            self._keepout_added = True
+            lo, hi = aabb
+            obj.operation = CollisionObject.ADD
+            obj.primitives.append(SolidPrimitive(type=SolidPrimitive.BOX,
+                                                 dimensions=[float(v) for v in hi - lo]))
+            pose = Pose()
+            pose.position.x, pose.position.y, pose.position.z = (float(v) for v in (lo + hi) / 2)
+            pose.orientation.w = 1.0
+            obj.primitive_poses.append(pose)
+            return obj
         try:
             pad = [float(v) for v in self.get_parameter('keepout_pad').value]
         except (TypeError, ValueError):
             pad = []
-        obj = CollisionObject()
-        obj.header.frame_id = self.parent
-        obj.id = KEEPOUT_ID
         if len(pad) != 6 or not any(v > 0 for v in pad):
             if not getattr(self, '_keepout_added', False):
                 return None                      # (never added: nothing to remove)
@@ -1236,13 +1274,53 @@ class LidarBridge(Node):
             (float(v) for v in q)
         obj.primitive_poses.append(pose)
         scene = PlanningScene(is_diff=True)
-        scene.world.collision_objects = [obj]
         keep = self.keepout_object(t, R, size)
+        aabb = self.keepout_aabb()
+        # with the L2 itself (Unitree's drawing: round, 75 x 65 mm, at the housing pose) inside
+        # the square keep-out, the housing box -- looser, its corners out past the keep-out's
+        # -- only hides the L2 the URDF draws (link l2_lidar_body): out of the scene then.
+        hidden = aabb is not None and _l2_inside(t, R, *aabb)
+        if hidden:
+            if not getattr(self, '_housing_removed', False):
+                self._housing_removed = True
+                gone = CollisionObject(id=HOUSING_ID, operation=CollisionObject.REMOVE)
+                gone.header.frame_id = self.parent
+                # alone, its answer ignored: no housing there (a fresh move_group) is a failure
+                self.scene.call_async(ApplyPlanningScene.Request(
+                    scene=PlanningScene(is_diff=True, world=PlanningSceneWorld(
+                        collision_objects=[gone]))))
+        else:
+            self._housing_removed = False
+            scene.world.collision_objects = [obj]
         if keep is not None:
             scene.world.collision_objects.append(keep)
+            if keep.operation == CollisionObject.ADD:
+                try:
+                    rgba = [float(v) for v in self.get_parameter('keepout_rgba').value]
+                except (TypeError, ValueError):
+                    rgba = []
+                if len(rgba) == 4:
+                    scene.object_colors = [ObjectColor(id=KEEPOUT_ID, color=ColorRGBA(
+                        r=rgba[0], g=rgba[1], b=rgba[2], a=rgba[3]))]
+        if not scene.world.collision_objects:
+            self._housing_done = True
+            return
         future = self.scene.call_async(ApplyPlanningScene.Request(scene=scene))
         future.add_done_callback(lambda f: setattr(self, '_housing_done', bool(
             f.result() is not None and f.result().success)))
+
+
+L2_RADIUS, L2_HEIGHT = 0.0375, 0.065   # m, Unitree L2 user manual, "L2 Mechanical Dimensions"
+
+
+def _l2_inside(t, R, lo, hi):
+    """Whether the L2 -- a cylinder L2_RADIUS x L2_HEIGHT up its own Z from t (rotation R) --
+    lies within the axis-aligned lo..hi."""
+    a = np.radians(np.arange(0.0, 360.0, 5.0))
+    ring = np.c_[L2_RADIUS * np.cos(a), L2_RADIUS * np.sin(a), np.zeros(len(a))]
+    pts = np.concatenate([ring, ring + [0.0, 0.0, L2_HEIGHT]])
+    p = np.asarray(t, float) + pts @ np.asarray(R, float).T
+    return bool((p >= lo).all() and (p <= hi).all())
 
 
 def _keepout_box(size, pad):

@@ -6,8 +6,10 @@ Built 2026-11-13/16 from three tried designs (designs/); this one won on the han
 on grid_part3, which it was not tuned on.
 
 Every tolerance is a share of the box measured in this frame: its width W and height H (from the
-fronts), its thickness t = the smaller of the two, and its depth D. No set distances, so the same
-rules hold for any box size, and nothing is tuned to one recording.
+fronts), its thickness t = the smaller of the two, and its depth D (front to back). No set
+distances, so the same rules hold for any box size, and nothing is tuned to one recording. The
+layers use D only, never W, H or t: a box can be much shallower than its front is wide (the robot's
+125 x 125 x 54 mm boxes, 18 Nov 2026), so nothing about its depth follows from its front.
 
 0. THE CARTON (v2, carton.py)  With frame["cartons"] (SAM's carton outlines), only the boxes in the
    carton in front are used: the carton whose near edge is closest to the camera, and the boxes
@@ -28,9 +30,11 @@ rules hold for any box size, and nothing is tuned to one recording.
 
 2. THE BOX  (W x H x D)
    W, H: the median width (across) and height (up) of the fronts in view.
-   D: the step between the grid's layers (median), or, with one layer in view, the median depth of
-   the tops as wide as a box and the sides as high as one (none shallower than t: those are
-   slivers). D is only reported; no rule depends on it.
+   D: frame["box_depth"], the box size given from outside (live: the robot's
+   /beast_arm/held_object/fixed_size, the size entered in its GUI; the pick loop doesn't pick
+   without it). The layers below use it. Without it (offline runs), only reported: the step
+   between the grid's layers (median), or the median depth of the tops as wide as a box and the
+   sides as high as one (none shallower than t: those are slivers).
 
 3. WHAT IS A BOX  Something must hold it up: its bottom is on the floor (the lowest front bottom
    in view) or on the top of a box that is held up and side by side with it, within t. A box seen
@@ -50,9 +54,12 @@ rules hold for any box size, and nothing is tuned to one recording.
    it taller, lift it off the floor or turn it round.
 
 5. THE LATTICE
-   Layers: the boxes' fronts sorted by distance along forward; a step of more than t starts a new
-   layer (in the grid the fronts of one layer lie within half t of each other, and layers are
-   whole box depths apart). Layer 1 is the nearest.
+   Layers: the boxes' fronts sorted by distance along forward; a step of more than half the box
+   depth D starts a new layer (layers are whole box depths apart). Without D every box is in one
+   layer: from one picture, a box one layer back can't be told from a box set back a little,
+   without knowing how deep a box is. A box standing on a box of a nearer layer with its middle
+   over it (its front less than half a box depth behind that box's back) joins that layer, so it
+   is picked before the box under it. Layer 1 is the nearest.
    Rows: inside a layer, the boxes sorted by the height of their top; a drop of more than half a
    box height starts a new row (tops of one row lie within a third of H, rows a whole H apart).
    Row 1 is the highest.
@@ -79,7 +86,7 @@ TALL = 1.5       # x H: a front taller than this is on its side or end         (
                  # x W, with a front lower than LOW x H: lying flat             (grid: none lower; wider <= 2.1)
 TURN = 0.85      # x t: a front end sticking out more than this is turned      (grid <= 0.68, fallen >= 1.08)
 APART = 1.0      # x t: a gap to the box behind wider than this: lying apart   (fallen >= 2.2)
-STEP = 1.0       # x t: fronts further back than this start a new layer        (in a layer <= 0.49, layers >= 2.5)
+LAYER = 0.5      # x D: fronts further back than this start a new layer (D: the box depth, from the picks)
 DROP = 0.5       # x H: tops lower than this start a new row                   (in a row <= 0.33, rows >= 0.68)
 HOLD = 1.0       # x t: a bottom this close to the floor / a box top rests on it
 
@@ -199,9 +206,11 @@ def supported(ps, W, H):
     return held, floor
 
 
-def find_fallen(ps, floor, W, H):
-    """Set p.why ('' = fits the lattice) for each piece: see 4 in the docstring."""
+def find_fallen(ps, floor, W, H, D=None):
+    """Set p.why ('' = fits the lattice) for each piece: see 4 in the docstring. D: the box depth,
+    which tells what counts as behind (half a box depth back), else t as before."""
     t = min(W, H)
+    back = LAYER * D if D else t
     for p in ps:
         if p.hi - floor < LOW * H:
             p.why = "low"
@@ -214,7 +223,7 @@ def find_fallen(ps, floor, W, H):
     for p in ps:
         if p.why or p.front is not None:
             continue
-        behind = [q.f for q in ps if not q.why and q is not p and q.f > p.f + t
+        behind = [q.f for q in ps if not q.why and q is not p and q.f > p.f + back
                   and q.left < p.right and p.left < q.right and q.lo < p.hi and p.lo < q.hi]
         if behind and min(behind) - p.back > APART * t:
             p.why = "apart"
@@ -234,9 +243,31 @@ def runs(ps, key, gap):
     return out
 
 
-def lattice(grid, W, H):
-    """Set layer, row (0 = nearest / highest) and column of each grid piece; -> the layers."""
-    layers = runs(grid, lambda p: p.f, STEP * min(W, H))
+def rests_on(p, q, W, H, D):
+    """p stands on q's top with its middle over q (p's middle, D/2 behind its front, is in front of
+    q's back, D behind q's front): taking q first would drop p."""
+    t = HOLD * min(W, H)
+    return (abs(p.lo - q.hi) <= t and q.left < p.right and p.left < q.right
+            and p.f + D / 2 < q.f + D)
+
+
+def lattice(grid, W, H, D=None):
+    """Set layer, row (0 = nearest / highest) and column of each grid piece; -> the layers.
+    D: the box depth (frame["box_depth"]); None: one layer. A box resting on a box of a nearer
+    layer (rests_on) joins that layer, so it comes before the box under it."""
+    layers = runs(grid, lambda p: p.f, LAYER * D) if D else runs(grid, lambda p: p.f, np.inf)
+    for k, layer in enumerate(layers):
+        for p in layer:
+            p.layer = k
+    changed = D is not None
+    while changed:
+        changed = False
+        for p in grid:
+            under = [q for q in grid if q.layer < p.layer and rests_on(p, q, W, H, D)]
+            if under:
+                p.layer, changed = min(q.layer for q in under), True
+    layers = [sorted([p for p in grid if p.layer == k], key=lambda p: p.f) for k in range(len(layers))]
+    layers = [l for l in layers if l]
     a0 = min((p.a for p in grid), default=0.0)
     for k, layer in enumerate(layers):
         for r, row in enumerate(runs(layer, lambda p: -p.hi, DROP * H)):
@@ -245,8 +276,10 @@ def lattice(grid, W, H):
     return layers
 
 
-def depth(grid, layers, W, H):
+def depth(grid, layers, W, H, known=None):
     """D: see 2 in the docstring. -> (D or None, how it was measured)."""
+    if known:
+        return float(known), "given"
     steps = np.diff([np.median([p.f for p in l]) for l in layers if len(l) >= 2])
     if len(steps):
         return float(np.median(steps)), "layers"
@@ -300,18 +333,20 @@ def order(frame):
         return {"picks": [], "grid_boxes": 0, "box_size_mm": None, "carton": found}
     W, H = front_size(ps)
     ps, floor = supported(ps, W, H)
-    find_fallen(ps, floor, W, H)
+    known = frame.get("box_depth")
+    find_fallen(ps, floor, W, H, known)
     grid = [p for p in ps if not p.fallen]
     fallen = [p for p in ps if p.fallen]
-    layers = lattice(grid, W, H)
-    D, how = depth(grid, layers, W, H)
+    layers = lattice(grid, W, H, known)
+    D, how = depth(grid, layers, W, H, known)
 
     picks = [pick(p, max([f for f in (p.front, p.top) if f is not None], key=lambda f: f.area_mm2))
              for p in sorted(fallen, key=lambda p: (-p.hi, p.f, p.a))]
     picks += [pick(p, p.front if p.front is not None else p.top)
               for p in sorted(grid, key=lambda p: (p.layer, p.row, p.a))]
     out = {"picks": picks, "grid_boxes": seen_places(grid, W),
-           "box_size_mm": (W * 1000, H * 1000, None if D is None else D * 1000), "carton": found}
+           "box_size_mm": (W * 1000, H * 1000, None if D is None else D * 1000), "box_depth_from": how,
+           "forward": fwd, "carton": found}
     if frame.get("debug"):
         mm = lambda x: "-" if x is None else f"{x * 1000:.0f}"
         out["debug"] = [f"fwd {np.round(fwd, 3)} W {mm(W)} H {mm(H)} D {mm(D)} ({how}) floor {mm(floor)}"] + [

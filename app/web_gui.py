@@ -150,7 +150,19 @@ class WebStack(pick_stack.PickStack):
             'Detect a box, then MOVE.'
         self.dummy = False            # publish a test size on held_object/size
         self.size_presets, self.size_name = {}, None
+        # (2026-11-18) the user's fixed size, for other systems: latched on
+        # held_object/fixed_size (frame_id = its saved name, or "dummy") at every change,
+        # and again on request (held_object/get_size, which also answers the camera's
+        # last measured box from box_model/box_size)
+        from pick_interfaces.msg import ObjectSize
+        from std_srvs.srv import Trigger
+        self.fixed_pub = node.create_publisher(ObjectSize, f'{ns}/held_object/fixed_size', latched)
+        self.measured_size = None
+        node.create_subscription(ObjectSize, f'{ns}/box_model/box_size',
+                                 lambda m: setattr(self, 'measured_size', m), latched)
+        node.create_service(Trigger, f'{ns}/held_object/get_size', self._on_get_size)
         self._load_sizes()            # (2026-11-18) on, with the last size, unless switched off
+        self._publish_fixed()
         node.create_timer(1.0, self._publish_dummy)
         self.box = None               # the last DETECT BOX result (PickTarget)
         self.model_pick = None        # self.pick when it came from that result
@@ -323,7 +335,8 @@ class WebStack(pick_stack.PickStack):
             self._save_sizes()
             return True, 'dummy size ' + ('on' if self.dummy else 'off')
         if name in ('size_save', 'size_use', 'size_delete'):
-            label = ' '.join(str(data.get('name') or '').split())[:40]
+            # (the page sends the size's name as "label": "name" is the action's own)
+            label = ' '.join(str(data.get('label') or '').split())[:40]
             if not label:
                 return False, 'a name for the size, please'
             if name == 'size_save':
@@ -686,6 +699,37 @@ class WebStack(pick_stack.PickStack):
             os.replace(tmp, self.SIZES_FILE)
         except Exception as exc:                         # noqa: BLE001 - kept in memory
             self.say(f'held sizes not saved ({exc})', True)
+        self._publish_fixed()
+
+    def _publish_fixed(self):
+        """held_object/fixed_size: the user's fixed size now (whether or not Dummy size is
+        on -- it says so nowhere else; frame_id: its saved name, or "dummy")."""
+        try:
+            from pick_interfaces.msg import ObjectSize
+            msg = ObjectSize(height_mm=float(self.DUMMY_MM[0]), width_mm=float(self.DUMMY_MM[1]),
+                             depth_mm=float(self.DUMMY_MM[2]))
+            msg.header.frame_id = self.size_name or 'dummy'
+            msg.header.stamp = self.node.get_clock().now().to_msg()
+            self.fixed_pub.publish(msg)
+        except Exception as exc:                         # noqa: BLE001 - an extra
+            self.node.get_logger().warn(f'fixed size not published ({exc})')
+
+    def _on_get_size(self, _request, response):
+        """held_object/get_size (std_srvs/Trigger): pushes the fixed size again (and, with
+        Dummy size on, held_object/size) and answers both sizes as JSON."""
+        self._publish_fixed()
+        if self.dummy:
+            self._publish_dummy()
+        m = self.measured_size
+        h, w, d = self.DUMMY_MM
+        response.success = True
+        response.message = json.dumps({
+            'fixed': {'name': self.size_name, 'height_mm': h, 'width_mm': w, 'depth_mm': d,
+                      'dummy_on': self.dummy},
+            'measured': (None if m is None else
+                         {'height_mm': m.height_mm, 'width_mm': m.width_mm,
+                          'depth_mm': m.depth_mm, 'stamp': m.header.stamp.sec})})
+        return response
 
     def _publish_dummy(self):
         if self.dummy:
@@ -1448,10 +1492,10 @@ class WebStack(pick_stack.PickStack):
             # (the arm back at pre_pick, out of the picture); the camera check only in
             # camera mode, or with nothing to compare with
             verified = self._verified_by_weight(self.last_contact, mine)
-            if verified is None and self.last_contact is not None and \
-                    not self._camera_check_mode() and run.get('ref') is not None:
-                self._wait_arm_clear(arm)
-                verified = self._verified_by_depth(run['ref'])
+            if self.last_contact is not None and not self._camera_check_mode() and \
+                    run.get('ref') is not None:
+                self._wait_arm_clear(arm)               # (back at pre_pick: out of view)
+                verified = self._combine_checks(verified, self._verified_by_depth(run['ref']))
         pick_stack.PickStack.finish_pick(self, arm, pick=mine['pick'], target=mine['target'],
                                          verified=verified, count=False)
         r = self.pick_result or {}
@@ -1817,13 +1861,32 @@ class WebStack(pick_stack.PickStack):
         held = contact.get('held')
         if not self._camera_check_mode():
             if held is True:
-                return True, 'success', 'the cup weighed the box (no camera check)', None
+                return True, 'success', 'the cup weighed the box', None
             if held is False:
-                return False, 'missed', 'the cup holds nothing (weighed; no camera check)', None
+                return False, 'missed', 'the cup holds nothing (weighed)', None
         if mine.get('from_plan') and self._camera_check_mode():
             # (the picker's check is of its own target, another box)
             return None, 'no_check', 'no camera check for a box from the plan', None
         return None
+
+    def _combine_checks(self, weight, cam):
+        """The cup's weighing and the camera's check of the box's spot, as one verdict
+        (picked, outcome, message, None). The weight wins when both speak; a camera
+        that disagrees is said (a person should look)."""
+        seen = cam is not None and cam[0] is not None
+        if weight is None:
+            return cam
+        if not seen:
+            return weight if cam is None else (weight[0], weight[1],
+                                               f'{weight[2]}; camera: {cam[2]}', None)
+        text = f'{weight[2]}; camera: {cam[2]}'
+        if weight[0] is True and cam[0] is False:
+            self.say(f'PICK ALL: the cup weighed a box but the camera still sees one in its spot '
+                     f'- have a look ({cam[2]})', True)
+            return True, 'success', text + ' - DISAGREE', None
+        if weight[0] is False and cam[0] is True:
+            return False, 'dropped', text + ' (it left its spot: knocked or dropped)', None
+        return weight[0], weight[1], text, None
 
     def _camera_check_mode(self):
         return str(getattr(self.node.args, 'pick_all_verify', 'weight')) == 'camera'
@@ -1873,15 +1936,17 @@ class WebStack(pick_stack.PickStack):
                 # never touched: not taken -- no camera check for it (2026-11-17: 49 s
                 # of "waiting for the arm" on a box never touched, 2026-11-16 17:39:55)
                 verified = (False, 'no_contact', 'the arm never touched the box', None)
-            elif by_weight is not None:
-                verified = by_weight
-            elif self._camera_check_mode() or (run.get('ref') is None and not mine.get('from_plan')):
-                verified = self._out_of_view(ahead, lambda: self.verify_pick(holding, wait=0.0))
+            elif self._camera_check_mode() or run.get('ref') is None:
+                verified = by_weight if by_weight is not None else \
+                    self._out_of_view(ahead, lambda: self.verify_pick(holding, wait=0.0))
             else:
-                # (2026-11-18) the cup could not weigh: one depth frame of the box's spot,
-                # the arm out of the picture -- never the picker's ~30 s camera check
-                verified = self._out_of_view(ahead, lambda: self._verified_by_depth(run['ref']),
-                                             tries=1)
+                # (2026-11-18) the camera's pick check on every pick, with the cup's
+                # weight: the box's spot in one depth frame, the arm out of the picture
+                # (the picker's own check waited ~30 s with the hand in view). If the arm
+                # comes into the picture meanwhile: made at once once it is back
+                cam = self._out_of_view(ahead, lambda: self._verified_by_depth(run['ref']),
+                                        tries=1)
+                verified = self._combine_checks(by_weight, cam)
             ahead['verified'] = verified
             # as finish_pick will read it: never touched = not taken; no camera check:
             # the contact and the weight

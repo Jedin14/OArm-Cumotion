@@ -842,6 +842,18 @@ def make_parser():
     parser.add_argument('--return-to', choices=('nominal', 'measured'), default='nominal',
                         help='after a pick: back to the nominal pre_pick_state (when it started '
                              'within 0.15 rad of it), or to the posture it started from')
+    parser.add_argument('--no-drop-x', nargs=2, type=float, default=[87.0, 152.0],
+                        metavar=('MIN', 'MAX'),
+                        help='cm: while x (--vertical-topic) reads between these, a held box is '
+                             'let go at pre_pick, not at the drop pose -- the box under the arms '
+                             'is then too high, the drop pose would collide (2026-11-19). '
+                             'No reading for 3 s: the drop pose as usual. "0 0": off')
+    parser.add_argument('--vertical-topic', default='/c60000004/vertical_distance',
+                        help='sensor_msgs/Range: x = range x 100 cm (robot/height_box.py reads it too)')
+    on_off(parser, '--spot-check', 'on',
+           'the camera on the box\'s spot before the touch and once the arm is back: the box '
+           'still there -> nothing to take to the drop; gone -> to the drop even if the cup '
+           'weighed nothing (the weighing misses boxes on the cup)')
     on_off(parser, '--skip-empty-drop', 'on',
            'nothing held and the cup never pressed: straight back to pre_pick, not via the drop')
     parser.add_argument('--lead-in-max', type=float, default=0.10,

@@ -33,9 +33,6 @@ SUPPORT_M = 0.02         # a box's top must reach this far behind another's fron
 FAR_SMEAR_M = 0.015      # a top's depth reaching up to this past its outline's far edge is smeared past it
 HIGHEST_TOL_M = 0.015    # boxes on a box whose tops are within this of the highest one's count as highest
                          # (under the thinnest box, 2.7 cm: a pile one box lower is lower)
-WEIGHTS = (10, 3, 1)     # order v3: how much each cm higher, closer and further left counts (0-20 each; the
-                         # window's ORDER tab, or --w-high / --w-near / --w-left): 10 / 3 / 1 = 1 cm higher is
-                         # worth 10 cm further left, 1 cm closer 3 cm further left
 NEAREST_TOL_M = 0.03     # free boxes whose grip point is within this of the nearest one's count as nearest
 SKIP_OVERLAP = 0.5       # a box whose outline overlaps an avoided one's (passed over) this much (of the smaller) is that box
 EDGE_PX = 3              # a pick face this close to the picture's edge is cut off by it (at_edge)
@@ -602,76 +599,6 @@ def find_hidden(boxes, depth_m, intr=None, up=None):
                 x.blocked_by.remove(i)                     # y doesn't rest on x, it stands behind it
 
 
-def seen_on_behind(boxes, depth_m, intr, up, depth_tol=DEFAULT_DEPTH_TOL, top_faces=False):
-    """Order v3: for every box over a nearer box (one found resting on it, or standing behind it),
-    look straight up the columns between them and decide by what the camera sees (column_vote):
-    behind, or else on: seen running into it, or not seen at all (then on, the safe side: nothing is
-    pulled out from under a box). Replaces analyse's guesses with set distances (MAX_BOX_DEPTH_M,
-    SUPPORT_M, the twin's top) for these pairs, then picks the pick faces again (on a box or not)."""
-    up = np.asarray(up, float) / np.linalg.norm(up)
-    for j, b in enumerate(boxes):                      # the lower, nearer box
-        for i, a in enumerate(boxes):                  # the box over it
-            if i == j or a.pick is None or b.pick is None or not a.depth or not b.depth:
-                continue
-            if not (i in b.blocked_by or j in a.hidden_by) or b.depth >= a.depth - depth_tol:
-                continue
-            others = [o for k, o in enumerate(boxes) if k not in (i, j) and o.mask is not None]
-            # a seen reaching down below b's top (more than 3 picture rows) can't be resting on it
-            below = a.low < b.high - 3 * a.depth / intr.fy
-            if below or column_vote(a, b, depth_m, intr, up, others) == "behind":
-                if i in b.blocked_by:
-                    b.blocked_by.remove(i)
-                if j not in a.hidden_by:
-                    a.hidden_by.append(j)
-            else:
-                if i not in b.blocked_by:
-                    b.blocked_by.append(i)
-                if j in a.hidden_by:
-                    a.hidden_by.remove(j)
-    for i, b in enumerate(boxes):
-        if b.pick is not None:
-            b.pick, b.top_only = pick_face(b.faces, any(i in a.blocked_by for a in boxes), top_faces)
-
-
-def column_vote(a, b, depth_m, intr, up, others=()):
-    """Box a over the nearer box b: "behind", "on", or None (not seen). Each column between them
-    (off the outlines' sides, ERODE_PX) votes:
-      behind: a's front is seen going on below b's top (by more than 3 picture rows cover in height
-              there): b hides a's lower part (outlines between them say nothing: the box finder can
-              outline b's own top as a box);
-      on:     b's top is seen all the way from b's front into a's front, no break longer than 3
-              picture rows;
-      none:   nothing seen there (no depth on a shiny top, say).
-    behind needs more columns than on and at least 3; on at least 3. The allowances are picture
-    rows, what the camera can resolve there, not set distances."""
-    hrow = a.depth / intr.fy                            # height one picture row covers on a's front
-    s = b.depth ** 2 / (intr.fy * max(abs(b.high), 1e-3))  # depth one picture row covers on b's top
-    inner = lambda m: np.convolve(m.any(0), np.ones(2 * ERODE_PX + 1), "same") >= 2 * ERODE_PX + 1
-    votes = {"on": 0, "behind": 0}
-    for u in np.flatnonzero(a.mask.any(0) & b.mask.any(0) & inner(a.mask) & inner(b.mask)):
-        ra = np.flatnonzero(a.mask[:, u]).max()         # a's lowest row in this column
-        rb = np.flatnonzero(b.mask[:, u]).min()         # b's top row
-        if rb < ra - 2:
-            continue
-        v = np.arange(max(ra - 3, 0), min(rb + 8, depth_m.shape[0]))
-        z = depth_m[v, u]
-        v, z = v[z > 0], z[z > 0]
-        if not len(z):
-            continue
-        q = np.stack([(u - intr.cx) * z / intr.fx, (v - intr.cy) * z / intr.fy, z], axis=1)
-        h = q @ up
-        front_a = h[np.abs(z - a.depth) <= 2 * s]
-        if len(front_a) and front_a.min() < b.high - 3 * hrow:
-            votes["behind"] += 1                        # a's front goes on below b's top
-            continue
-        top_b = np.sort(z[(z > b.depth - s) & (z < a.depth + s) & (np.abs(h - b.high) <= 3 * hrow)])
-        if len(top_b) and np.diff(np.concatenate([[b.depth], top_b, [a.depth]])).max() <= 3 * s:
-            votes["on"] += 1                            # b's top seen all the way into a's front
-    if votes["behind"] > votes["on"] and votes["behind"] >= 3:
-        return "behind"
-    return "on" if votes["on"] >= 3 else None
-
-
 def twins(boxes, j):
     """Boxes of the same kind as box j in the same row: front the same size (within SAME_LENGTH),
     as near (within DEFAULT_DEPTH_TOL), top as high (within SAME_PLANE_M)."""
@@ -928,7 +855,7 @@ def rests_on(b, a):
             and (a.depth - REST_TOL_M <= b.depth or sticks_out) and b.depth <= a.depth + MAX_BOX_DEPTH_M)
 
 
-def choose_target(boxes, tol=None, depth_tol=DEFAULT_DEPTH_TOL, avoid=(), order="v1", weights=None):
+def choose_target(boxes, tol=None, depth_tol=DEFAULT_DEPTH_TOL, avoid=(), order="v1"):
     """Index of the target box, or None. docs/picking_rules.md:
     free boxes (nothing resting on it, nothing in front of it), then the highest, on a box or
     on the floor (top within HIGHEST_TOL_M of the highest), then the nearest (within NEAREST_TOL_M of the nearest one's grip point), then
@@ -945,9 +872,7 @@ def choose_target(boxes, tol=None, depth_tol=DEFAULT_DEPTH_TOL, avoid=(), order=
       - a box seen only from above, with a nearer box right under it in the picture, stands
         behind that box: lying on it, its front would be in full view above that box's top and
         would have been found (hidden_top);
-      and of the free boxes, the one with the best score from weights = (highest, closest,
-      leftmost) instead of set distances (by_weights). Which box rests on which is also decided
-      by what the camera sees (seen_on_behind, called by pick_pipeline.run before this).
+      then the highest, nearest and leftmost as in v1.
     (tol: no longer used, kept so old calls work.)"""
     # Only outlines with a front or top face count: every box resting in the basket has one
     # (docs/picking_rules.md), so one without is a side split off a box, or a sliver.
@@ -979,8 +904,6 @@ def choose_target(boxes, tol=None, depth_tol=DEFAULT_DEPTH_TOL, avoid=(), order=
         return None
     if order == "v2":
         return min(free, key=lambda i: boxes[i].bbox[0] + boxes[i].bbox[2])
-    if order == "v3":
-        return by_weights(boxes, free, real, WEIGHTS if weights is None else weights)
     # The highest top first, on a box or on the floor: stacks are cleared from the top down, so
     # the boxes under them (and their neighbours, which a pull can drag) are taken only when
     # nothing stands on them, and a tall box standing on the floor goes before a low stack.
@@ -1053,17 +976,6 @@ def split_doubles(boxes):
                 halves = [a, b.mask & ~a]
         out.append(halves)
     return out
-
-
-def by_weights(boxes, free, seen, weights):
-    """Order v3: the free box with the best score. weights = (highest, closest, leftmost): what
-    each cm higher (top), closer (grip point) and further left (grip point) is worth. All in real
-    distances, so a few mm of measuring noise between look-alike boxes can't decide; no set
-    distances. Equal scores: the leftmost. (seen: unused, kept for the call.)"""
-    wh, wn, wl = weights
-    x = {i: float(boxes[i].pick.centroid[0]) for i in free}
-    score = lambda i: wh * boxes[i].high - wn * float(boxes[i].pick.centroid[2]) - wl * x[i]
-    return max(free, key=lambda i: (round(score(i), 9), -x[i]))
 
 
 def hidden_top(b, a, depth_tol=DEFAULT_DEPTH_TOL):

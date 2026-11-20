@@ -9,7 +9,8 @@ Run: python test_pick_watch.py
 import numpy as np
 
 from faces import analyse, choose_target, up_from_pitch
-from pick_watch import CLEAR_FRAMES, DROP_FRAMES, MOVED_FRAMES, STEADY_FRAMES, STILL_S, PickTracker, PickWatcher
+from pick_watch import (CLEAR_FRAMES, DROP_FRAMES, MOVED_FRAMES, SETTLE_S, STEADY_FRAMES, STILL_S, PickTracker,
+                        PickWatcher)
 from test_faces import INTR, PITCH, box_world, check, render
 
 FRONT_TARGET = box_world(-0.06, 0.45, (0.10, 0.08, 0.04))     # upright: picked from the front
@@ -60,14 +61,15 @@ def case(fn):
     return fn
 
 
-def verdict(name, target_box, arm, after, expect, noise, holes, arm_seen=True, extra=(), lifted=None):
+def verdict(name, target_box, arm, after, expect, noise, holes, arm_seen=True, extra=(), lifted=None, box_mm=None):
     """extra: more boxes, there all along. lifted: what is in view while the box is carried
-    off (the arm with the box in the gripper), between the arm and `after`."""
+    off (the arm with the box in the gripper), between the arm and `after`. box_mm: the box's
+    size, given to the watcher."""
     face, depth0, t, masks = target_face(target_box, noise, holes, extra, with_masks=True)
     ok = check("target", t == 0 and face is not None, f"box {t}, {face.kind if face else None} face")
     if not ok:
         return ok
-    w = PickWatcher(face, depth0, masks[0])
+    w = PickWatcher(face, depth0, masks[0], box_mm=box_mm)
     rest = [beside(target_box), WALL, *extra]
     frames = [scene([target_box] + rest, noise, holes, 1)]
     frames += [scene([target_box, arm] + rest, noise, holes, 2)] if arm_seen else []
@@ -256,6 +258,183 @@ def tracker_retry_then_pick(noise=0.0, holes=0.0):
     ok &= check("retry", second is not None and second["pick"] == 2 and second["attempt"] == 2, f"{second}")
     got = [(e["pick"], e["attempt"], e["result"]) for e in events]
     return ok & check("results", got == [(1, 1, "missed"), (2, 2, "picked")], f"{got}")
+
+
+# -- 19 Nov 2026: what went wrong on the robot ---------------------------------------------------
+
+def feed(watcher, frames, fps=30.0, arm_out_at=None, edge_flicker=False):
+    """Feed [(depth, n), ...] at fps, frame by frame, until a verdict -> (verdict or None, frames fed).
+    arm_out_at: from this frame on (1 = the first) the robot says its arm is out. edge_flicker: each
+    frame's left edge loses depth as the D455's does (flicker())."""
+    k = 0
+    for depth, n in frames:
+        for _ in range(n):
+            k += 1
+            d = flicker(depth, 1000 + k) if edge_flicker else depth
+            result = watcher.update(d, INTR, k / fps, arm_out=arm_out_at is not None and k >= arm_out_at)
+            if result:
+                return result, k
+    return None, k
+
+
+def flicker(depth, seed):
+    """The D455's strip with no depth down the picture's left side, its border flickering from frame
+    to frame: each row loses 50-90 px."""
+    d = depth.copy()
+    w = 50 + np.random.default_rng(seed).integers(0, 40, d.shape[0])
+    d[np.arange(d.shape[1])[None, :] < w[:, None]] = 0
+    return d
+
+
+LIP = bar(-0.06, 0.04, 0.415, (0.10, 0.012, 0.01))   # a thin strip 1.5 cm in front of the upright target's face
+
+
+@case
+def pushed_back_15mm(noise=0.0, holes=0.0):
+    """The arm pushes the box 1.5 cm back and leaves it (size not known): moved, not picked (was picked)."""
+    pushed = box_world(-0.06, 0.465, (0.10, 0.08, 0.04))
+    return verdict("result", FRONT_TARGET, ARM_FRONT, [pushed], "moved", noise, holes)
+
+
+@case
+def pushed_back_2cm_size_known(noise=0.0, holes=0.0):
+    """Box 100 x 80 x 40 mm pushed 2 cm back, its size given: moved, not picked (gone needs 24 mm)."""
+    pushed = box_world(-0.06, 0.47, (0.10, 0.08, 0.04))
+    return verdict("result", FRONT_TARGET, ARM_FRONT, [pushed], "moved", noise, holes, box_mm=(80, 100, 40))
+
+
+@case
+def taken_with_same_box_behind_size_known(noise=0.0, holes=0.0):
+    """Box taken, an identical box right behind it, the size given: picked (4 cm back > 24 mm)."""
+    behind = box_world(-0.06, 0.49, (0.10, 0.08, 0.04))
+    return verdict("result", FRONT_TARGET, ARM_FRONT, [], "picked", noise, holes, extra=[behind], box_mm=(80, 100, 40))
+
+
+@case
+def flickering_edge_picked_quickly(noise=0.0, holes=0.0):
+    """The left edge's depth flickers in every frame; reference from 5 frames before the pick: picked
+    within a second of the box going (it waited for the 10 s limit: 'can't tell' on the robot)."""
+    face, depth0, _, masks = target_face(FRONT_TARGET, noise, holes, with_masks=True)
+    rest = [beside(FRONT_TARGET), WALL]
+    there = scene([FRONT_TARGET] + rest, noise, holes, 1)
+    refs = [flicker(scene([FRONT_TARGET] + rest, noise, holes, 10 + i), 10 + i) for i in range(4)]
+    w = PickWatcher(face, flicker(depth0, 9), masks[0], refs=refs)
+    frames = [(there, 6), (scene([FRONT_TARGET, ARM_FRONT] + rest, noise, holes, 2), 10),
+              (scene(rest, noise, holes, 3), 400)]
+    result, k = feed(w, frames, edge_flicker=True)
+    return check("result", result == "picked" and k - 16 <= 30, f"{result} {k - 16} frames after the box went "
+                 f"(expected picked within 30)")
+
+
+@case
+def hand_with_box_stays_past_time_limit(noise=0.0, holes=0.0):
+    """Box carried up, the arm with it stays in view past SETTLE_S: still no verdict (was picked)."""
+    face, depth0, _, masks = target_face(FRONT_TARGET, noise, holes, with_masks=True)
+    rest = [beside(FRONT_TARGET), WALL]
+    w = PickWatcher(face, depth0, masks[0])
+    frames = [(scene([FRONT_TARGET] + rest, noise, holes, 1), 6),
+              (scene([FRONT_TARGET, ARM_FRONT] + rest, noise, holes, 2), 10),
+              (scene(carried(FRONT_TARGET) + rest, noise, holes, 4), int(1.5 * SETTLE_S * 30))]
+    result, _ = feed(w, frames)
+    return check("result", result is None, f"{result} (expected None)")
+
+
+@case
+def outline_with_lip_missed(noise=0.0, holes=0.0):
+    """Part of the face's outline is not on its plane before the pick (a lip in front): arm comes and
+    goes, box still there: missed (it read 'arm in view' for ever: can't tell)."""
+    face, _, _, masks = target_face(FRONT_TARGET, noise, holes, with_masks=True)
+    rest = [beside(FRONT_TARGET), WALL, LIP]
+    depth0 = scene([FRONT_TARGET] + rest, noise, holes, 0)
+    w = PickWatcher(face, depth0, masks[0])
+    frames = [(scene([FRONT_TARGET] + rest, noise, holes, 1), 6),
+              (scene([FRONT_TARGET, ARM_FRONT] + rest, noise, holes, 2), 10),
+              (scene([FRONT_TARGET] + rest, noise, holes, 3), 60)]
+    result, _ = feed(w, frames)
+    return check("result", result == "missed", f"{result} (expected missed; {w.off_plane} face pixels off its plane)")
+
+
+@case
+def arm_out_missed_arm_never_seen(noise=0.0, holes=0.0):
+    """The arm never covered the face; the robot says its arm is out: missed at once (it waited for
+    the arm for ever: can't tell)."""
+    face, depth0, _, masks = target_face(FRONT_TARGET, noise, holes, with_masks=True)
+    w = PickWatcher(face, depth0, masks[0])
+    there = scene([FRONT_TARGET, beside(FRONT_TARGET), WALL], noise, holes, 1)
+    result, k = feed(w, [(there, 60)], arm_out_at=31)
+    return check("result", result == "missed" and k <= 31 + STEADY_FRAMES, f"{result} at frame {k} (arm out at 31)")
+
+
+@case
+def arm_out_flap_in_front_moved(noise=0.0, holes=0.0):
+    """After the arm, something stays in front of the face, not reaching in from the edge (a flap
+    pulled open); the robot says its arm is out: moved (it read 'arm in view' for ever)."""
+    face, depth0, _, masks = target_face(FRONT_TARGET, noise, holes, with_masks=True)
+    rest = [beside(FRONT_TARGET), WALL]
+    w = PickWatcher(face, depth0, masks[0])
+    frames = [(scene([FRONT_TARGET] + rest, noise, holes, 1), 6),
+              (scene([FRONT_TARGET, ARM_FRONT] + rest, noise, holes, 2), 10),
+              (scene([FRONT_TARGET, LIP] + rest, noise, holes, 3), 60)]
+    no_robot, _ = feed(PickWatcher(face, depth0, masks[0]), frames)
+    result, k = feed(w, frames, arm_out_at=40)
+    ok = check("without the robot's word", no_robot is None, f"{no_robot} (expected None: something in front)")
+    return ok & check("result", result == "moved" and k <= 40 + 2 * STEADY_FRAMES, f"{result} at frame {k}")
+
+
+@case
+def arm_out_picked_despite_lost_depth_at_edge(noise=0.0, holes=0.0):
+    """Box gone, a patch at the picture's left edge loses its depth for good (a cable moved): without
+    the robot's word picked only after SETTLE_S; with it (arm out) within a second."""
+    face, depth0, _, masks = target_face(FRONT_TARGET, noise, holes, with_masks=True)
+    rest = [beside(FRONT_TARGET), WALL]
+    gone = scene(rest, noise, holes, 3)
+    gone[200:400, :120] = 0
+    frames = [(scene([FRONT_TARGET] + rest, noise, holes, 1), 6),
+              (scene([FRONT_TARGET, ARM_FRONT] + rest, noise, holes, 2), 10), (gone, 400)]
+    slow, k_slow = feed(PickWatcher(face, depth0, masks[0]), frames)
+    fast, k_fast = feed(PickWatcher(face, depth0, masks[0]), frames, arm_out_at=20)
+    ok = check("without the robot's word", slow == "picked" and k_slow >= 16 + SETTLE_S * 30,
+               f"{slow} at frame {k_slow}")
+    return ok & check("arm out", fast == "picked" and k_fast <= 20 + 30, f"{fast} at frame {k_fast} (arm out at 20)")
+
+
+@case
+def moved_after_one_second_at_15_fps(noise=0.0, holes=0.0):
+    """At 15 frames a second, 'moved' comes 1 s after the arm (MOVED_S), not after 30 frames (2 s)."""
+    face, depth0, _, masks = target_face(FRONT_TARGET, noise, holes, with_masks=True)
+    rest = [beside(FRONT_TARGET), WALL]
+    pushed = box_world(-0.11, 0.45, (0.10, 0.08, 0.04))
+    frames = [(scene([FRONT_TARGET] + rest, noise, holes, 1), 6),
+              (scene([FRONT_TARGET, ARM_FRONT] + rest, noise, holes, 2), 8), (scene([pushed] + rest, noise, holes, 3), 60)]
+    result, k = feed(PickWatcher(face, depth0, masks[0]), frames, fps=15)
+    return check("result", result == "moved" and k - 14 <= 16, f"{result} {k - 14} frames after the arm left (15 fps)")
+
+
+@case
+def reopened_miss_then_picked(noise=0.0, holes=0.0):
+    """A miss before the robot is done is reopened (it presses again); then the box goes: picked."""
+    face, depth0, _, masks = target_face(FRONT_TARGET, noise, holes, with_masks=True)
+    rest = [beside(FRONT_TARGET), WALL]
+    there = scene([FRONT_TARGET] + rest, noise, holes, 1)
+    arm = scene([FRONT_TARGET, ARM_FRONT] + rest, noise, holes, 2)
+    w = PickWatcher(face, depth0, masks[0])
+    first, _ = feed(w, [(there, 6), (arm, 10), (there, 30)])
+    w.reopen(first)
+    again, _ = feed(w, [(there, 20)])
+    second, _ = feed(w, [(arm, 10), (scene(rest, noise, holes, 3), 60)])
+    ok = check("first", first == "missed", f"{first}")
+    ok &= check("no second miss without the arm", again is None, f"{again}")
+    return ok & check("then", second == "picked", f"{second}")
+
+
+@case
+def arm_out_camera_moved(noise=0.0, holes=0.0):
+    """The camera tilts 6 degrees between the pick and the robot's word: camera_moved (can't tell)."""
+    face, depth0, _, masks = target_face(FRONT_TARGET, noise, holes, with_masks=True)
+    boxes = [FRONT_TARGET, beside(FRONT_TARGET), WALL]
+    tilted = render(boxes, noise, holes, seed=3, floor=True, pitch=PITCH + 6)[0]
+    result, _ = feed(PickWatcher(face, depth0, masks[0]), [(tilted, 30)], arm_out_at=1)
+    return check("result", result == "camera_moved", f"{result}")
 
 
 def main():

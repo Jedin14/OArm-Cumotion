@@ -30,9 +30,9 @@ from rcl_interfaces.srv import GetParameters, SetParameters
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image, JointState
+from sensor_msgs.msg import CameraInfo, Image, JointState, Range
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import String, UInt32
 from std_srvs.srv import Empty, Trigger
@@ -177,7 +177,10 @@ def held_spheres(rot, centre, ext):
 
 
 TIMED_OUT = object()      # move_group did not answer (not "no solution": never cached)
-EARLY_CONTACT_M = 0.03    # a contact this far before the measured surface is not one
+EARLY_CONTACT_M = 0.015   # a contact this far before the measured surface is not one
+                          # (2026-11-19: 0.03 armed the whole line -- it starts ~3 cm out --
+                          # and a 0.35 s stick in free air read as contact 13 mm short)
+KEEP_FRAC = 0.5           # the tip keeps up: >= this share of the line's speed over STUCK_S
 BLOCKED_LAG_M = 0.02      # the command this far ahead and the arm never got going: blocked
 START_MOVE_M = 0.003      # ... nor before the arm is rolling: moved this far, and seen
                           # advancing (the start-up stall winds the torque up like a push)
@@ -282,6 +285,13 @@ class ClickToMove(Node):
                                  callback_group=cb)
         self.create_subscription(String, '/lidar/status', self._on_lidar_status,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+                                 callback_group=cb)
+        # x, the range sensor under the box below the arms (2026-11-19): from 87 to 152 cm
+        # the drop pose would collide, so a held box is let go at pre_pick (touch.py)
+        self.vertical = None              # (x cm, time.monotonic()) of the last valid reading
+        self.create_subscription(Range, getattr(args, 'vertical_topic', '/c60000004/vertical_distance'),
+                                 self._on_vertical,
+                                 QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT),
                                  callback_group=cb)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.marker_pub = self.create_publisher(MarkerArray, '/click_to_move/marker', latched)
@@ -414,6 +424,20 @@ class ClickToMove(Node):
         motor reports one (fake hardware). Compare two of them to see a change."""
         out = [self.motor_status.get(n) for n in arm_joints(arm)]
         return None if all(v is None for v in out) else out
+
+    def _on_vertical(self, msg):
+        r = float(msg.range)
+        lo, hi = float(msg.min_range), float(msg.max_range)
+        if not math.isfinite(r) or (hi > lo and not lo <= r <= hi):
+            return                        # REP 117: +-inf / outside its limits = no reading
+        self.vertical = (r * 100.0, time.monotonic())
+
+    def vertical_x(self, max_age=3.0):
+        """The last x reading, cm, or None (none, or older than max_age s)."""
+        v = self.vertical
+        if v is None or time.monotonic() - v[1] > max_age:
+            return None
+        return v[0]
 
     def _on(self, name, default=True):
         """An on/off option from args (a bool, or 'on'/'off'), `default` if unset."""
@@ -2394,6 +2418,18 @@ class ClickToMove(Node):
                 commanded = min(1.0, (now - t0) / wanted) * length
                 return progress - slow[0][1] < STUCK_M and commanded - progress > 0.002
 
+            def keeping_up():
+                """The tip advanced, over the last ~STUCK_S, at KEEP_FRAC or more of the
+                line's commanded speed: moving freely (stick-slip in free air does, on
+                average: 0.67-1.66 of it in the 17 false stops of 11-18/11-19) -- not
+                blocked or squashing the cup (~0). Too soon to tell: True."""
+                if p0 is None or len(slow) < 2:
+                    return p0 is not None
+                span = slow[-1][0] - slow[0][0]
+                if span < 0.6 * STUCK_S:
+                    return True
+                return (slow[-1][1] - slow[0][1]) >= KEEP_FRAC * (length / wanted) * span
+
             def past(seconds):
                 """The torques `seconds` ago (the oldest kept if not that old)."""
                 now = time.monotonic()
@@ -2437,7 +2473,17 @@ class ClickToMove(Node):
                         f'{label}: contact (blocked: {1000 * commanded:.0f} mm commanded, '
                         f'{1000 * progress:.0f} mm moved)')
                     return True
-                cap = max_torque if near else args.max_touch_torque
+                # the tool's soft limit (max_torque) once the arm is rolling: at or past
+                # the measured surface, and before it while the tip is not keeping up
+                # (blocked by a box nearer than measured, squashing the cup). In free air
+                # the shoulder's stick-slip swings 0.6-1.2 Nm in 0.5 s: armed over the
+                # whole line (EARLY_CONTACT_M 3 cm, the line starts ~3 cm out) it stopped
+                # 17 of the last 50 presses 6-28 mm short (2026-11-19 17:36: three presses,
+                # the box missed, picked unchanged at the next try). The arm's own limit
+                # (--max-touch-torque) holds everywhere.
+                soft_on = p0 is None or (rolling['on'] and
+                                         (progress >= surface or not keeping_up()))
+                cap = max_torque if soft_on else args.max_touch_torque
                 trace.append((round(now - t0, 3), round(1000 * progress, 1),
                               [round(float(v), 2) for v in e - past(0.5)]))
                 count['cap'] = count['cap'] + 1 if np.any(big > cap) else 0

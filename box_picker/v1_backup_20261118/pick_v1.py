@@ -1,0 +1,167 @@
+"""Run v1 on recorded frames: the pick order, the face to grip each box by, and the box size.
+
+Uses the boxes saved in cache/ (detect_cache.py) when they are there, else finds them with
+SAM 3.1 (needs the GPU, ~4 GB, ~5 s to load). Prints one JSON line per frame and saves a
+picture of it (outputs/pick_v1/<recording>_<frame>.jpg, or --out).
+
+v2: only the boxes in the carton in front are used (carton.py); --no-carton uses every box.
+
+Usage (from box_picking/v1/):
+    PY=../../vlm/molmo2-box-picking/.venv/bin/python
+    R=../../vlm/molmo2-box-picking/recordings
+    $PY pick_v1.py $R/grid_part2 7 8 frame_00009
+    $PY pick_v1.py $R/grid_part3 0-5 --out /tmp/v1
+    $PY pick_v1.py $R/grid_part2 7 --sam            # find the boxes again, not from cache/
+    $PY pick_v1.py captures/snaps 0 --box-size 125 125 54   # the box size (height width depth, mm)
+
+The box depth sets the layers (grid_order.py, 5). It comes from --box-size, else the frame's own
+meta (box_size: saved by the pick loop from the robot's topic), else, for the hand-labelled
+recordings, test_v1.RECORDING_DEPTH_MM. Without it every box is in one layer.
+
+Output, one line per frame:
+    {"frame", "box_size_mm": [w, h, d or null], "grid_boxes",
+     "carton": null (not checked) | {"found": false} | {"found": true, "boxes_in", "left_out", "near_m"},
+     "picks": [{"rank", "face": "front" | "top", "fallen", "u", "v", "x_m", "y_m", "z_m",
+                "face_mm": [long, short], "cell": [layer, row, column] or null}, ...]}
+    x right, y down, z away from the camera, in metres; u, v the same point in the picture.
+    cell counts from 1: layer 1 = the front, row 1 = the highest row now in that layer,
+    column 1 = the leftmost box seen. Fallen boxes have no cell.
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+import carton
+import grid_order
+from detect_cache import find_boxes, load_cache, load_frame
+
+HERE = Path(__file__).parent
+
+
+def stems(specs):
+    """'7', '0-5', 'frame_00009' -> frame stems."""
+    out = []
+    for s in specs:
+        s = s.removeprefix("frame_")
+        if "-" in s:
+            a, b = s.split("-")
+            out += [f"frame_{n:05d}" for n in range(int(a), int(b) + 1)]
+        else:
+            out.append(f"frame_{int(s):05d}")
+    return out
+
+
+LAYER_COLOURS = [(0, 220, 255), (255, 255, 0), (255, 0, 255)]   # layer 1 yellow, 2 cyan, 3 magenta (BGR)
+
+
+def layer_colour(k):
+    return LAYER_COLOURS[k] if k < len(LAYER_COLOURS) else (255, 255, 255)
+
+
+def draw(color, boxes, res):
+    img = color.copy()
+    layer = {p["box"]: p["cell"][0] for p in res["picks"] if p["cell"] is not None}
+    for i, b in enumerate(boxes):
+        cs, _ = cv2.findContours(b.mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(img, cs, -1, (0, 220, 255), 1)
+    outlines = [(i, cv2.findContours(boxes[i].mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0])
+                for i in layer]
+    found = res.get("carton")
+    carton.draw(img, found, boxes)
+    picks = list(enumerate(res["picks"]))
+    for k, p in picks[:4]:                       # the faces to grip of the first 4: green front, blue top
+        face_col = (0, 200, 0) if p["face"] == "front" else (255, 120, 0)
+        cv2.polylines(img, [np.int32(p["corners_px"])], True, face_col, 2)
+    for i, cs in outlines:                       # each grid box's outline in its layer's colour
+        cv2.drawContours(img, cs, -1, layer_colour(layer[i]), 2)
+    for k, p in reversed(picks):                 # the order on top: number, layer (or F)
+        col = (0, 0, 255) if k == 0 else (0, 165, 255) if k < 4 else (160, 160, 160)
+        u, v = map(int, p["uv"])
+        cv2.circle(img, (u, v), 6 if k < 4 else 3, col, 2)
+        label = f"{k + 1}" + (" F" if p["fallen"] else f" L{p['cell'][0] + 1}" if p["cell"] is not None else "")
+        cv2.putText(img, label, (u + 6, v - 6), 0, 0.55, (0, 0, 0), 4)
+        cv2.putText(img, label, (u + 6, v - 6), 0, 0.55, col, 2)
+    given = res.get("box_given_mm")
+    w, h, d = res["box_size_mm"] or (None, None, None)
+    if given and given[0] and given[1]:
+        size = f"{given[1]:.0f} x {given[0]:.0f} x {given[2]:.0f} mm (given)"
+    elif given:
+        size = ("?" if w is None else f"{w:.0f} x {h:.0f}") + f" x {given[2]:.0f} mm (depth given)"
+    else:
+        size = "?" if w is None else f"{w:.0f} x {h:.0f} x {'?' if d is None else f'{d:.0f}'} mm (measured)"
+    cv2.rectangle(img, (0, 0), (img.shape[1], 24), (0, 0, 0), -1)
+    cv2.putText(img, f"box {size}  {len(res['picks'])} to pick  red 1 = now, orange 2-4 next, F fallen; L1 L2: layer"
+                     f" (yellow, cyan); green face = front, blue = top", (6, 17), 0, 0.38, (255, 255, 255), 1)
+    if found is not None:
+        line = carton.message(res)[0] + (" (white; boxes outside it grey)" if found["found"] else "")
+        cv2.rectangle(img, (0, img.shape[0] - 22), (img.shape[1], img.shape[0]), (0, 0, 0), -1)
+        cv2.putText(img, line, (6, img.shape[0] - 7), 0, 0.42, (255, 255, 255), 1)
+    return img
+
+
+def box_size(args, stem):
+    """(height, width, depth) mm: --box-size, else the frame's meta, else the labelled recordings' depth."""
+    if args.box_size:
+        return tuple(args.box_size)
+    meta = json.loads((args.recording / f"{stem}_meta.json").read_text())
+    if meta.get("box_size"):
+        return tuple(meta["box_size"])
+    from test_v1 import RECORDING_DEPTH_MM
+    d = RECORDING_DEPTH_MM.get(args.recording.name)
+    return None if d is None else (None, None, d)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("recording", type=Path)
+    ap.add_argument("frames", nargs="+", help="frame numbers (7), ranges (0-5) or names (frame_00007)")
+    ap.add_argument("--out", type=Path, default=HERE / "outputs" / "pick_v1")
+    ap.add_argument("--sam", action="store_true", help="find the boxes with SAM 3.1 even if cache/ has them")
+    ap.add_argument("--score", type=float, default=0.4, help="SAM confidence cut-off")
+    ap.add_argument("--no-carton", action="store_true", help="use every box, not only those in the carton in front")
+    ap.add_argument("--box-size", type=float, nargs=3, metavar=("H", "W", "D"),
+                    help="the boxes' height, width and depth in mm (the depth sets the layers)")
+    args = ap.parse_args()
+    args.out.mkdir(parents=True, exist_ok=True)
+    finder = None
+    for stem in stems(args.frames):
+        color, depth, intr, up = load_frame(args.recording, stem)
+        cached = HERE / "cache" / args.recording.name / f"{stem}.pkl.gz"
+        if cached.exists() and not args.sam:
+            d = load_cache(cached)
+            boxes, cartons = d["boxes"], d.get("cartons")
+            if cartons is None and not args.no_carton:
+                print(f"{stem}: no cartons in cache/ (detect_cache.py --cartons): every box used", file=sys.stderr)
+        else:
+            if finder is None:
+                from box_masks import BoxFinder
+                finder = BoxFinder("box", args.score)
+                carton.keep_image(finder)
+            boxes = find_boxes(finder, color, depth, intr, up)[3]
+            cartons = None if args.no_carton else carton.find_cartons(finder)
+        given = box_size(args, stem)
+        res = grid_order.order({"boxes": boxes, "intr": intr, "up": up, "depth": depth,
+                                "cartons": None if args.no_carton else cartons,
+                                "box_depth": None if given is None else given[2] / 1000.0})
+        res["box_given_mm"] = given
+        size = res["box_size_mm"]
+        print(json.dumps({
+            "frame": stem,
+            "box_size_mm": None if size is None else [None if v is None else round(v) for v in size],
+            "grid_boxes": res["grid_boxes"],
+            "carton": carton.summary(res["carton"]),
+            "picks": [{"rank": k + 1, "face": p["face"], "fallen": p["fallen"],
+                       "u": round(p["uv"][0], 1), "v": round(p["uv"][1], 1),
+                       "x_m": round(p["xyz"][0], 4), "y_m": round(p["xyz"][1], 4), "z_m": round(p["xyz"][2], 4),
+                       "face_mm": [round(v) for v in p["size_mm"]],
+                       "cell": None if p["cell"] is None else [c + 1 for c in p["cell"]]}
+                      for k, p in enumerate(res["picks"])]}), flush=True)
+        cv2.imwrite(str(args.out / f"{args.recording.name}_{stem}.jpg"), draw(color, boxes, res))
+
+
+if __name__ == "__main__":
+    main()

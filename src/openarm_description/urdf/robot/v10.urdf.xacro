@@ -88,10 +88,35 @@
   />
   <xacro:include filename="$(find realsense2_description)/urdf/_d455.urdf.xacro" />
   <xacro:sensor_d455 parent="world" name="camera">
-    <!-- V10: set by hand 2026-11-16T17:20 with robot/sensor_align.py (live, the clouds
-         against the arm; 8.0 mm / 0.00 deg from the one before). History in cam_org.txt. -->
-    <origin xyz="0.01598 0.02000 0.52425" rpy="0.01931 -0.01182 -0.01906"/>
+    <!-- V11: set by hand 2026-11-18T16:20 with robot/sensor_align.py (live, the clouds
+         against the arm; 41.3 mm / 3.50 deg from the one before). History in cam_org.txt. -->
+    <origin xyz="0.01587 0.02000 0.56557" rpy="0.01815 0.04926 -0.01908"/>
   </xacro:sensor_d455>
+
+  <!-- The Unitree 4D LiDAR L2 on top of the body (2026-11-19), mounted straight on the
+       robot: meshes/sensors/unitree_l2.stl, made from Unitree's L2 user manual drawing
+       (75 x 75 x 65 mm; origin the centre of its bottom face, +z up its dome). Where it
+       physically is: lidar_bridge housing_xyz, its dome tilted forward 113.4 deg from up
+       (housing_rpy_deg; the fitted 2.2 / 0.8 deg roll / yaw squared off). Drawn only, no
+       collision here (cuMotion plans with robot/openarm.urdf, the SRDF has no pairs for
+       it): lidar_bridge puts the see-through keep-out l2_lidar_keepout round it in the
+       planning scene. Not the l2_lidar TF frame, which is the cloud's (a calibration). -->
+  <link name="l2_lidar_body">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://openarm_description/meshes/sensors/unitree_l2.stl"/>
+      </geometry>
+      <material name="l2_lidar_grey">
+        <color rgba="0.16 0.16 0.18 1.0"/>
+      </material>
+    </visual>
+  </link>
+  <joint name="l2_lidar_body_joint" type="fixed">
+    <parent link="openarm_body_link0"/>
+    <child link="l2_lidar_body"/>
+    <origin xyz="-0.028 0.003 0.8829" rpy="0 1.97920 0"/>
+  </joint>
 
 
 </robot>

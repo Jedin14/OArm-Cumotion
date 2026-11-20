@@ -16,7 +16,13 @@ Run it in its own terminal (system Python, not the .venv), and leave it running:
 
 Protocol (127.0.0.1:--port): the client sends one byte per frame it wants; the bridge
 answers with the next pair newer than that request: a 4-byte length, a JSON header (width,
-height, fx, fy, cx, cy, stamp, accel: [x, y, z] m/s^2 or null) and the raw colour (BGR uint8) then depth (uint16, mm) bytes.
+height, fx, fy, cx, cy, stamp, accel: [x, y, z] m/s^2 or null, box_size: [height, width, depth] mm
+or null) and the raw colour (BGR uint8) then depth (uint16, mm) bytes.
+
+box_size: the robot's box size, read (never published) from --box-size-topic
+(/beast_arm/held_object/fixed_size, the size entered in the robot's GUI; latched). Its message type
+(pick_interfaces/ObjectSize) is the robot's: build the copy in ros/ once (see box_picking/README.md);
+without it, box_size is always null, and the pick loop won't pick.
 """
 import argparse
 import collections
@@ -30,8 +36,13 @@ import numpy as np
 import rclpy
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image, Imu
+
+try:
+    from pick_interfaces.msg import ObjectSize     # the robot's message (ros/pick_interfaces)
+except ImportError:
+    ObjectSize = None
 
 PORT = 50555
 ACCEL_S = 0.5            # the accelerometer is averaged over this long
@@ -62,9 +73,17 @@ class Bridge(Node):
         qos = qos_profile_sensor_data if args.qos == "best_effort" else QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE)
         self.create_subscription(CameraInfo, args.info, self.on_info, qos)
         self.accels = collections.deque(maxlen=400)          # (time, x, y, z)
-        self.create_subscription(Imu, args.accel, self.on_accel, qos_profile_sensor_data)
+        for topic in args.accel:                              # whichever sends (see --accel)
+            self.create_subscription(Imu, topic, self.on_accel, qos_profile_sensor_data)
         color = Subscriber(self, Image, args.color, qos_profile=qos)
         depth = Subscriber(self, Image, args.depth, qos_profile=qos)
+        self.box_size = None                                  # [height, width, depth] mm, from the robot
+        if args.box_size_topic and ObjectSize is None:
+            self.get_logger().warn("pick_interfaces isn't built (box_picking/README.md): the box size can't be read")
+        elif args.box_size_topic:
+            latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                                 reliability=ReliabilityPolicy.RELIABLE)
+            self.create_subscription(ObjectSize, args.box_size_topic, self.on_box_size, latched)
         self.counts = {"colour": 0, "depth": 0, "pairs": 0}
         color.registerCallback(lambda m: self.count("colour"))
         depth.registerCallback(lambda m: self.count("depth"))
@@ -89,6 +108,14 @@ class Bridge(Node):
             if self.intr is None:
                 self.get_logger().info(f"camera info: {msg.width}x{msg.height} fx {k[0]:.1f} fy {k[4]:.1f} cx {k[2]:.1f} cy {k[5]:.1f}")
             self.intr = (k[0], k[4], k[2], k[5])
+
+    def on_box_size(self, msg):
+        size = [float(msg.height_mm), float(msg.width_mm), float(msg.depth_mm)]
+        with self.lock:
+            changed, self.box_size = size != self.box_size, size
+        if changed:
+            self.get_logger().info(f"box size from the robot: {size[0]:.0f} high x {size[1]:.0f} wide x "
+                                   f"{size[2]:.0f} deep mm ({msg.header.frame_id})")
 
     def on_accel(self, msg):
         a = msg.linear_acceleration
@@ -158,7 +185,7 @@ def client(bridge, conn):
             c, d, stamp, _ = pair
             fx, fy, cx, cy = intr
             header = json.dumps({"width": c.shape[1], "height": c.shape[0], "fx": fx, "fy": fy, "cx": cx, "cy": cy,
-                                 "stamp": stamp, "accel": bridge.accel()}).encode()
+                                 "stamp": stamp, "accel": bridge.accel(), "box_size": bridge.box_size}).encode()
             conn.sendall(struct.pack("!I", len(header)) + header + c.tobytes() + d.tobytes())
 
 
@@ -167,8 +194,11 @@ def main():
     ap.add_argument("--color", default="/camera/camera/color/image_raw")
     ap.add_argument("--depth", default="/camera/camera/aligned_depth_to_color/image_raw")
     ap.add_argument("--info", default="/camera/camera/color/camera_info")
-    ap.add_argument("--accel", default="/camera/camera/accel/sample",
-                    help="the camera's accelerometer (launch the driver with enable_accel:=true)")
+    ap.add_argument("--accel", nargs="+", default=["/camera/camera/accel/sample", "/camera/camera/imu"],
+                    help="the camera's accelerometer: every topic given is listened to, whichever sends "
+                         "(accel/sample with enable_accel:=true; imu when the driver unites accel and gyro)")
+    ap.add_argument("--box-size-topic", default="/beast_arm/held_object/fixed_size",
+                    help="the robot's box size (pick_interfaces/ObjectSize), read only; '' to leave it out")
     ap.add_argument("--slop", type=float, default=0.05, help="max time between a colour and a depth frame, s")
     ap.add_argument("--qos", choices=["best_effort", "reliable"], default="best_effort",
                     help="reliable resends lost pieces of big images, but needs a reliable publisher")

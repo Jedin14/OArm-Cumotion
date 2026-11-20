@@ -1,0 +1,160 @@
+BOX PICKER - PICK CHECK UPDATE, 19 Nov 2026
+Integration steps for Beast
+===============================================================================
+
+FILE TO INSTALL
+  box_picker_pickcheck_addon.zip   (about 150 KB; this text is also inside it)
+
+
+WHAT IT CHANGES
+  Only the pick check: the part that says, after a pick, whether the box was
+  taken. Box detection (SAM 3.1), the choice of target, and the ROS topics,
+  services and messages stay the same. No new packages, no colcon build.
+
+  It fixes three problems seen on the robot:
+   1. "Can't tell" although the box was picked; "picked" came only on a later
+      check. Depth noise at the left edge of the picture was read as "arm
+      still in view", so the check waited longer than the robot does.
+   2. "Can't tell" although the box was never touched. The check waited for
+      ever to see the arm.
+   3. "Picked" although the box was still there. A box pushed back by 1-2 cm
+      counted as gone.
+
+  Now the check decides as soon as the robot sends "check" (its arm is back at
+  pre_pick), usually within 1 s. A box counts as gone only when its face reads
+  about 32 mm further back (for the 125 x 125 x 54 mm boxes), from the box size
+  the robot already sends. A smaller push reads PICK FAILED: BOX MOVED.
+
+
+BEFORE YOU START
+  - Beast already has the box picker (box_picker/src with its .venv) and the
+    box size add-on of 18 Nov 2026 (box_picker_boxsize_addon.zip).
+  - In these steps:
+      <WS>   the robot's workspace: the folder that holds box_picker/
+      <APP>  the folder that holds the robot app's box_model_node.py.
+             box_picker_server.py must be in the same folder: the node starts
+             it from there.
+  - Stop the robot app.
+
+
+STEP 1  Back up the current files
+
+    cd <WS>
+    cp -r box_picker/v1 box_picker/v1_backup_20261118
+    cp box_picker/src/pick_watch.py box_picker/src/pick_watch.py.bak_20261118
+    cp <APP>/box_model_node.py    <APP>/box_model_node.py.bak_20261118
+    cp <APP>/box_picker_server.py <APP>/box_picker_server.py.bak_20261118
+
+
+STEP 2  Unzip in the workspace, overwriting the old files
+
+    cd <WS>
+    unzip -o box_picker_pickcheck_addon.zip
+
+  This replaces:  box_picker/v1/          (all its files)
+                  box_picker/src/pick_watch.py
+                  box_picker/src/test_pick_watch.py
+  It adds:        box_picker_app/         (box_picker_server.py, box_model_node.py,
+                                           test_check_server.py)
+                  RUN_LIVE_v2.md, INTEGRATION_STEPS_pickcheck_20261119.txt
+
+
+STEP 3  Copy the robot app's two files
+
+    cp <WS>/box_picker_app/box_picker_server.py <APP>/
+    cp <WS>/box_picker_app/box_model_node.py    <APP>/
+
+  (If <APP> is <WS>/box_picker_app, step 2 has already done this.)
+
+
+STEP 4  Test without the robot (no GPU needed, about 3 minutes)
+
+    cd <WS>/box_picker/src
+    .venv/bin/python test_pick_watch.py
+        last line must be:   58/58 passed
+
+    cd <WS>/box_picker_app
+    ../box_picker/src/.venv/bin/python test_check_server.py
+        last line must be:   all passed
+
+  test_check_server.py runs the robot's "pick" and "check" end to end on
+  synthetic depth from a fake 15 fps camera: picked, missed, pushed (moved),
+  a second press after a miss, and the arm staying in view.
+
+
+STEP 5  Start the robot app and check the start-up
+
+  <WS>/native/logs/box_picker.log must contain the line:
+
+      pick check: <WS>/box_picker/v1/pick_watch.py
+
+  If it says "older than 19 Nov 2026" instead, box_picker/v1/pick_watch.py
+  was not replaced: repeat step 2.
+
+
+STEP 6  Check on real picks
+
+  - Run a normal pick (ready_to_pick). The camera's answer should come within
+    about 1-2 s of the robot's "check". Before, it took up to 15 s and was
+    often "can't tell".
+  - Stop short of a box on purpose (a miss): it must say
+    PICK FAILED: MISSED, not "can't tell".
+  - Each pick leaves a folder:
+        <WS>/box_picker/src/outputs/gui/<run>/checks/NNN_HHMMSS/
+    Open check1_<outcome>_timeline.txt: each step with its time, from the arm
+    coming in to the decision. Send this folder when something looks wrong.
+
+
+WHAT THE ROBOT SIDE SEES (no change needed on the robot side)
+  - The same service (/beast_arm/box_model/check) and the same messages.
+  - verdict_json has new fields: detail, timeline, fps, gone_mm, log,
+    provisional, decided_before_check, by_gripper.
+  - outcome can now also be "camera_moved": most of the view changed since
+    before the pick. picked = null (-1 in CheckPick), like "blocked".
+  - For "can't tell" (outcome blocked), the reason is now in the answer's
+    message and "why", for example:
+        "box left its spot; something as big as a box stays at the picture's
+         edge (the arm?)"
+    The robot's screen shows "Something was in view" for every blocked.
+    Please show the message there instead.
+  - "check held" / "check empty" (the gripper's word) still wins over the
+    camera. It also decides when the box left its spot but the camera can't
+    settle.
+
+
+ALSO IN THIS ZIP
+  - SAM confidence stays 0.4 (box_model_node.py and box_picker_server.py are
+    as on 18 Nov but for the pick check). At 0.3 SAM also outlines parts of
+    the carton, and on the hand-labelled frames pick 1 fell from 100% to 94%.
+  - Recording for troubleshooting (off by default). Publish on
+    /beast_arm/box_model/cmd:
+        set record on
+    Every frame each pick check sees is then saved in the pick's folder
+    (frames/, about 4 MB a second). "set record off" stops it. To replay a
+    recorded pick on any PC:
+        cd <WS>/box_picker/v1
+        ../src/.venv/bin/python replay_check.py <pick folder>
+
+
+ROLLBACK (back to 18 Nov 2026)
+
+    cd <WS>
+    rm -rf box_picker/v1
+    mv box_picker/v1_backup_20261118 box_picker/v1
+    mv box_picker/src/pick_watch.py.bak_20261118 box_picker/src/pick_watch.py
+    mv <APP>/box_model_node.py.bak_20261118    <APP>/box_model_node.py
+    mv <APP>/box_picker_server.py.bak_20261118 <APP>/box_picker_server.py
+
+  Then restart the robot app.
+
+
+IF SOMETHING GOES WRONG
+  test_check_server.py: "No module named box_picker_server"
+      Run it from <WS>/box_picker_app, where step 2 put it.
+  box_picker.log: "pick_watch.py is older than 19 Nov 2026"
+      box_picker/v1/pick_watch.py was not replaced: repeat step 2.
+  Still "can't tell" on a pick
+      Read why in the check's message, or in check1_blocked_timeline.txt in
+      the pick's folder. Send that folder back to us.
+
+More detail: RUN_LIVE_v2.md (in this zip), section "Update 19 Nov 2026".
